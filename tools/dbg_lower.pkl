@@ -1,0 +1,39 @@
+module tools.dbg_lower
+
+import { DiagnosticSink } from compiler.diag
+import { lowerModuleObjEx } from cli.buildlib
+
+fn main() {
+    let path = args()[0]
+    if (let some(src) = read_file(path)) {
+        let sinks = DiagnosticSink()
+        if (let some(mp) = lowerModuleObjEx(path, src, sinks, 0, "pkl_setup_dbg")) {
+            let o = mp.obj
+            println("syms=" + str(len(o.syms)) + " secs=" + str(len(o.secs)) + " classCount=" + str(mp.classCount))
+            var i = 0
+            while (i < len(o.syms)) {
+                let s = o.syms[i]
+                if (s.name == "pkl_closure_0" || s.name == "pickle_class_is" || s.name == ".text" || s.name == ".rdata" || s.name == ".data") {
+                    println("sym " + str(i) + " name=" + s.name + " sec=" + str(s.sec) + " scl=" + str(s.scl) + " val=" + str(s.value))
+                }
+                i = i + 1
+            }
+            let cs = o.secs[0]
+            println("text relocs=" + str(len(cs.relocs)))
+            var r = 0
+            while (r < len(cs.relocs)) {
+                let rl = cs.relocs[r]
+                if (rl.va >= 0x13c0 && rl.va <= 0x13d0) {
+                    let c = o.mapIdx[rl.symIdx]
+                    let s2 = o.syms[c]
+                    println("reloc va=" + str(rl.va) + " symIdx=" + str(rl.symIdx) + " -> '" + s2.name + "' sec=" + str(s2.sec))
+                }
+                r = r + 1
+            }
+        } else {
+            println("lower failed")
+        }
+    } else {
+        println("read failed")
+    }
+}
