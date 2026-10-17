@@ -1,10 +1,10 @@
 # SOVEREIGN BUILDRUN GATE — the product build path without Rust.
 #
 # GATE12/12b build + run every battery main against the PICKLE runtime archive
-# (tools\diff\rtlib.ar, built by pickle\cli/rtlib.pkl), so the battery needs no
+# (tools\diff\rtlib.ar, built by cli/rtlib.pkl), so the battery needs no
 # cargo and no combined.lib. This gate goes still deeper: each main is lowered and
-# linked by the pickle selfhost linker (pickle\cli/selflink.pkl) directly against
-# the PICKLE runtime DIRECTORY (pickle\runtime) — members are themselves pickle
+# linked by the pickle selfhost linker (cli/selflink.pkl) directly against
+# the PICKLE runtime DIRECTORY (runtime) — members are themselves pickle
 # `#[symbol]` bodies, and no archive step happens at all. The producted exe is then
 # run and its stdout+exit byte-compared to the FROZEN `pickle run` golden
 # (tools\diff\golden\run\<name>.{out,exit}), exactly like GATE12 — so no Rust cli is
@@ -36,8 +36,8 @@ Remove-Item Env:PKL_NO_AUTO_GC -ErrorAction SilentlyContinue
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $Root
 . (Join-Path $PSScriptRoot "battery_common.ps1")
-$sl = "pickle\cli\selflink.pkl"
-$rt = (Resolve-Path "pickle\runtime").Path
+$sl = "cli\selflink.pkl"
+$rt = (Resolve-Path "runtime").Path
 
 # The selfhost linker is itself AOT-built and stamp-gated on the port source
 # trees (pickle_common's Get-DriverHash), so the build+run path never shells

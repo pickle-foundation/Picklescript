@@ -15,7 +15,7 @@
 # which is why grepping the .ir/.irx for "pickle_" finds nothing.
 #
 # Then it crosses-references the ported runtime: a symbol counts as ported when some
-# pickle/runtime/*.pkl declares it with #[symbol("...")], which is the same convention
+# runtime/*.pkl declares it with #[symbol("...")], which is the same convention
 # the string cluster landed with.
 #
 # Usage: powershell -NoProfile -ExecutionPolicy Bypass -File tools\extern_surface.ps1
@@ -33,14 +33,14 @@ $srcs = @()
 switch ($Shapes) {
     "battery"  { $srcs += Get-ChildItem "tests\pickle\*.pkl" -File }
     "examples" { $srcs += Get-ChildItem "examples" -Recurse -Filter *.pkl -File }
-    "runtime"  { $srcs += Get-ChildItem "pickle\runtime\*.pkl" -File }
-    "self"     { $srcs += Get-ChildItem "pickle\compiler\*.pkl" -File; $srcs += Get-ChildItem "pickle\cli\*.pkl" -File }
+    "runtime"  { $srcs += Get-ChildItem "runtime\*.pkl" -File }
+    "self"     { $srcs += Get-ChildItem "compiler\*.pkl" -File; $srcs += Get-ChildItem "cli\*.pkl" -File }
     "all" {
         $srcs += Get-ChildItem "tests\pickle\*.pkl" -File
         $srcs += Get-ChildItem "examples" -Recurse -Filter *.pkl -File
-        $srcs += Get-ChildItem "pickle\compiler\*.pkl" -File
-        $srcs += Get-ChildItem "pickle\cli\*.pkl" -File
-        $srcs += Get-ChildItem "pickle\runtime\*.pkl" -File
+        $srcs += Get-ChildItem "compiler\*.pkl" -File
+        $srcs += Get-ChildItem "cli\*.pkl" -File
+        $srcs += Get-ChildItem "runtime\*.pkl" -File
     }
 }
 # Drop scratch/debug sources that are not part of the real surface. These are
@@ -78,7 +78,7 @@ foreach ($f in $srcs) {
 
 # ported symbol -> declaring file, from the #[symbol("...")] convention
 $ported = @{}
-foreach ($rf in Get-ChildItem "pickle\runtime\*.pkl" -File) {
+foreach ($rf in Get-ChildItem "runtime\*.pkl" -File) {
     $rt = [System.IO.File]::ReadAllText($rf.FullName)
     foreach ($m in [regex]::Matches($rt, '#\[symbol\("([^"]+)"\)\]')) {
         $ported[$m.Groups[1].Value] = $rf.Name

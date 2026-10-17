@@ -26,14 +26,14 @@ $repoAbs = (Resolve-Path ".").Path
 $portDir = "tools\diff\port"
 $driftDir = "tools\diff\drift"
 
-# Same 13 self targets as tools/battery_prep.ps1: the 12 pickle\compiler modules plus
-# pickle\cli/main. These are the sources whose self-compilation PICKLE_AUDIT.md 17.2
+# Same 13 self targets as tools/battery_prep.ps1: the 12 compiler modules plus
+# cli/main. These are the sources whose self-compilation PICKLE_AUDIT.md 17.2
 # and 17.4 rest on - if they drift, every later gate is measuring a moving target.
 $Targets = @("ast", "check", "diag", "emit", "error", "front", "ir", "lexer", "parser", "resolve", "token", "ty", "main")
 
 function TargetPath([string]$t) {
-    if ($t -eq "main") { return (Join-Path $repoAbs "pickle\cli\main.pkl") }
-    return (Join-Path $repoAbs "pickle\compiler\$t.pkl")
+    if ($t -eq "main") { return (Join-Path $repoAbs "cli\main.pkl") }
+    return (Join-Path $repoAbs "compiler\$t.pkl")
 }
 
 # run_one_self.pkl derives <base> from the target path by stripping ".pkl" and writes
@@ -47,9 +47,9 @@ if ($Cycles -lt 2) { Write-Output "DRIFT ABORT: -Cycles must be >= 2 to have som
 New-Item -ItemType Directory -Path $driftDir -Force | Out-Null
 
 $driver = Join-Path $portDir "pklc_runone.exe"
-Write-Output "DRIFT driver: building pklc_runone.exe from pickle\cli\run_one_self.pkl"
-if (-not (Invoke-BuildDriver "pickle\cli\run_one_self.pkl" $driver)) {
-    Write-Output "DRIFT FAILED: could not AOT-build pickle\cli\run_one_self.pkl"
+Write-Output "DRIFT driver: building pklc_runone.exe from cli\run_one_self.pkl"
+if (-not (Invoke-BuildDriver "cli\run_one_self.pkl" $driver)) {
+    Write-Output "DRIFT FAILED: could not AOT-build cli\run_one_self.pkl"
     exit 1
 }
 

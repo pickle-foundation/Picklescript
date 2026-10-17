@@ -2,7 +2,7 @@
 #
 # Proves the two properties that make Rust a seed-only dependency:
 #   1. FIXED POINT  the pickle seed (a `build` driver on the pickle runtime)
-#                   rebuilds pickle\cli\build.pkl byte-identically to itself.
+#                   rebuilds cli\build.pkl byte-identically to itself.
 #   2. RT ARCHIVE   the seed-built rtlib driver regenerates tools\diff\rtlib.ar
 #                   byte-identically, so the runtime archive is itself pickled.
 #
@@ -33,8 +33,8 @@ $work = "tools\diff\selfhost"
 $buildDrv = Join-Path $port "pklc_build.exe"
 $rtlDrv   = Join-Path $port "pklc_rtlib.exe"
 
-if (-not (Invoke-BuildDriver "pickle\cli\build.pkl" $buildDrv)) { Write-Output "FAIL selfhost: pklc_build driver build failed"; exit 1 }
-if (-not (Invoke-BuildDriver "pickle\cli\rtlib.pkl" $rtlDrv))   { Write-Output "FAIL selfhost: pklc_rtlib driver build failed"; exit 1 }
+if (-not (Invoke-BuildDriver "cli\build.pkl" $buildDrv)) { Write-Output "FAIL selfhost: pklc_build driver build failed"; exit 1 }
+if (-not (Invoke-BuildDriver "cli\rtlib.pkl" $rtlDrv))   { Write-Output "FAIL selfhost: pklc_rtlib driver build failed"; exit 1 }
 
 $H = (Get-Sha $selfhostSeed) + "|" + (Get-Sha $selfhostArchive) + "|" + (Get-DriverHash)
 $stamp = Join-Path $work "gate.hash"
@@ -48,17 +48,17 @@ $ok = $true
 
 # 1) Fixed point: the seed compiles the build driver and gets itself back.
 $fp = Join-Path $work "gate_build.exe"
-$null = Invoke-NativeQuiet $selfhostSeed @("pickle\cli\build.pkl", $selfhostArchive, $fp)
+$null = Invoke-NativeQuiet $selfhostSeed @("cli\build.pkl", $selfhostArchive, $fp)
 if (ByteEq $fp $selfhostSeed) {
-    Write-Output "PASS selfhost fixed-point: seed rebuilds pickle\cli\build.pkl byte-identically"
+    Write-Output "PASS selfhost fixed-point: seed rebuilds cli\build.pkl byte-identically"
 } else {
     $ok = $false
-    Write-Output "FAIL selfhost fixed-point: seed != rebuild of pickle\cli\build.pkl"
+    Write-Output "FAIL selfhost fixed-point: seed != rebuild of cli\build.pkl"
 }
 
 # 2) Runtime archive: the seed-built rtlib driver reproduces rtlib.ar.
 $ar = Join-Path $work "gate_rtlib.ar"
-$null = Invoke-NativeQuiet $rtlDrv @("pickle\runtime", $ar)
+$null = Invoke-NativeQuiet $rtlDrv @("runtime", $ar)
 if (ByteEq $ar $selfhostArchive) {
     Write-Output "PASS selfhost rt-archive: pickled rtlib driver reproduces $selfhostArchive"
 } else {

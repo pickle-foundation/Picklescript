@@ -9,7 +9,7 @@
 $batteryCommonCli = "target\debug\pickle-cli.exe"
 if (Test-Path -LiteralPath $batteryCommonCli) { $batteryCommonCli = (Resolve-Path $batteryCommonCli).Path }
 
-# Pickle self-host seed: a pickled `build` driver (pickle\cli\build.pkl compiled by
+# Pickle self-host seed: a pickled `build` driver (cli\build.pkl compiled by
 # the pickle toolchain, linked against the pickle runtime archive, so it runs on the
 # PICKLE runtime). When the seed and the archive it links against both exist, every
 # AOT driver below is built by the seed instead of the Rust cli, so Rust leaves the
@@ -106,21 +106,21 @@ function Get-TreeHash([string[]]$dirs) {
 # Content hash that gates oracle regeneration in tools/battery_prep.ps1: every
 # input the oracles are derived from (the self trees, the battery, the stdlib the
 # ported drivers import, and the Rust compiler binary that produces the oracles).
-$batteryPrepDirs = @("pickle\compiler", "pickle\cli", "pickle\runtime", "stdlib", "tests\pickle")
+$batteryPrepDirs = @("compiler", "cli", "runtime", "stdlib", "tests\pickle")
 
 # Source trees embedded in the AOT drivers (compiler + cli + stdlib imports).
-$batteryDriverDirs = @("pickle\compiler", "pickle\cli", "stdlib")
+$batteryDriverDirs = @("compiler", "cli", "stdlib")
 
 function Get-PrepHash { Get-TreeHash $batteryPrepDirs }
 
 function Get-DriverHash { Get-TreeHash $batteryDriverDirs }
 
 # Inputs the frozen IR/IRX/lex oracles are derived from: the 13 self targets
-# (pickle\compiler + pickle\cli) and the battery sources the lex oracles cover.
-# pickle\runtime is included: cli/main (a self target) imports runtime.* sources,
+# (compiler + cli) and the battery sources the lex oracles cover.
+# runtime is included: cli/main (a self target) imports runtime.* sources,
 # so those modules are compiled into its IR - a runtime edit shifts its fn indices
 # and must regenerate the oracle. stdlib stays excluded: no oracle depends on it.
-$batteryOracleDirs = @("pickle\compiler", "pickle\cli", "pickle\runtime", "tests\pickle")
+$batteryOracleDirs = @("compiler", "cli", "runtime", "tests\pickle")
 
 function Get-OracleHash { Get-TreeHash $batteryOracleDirs }
 
@@ -207,18 +207,18 @@ function Invoke-Artifact([string]$builder, [string]$source, [string]$lib, [strin
 }
 
 # Pickle-built runtime archive in place of the Rust combined.lib (which needs
-# cargo tools\build_combined_lib.ps1). pickle\cli/rtlib.pkl is AOT-built to a
-# driver, then lowers every pickle\runtime member to COFF and packs them into one
+# cargo tools\build_combined_lib.ps1). cli/rtlib.pkl is AOT-built to a
+# driver, then lowers every runtime member to COFF and packs them into one
 # GNU .ar (tools\diff\rtlib.ar) — the exact archive build.pkl/run.pkl link against.
 # It is stamp-gated on the driver tree (compiler+cli+stdlib) plus the runtime
 # member sources, so it only rebuilds when any input changed. Returns the archive
 # path, or $null when the driver build or the archive write fails.
 $rtlibArchive = "tools\diff\rtlib.ar"
 $rtlibDriver = "tools\diff\port\pklc_rtlib.exe"
-$rtlibRuntimeDir = "pickle\runtime"
+$rtlibRuntimeDir = "runtime"
 
 function Get-RtlibArchive() {
-    if (-not (Invoke-BuildDriver "pickle\cli\rtlib.pkl" $rtlibDriver)) {
+    if (-not (Invoke-BuildDriver "cli\rtlib.pkl" $rtlibDriver)) {
         Write-Host "RTLIB-ARCHIVE: driver build failed"
         return $null
     }

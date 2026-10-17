@@ -6,7 +6,7 @@
 #   stage0 (genesis, Rust)   pickle-cli build  ->  a single "seed" build driver
 #   seed  (pickle-runtime)   seed <src> <lib> <out>  ->  every other ported driver
 #
-# The seed is a `pickle\cli\build.pkl` driver that runs on the PICKLE runtime
+# The seed is a `cli\build.pkl` driver that runs on the PICKLE runtime
 # (tools\diff\rtlib.ar), not the Rust runtime. Once it exists, every driver below
 # is compiled by the seed from pickle source against the pickle runtime archive -
 # no rustc, no cargo, no combined.lib, no Rust compiler in the loop.
@@ -66,7 +66,7 @@ function Invoke-Quiet([string]$exe, [string[]]$argv, [string]$log) {
 # Hash of every input a driver build depends on: the ported source tree, the seed
 # binary, and the runtime archive it links against.
 function Get-SelfHostHash([string]$seed, [string]$lib) {
-    $dirs = @("pickle\compiler", "pickle\cli", "pickle\runtime", "stdlib")
+    $dirs = @("compiler", "cli", "runtime", "stdlib")
     $files = @()
     foreach ($d in $dirs) {
         if (Test-Path -LiteralPath $d) {
@@ -105,7 +105,7 @@ if ($Seed -and (Test-Path -LiteralPath $Seed)) {
     # pickle-runtime seed from the very same source.
     $stage0Build = Join-Path $WorkDir "stage0_build.exe"
     $t0 = Get-Date
-    Invoke-Quiet $RustCli @("build", "pickle\cli\build.pkl", "-o", $stage0Build) (Join-Path $WorkDir "stage0_build.log") | Out-Null
+    Invoke-Quiet $RustCli @("build", "cli\build.pkl", "-o", $stage0Build) (Join-Path $WorkDir "stage0_build.log") | Out-Null
     if (-not (Test-Path -LiteralPath $stage0Build)) { throw "selfhost: genesis stage0 build failed; see $WorkDir\stage0_build.log" }
     Write-Output ("SELFHOST: stage0 build driver ready t={0}s" -f [math]::Round(((Get-Date) - $t0).TotalSeconds, 1))
 
@@ -113,16 +113,16 @@ if ($Seed -and (Test-Path -LiteralPath $Seed)) {
     # produce it once with a Rust-built rtlib driver (the last Rust build in the chain).
     if (-not (Test-Path -LiteralPath $SeedLib)) {
         $stage0Rtlib = Join-Path $WorkDir "stage0_rtlib.exe"
-        Invoke-Quiet $RustCli @("build", "pickle\cli\rtlib.pkl", "-o", $stage0Rtlib) (Join-Path $WorkDir "stage0_rtlib.log") | Out-Null
+        Invoke-Quiet $RustCli @("build", "cli\rtlib.pkl", "-o", $stage0Rtlib) (Join-Path $WorkDir "stage0_rtlib.log") | Out-Null
         if (-not (Test-Path -LiteralPath $stage0Rtlib)) { throw "selfhost: genesis stage0 rtlib driver build failed" }
-        Invoke-Quiet $stage0Rtlib @("pickle\runtime", $SeedLib) (Join-Path $WorkDir "stage0_rtlib_run.log") | Out-Null
+        Invoke-Quiet $stage0Rtlib @("runtime", $SeedLib) (Join-Path $WorkDir "stage0_rtlib_run.log") | Out-Null
         if (-not (Test-Path -LiteralPath $SeedLib)) { throw "selfhost: genesis runtime archive write failed" }
         Write-Output "SELFHOST: genesis runtime archive $SeedLib"
     }
 
     $Seed = Join-Path $WorkDir "seed.exe"
     $t0 = Get-Date
-    Invoke-Quiet $stage0Build @("pickle\cli\build.pkl", $SeedLib, $Seed) (Join-Path $WorkDir "seed_build.log") | Out-Null
+    Invoke-Quiet $stage0Build @("cli\build.pkl", $SeedLib, $Seed) (Join-Path $WorkDir "seed_build.log") | Out-Null
     if (-not (Test-Path -LiteralPath $Seed)) { throw "selfhost: seed build failed; see $WorkDir\seed_build.log" }
     Write-Output ("SELFHOST: pickle seed ready t={0}s" -f [math]::Round(((Get-Date) - $t0).TotalSeconds, 1))
 }
@@ -136,16 +136,16 @@ if ($SeedOnly) { Write-Output "SELFHOST: DONE (seed only)"; exit 0 }
 
 # ---- Driver map: every ported driver the battery/sovereign gates build ----------
 $drivers = @(
-    @{ src = "pickle\cli\rtlib.pkl";         out = "pklc_rtlib.exe"    },
-    @{ src = "pickle\cli\build.pkl";         out = "pklc_build.exe"    },
-    @{ src = "pickle\cli\run.pkl";           out = "pklc_run.exe"      },
-    @{ src = "pickle\cli\main.pkl";          out = "pklc_main.exe"     },
-    @{ src = "pickle\cli\main.pkl";          out = "pklc_cli.exe"      },
-    @{ src = "pickle\cli\test.pkl";          out = "pklc_test.exe"     },
-    @{ src = "pickle\cli\gen2_run_one.pkl";  out = "pklc_gen2.exe"     },
-    @{ src = "pickle\cli\run_irx.pkl";       out = "pklc_irx.exe"      },
-    @{ src = "pickle\cli\run_one_self.pkl";  out = "pklc_runone.exe"   },
-    @{ src = "pickle\cli\selflink.pkl";      out = "pklc_selflink.exe" }
+    @{ src = "cli\rtlib.pkl";         out = "pklc_rtlib.exe"    },
+    @{ src = "cli\build.pkl";         out = "pklc_build.exe"    },
+    @{ src = "cli\run.pkl";           out = "pklc_run.exe"      },
+    @{ src = "cli\main.pkl";          out = "pklc_main.exe"     },
+    @{ src = "cli\main.pkl";          out = "pklc_cli.exe"      },
+    @{ src = "cli\test.pkl";          out = "pklc_test.exe"     },
+    @{ src = "cli\gen2_run_one.pkl";  out = "pklc_gen2.exe"     },
+    @{ src = "cli\run_irx.pkl";       out = "pklc_irx.exe"      },
+    @{ src = "cli\run_one_self.pkl";  out = "pklc_runone.exe"   },
+    @{ src = "cli\selflink.pkl";      out = "pklc_selflink.exe" }
 )
 if ($Only) {
     $Only = @($Only -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
@@ -182,7 +182,7 @@ $rtDriveOut = Join-Path $OutDir "pklc_rtlib.exe"
 $regen = Join-Path $WorkDir "rtlib_regen.ar"
 if (Test-Path -LiteralPath $rtDriveOut) {
     $t0 = Get-Date
-    Invoke-Quiet $rtDriveOut @("pickle\runtime", $regen) (Join-Path $WorkDir "rtlib_regen.log") | Out-Null
+    Invoke-Quiet $rtDriveOut @("runtime", $regen) (Join-Path $WorkDir "rtlib_regen.log") | Out-Null
     $same = ByteEq $regen $SeedLib
     Write-Output ("SELFHOST: RT_ARCHIVE byte_identical={0} t={1}s" -f $same, [math]::Round(((Get-Date) - $t0).TotalSeconds, 1))
     if (-not $same) { Write-Output "SELFHOST: FAIL - pickle-built rtlib driver does not reproduce $SeedLib" }
@@ -194,7 +194,7 @@ if (Test-Path -LiteralPath $rtDriveOut) {
 $buildOut = Join-Path $OutDir "pklc_build.exe"
 $build2 = Join-Path $WorkDir "pklc_build_v2.exe"
 if (Test-Path -LiteralPath $buildOut) {
-    Invoke-Quiet $buildOut @("pickle\cli\build.pkl", $SeedLib, $build2) (Join-Path $WorkDir "build_v2.log") | Out-Null
+    Invoke-Quiet $buildOut @("cli\build.pkl", $SeedLib, $build2) (Join-Path $WorkDir "build_v2.log") | Out-Null
     $fp = ByteEq $build2 $buildOut
     Write-Output ("SELFHOST: FIXED POINT byte_identical={0}" -f $fp)
     if (-not $fp) { Write-Output "SELFHOST: FAIL - pklc_build.exe does not reproduce itself" }

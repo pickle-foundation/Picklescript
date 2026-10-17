@@ -34,8 +34,8 @@ $Root = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $Root
 . (Join-Path $PSScriptRoot "battery_common.ps1")
 $cli = (Resolve-Path "target\debug\pickle-cli.exe").Path
-$sl = "pickle\cli\selflink.pkl"
-$rt = (Resolve-Path "pickle\runtime").Path
+$sl = "cli\selflink.pkl"
+$rt = (Resolve-Path "runtime").Path
 $slDriver = Join-Path $PSScriptRoot "diff\port\pklc_selflink.exe"
 if (-not (Invoke-BuildDriver $sl "tools\diff\port\pklc_selflink.exe")) {
     Write-Output "AUTO-COLLECT PARITY: selflink driver build failed"

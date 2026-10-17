@@ -24,7 +24,7 @@ $repoAbs = (Resolve-Path ".").Path
 # runtime's contract: it deadlocks here exactly as it would on the Rust nostd build.
 # These four files are therefore scoped OUT by design, not by a port bug. The port's
 # own thread/sync contract is proven positively by the pickled runtime suite
-# (pickle\runtime\abi_threads_test.pkl, abi_sync_test.pkl) in GATE10.
+# (runtime\abi_threads_test.pkl, abi_sync_test.pkl) in GATE10.
 $threadGoldenKeys = @(
     "tests_pickle_channel_test",
     "tests_pickle_task_test",
@@ -52,7 +52,7 @@ try {
     exit 1
 }
 
-# ---- Battery targets: 13 self targets (12 pickle\compiler + pickle\cli/main) ----
+# ---- Battery targets: 13 self targets (12 compiler + cli/main) ----
 # Genuine oracles are regenerated from the Rust compiler for all 13
 # (tools/diff/oracle/<t>.pkl_gen.{ir,irx}) by tools/battery_prep.ps1 on every run.
 # NOTE (path-collision): the JIT refuses to re-compile a target whose path string is exactly
@@ -92,16 +92,16 @@ Write-Output "GATE1 PORT PARITY (13x2): PASS=$gate1ok FAIL=$gate1fail"
 # compiled driver emits the same artifacts as the JIT, so one run through the AOT
 # driver covers both old loops; Rust is used only to bootstrap-link.
 $pklc2 = "tools\diff\port\pklc_gen2.exe"
-if (-not (Invoke-BuildDriver "pickle\cli\gen2_run_one.pkl" $pklc2)) {
+if (-not (Invoke-BuildDriver "cli\gen2_run_one.pkl" $pklc2)) {
     Write-Output "GATE2 AOT GEN2: DRIVER BUILD FAILED"
 } else {
     $gate2ok = 0; $gate2fail = 0
     foreach ($t in $Targets) {
         if ($t -eq "resolve" -or $t -eq "front" -or $t -eq "main") {
-            $src = Join-Path $repoAbs $(if ($t -eq "main") { "pickle\cli\main.pkl" } else { "pickle\compiler\$t.pkl" })
+            $src = Join-Path $repoAbs $(if ($t -eq "main") { "cli\main.pkl" } else { "compiler\$t.pkl" })
             & $pklc2 $src 2>&1 | Out-Null
         } else {
-            $src = if ($t -eq "main") { "pickle\cli\main.pkl" } else { "pickle\compiler\$t.pkl" }
+            $src = if ($t -eq "main") { "cli\main.pkl" } else { "compiler\$t.pkl" }
             & $pklc2 $src 2>&1 | Out-Null
         }
         $gen2Ir  = "tools\diff\gen2\${t}_gen2.ir"
@@ -131,7 +131,7 @@ Write-Output "GATE3 GEN2_DRIVER PARITY (2): ir=$g3ir irx=$g3irx"
 # against the Rust oracles. Rust becomes bootstrap-only here: the compiled driver
 # runs the full pipeline standalone and produces Rust-identical artifacts.
 $pklc = "tools\diff\port\pklc_main.exe"
-if (-not (Invoke-BuildDriver "pickle\cli\main.pkl" $pklc)) {
+if (-not (Invoke-BuildDriver "cli\main.pkl" $pklc)) {
     Write-Output "GATE4 AOT DRIVER: BUILD FAILED"
 } else {
     $battery = @(Get-ChildItem "tests\pickle\*_main.pkl") + @(Get-ChildItem "tests\pickle\*_test.pkl")
@@ -161,7 +161,7 @@ if (-not (Invoke-BuildDriver "pickle\cli\main.pkl" $pklc)) {
 # unrolled index loop — a behavior-identical difference proven equal end-to-end by
 # GATE12/12b. Byte-exact IRX parity is asserted for the 13 self targets by GATE1/2.
 $pklcIrx = "tools\diff\port\pklc_irx.exe"
-Invoke-BuildDriver "pickle\cli\run_irx.pkl" $pklcIrx | Out-Null
+Invoke-BuildDriver "cli\run_irx.pkl" $pklcIrx | Out-Null
 $mains = @(Get-ChildItem "tests\pickle\*_main.pkl")
 $gate6ok = 0; $gate6fail = 0
 foreach ($m in $mains) {
@@ -176,8 +176,8 @@ foreach ($m in $mains) {
 Write-Output "GATE6 IRX COMPILE COVERAGE (mains lowered by the port, no irfail): PASS=$gate6ok FAIL=$gate6fail"
 
 # ---- GATE 7: port-side unit suite — the port tests itself (native, no Rust) ----
-# `pickle\compiler/*_test.pkl` import the ported components and assert on their
-# behavior via the `expect` DSL. The AOT-built ported test driver (pickle\cli/test.pkl)
+# `compiler/*_test.pkl` import the ported components and assert on their
+# behavior via the `expect` DSL. The AOT-built ported test driver (cli/test.pkl)
 # synthesizes the harness, links it against the pickle runtime archive, spawns it, and
 # propagates its exit code — so the port's own components are exercised entirely on the
 # pickle runtime. GATE7 runs every port `_test.pkl` and requires 0 failures.
@@ -188,8 +188,8 @@ $gate7ok = 0; $gate7fail = 0
 if (-not $rtlibCand) {
     Write-Output "GATE7 PORT UNIT SUITE: RUNTIME ARCHIVE MISSING"
 } else {
-Invoke-BuildDriver "pickle\cli\test.pkl" $pklcTest | Out-Null
-$portTests = @(Get-ChildItem "pickle\compiler\*_test.pkl")
+Invoke-BuildDriver "cli\test.pkl" $pklcTest | Out-Null
+$portTests = @(Get-ChildItem "compiler\*_test.pkl")
 foreach ($pt in $portTests) {
     $code = Invoke-NativeTimeout $pklcTest @($pt.FullName, $rtlibCand) "$g7dir\g7.txt" 300
     if ($code -eq 0) { $gate7ok++ } else {
@@ -203,7 +203,7 @@ Write-Output "GATE7 PORT UNIT SUITE (self-test, native): PASS=$gate7ok FAIL=$gat
 
 # ---- GATE 8: std.test runner byte-parity — the ported runner reproduces the
 # committed Rust goldens (describe/hook DSL: 2-pass, mixed pass/fail, hook
-# scheduling) with NO Rust. The ported run driver (pickle\cli/run.pkl) compiles the
+# scheduling) with NO Rust. The ported run driver (cli/run.pkl) compiles the
 # runner fixture, links it against the pickle runtime archive, and spawns it; its
 # stdout must equal tools\diff\testrunner_golden.txt byte for byte. ----
 $g8ok = 0; $g8fail = 0
@@ -214,7 +214,7 @@ if (-not (Test-Path -LiteralPath $testDriver)) {
 } elseif (-not $rtlibCand) {
     $g8fail++; Write-Output "GATE8: RUNTIME ARCHIVE MISSING"
 } else {
-    Invoke-BuildDriver "pickle\cli\run.pkl" "tools\diff\port\pklc_run.exe" | Out-Null
+    Invoke-BuildDriver "cli\run.pkl" "tools\diff\port\pklc_run.exe" | Out-Null
     $code = Invoke-NativeTimeout "tools\diff\port\pklc_run.exe" @($testDriver, $rtlibCand) "$g8dir\runner.txt" 180
     if ($code -ne 0) { $g8fail++; Write-Output "GATE8 $($testDriver): run exit=$code" }
     elseif (ByteEq "$g8dir\runner.txt" "tools\diff\testrunner_golden.txt") { $g8ok++ }
@@ -231,7 +231,7 @@ Write-Output "GATE8 TESTRUNNER BYTE-PARITY (stdout byte-eq vs goldens, native): 
 $g9tests = @(Get-ChildItem "tests\pickle\*_test.pkl")
 $g9dir = "tools\diff\g9"; New-Item -ItemType Directory -Path $g9dir -Force | Out-Null
 $g9ok = 0; $g9fail = 0; $g9skip = 0
-if (-not (Test-Path -LiteralPath $pklcTest)) { Invoke-BuildDriver "pickle\cli\test.pkl" $pklcTest | Out-Null }
+if (-not (Test-Path -LiteralPath $pklcTest)) { Invoke-BuildDriver "cli\test.pkl" $pklcTest | Out-Null }
 if (-not $rtlibCand) {
     Write-Output "GATE9 TEST BYTE-PARITY: RUNTIME ARCHIVE MISSING"
 } else {
@@ -250,21 +250,21 @@ if (-not $rtlibCand) {
     Write-Output "GATE9 TEST BYTE-PARITY (stdout+exit, $($g9tests.Count) files, native vs golden, skip=$g9skip): PASS=$g9ok FAIL=$g9fail"
 }
 
-# ---- GATE 10: pickle\runtime unit suite — the ported runtime tested in Pickle ----
-# The runtime pillar's parallel to GATE7: every `pickle\runtime/*_test.pkl` is compiled
-# by the ported test driver (AOT-built pickle\cli/test.pkl), linked against the pickle
+# ---- GATE 10: runtime unit suite — the ported runtime tested in Pickle ----
+# The runtime pillar's parallel to GATE7: every `runtime/*_test.pkl` is compiled
+# by the ported test driver (AOT-built cli/test.pkl), linked against the pickle
 # runtime archive, spawned, and must report 0 failures — the ported runtime is exercised
 # by Pickle, with no Rust harness and no Rust interpreter in the loop. (The Rust `test`
 # dir-mode is replaced by an explicit per-file loop since the ported driver takes one
 # target at a time.) Like GATE7 this is a local-only gate: both selfhost trees are
 # gitignored by design until the switchover.
 $g10total = 0; $g10pass = 0; $g10fail = 0
-if (-not (Test-Path -LiteralPath $pklcTest)) { Invoke-BuildDriver "pickle\cli\test.pkl" $pklcTest | Out-Null }
+if (-not (Test-Path -LiteralPath $pklcTest)) { Invoke-BuildDriver "cli\test.pkl" $pklcTest | Out-Null }
 if (-not $rtlibCand) {
     Write-Output "GATE10 PICKLE RUNTIME SUITE: RUNTIME ARCHIVE MISSING"
 } else {
     $g10dir = "tools\diff\ptest"; New-Item -ItemType Directory -Path $g10dir -Force | Out-Null
-    foreach ($f in @(Get-ChildItem "pickle\runtime\*_test.pkl")) {
+    foreach ($f in @(Get-ChildItem "runtime\*_test.pkl")) {
         $code = Invoke-NativeTimeout $pklcTest @($f.FullName, $rtlibCand) "$g10dir\g10.txt" 180
         if ($code -ne 0) { Write-Output "GATE10 $($f.Name): exit=$code" }
         foreach ($l in (Get-Content -LiteralPath "$g10dir\g10.txt" | Select-String "test result:")) {
@@ -306,16 +306,16 @@ if (-not $rtlibCand) {
 }
 
 # ---- GATE 12: ported AOT build — source -> IR -> x64 -> COFF -> PE-link, all in the port ----
-# Deepest build-path proof (PICKLE_AUDIT 17.2): pickle\cli/build.pkl is AOT-built to a
+# Deepest build-path proof (PICKLE_AUDIT 17.2): cli/build.pkl is AOT-built to a
 # native driver (Rust only bootstraps that link), then with no Rust compiler in the loop it
 # lowers every battery main to a real PE .exe via the ported x64 backend, COFF writer, and
 # ported PE linker (compiler.linklib). It links against the PICKLE runtime archive
-# (tools\diff\rtlib.ar: every pickle\runtime member lowered to COFF by pickle\cli/rtlib.pkl)
+# (tools\diff\rtlib.ar: every runtime member lowered to COFF by cli/rtlib.pkl)
 # — no Rust objects, no cargo, no combined.lib. Each produced exe
 # must then run with stdout+exit byte-identical to the frozen `pickle run` golden
 # for the same source (tools\capture_goldens.ps1).
 $pklcBuild = "tools\diff\port\pklc_build.exe"
-if (-not (Invoke-BuildDriver "pickle\cli\build.pkl" $pklcBuild)) {
+if (-not (Invoke-BuildDriver "cli\build.pkl" $pklcBuild)) {
     Write-Output "GATE12 PORTED BUILD: DRIVER BUILD FAILED"
 } else {
     $rtlibCand = Get-RtlibArchive
@@ -355,7 +355,7 @@ if (-not (Invoke-BuildDriver "pickle\cli\build.pkl" $pklcBuild)) {
 }
 
 # ---- GATE 12b: ported run — compile -> COFF -> PE-link -> spawn, all in the port ----
-# The ported run driver (pickle\cli/run.pkl, AOT-built the same way) goes one step
+# The ported run driver (cli/run.pkl, AOT-built the same way) goes one step
 # further than the build driver: it compiles the source, links the PE, then spawns the
 # exe and propagates its exit code — with zero Rust compiler or irx-run in the loop.
 # It links the PICKLE runtime archive (tools\diff\rtlib.ar, like GATE12) rather than
@@ -364,7 +364,7 @@ if (-not (Invoke-BuildDriver "pickle\cli\build.pkl" $pklcBuild)) {
 # command line via GetCommandLineW/CommandLineToArgvW (routed through shell32 by the
 # ported PE linker), so os_args_main runs WITH arguments here, unlike the build block.
 $pklcRun = "tools\diff\port\pklc_run.exe"
-if (-not (Invoke-BuildDriver "pickle\cli\run.pkl" $pklcRun)) {
+if (-not (Invoke-BuildDriver "cli\run.pkl" $pklcRun)) {
     Write-Output "GATE12b PORTED RUN: DRIVER BUILD FAILED"
 } else {
     $rtlibCand = Get-RtlibArchive
@@ -419,7 +419,7 @@ if (-not (Invoke-BuildDriver "pickle\cli\run.pkl" $pklcRun)) {
 # frozen goldens. `history`/`builds` are not captured — their output tracks the live
 # git log, so there is no stable golden for them. ----
 $pklcMain = "tools\diff\port\pklc_cli.exe"
-if (-not (Invoke-BuildDriver "pickle\cli\main.pkl" $pklcMain)) {
+if (-not (Invoke-BuildDriver "cli\main.pkl" $pklcMain)) {
     Write-Output "CLI PERSONALITY: DRIVER BUILD FAILED"
 } else {
     $g13dir = "tools\diff\g13"

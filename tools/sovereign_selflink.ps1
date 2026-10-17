@@ -1,7 +1,7 @@
 # SOVEREIGN SELFLINK GATE
 #
 # Proves a zero-Rust-object executable — the literal empty-archive link:
-# links pickle\cli\main.pkl via pickle\cli\selflink.pkl against an EMPTY
+# links cli\main.pkl via cli\selflink.pkl against an EMPTY
 # runtime directory, so the exe is built from exactly ONE object (the program
 # itself) with ZERO members and ZERO unresolved symbols. All runtime `#[symbol]`
 # bodies the build image needs arrive through cli/main.pkl's own `runtime.*`
@@ -27,8 +27,8 @@ Remove-Item Env:PKL_NO_AUTO_GC -ErrorAction SilentlyContinue
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $Root
 . (Join-Path $PSScriptRoot "battery_common.ps1")
-$slprog = "pickle\cli\selflink.pkl"
-$target = "pickle\cli\main.pkl"
+$slprog = "cli\selflink.pkl"
+$target = "cli\main.pkl"
 $work = "tests\tmp\sovereign_selflink"
 New-Item -ItemType Directory -Path $work -Force | Out-Null
 

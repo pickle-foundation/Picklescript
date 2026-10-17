@@ -125,7 +125,7 @@ foreach ($pr in $pairs) {
     # ---- self: source -> IR -> x64 -> COFF -> self-host link ----
     $probe = Join-Path $Work $stem
     New-Item -ItemType Directory -Force -Path $probe | Out-Null
-    $drv = & $Cli run pickle\cli\x64_real_run.pkl -- $selfSrc $probe 2>&1
+    $drv = & $Cli run cli\x64_real_run.pkl -- $selfSrc $probe 2>&1
     if ($LASTEXITCODE -ne 0 -or (($drv -join "`n") -notmatch "X64REAL OK")) {
         Write-Output "FAIL $stem : lowering failed"
         Write-Output ($drv -join "`n")
@@ -135,7 +135,7 @@ foreach ($pr in $pairs) {
     $obj = Join-Path $probe "funcs.obj"
     if (-not (Test-Path $obj)) { Write-Output "FAIL $stem : no funcs.obj"; $fail++; continue }
     $exe = Join-Path $probe "probe.exe"
-    $lk = & $Cli run pickle\compiler\linker.pkl -- $obj $Combined $exe 2>&1
+    $lk = & $Cli run compiler\linker.pkl -- $obj $Combined $exe 2>&1
     if ($LASTEXITCODE -ne 0 -or (($lk -join "`n") -notmatch "LINKER WROTE")) {
         Write-Output "FAIL $stem : selfhost link failed"
         Write-Output ($lk -join "`n")

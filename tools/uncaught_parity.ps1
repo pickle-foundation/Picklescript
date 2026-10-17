@@ -25,9 +25,9 @@ achieved by both sides being wrong in the same way:
 
 .PARAMETER SelfhostLink
 Link with the self-hosted linker against the PICKLE runtime DIRECTORY
-(pickle\runtime, whose members are themselves pickle `#[symbol]` bodies) instead
+(runtime, whose members are themselves pickle `#[symbol]` bodies) instead
 of `rustc` and a shim. This is the battery path and it runs with NO Rust cli:
-the selfhost linker (pickle\cli/selflink.pkl, AOT-built by the pickle seed)
+the selfhost linker (cli/selflink.pkl, AOT-built by the pickle seed)
 compiles+links each fixture, and the reference behaviour is read from FROZEN
 goldens (tools\diff\golden\uncaught\<stem>.{out,err,exit}, captured by
 tools\capture_goldens.ps1 from `pickle-cli run`). No cargo, no combined.lib, no
@@ -103,11 +103,11 @@ if ($SelfhostLink) {
     # Port selfhost linker: AOT-built by the pickle seed, links against the PICKLE
     # runtime DIRECTORY. No Rust cli, no rtlib.ar, no cargo.
     $slDriver = "tools\diff\port\pklc_selflink.exe"
-    if (-not (Invoke-BuildDriver "pickle\cli\selflink.pkl" $slDriver)) {
+    if (-not (Invoke-BuildDriver "cli\selflink.pkl" $slDriver)) {
         Write-Output "SELFHOST LINKER DRIVER BUILD FAILED: $slDriver"
         exit 1
     }
-    $rtdir = (Resolve-Path "pickle\runtime").Path
+    $rtdir = (Resolve-Path "runtime").Path
     if (-not (Test-Path -LiteralPath "$goldenDir\uncaught")) {
         Write-Output "UNCAUGHT GOLDENS MISSING: $goldenDir\uncaught (run tools\capture_goldens.ps1)"
         exit 1
@@ -205,7 +205,7 @@ foreach ($f in $fixtures) {
         $nat = Invoke-Captured -Exe $Cli -ExeArgs @("run", $f.FullName) -WorkingDir $Root -Tag "nat_$stem"
 
         # ---- self-host: source -> IR -> x64 -> COFF ----
-        $drv = & $Cli run pickle\cli\x64_real_run.pkl -- $f.FullName $probe 2>&1
+        $drv = & $Cli run cli\x64_real_run.pkl -- $f.FullName $probe 2>&1
         if ($LASTEXITCODE -ne 0 -or (($drv -join "`n") -notmatch "X64REAL OK")) {
             Write-Output "FAIL $stem : lowering failed"
             Write-Output ($drv -join "`n")

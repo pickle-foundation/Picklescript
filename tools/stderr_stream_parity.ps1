@@ -19,7 +19,7 @@
 #
 # Usage:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\stderr_stream_parity.ps1
-#   ... -SelfhostLink    link the fixture with pickle\compiler\linker.pkl instead
+#   ... -SelfhostLink    link the fixture with compiler\linker.pkl instead
 
 param(
     [switch]$SelfhostLink,
