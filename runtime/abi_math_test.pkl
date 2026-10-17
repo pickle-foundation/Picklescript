@@ -1,0 +1,91 @@
+module runtime.abi_math_test
+
+// Exercises `runtime.abi_math` through the ported test driver (GATE10): the
+// `**` and `in` operators lower to these `#[symbol]` bodies, so importing the
+// module binds them and every expression below runs the PORTED body, not the
+// Rust archive's.
+//
+// The float rows are deliberately bit-sensitive: `pickle_float_pow` mirrors
+// `math.rs` operation for operation (exact by-squaring for an integral
+// exponent, `2^(exp*log2(base))` otherwise), so these decimal literals are the
+// exact results the native routine produces - a platform `pow` would answer
+// differently.
+
+import { abiIntPow, abiFloatPow } from runtime.abi_math
+
+test fn int_pow_matches_repeated_multiplication() {
+    expect(abiIntPow(2, 10)).toBe(1024)
+    expect(2 ** 10).toBe(1024)
+    expect(3 ** 0).toBe(1)
+    expect(0 ** 0).toBe(1)
+    expect((0 - 2) ** 3).toBe(0 - 8)
+    expect((0 - 2) ** 4).toBe(16)
+    expect(5 ** 1).toBe(5)
+}
+
+test fn int_pow_negative_exponent_rounds_toward_zero() {
+    expect(1 ** (0 - 5)).toBe(1)
+    expect((0 - 1) ** (0 - 5)).toBe(0 - 1)
+    expect((0 - 1) ** (0 - 4)).toBe(1)
+    expect(2 ** (0 - 3)).toBe(0)
+}
+
+test fn int_pow_wraps_like_mul() {
+    var base = 1000000000000000007
+    var want = 1
+    var i = 0
+    while (i < 5) {
+        want = want * base
+        i = i + 1
+    }
+    expect(abiIntPow(base, 5)).toBe(want)
+}
+
+test fn float_pow_integral_is_exact() {
+    expect(abiFloatPow(2.0, 10.0)).toBe(1024.0)
+    expect(2.0 ** 10.0).toBe(1024.0)
+    expect(1.5 ** (0 - 2)).toBe(0.4444444444444444)
+    expect((0 - 2.0) ** 3.0).toBe(0.0 - 8.0)
+    expect(2.0 ** 0.0).toBe(1.0)
+    expect(1.0 ** 123.0).toBe(1.0)
+    expect((0 - 1.5) ** 2.0).toBe(2.25)
+}
+
+test fn float_pow_non_integral_matches_the_mirrored_algorithm() {
+    expect(2.0 ** 0.5).toBe(1.414213562373095)
+    expect(9.0 ** 0.5).toBe(2.9999999999999996)
+}
+
+test fn float_pow_specials() {
+    var a = abiFloatPow(0.0 - 2.0, 0.5)
+    expect(a != a).toBe(true)
+    var b = 0.0 / 0.0
+    expect(abiFloatPow(b, 2.0) != abiFloatPow(1.0, 1.0)).toBe(true)
+    expect(2.0 ** (0 - 1.0)).toBe(0.5)
+}
+
+test fn in_list_matches_structurally() {
+    var xs = [1, 2, 3]
+    expect(2 in xs).toBe(true)
+    expect(9 in xs).toBe(false)
+    var ss = ["alpha", "beta"]
+    expect("beta" in ss).toBe(true)
+    expect("gamma" in ss).toBe(false)
+    var empty = [1]
+    expect(1 in empty).toBe(true)
+}
+
+test fn in_map_tests_keys() {
+    var m = {"a": 1, "b": 2}
+    expect("a" in m).toBe(true)
+    expect("z" in m).toBe(false)
+}
+
+test fn in_string_finds_byte_runs() {
+    expect("ell" in "hello").toBe(true)
+    expect("hello" in "hello").toBe(true)
+    expect("" in "hello").toBe(true)
+    expect("xyz" in "hello").toBe(false)
+    expect("hellos" in "hello").toBe(false)
+    expect("ol" in "hello").toBe(false)
+}

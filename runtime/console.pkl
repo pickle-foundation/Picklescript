@@ -1,0 +1,159 @@
+module runtime.console
+
+/// Port of `runtime/src/console.rs` (pure, portable render contracts).
+///
+/// The raw byte I/O stays native (`write_to_con` -> stdout); what a
+/// self-hosted runtime owns is the VALUE-TO-TEXT layer `print`/`println` and
+/// the test runner's `fmt_obj_to` build on. Two families, mirroring
+/// `console.rs` exactly:
+///
+///   - `printText*` — the `print(x)` raw form (`pickle_print_obj` /
+///     `print_obj_raw`): string prints its contents, a collection prints
+///     `List(len=N)` / `Map(len=N)` / `Enum(tag=N)` / `Tuple(len=N)`, `none`
+///     prints `none`, non-builtin classes print their registered name.
+///   - `strText*` — the `fmt_obj_to` form used by `expect` for
+///     `Expected:`/`Received:` lines: lists and tuples render element-wise with
+///     `[a, b]` / `(a, b)`.
+///
+/// Scalar text comes from `runtime.strings` (`int64ToString`, `charToUtf8`);
+/// float text is the ABI seam (`str(v)` is Rust's shortest round trip).
+/// Class-name lookup is the `runtime.object` registry seam.
+
+import { int64ToString, charToUtf8 } from runtime.strings
+
+/// The color decision from `console.rs::terminal_color_enabled`: color is on
+/// for a real terminal unless `NO_COLOR` / `PICKLE_NO_COLOR` is set. `tty` and
+/// the env flags are measured at the ABI boundary; the decision is this fn.
+fn terminalColorEnabled(envNoColor: bool, envPickleNoColor: bool, isTty: bool) -> bool {
+    if (envNoColor) {
+        return false
+    }
+    if (envPickleNoColor) {
+        return false
+    }
+    isTty
+}
+
+/// `none` print text (`pickle_print_obj` null case). In the runtime `obj ==
+/// null` prints `none`.
+fn printTextNone() -> string {
+    "none"
+}
+
+fn printTextStr(s: string) -> string {
+    s
+}
+
+/// `print(<int>)` text.
+fn printTextInt(v: int) -> string {
+    int64ToString(v)
+}
+
+/// `print(<float>)` text (ABI seam: `pickle_print_f64` shortest round trip).
+fn printTextFloat(v: float) -> string {
+    str(v)
+}
+
+fn printTextBool(v: bool) -> string {
+    if (v) {
+        return "true"
+    }
+    "false"
+}
+
+/// `print(<char>)` text (a code point is UTF-8 first, multiple bytes).
+fn printTextCharCp(cp: int) -> string {
+    charToUtf8(cp)
+}
+
+/// `print(<byte>)` text — a byte writes verbatim (single raw byte).
+fn printTextByte(b: byte) -> string {
+    charToUtf8(b as int)
+}
+
+/// `List(len=N)` text (`print_obj_raw` LIST arm).
+fn printTextOfListLen(n: int) -> string {
+    "List(len=" + int64ToString(n) + ")"
+}
+
+/// `Map(len=N)` text (`print_obj_raw` MAP arm).
+fn printTextOfMapLen(n: int) -> string {
+    "Map(len=" + int64ToString(n) + ")"
+}
+
+/// `Enum(tag=N)` text (`print_obj_raw` ENUM arm).
+fn printTextOfEnumTag(n: int) -> string {
+    "Enum(tag=" + int64ToString(n) + ")"
+}
+
+/// `Tuple(len=N)` text (`print_obj_raw` TUPLE arm).
+fn printTextOfTupleLen(n: int) -> string {
+    "Tuple(len=" + int64ToString(n) + ")"
+}
+
+/// Class-name text for a non-builtin instance; callers supply `nameOf`, the
+/// registry lookup (`gc.class_name` mirror). Unregistered ids print `<object>`.
+fn printTextClassById(id: int, nameOf: fn (int) -> string?) -> string {
+    var nm = nameOf(id)
+    if (let some(n) = nm) {
+        return n
+    }
+    "<object>"
+}
+
+/// str() form (`fmt_obj_to`): `none` -> `none`.
+fn strTextNone() -> string {
+    "none"
+}
+
+/// str() form for a string (contents verbatim).
+fn strTextStr(s: string) -> string {
+    s
+}
+
+/// str() form for a list: `[a, b, c]`, element-wise through `f`.
+fn strTextList(xs: List<string>, f: fn (string) -> string) -> string {
+    var out = "["
+    var i = 0
+    while (i < len(xs)) {
+        if (i > 0) {
+            out = out + ", "
+        }
+        out = out + f(xs[i])
+        i = i + 1
+    }
+    out + "]"
+}
+
+/// str() form for a map: `Map(N)` (`fmt_obj_to` MAP arm keeps it flat).
+fn strTextOfMapLen(n: int) -> string {
+    "Map(" + int64ToString(n) + ")"
+}
+
+/// str() form for an enum: `Enum(N)` (`fmt_obj_to` ENUM arm).
+fn strTextOfEnumTag(n: int) -> string {
+    "Enum(" + int64ToString(n) + ")"
+}
+
+/// str() form for a tuple: `(a, b, c)`, element-wise through `f`.
+fn strTextTuple(fields: List<string>) -> string {
+    var out = "("
+    var i = 0
+    while (i < len(fields)) {
+        if (i > 0) {
+            out = out + ", "
+        }
+        out = out + fields[i]
+        i = i + 1
+    }
+    out + ")"
+}
+
+/// str() form for a non-builtin class name (`fmt_obj_to` class arm).
+fn strTextClassById(id: int, nameOf: fn (int) -> string?) -> string {
+    var nm = nameOf(id)
+    if (let some(n) = nm) {
+        return n
+    }
+    "<object>"
+}

@@ -1,0 +1,58 @@
+module cli.dump
+
+import { DiagnosticSink } from compiler.diag
+import { frontend } from compiler.front
+import { emitIr } from compiler.emit
+import { x64LowerModule, x64Dump } from compiler.x64
+import { irInstrStr, irTermStr } from compiler.ir
+
+fn main() {
+    let argv = args()
+    if (len(argv) < 2) {
+        println("DUMP NO ARGS")
+        return
+    }
+    let target = argv[0]
+    let logPath = argv[1]
+    if (let some(src) = read_file(target)) {
+        let sinks = DiagnosticSink()
+        write_file(logPath, "stage=start\n")
+        if (let some(loaded) = frontend(target, src, sinks)) {
+            write_file(logPath, "stage=frontend-ok\n")
+            if (let some(irModule) = emitIr(loaded.program, loaded.resolved, sinks)) {
+                var acc = "stage=emitir-ok\n"
+                var fi = 0
+                while (fi < len(irModule.funcs)) {
+                    let f = irModule.funcs[fi]
+                    acc = acc + "== fn " + f.name + " slots=" + str(len(f.slots)) + "\n"
+                    var bi = 0
+                    while (bi < len(f.blocks)) {
+                        let b = f.blocks[bi]
+                        acc = acc + "-- block " + str(bi) + "\n"
+                        var ii = 0
+                        while (ii < len(b.instrs)) {
+                            acc = acc + irInstrStr(b.instrs[ii]) + "\n"
+                            ii = ii + 1
+                        }
+                        acc = acc + irTermStr(b.term) + "\n"
+                        bi = bi + 1
+                    }
+                    fi = fi + 1
+                }
+                write_file(logPath, acc)
+                if (let some(out) = x64LowerModule(irModule, sinks)) {
+                    write_file(logPath, acc + "stage=x64-ok\n" + x64Dump(out) + "\n")
+                    println("DUMP-X64-OK")
+                    return
+                }
+                write_file(logPath, acc + "stage=x64-fail\n")
+                println("DUMP-X64-FAIL")
+                return
+            }
+        }
+        write_file(logPath, "stage=frontend-fail\n")
+        println("DUMP-FAIL")
+        return
+    }
+    println("DUMP-FAIL nosrc")
+}

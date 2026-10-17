@@ -1,0 +1,2003 @@
+module runtime.abi_process
+
+/// Port of the process half of `runtime/src/os.rs`, as `#[symbol]` bodies.
+///
+/// `pickle_args` — WHY THIS ONE CAPTURES THE COMMAND LINE ITSELF. The Rust
+/// build reaches `args()` through a `main` wrapper (`cli/src/build.rs` and the
+/// JIT driver both call `pickle_args_set(argc, argv)` before the program's
+/// `main` runs), so the reference implementation is a store two calls away.
+/// A selflinked executable has no wrapper: `pelink::startupBytes` is a fixed
+/// trampoline — runtime init, `pickle_main`, flush, exit — and teaching it to
+/// scrape `GetCommandLineW`, pack pointers, and call into a store before the
+/// first line of user code would mean hand-assembling that sequence as bytes.
+/// Capturing here costs one import (`CommandLineToArgvW` already has its
+/// SHELL32 route in `pelink::isShellImp`) and needs no startup hook at all:
+/// the store is question-shaped, and the question can be answered on demand.
+/// `pickle_args_set` stays where it is on the Rust side; a linked program
+/// simply never calls it, and nothing reads what it would have stored.
+///
+/// `pickle_run_cmd` — THE SPAWN HALF, PORTED RATHER THAN DELEGATED. The shape
+/// comes from `runtime/src/process.rs::run_cmd`: `(exit code or none, stdout,
+/// stderr, timed out)`, `none` for the exit code meaning wait had no answer
+/// for it, and a null return meaning the process was never created. The
+/// mechanics — command line quoting, executable resolution, environment block,
+/// `STARTUPINFO`, pipes, `CreateProcessW` — follow
+/// `std::sys::process::windows.rs`, because that is what the reference binary
+/// itself reaches through `Command`. Both halves were read at the source (the
+/// `args::append_arg` quoting loop, `resolve_exe`'s search order,
+/// `make_envp`'s block rules, `Stdio::to_handle`, `capture_if_changed`), and
+/// the helpers below name their reference as they go.
+///
+/// WHAT DIFFERS FROM THE REFERENCE, RECORDED RATHER THAN HIDDEN:
+///
+/// - Batch files. `std` rewrites a `.bat`/`.cmd` target into `cmd.exe /c …`
+///   before spawning; this port hands it to `CreateProcessW`, which refuses
+///   it. Every test spawns `cmd.exe` or `git` directly, so the gap is real
+///   but unobserved.
+/// - Standard handles are passed through raw instead of `DuplicateHandle`d
+///   with the inherit bit set, so the spawn assumes the parent's handles are
+///   already inheritable (console and normally-inherited handles are). A null
+///   standard handle is treated as "not set" — the OS default applies —
+///   where the reference would fail the spawn.
+/// - `to_user_path` (the `\\?\` prefix strip) is not applied; verbatim and
+///   long-path inputs reach `CreateProcessW` as typed.
+/// - stdin is written in full before the wait loop starts, where the
+///   reference writes it on a thread concurrent with the drains. Within the
+///   pipe buffer — every practical input, both tests — the bytes queue
+///   identically; a child that never reads past its stdin pipe buffer while
+///   its output fills the opposite pipe would deadlock here, and the timeout
+///   would never get its chance to fire.
+/// - The environment block is ordered by an ASCII case-fold instead of
+///   `CompareStringOrdinal`, so non-ASCII keys may order differently, and an
+///   invalid-UTF-8 key or value is dropped rather than converted lossily —
+///   a dropped set-entry also vacates its parent slot, where the reference
+///   would hold a lossy entry.
+/// - Argument list elements are walked directly; `args_of` skips nulls on the
+///   reference side. A null inside a typed list is not a thing this language
+///   can express, so the direct walk is the honest one.
+/// - Sub-path detection reads `\`/`/` bytes, so a drive-relative `C:name`
+///   searches `PATH` where `std` may not.
+///
+/// The argv walk below skips index 0, matching `os.rs::pickle_args`, which
+/// hands out `argv[1..]` — the program name is not a program's argument.
+///
+/// `pickle_run_spawn` AND THE `pickle_proc_*` STREAM HANDLE — THE ASYNC HALF,
+/// PORTED UNDER THE SAME SPAWN MACHINERY. The shape mirrors
+/// `process.rs::run_spawn`: same resolution, quoting, environment block, and
+/// pipe setup as `run_cmd` above, but the pipes and both process handles are
+/// kept alive and the caller drives the child through the returned `Stream`.
+/// Every `proc_*` derferences the stream's inner block (the object at
+/// `STREAM_INNER_OFF`, word 3 of the 32-byte `PStream`), guarded exactly as
+/// `proc_inner_mut` guards: null, closed, or non-`Proc` handles answer the
+/// type's default. The drainable state lives in a 22-word raw block owned by
+/// this module (offsets below); WORDS 0-7 deliberately align with
+/// `abi_stream`'s 8-word inner (`CLOSED`/`KIND`/`HANDLE`/`RPOS`/`REND`/
+/// `WLEN`/`RBUF`/`WBUF` mean their stream meanings there, and the proc block
+/// reuses the first three slots — closed flag, `KIND == STREAM_PROC`, process
+/// handle — overwriting the rest with its own fields), so `abi_stream`'s
+/// `close` can recognize this kind and hand the whole block to `abiProcClose`
+/// instead of walking fields it does not know.
+///
+/// WHAT DIFFERS FROM THE REFERENCE, RECORDED RATHER THAN HIDDEN:
+///
+/// - There are no reader threads. The reference's drainers move the pipes
+///   into `Arc<Mutex<Vec<u8>>>` buffers as bytes arrive; here every
+///   `proc_out_read`/`proc_wait` call runs a poll pass (`procPoll`) that
+///   peeks both pipes, moves what waits into the raw drain block (capped at
+///   `max_out` like the reference; overflow is read and discarded, so the
+///   child never blocks on a full pipe), and — the moment the child has been
+///   seen to exit — finishes both pipes with blocking reads and flags EOF.
+///   A child is therefore drained before a poll returns, where the reference
+///   drains on its own schedule; the bytes, the cap, and the EOF-to-`none`
+///   boundary are the same, and a child that never gets polled still cannot
+///   deadlock while this process keeps polling.
+/// - `proc_wait` reaps through `WaitForSingleObject` + `GetExitCodeProcess`
+///   instead of `child.wait()`; a failed wait leaves the code unset and still
+///   answers `true`, exactly as the reference does with an `Err`.
+/// - The finalizer is not replicated — same story as `abi_stream`: the object
+///   is raw-heap, invisible to the native collector, and `PKL_NO_AUTO_GC=1`
+///   never runs it anyway. `abi_stream`'s `close` on a `Proc` handle calls
+///   `abiProcClose` (kill, reap, release every handle and drain block), which
+///   stands in for `ProcInner::drop`; a handle that is never closed holds its
+///   resources until the process exits, where native GC would have reclaimed
+///   it. `proc_err_read` is ported too — unused by any shape today, but the
+///   stderr pipe is always drained, and the body is the same serve as stdout.
+///
+/// The spawn itself is byte-for-byte the `run_cmd` capture path minus the
+/// stdin write, the deadline, and the post-spawn cleanup — `Stdio::piped` on
+/// all three standard streams, child sides closed, parent sides inherited by
+/// the child only through `CreateProcessW`. The stream object handed back is
+/// the same 32-byte `PStream` layout `abi_stream.makeStream` builds.
+
+import { unitAt, putUnit, unitRun, wideToStr, wideUnits, wideBuf, dword, putRawByte, wideCp, wideStep, pushCp, abiFileExists, GENERIC_READ, FILE_SHARE_ALL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, INVALID_FILE_ATTRIBUTES } from runtime.abi_fs
+import { rawByteAt } from runtime.abi_string
+import { PICKLE_CLASS_STREAM, PICKLE_CLASS_BOX_INT } from runtime.object
+import { newBox, boxBits } from runtime.abi_box
+import { abiListNew, abiListPush, abiListLen, abiListGet } from runtime.abi_list
+import { STREAM_OBJECT_SIZE } from runtime.layout
+// Proc stream objects are managed objects built with `alloc(int, 4)`; record
+// them in the port's sweepability registry like `abi_stream.makeStream` does.
+import { abiRegisterObject } from runtime.abi_raw
+
+/// `STARTUPINFOW.dwFlags` bit: the three `hStd*` fields carry real handles.
+/// Only set when at least one of them is non-null, which is the exact
+/// `is_set` test `windows.rs` runs (and `-1` counts as set there and here).
+const STARTF_USESTDHANDLES: int = 256
+
+/// `CreateProcessW` flag: `lpEnvironment` is a UTF-16 block. The reference
+/// ORs it into every spawn, even when the environment pointer is null.
+const CREATE_UNICODE_ENVIRONMENT: int = 1024
+
+/// `SetHandleInformation` mask / `SECURITY_ATTRIBUTES.bInheritHandle`.
+const HANDLE_FLAG_INHERIT: int = 1
+
+/// `WaitForSingleObject`'s `WAIT_FAILED` — every bit set in 32 bits.
+const WAIT_FAILED_ANSWER: int = 4294967295
+
+/// `WaitForSingleObject`'s `INFINITE`: the same all-bits value, meaning
+/// "block until the handle signals" as a timeout argument.
+const INFINITE_MS: int = 4294967295
+
+/// The capture ceiling when `max_out` is `none`: `DEFAULT_MAX_OUT` in
+/// `process.rs`, 16 MiB per stream.
+const DEFAULT_MAX_OUT: int = 16777216
+
+/// Standard handle numbers for `GetStdHandle`, spelled as the SDK does.
+const STD_IN_HANDLE: int = -10
+const STD_OUT_HANDLE: int = -11
+const STD_ERR_HANDLE: int = -12
+
+/// One drain read: bytes per `ReadFile`/`PeekNamedPipe`, and bytes per
+/// chunk buffer.
+const DRAIN_BYTES: int = 8192
+
+/// Scratch ceiling for the directory APIs, in UTF-16 units.
+const MAX_DIR_UNITS: int = 4096
+
+/// Cap for walking the parent environment block in one `unitRun`.
+const ENV_PARSE_CAP: int = 4194304
+
+/// The empty `List<string>`, built the way the language's factory idiom
+/// requires (`[]` is not an expression on its own): one literal, popped back
+/// to empty, so the value is a real list object with a real allocation rather
+/// than a null pretending to be one.
+fn noArgs() -> List<string> {
+    var out = [""]
+    out.pop()
+    out
+}
+
+/// ASCII case-fold for one byte — the range `CompareStringOrdinal`'s
+/// ignore-case pass treats like this for environment keys and `PATH`.
+fn fold(c: int) -> int {
+    if (c >= 97 && c <= 122) {
+        return c - 32
+    }
+    c
+}
+
+/// Case-insensitive equality over ASCII: the comparison `EnvKey` performs
+/// for every environment operation on the reference side.
+fn ciEq(a: string, b: string) -> bool {
+    let ba = bytes(a)
+    let bb = bytes(b)
+    let n = len(ba)
+    if (n != len(bb)) {
+        return false
+    }
+    var i = 0
+    while (i < n) {
+        if (fold(ba[i] as int) != fold(bb[i] as int)) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+/// ASCII case-insensitive order, for sorting the block into the sequence
+/// the reference's `BTreeMap<EnvKey>` iteration produces.
+fn ciLess(a: string, b: string) -> bool {
+    let ba = bytes(a)
+    let bb = bytes(b)
+    let la = len(ba)
+    let lb = len(bb)
+    let m = min(la, lb)
+    var i = 0
+    while (i < m) {
+        let ca = fold(ba[i] as int)
+        let cb = fold(bb[i] as int)
+        if (ca != cb) {
+            return ca < cb
+        }
+        i = i + 1
+    }
+    la < lb
+}
+
+/// Case-insensitive suffix test — `.exe`, as `eq_ignore_ascii_case` spells
+/// it in `resolve_exe`.
+fn endsWithCi(s: string, suf: string) -> bool {
+    let bs = bytes(s)
+    let bf = bytes(suf)
+    let n = len(bs)
+    let k = len(bf)
+    if (n < k) {
+        return false
+    }
+    var i = 0
+    while (i < k) {
+        if (fold(bs[n - k + i] as int) != fold(bf[i] as int)) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+/// Whether `s` holds a NUL byte — `ensure_no_nuls` on everything that
+/// reaches a Win32 entry point as a C string.
+fn hasNul(s: string) -> bool {
+    let bs = bytes(s)
+    let n = len(bs)
+    var i = 0
+    while (i < n) {
+        if (bs[i] as int == 0) {
+            return true
+        }
+        i = i + 1
+    }
+    false
+}
+
+/// The `n` units at `w[start..]` as a string — the offset-taking twin of
+/// `abi_fs.wideToStr`, which only reads from unit 0. Lossy on unpaired
+/// surrogates, exactly as its model.
+fn sliceToStr(w: *int, start: int, n: int) -> string {
+    let out = bytes("")
+    let stop = start + n
+    var pos = start
+    while (pos < stop) {
+        pushCp(out, wideCp(w, pos, stop))
+        pos = pos + wideStep(w, pos, stop)
+    }
+    str(out)
+}
+
+/// Close a handle that may be the 0 "never created" marker.
+fn closeIf(h: int) {
+    unsafe {
+        if (!(h == 0)) {
+            let _ = win_close_handle(h)
+        }
+    }
+}
+
+/// Release a `GetEnvironmentStringsW` block that may be the 0 "failed"
+/// marker. `FreeEnvironmentStringsW` is its pair — never the process-heap
+/// free the allocator builtins use.
+fn freeEnvStrings(w: int) {
+    unsafe {
+        if (!(w == 0)) {
+            let _ = win_free_environment_strings_w(w)
+        }
+    }
+}
+
+/// Split a `PATH`-style string on `;` the way `env::split_paths` does on
+/// Windows: no trimming, no empty filtering (the caller skips empties).
+fn splitSemi(s: string) -> List<string> {
+    let bs = bytes(s)
+    var out = noArgs()
+    let n = len(bs)
+    var start = 0
+    var i = 0
+    while (i <= n) {
+        if (i == n || bs[i] as int == 59) {
+            if (i > start) {
+                var piece = bytes("")
+                var p = start
+                while (p < i) {
+                    piece.push(bs[p])
+                    p = p + 1
+                }
+                out.push(str(piece))
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    out
+}
+
+/// Whether the child's env map carries `s` under any casing — the question
+/// `maybe_saw_path` asks of the map before the child's `PATH` is searched.
+fn envsHasKey(em: Map<string, string>, s: string) -> bool {
+    for (k in em.keys()) {
+        if (ciEq(k, s)) {
+            return true
+        }
+    }
+    false
+}
+
+/// The child's value for `s` under any casing, or `none`.
+fn envsGetCi(em: Map<string, string>, s: string) -> string? {
+    var res: string? = none
+    for (k in em.keys()) {
+        if (ciEq(k, s)) {
+            if (let some(v) = em.get(k)) {
+                res = v
+            }
+        }
+    }
+    res
+}
+
+/// Copy `n` UTF-16 units from `src[start..]` into `dst` at unit index `di`;
+/// answers the index just past what was written.
+fn catW(dst: *int, di: int, src: *int, start: int, n: int) -> int {
+    unsafe {
+        var i = 0
+        var d = di
+        while (i < n) {
+            putUnit(dst, d, unitAt(src, start + i))
+            d = d + 1
+            i = i + 1
+        }
+        d
+    }
+}
+
+/// Append `s` as UTF-16 at unit index `di`; answers the next index. An
+/// invalid string appends nothing — `wideBuf`'s answer for one is empty,
+/// the same loss `path_w` accepts.
+fn catStrW(dst: *int, di: int, s: string) -> int {
+    unsafe {
+        var u = wideUnits(s)
+        if (u < 0) {
+            u = 0
+        }
+        let tmp = wideBuf(s)
+        let nd = catW(dst, di, tmp, 0, u)
+        free(tmp)
+        nd
+    }
+}
+
+/// One argument appended per `args::append_arg` with `Quote::Auto`: quoted
+/// when it holds a space or a tab, or when it is empty. Escaping runs in
+/// both cases — `escape` is true for every regular argument (it only goes
+/// false for `Arg::Raw`, which this builder never sees) — so an internal
+/// quote gains `2n+1` backslashes, a backslash run stays a backslash run,
+/// and the run before the closing quote doubles.
+fn appendArgW(dst: *int, di: int, a: string) -> int {
+    unsafe {
+        let bs = bytes(a)
+        let n = len(bs)
+        var quote = n == 0
+        var i = 0
+        while (i < n) {
+            let b = bs[i] as int
+            if (b == 32 || b == 9) {
+                quote = true
+            }
+            i = i + 1
+        }
+        var u = wideUnits(a)
+        if (u < 0) {
+            u = 0
+        }
+        let tmp = wideBuf(a)
+        var d = di
+        if (quote) {
+            putUnit(dst, d, 34)
+            d = d + 1
+        }
+        var backslashes = 0
+        var k = 0
+        while (k < u) {
+            let x = unitAt(tmp, k)
+            if (x == 92) {
+                backslashes = backslashes + 1
+            } else {
+                if (x == 34) {
+                    var c = 0
+                    while (c <= backslashes) {
+                        putUnit(dst, d, 92)
+                        d = d + 1
+                        c = c + 1
+                    }
+                }
+                backslashes = 0
+            }
+            putUnit(dst, d, x)
+            d = d + 1
+            k = k + 1
+        }
+        if (quote) {
+            var c = 0
+            while (c < backslashes) {
+                putUnit(dst, d, 92)
+                d = d + 1
+                c = c + 1
+            }
+            putUnit(dst, d, 34)
+            d = d + 1
+        }
+        free(tmp)
+        d
+    }
+}
+
+/// The full command line `make_command_line` builds: the program word raw
+/// inside quotes — `std` does not escape it, because a path cannot hold a
+/// quote — then each remaining argument via `appendArgW` behind a space,
+/// then the trailing NUL `std` pushes itself right before `CreateProcessW`.
+/// Answers 0 when an argument holds a NUL, which is where `ensure_no_nuls`
+/// would have failed the spawn.
+fn buildCommandLine(orig: string, argv: List<string>) -> *int {
+    unsafe {
+        var progU = wideUnits(orig)
+        if (progU < 0) {
+            progU = 0
+        }
+        var cap = progU + 8
+        let argc = len(argv)
+        var i = 1
+        while (i < argc) {
+            let a = argv[i]
+            if (hasNul(a)) {
+                return 0 as *int
+            }
+            let ab = bytes(a)
+            cap = cap + (len(ab) * 2) + 8
+            i = i + 1
+        }
+        cap = cap + (argc * 2)
+        let words = (cap + 8) / 4 + 1
+        let w = alloc(int, words)
+        var z = 0
+        while (z < words) {
+            w[z] = 0
+            z = z + 1
+        }
+        var d = 0
+        putUnit(w, d, 34)
+        d = d + 1
+        d = catStrW(w, d, orig)
+        putUnit(w, d, 34)
+        d = d + 1
+        i = 1
+        while (i < argc) {
+            putUnit(w, d, 32)
+            d = d + 1
+            d = appendArgW(w, d, argv[i])
+            i = i + 1
+        }
+        putUnit(w, d, 0)
+        w
+    }
+}
+
+/// The parent's `PATH`, read out of a `GetEnvironmentStringsW` block —
+/// step 5 of `search_paths` asks for it lazily, only when the earlier steps
+/// missed. Answers `none` when the block cannot be read at all.
+fn parentPathValue() -> string? {
+    unsafe {
+        let w = win_get_environment_strings_w()
+        if (w == 0) {
+            return none
+        }
+        var pos = 0
+        var res: string? = none
+        var done = false
+        while (!done) {
+            let eLen = unitRun(w as *int, pos, ENV_PARSE_CAP)
+            if (eLen == 0) {
+                done = true
+            }
+            if (eLen != 0) {
+                var kEnd = 0
+                var saw = false
+                while (kEnd < eLen && !saw) {
+                    if (unitAt(w as *int, pos + kEnd) == 61) {
+                        saw = true
+                    }
+                    if (!saw) {
+                        kEnd = kEnd + 1
+                    }
+                }
+                if (saw) {
+                    let key = sliceToStr(w as *int, pos, kEnd)
+                    if (ciEq(key, "PATH")) {
+                        res = sliceToStr(w as *int, pos + kEnd + 1, eLen - kEnd - 1)
+                    }
+                }
+                pos = pos + eLen + 1
+            }
+        }
+        let _ = win_free_environment_strings_w(w)
+        res
+    }
+}
+
+/// The executable `resolve_exe` would hand `CreateProcessW`, or 0 when it
+/// gives up. `childPath` is the child's `PATH` when the caller set one.
+/// `search_paths` order: 1 the child's `PATH` (only when it was brought
+/// along), 2 this executable's directory (`current_exe().pop()`), 3
+/// System32, 4 the Windows directory, 5 the parent's `PATH` — each probed
+/// as `name`, with `.exe` appended only when the name carries no dot.
+/// A sub-path skips the search entirely: with a `.exe` suffix it goes to
+/// `CreateProcessW` as typed, without one it tries `name.exe` and falls
+/// back to `name`.
+fn resolveProgram(name: string, childPath: string?) -> *int {
+    unsafe {
+        if (hasNul(name)) {
+            return 0 as *int
+        }
+        let bs = bytes(name)
+        let n = len(bs)
+        if (n == 0) {
+            return 0 as *int
+        }
+        let lastB = bs[n - 1] as int
+        if (lastB == 92 || lastB == 47) {
+            return 0 as *int
+        }
+        var isBare = true
+        var i = 0
+        while (i < n) {
+            let b = bs[i] as int
+            if (b == 92 || b == 47) {
+                isBare = false
+            }
+            i = i + 1
+        }
+        if (!isBare) {
+            if (endsWithCi(name, ".exe")) {
+                return wideBuf(name)
+            }
+            let cand = name + ".exe"
+            if (abiFileExists(cand)) {
+                return wideBuf(cand)
+            }
+            return wideBuf(name)
+        }
+        var hasExt = false
+        i = 0
+        while (i < n) {
+            if (bs[i] as int == 46) {
+                hasExt = true
+            }
+            i = i + 1
+        }
+        var nm = name
+        if (!hasExt) {
+            nm = name + ".exe"
+        }
+        if (let some(cp) = childPath) {
+            let parts = splitSemi(cp)
+            var j = 0
+            while (j < len(parts)) {
+                if (len(parts[j]) > 0) {
+                    let cand = parts[j] + "\\" + nm
+                    if (abiFileExists(cand)) {
+                        return wideBuf(cand)
+                    }
+                }
+                j = j + 1
+            }
+        }
+        // Step 2: this executable's directory, as `current_exe().pop()`
+        // does — `GetModuleFileNameW` on a null module, backslash-trimmed.
+        let mbuf = alloc(int, MAX_DIR_UNITS / 4)
+        var z = 0
+        while (z < MAX_DIR_UNITS / 4) {
+            mbuf[z] = 0
+            z = z + 1
+        }
+        let mlen = dword(win_get_module_file_name_w(0, mbuf, MAX_DIR_UNITS))
+        if (mlen > 0 && mlen < MAX_DIR_UNITS) {
+            var cut = mlen
+            var sawSep = false
+            while (cut > 0 && !sawSep) {
+                if (unitAt(mbuf, cut - 1) == 92) {
+                    sawSep = true
+                }
+                if (!sawSep) {
+                    cut = cut - 1
+                }
+            }
+            if (sawSep) {
+                let dir = sliceToStr(mbuf, 0, cut - 1)
+                let cand = dir + "\\" + nm
+                if (abiFileExists(cand)) {
+                    free(mbuf)
+                    return wideBuf(cand)
+                }
+            }
+        }
+        free(mbuf)
+        // Steps 3 and 4: System32 then the Windows directory, each a
+        // fixed 4096-unit scratch — both APIs answer in units, excluding
+        // their NUL, and 4096 is far past either real length.
+        let sbuf = alloc(int, MAX_DIR_UNITS / 4)
+        z = 0
+        while (z < MAX_DIR_UNITS / 4) {
+            sbuf[z] = 0
+            z = z + 1
+        }
+        let slen = dword(win_get_system_directory_w(sbuf, MAX_DIR_UNITS))
+        if (slen > 0 && slen < MAX_DIR_UNITS) {
+            let cand = sliceToStr(sbuf, 0, slen) + "\\" + nm
+            if (abiFileExists(cand)) {
+                free(sbuf)
+                return wideBuf(cand)
+            }
+        }
+        free(sbuf)
+        let wbuf = alloc(int, MAX_DIR_UNITS / 4)
+        z = 0
+        while (z < MAX_DIR_UNITS / 4) {
+            wbuf[z] = 0
+            z = z + 1
+        }
+        let wlen = dword(win_get_windows_directory_w(wbuf, MAX_DIR_UNITS))
+        if (wlen > 0 && wlen < MAX_DIR_UNITS) {
+            let cand = sliceToStr(wbuf, 0, wlen) + "\\" + nm
+            if (abiFileExists(cand)) {
+                free(wbuf)
+                return wideBuf(cand)
+            }
+        }
+        free(wbuf)
+        // Step 5: the parent's `PATH`, searched last even when the child
+        // brought one — `search_paths` appends it unconditionally.
+        if (let some(pp) = parentPathValue()) {
+            let parts = splitSemi(pp)
+            var j = 0
+            while (j < len(parts)) {
+                if (len(parts[j]) > 0) {
+                    let cand = parts[j] + "\\" + nm
+                    if (abiFileExists(cand)) {
+                        return wideBuf(cand)
+                    }
+                }
+                j = j + 1
+            }
+        }
+        0 as *int
+    }
+}
+
+/// The environment block `make_envp` would build. Answers -1 for "a NUL
+/// was found in a key or value" (`ensure_no_nuls` there), 0 for "pass no
+/// block at all" — the child inherits the parent's environment unmodified,
+/// which is what `capture_if_changed` says when no operation was queued —
+/// and otherwise the block pointer.
+///
+/// Entries are `key=value\0` runs sorted case-insensitively (the reference's
+/// `BTreeMap<EnvKey>` iteration), then the final `\0`; an operation set with
+/// nothing usable in it still gets the two-NUL block `make_envp` emits for
+/// an empty map. A parent entry whose key an operation touches is dropped
+/// and the operation's own entry takes the slot. Parent spans are copied
+/// verbatim so their values survive byte for byte.
+fn buildEnvBlock(envs: Map<string, string>?, removes: List<string>?) -> int {
+    unsafe {
+        var ops = false
+        if (let some(em) = envs) {
+            if (len(em.keys()) > 0) {
+                ops = true
+            }
+        }
+        if (let some(rs) = removes) {
+            if (len(rs) > 0) {
+                ops = true
+            }
+        }
+        if (!ops) {
+            return 0
+        }
+        let parentW = win_get_environment_strings_w()
+        // The caller's entries, checked before anything is written. An
+        // invalid-UTF-8 pair is dropped — `wideBuf` could only write an
+        // empty string for one, which would be a different lie.
+        var setKeys = noArgs()
+        var setVals = noArgs()
+        if (let some(em) = envs) {
+            for (k in em.keys()) {
+                if (let some(v) = em.get(k)) {
+                    if (hasNul(k) || hasNul(v)) {
+                        freeEnvStrings(parentW)
+                        return -1
+                    }
+                    if (wideUnits(k) >= 0 && wideUnits(v) >= 0) {
+                        setKeys.push(k)
+                        setVals.push(v)
+                    }
+                }
+            }
+        }
+        var rmKeys = noArgs()
+        if (let some(rs) = removes) {
+            for (r in rs) {
+                if (hasNul(r)) {
+                    freeEnvStrings(parentW)
+                    return -1
+                }
+                if (wideUnits(r) >= 0) {
+                    rmKeys.push(r)
+                }
+            }
+        }
+        // The set entries, written into their own buffer: `k=v\0` runs
+        // with the position of each recorded as a span into it.
+        var total = 0
+        var si = 0
+        while (si < len(setKeys)) {
+            total = total + wideUnits(setKeys[si]) + wideUnits(setVals[si]) + 2
+            si = si + 1
+        }
+        let setWords = (total + 4) / 4 + 1
+        let setW = alloc(int, setWords)
+        var z = 0
+        while (z < setWords) {
+            setW[z] = 0
+            z = z + 1
+        }
+        // `ents` is a flat run of `[src, start, len]` triples — 0 for a
+        // parent span, 1 for a set span — with `keys` parallel to it for
+        // the sort, so the two swap together.
+        var ents = [0]
+        ents.pop()
+        var keys = noArgs()
+        var pos = 0
+        si = 0
+        while (si < len(setKeys)) {
+            let k = setKeys[si]
+            let v = setVals[si]
+            let kw = wideBuf(k)
+            let eStart = pos
+            pos = catW(setW, pos, kw, 0, wideUnits(k))
+            free(kw)
+            putUnit(setW, pos, 61)
+            pos = pos + 1
+            let vw = wideBuf(v)
+            pos = catW(setW, pos, vw, 0, wideUnits(v))
+            free(vw)
+            putUnit(setW, pos, 0)
+            pos = pos + 1
+            ents.push(1)
+            ents.push(eStart)
+            ents.push(pos - eStart - 1)
+            keys.push(k)
+            si = si + 1
+        }
+        // Parent entries the operations do not touch, as raw spans.
+        if (!(parentW == 0)) {
+            var pPos = 0
+            var pDone = false
+            while (!pDone) {
+                let eLen = unitRun(parentW as *int, pPos, ENV_PARSE_CAP)
+                if (eLen == 0) {
+                    pDone = true
+                }
+                if (eLen != 0) {
+                    var kEnd = 0
+                    var saw = false
+                    while (kEnd < eLen && !saw) {
+                        if (unitAt(parentW as *int, pPos + kEnd) == 61) {
+                            saw = true
+                        }
+                        if (!saw) {
+                            kEnd = kEnd + 1
+                        }
+                    }
+                    let key = sliceToStr(parentW as *int, pPos, kEnd)
+                    var keep = true
+                    var ri = 0
+                    while (ri < len(rmKeys)) {
+                        if (ciEq(key, rmKeys[ri])) {
+                            keep = false
+                        }
+                        ri = ri + 1
+                    }
+                    if (keep) {
+                        if (let some(em) = envs) {
+                            if (envsHasKey(em, key)) {
+                                keep = false
+                            }
+                        }
+                    }
+                    if (keep) {
+                        ents.push(0)
+                        ents.push(pPos)
+                        ents.push(eLen)
+                        keys.push(key)
+                    }
+                    pPos = pPos + eLen + 1
+                }
+            }
+        }
+        // Insertion sort by key, the sequence the `BTreeMap` would iterate.
+        let cnt = len(keys)
+        var i = 1
+        while (i < cnt) {
+            var j = i
+            while (j > 0 && ciLess(keys[j], keys[j - 1])) {
+                let ks = keys[j - 1]
+                keys[j - 1] = keys[j]
+                keys[j] = ks
+                var t = 0
+                while (t < 3) {
+                    let idx = (j - 1) * 3 + t
+                    let ev = ents[idx]
+                    ents[idx] = ents[idx + 3]
+                    ents[idx + 3] = ev
+                    t = t + 1
+                }
+                j = j - 1
+            }
+            i = i + 1
+        }
+        // Emit: spans concatenated with a NUL after each; the allocation's
+        // own zeros close the block. An empty set gets the two NULs
+        // `make_envp` pushes for an empty map.
+        var units = 1
+        i = 0
+        while (i < cnt) {
+            units = units + ents[i * 3 + 2] + 1
+            i = i + 1
+        }
+        let outWords = (units + 4) / 4 + 1
+        let outW = alloc(int, outWords)
+        z = 0
+        while (z < outWords) {
+            outW[z] = 0
+            z = z + 1
+        }
+        var oPos = 0
+        i = 0
+        while (i < cnt) {
+            let src = ents[i * 3]
+            let st = ents[i * 3 + 1]
+            let ln = ents[i * 3 + 2]
+            if (src == 1) {
+                oPos = catW(outW, oPos, setW, st, ln)
+            } else {
+                oPos = catW(outW, oPos, parentW as *int, st, ln)
+            }
+            putUnit(outW, oPos, 0)
+            oPos = oPos + 1
+            i = i + 1
+        }
+        free(setW)
+        freeEnvStrings(parentW)
+        outW as int
+    }
+}
+
+/// Append up to the remaining room of `sink` from `n` raw bytes at
+/// `chunk`, discarding the overflow the way `drain` does — it stops
+/// counting at the cap but keeps reading, so the child never blocks on a
+/// full pipe.
+fn appendN(sink: List<byte>, chunk: *int, n: int, cap: int) {
+    unsafe {
+        let room = cap - len(sink)
+        if (room <= 0) {
+            return
+        }
+        var take = n
+        if (take > room) {
+            take = room
+        }
+        var b = 0
+        while (b < take) {
+            sink.push(rawByteAt(chunk, b) as byte)
+            b = b + 1
+        }
+    }
+}
+
+/// One pre-exit drain pass over a capture pipe: `PeekNamedPipe` reports
+/// what waits, `ReadFile` takes up to a chunk. A broken pipe — the child
+/// closed its end — ends the pass quietly, as the reference's reader does
+/// when its `read` hits the same wall.
+fn drainPeek(h: int, sink: List<byte>, chunk: *int, cap: int, pN: *int, pAv: *int) {
+    unsafe {
+        if (h == 0) {
+            return
+        }
+        // `PeekNamedPipe` fills the out-params reliably in the ported
+        // emit, but its own return value comes back as zero here. The
+        // count it left behind is the source of truth, so the return is
+        // discarded and the available bytes decide whether to read.
+        var go = true
+        while (go) {
+            pAv[0] = 0
+            win_peek_pipe(h, chunk, DRAIN_BYTES, pN, pAv)
+            let avail = dword(pAv[0])
+            if (avail == 0) {
+                return
+            }
+            var want = avail
+            if (want > DRAIN_BYTES) {
+                want = DRAIN_BYTES
+            }
+            pN[0] = 0
+            if (dword(win_read_file(h, chunk, want, pN, 0)) == 0) {
+                return
+            }
+            let n = dword(pN[0])
+            if (n == 0) {
+                return
+            }
+            appendN(sink, chunk, n, cap)
+        }
+    }
+}
+
+/// The post-exit drain: blocking reads until a zero count or an error.
+/// Both handles are at EOF only when their writer is gone, so after the
+/// child has exited these runs end — this is the reference's join of its
+/// reader threads, in one thread's worth of code.
+fn drainFinal(h: int, sink: List<byte>, chunk: *int, cap: int, pN: *int) {
+    unsafe {
+        if (h == 0) {
+            return
+        }
+        var go = true
+        while (go) {
+            pN[0] = 0
+            if (dword(win_read_file(h, chunk, DRAIN_BYTES, pN, 0)) == 0) {
+                return
+            }
+            let n = dword(pN[0])
+            if (n == 0) {
+                return
+            }
+            appendN(sink, chunk, n, cap)
+        }
+    }
+}
+
+/// A fresh `List<string>` of the command-line arguments, excluding the
+/// program name. Mirrors `os.rs::pickle_args`; the UTF-16 to UTF-8 walk reuses
+/// `abi_fs`'s lossy converter, which is the same conversion
+/// `String::from_utf16_lossy` performs on the reference side.
+#[symbol("pickle_args")]
+fn abiArgs() -> List<string> {
+    unsafe {
+        let line = win_get_command_line_w()
+        if (line == 0) {
+            return noArgs()
+        }
+        // The split returns an address, addresses are `int` until something
+        // is read through them (the `trace.pkl` NULL_ADDR convention).
+        // The split's second argument is an out slot for the count it does
+        // not need to return; the API insists on a writable one, so an
+        // 8-byte cell is handed over (the `abiReadFile` pattern) and never
+        // read back.
+        let argvRaw = win_command_line_to_argv_w(line, alloc(int, 1))
+        if (argvRaw == 0) {
+            return noArgs()
+        }
+        let argv = argvRaw as *int
+        var count = 0
+        while (argv[count] != 0) {
+            count = count + 1
+        }
+        var out = noArgs()
+        var i = 1
+        while (i < count) {
+            let p = argv[i] as *int
+            var n = 0
+            while (unitAt(p, n) != 0) {
+                n = n + 1
+            }
+            out.push(wideToStr(p, n))
+            i = i + 1
+        }
+        // The split block is `LocalAlloc`ed, so `LocalFree` is its pair —
+        // never the process-heap free the allocator builtins use.
+        win_local_free(argvRaw)
+        out
+    }
+}
+
+/// `run_cmd`: spawn, capture, wait — the whole exchange in one call.
+/// `argv[0]` is the program (resolved separately) and the rest its
+/// arguments, which is `base_command`'s split. A null return means
+/// `CreateProcessW` never ran or never started anything; otherwise the
+/// tuple carries the exit code (`none` when wait had no answer), both
+/// captured streams up to `max_out`, and whether the timeout fired —
+/// having killed the child with the reference's code of 1.
+#[symbol("pickle_run_cmd")]
+fn abiRunCmd(argv: List<string>, cwd: string?, envs: Map<string, string>?, envRemoves: List<string>?, stdinBytes: List<byte>?, maxOut: int?, timeoutMs: int?, inheritIo: bool) -> (int?, string, string, bool)? {
+    unsafe {
+        if (len(argv) == 0) {
+            return none
+        }
+        let prog = argv[0]
+        if (hasNul(prog)) {
+            return none
+        }
+        // The environment block first: a NUL in one of the caller's
+        // entries fails the spawn outright, before anything is allocated.
+        let envR = buildEnvBlock(envs, envRemoves)
+        if (envR < 0) {
+            return none
+        }
+        let envP = envR
+        // The child's own `PATH`, when it set one, is step 1 of the
+        // executable search — `maybe_saw_path` in `resolve_exe`.
+        var childPath: string? = none
+        if (let some(em) = envs) {
+            childPath = envsGetCi(em, "PATH")
+        }
+        let resolved = resolveProgram(prog, childPath)
+        if (resolved == 0 as *int) {
+            if (!(envP == 0)) {
+                free(envP as *int)
+            }
+            return none
+        }
+        // `make_command_line` quotes the ORIGINAL program word while
+        // `CreateProcessW` is handed the resolved one — both as `windows.rs`
+        // does, at lines 318 and 417.
+        let cmdW = buildCommandLine(prog, argv)
+        if (cmdW == 0 as *int) {
+            free(resolved)
+            if (!(envP == 0)) {
+                free(envP as *int)
+            }
+            return none
+        }
+        var cwdW: *int = 0 as *int
+        if (let some(d) = cwd) {
+            cwdW = wideBuf(d)
+        }
+        // `STARTUPINFOW` is 104 bytes — thirteen words — and
+        // `PROCESS_INFORMATION` three. Both start zeroed, as the reference's
+        // `zeroed_startupinfo` / `zeroed_process_information` produce.
+        let si = alloc(int, 13)
+        var z = 0
+        while (z < 13) {
+            si[z] = 0
+            z = z + 1
+        }
+        si[0] = 104
+        let pi = alloc(int, 3)
+        z = 0
+        while (z < 3) {
+            pi[z] = 0
+            z = z + 1
+        }
+        var hOutR = 0
+        var hOutW = 0
+        var hErrR = 0
+        var hErrW = 0
+        var hInR = 0
+        var hInW = 0
+        var hNul = 0
+        var capOk = true
+        if (inheritIo) {
+            // Pass the standard handles through raw; see the header for
+            // what that assumes instead of `DuplicateHandle`.
+            let hin = win_get_std_handle(STD_IN_HANDLE)
+            let hout = win_get_std_handle(STD_OUT_HANDLE)
+            let herr = win_get_std_handle(STD_ERR_HANDLE)
+            if (!(hin == 0) || !(hout == 0) || !(herr == 0)) {
+                putUnit(si, 30, STARTF_USESTDHANDLES)
+                si[10] = hin
+                si[11] = hout
+                si[12] = herr
+            }
+        } else {
+            // Capture mode: two pipe pairs plus stdin's source, built the
+            // way `Stdio::MakePipe` builds them — inheritable at creation,
+            // then the parent's own ends stripped of the inherit bit so
+            // only the child side leaks onward.
+            let sa = alloc(int, 3)
+            sa[0] = 24
+            sa[1] = 0
+            sa[2] = 1
+            let pr = alloc(int, 1)
+            let pw = alloc(int, 1)
+            pr[0] = 0
+            pw[0] = 0
+            if (dword(win_create_pipe(pr, pw, sa, 0)) == 0) {
+                capOk = false
+            }
+            if (capOk) {
+                hOutR = pr[0]
+                hOutW = pw[0]
+            }
+            pr[0] = 0
+            pw[0] = 0
+            if (capOk) {
+                if (dword(win_create_pipe(pr, pw, sa, 0)) == 0) {
+                    capOk = false
+                }
+            }
+            if (capOk) {
+                hErrR = pr[0]
+                hErrW = pw[0]
+            }
+            pr[0] = 0
+            pw[0] = 0
+            if (let some(sb) = stdinBytes) {
+                // `Stdio::MakePipe` for stdin: the child reads the far
+                // end, this process writes the near one.
+                if (capOk) {
+                    if (dword(win_create_pipe(pr, pw, sa, 0)) == 0) {
+                        capOk = false
+                    }
+                }
+                if (capOk) {
+                    hInR = pr[0]
+                    hInW = pw[0]
+                }
+            } else {
+                // `Stdio::Null`: `\\.\NUL`, opened read-only — the same
+                // `GENERIC_READ` a `File::open` would ask for. `CreateFile`
+                // answers the all-bits handle on failure.
+                let nulW = wideBuf("\\\\.\\NUL")
+                hNul = win_create_file_w(nulW, GENERIC_READ, FILE_SHARE_ALL, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0)
+                free(nulW)
+                if (dword(hNul) == INVALID_FILE_ATTRIBUTES) {
+                    capOk = false
+                    hNul = 0
+                }
+            }
+            free(pr)
+            free(pw)
+            if (capOk) {
+                if (dword(win_set_handle_information(hOutR, HANDLE_FLAG_INHERIT, 0)) == 0) {
+                    capOk = false
+                }
+                if (dword(win_set_handle_information(hErrR, HANDLE_FLAG_INHERIT, 0)) == 0) {
+                    capOk = false
+                }
+                if (!(hInW == 0)) {
+                    if (dword(win_set_handle_information(hInW, HANDLE_FLAG_INHERIT, 0)) == 0) {
+                        capOk = false
+                    }
+                }
+            }
+            if (capOk) {
+                putUnit(si, 30, STARTF_USESTDHANDLES)
+                si[10] = hInR
+                if (!(hNul == 0)) {
+                    si[10] = hNul
+                }
+                si[11] = hOutW
+                si[12] = hErrW
+            }
+            free(sa)
+        }
+        var spawnOk = false
+        var hProc = 0
+        var hThread = 0
+        if (capOk) {
+            // `inherit_handles: true` and `CREATE_UNICODE_ENVIRONMENT`
+            // unconditionally — lines 193 and 324 of `windows.rs`.
+            let rc = win_create_process_w(resolved, cmdW, 0, 0, 1, CREATE_UNICODE_ENVIRONMENT, envP, cwdW, si, pi)
+            spawnOk = !(dword(rc) == 0)
+            if (spawnOk) {
+                // `PROCESS_INFORMATION`: process handle in word 0, thread
+                // handle in word 1 — the thread stays open beside the
+                // process until this function ends, as `Process` holds it.
+                hProc = pi[0]
+                hThread = pi[1]
+            }
+            // The child's side of everything closes whether or not the
+            // spawn worked; `CreateProcessW` has its own copies either way.
+            if (!inheritIo) {
+                closeIf(hOutW)
+                closeIf(hErrW)
+                closeIf(hInR)
+                closeIf(hNul)
+            }
+        }
+        free(si)
+        free(pi)
+        if (!(cmdW == 0 as *int)) {
+            free(cmdW)
+        }
+        if (!(resolved == 0 as *int)) {
+            free(resolved)
+        }
+        if (!(cwdW == 0 as *int)) {
+            free(cwdW)
+        }
+        if (!(envP == 0)) {
+            free(envP as *int)
+        }
+        if (!spawnOk) {
+            if (!inheritIo) {
+                closeIf(hOutR)
+                closeIf(hErrR)
+                closeIf(hInW)
+            }
+            return none
+        }
+        // stdin, written before the wait loop — see the header for what
+        // that ordering assumes. A synchronous pipe write of this size
+        // completes against the buffer or blocks until the child reads,
+        // and the reference's writer thread ignores its errors, so a
+        // failure here closes the end all the same.
+        if (!inheritIo) {
+            if (let some(sb) = stdinBytes) {
+                if (!(hInW == 0)) {
+                    let n = len(sb)
+                    if (n > 0) {
+                        let wbuf = alloc(int, (n + 7) / 8)
+                        var b = 0
+                        while (b < n) {
+                            putRawByte(wbuf, b, sb[b] as int)
+                            b = b + 1
+                        }
+                        let _ = win_write_file(hInW, wbuf, n, 0, 0)
+                        free(wbuf)
+                    }
+                    closeIf(hInW)
+                }
+            }
+        }
+        // Capture state: the ceiling is `max_out` floored at zero, else
+        // the reference's 16 MiB.
+        var cap = DEFAULT_MAX_OUT
+        if (let some(m) = maxOut) {
+            cap = m
+            if (cap < 0) {
+                cap = 0
+            }
+        }
+        var outB = bytes("")
+        var errB = bytes("")
+        let chunk = alloc(int, (DRAIN_BYTES + 7) / 8)
+        let pN = alloc(int, 1)
+        let pAv = alloc(int, 1)
+        // The deadline, as `tick_count64` plus the floored span — `none`
+        // means no deadline at all, and the wait simply runs to the exit.
+        var deadline = -1
+        if (let some(t) = timeoutMs) {
+            var ms = t
+            if (ms < 0) {
+                ms = 0
+            }
+            deadline = win_tick_ms64() + ms
+        }
+        var timed = false
+        var waitErr = false
+        var exited = false
+        while (!exited) {
+            if (!inheritIo) {
+                drainPeek(hOutR, outB, chunk, cap, pN, pAv)
+                drainPeek(hErrR, errB, chunk, cap, pN, pAv)
+            }
+            // Two milliseconds: the exit check and the loop's pacing in
+            // one call — the reference blocks on the handle instead, which
+            // a single-threaded port cannot do between drains.
+            let rc = dword(win_wait_single(hProc, 2))
+            if (rc == 0) {
+                exited = true
+            } else {
+                if (rc == WAIT_FAILED_ANSWER) {
+                    waitErr = true
+                    exited = true
+                } else {
+                    if (deadline >= 0) {
+                        if (win_tick_ms64() >= deadline) {
+                            let _ = win_terminate_process(hProc, 1)
+                            let _ = win_wait_single(hProc, INFINITE_MS)
+                            timed = true
+                            exited = true
+                        }
+                    }
+                }
+            }
+        }
+        if (!inheritIo) {
+            drainFinal(hOutR, outB, chunk, cap, pN)
+            drainFinal(hErrR, errB, chunk, cap, pN)
+        }
+        var code: int? = none
+        if (!waitErr) {
+            let pC = alloc(int, 1)
+            pC[0] = 0
+            if (dword(win_get_exit_code_process(hProc, pC)) != 0) {
+                code = dword(pC[0])
+            }
+            free(pC)
+        }
+        closeIf(hProc)
+        closeIf(hThread)
+        if (!inheritIo) {
+            closeIf(hOutR)
+            closeIf(hErrR)
+        }
+        free(chunk)
+        free(pN)
+        free(pAv)
+        return (code, str(outB), str(errB), timed)
+    }
+}
+
+/// The proc stream kind, matching the reference's `StreamTarget::Proc` and
+/// kept equal to `abi_stream`'s own `STREAM_PROC` constant (the two modules
+/// maintain this single value by hand).
+const STREAM_PROC: int = 4
+
+/// The word holding the inner pointer on a `PStream` object — word 3,
+/// shared with `abi_stream` (`STREAM_INNER_OFF` = `HEADER` = 24 bytes).
+const STREAM_INNER_WORD: int = 3
+
+/// The 22-word proc inner block. Words 0-7 keep the `abi_stream` meanings
+/// (`CLOSED`, `KIND`, `HANDLE`, and four slots this module reuses); the rest
+/// describe the living child and its drain state. See the header for how the
+/// two modules share the first slots.
+const PROC_CLOSED: int = 0
+const PROC_KIND: int = 1
+const PROC_HPROC: int = 2
+const PROC_HTHREAD: int = 3
+const PROC_HOUT: int = 4
+const PROC_HIN: int = 5
+const PROC_HERR: int = 6
+const PROC_CAP: int = 7
+const PROC_REAPED: int = 8
+const PROC_HASCODE: int = 9
+const PROC_CODE: int = 10
+const PROC_OUTB: int = 11
+const PROC_OUTPOS: int = 12
+const PROC_OUTLEN: int = 13
+const PROC_OUTEOF: int = 14
+const PROC_ERRB: int = 15
+const PROC_ERRPOS: int = 16
+const PROC_ERRLEN: int = 17
+const PROC_ERREOF: int = 18
+const PROC_CHUNK: int = 19
+const PROC_PN: int = 20
+const PROC_PAV: int = 21
+const PROC_INNER_WORDS: int = 22
+
+/// The proc inner behind `h`, or null when `h` is not a live process handle:
+/// null, a closed stream, or a stream whose inner kind is not `STREAM_PROC` —
+/// the `proc_inner_mut` guard, so a closed or foreign stream answers every
+/// `proc_*` with its type's default.
+fn procInnerOf(h: *int) -> *int {
+    unsafe {
+        if (h == 0 as *int) {
+            return 0 as *int
+        }
+        var inner = h[STREAM_INNER_WORD] as *int
+        if (inner == 0 as *int) {
+            return 0 as *int
+        }
+        if (inner[PROC_CLOSED] != 0) {
+            return 0 as *int
+        }
+        if (inner[PROC_KIND] != STREAM_PROC) {
+            return 0 as *int
+        }
+        return inner
+    }
+}
+
+/// Whether the child has exited: `WaitForSingleObject(h, 0)` — `WAIT_OBJECT_0`
+/// (0) means signalled, which is `try_wait`'s "has exited" answer.
+fn procExited(hproc: int) -> bool {
+    unsafe {
+        dword(win_wait_single(hproc, 0)) == 0
+    }
+}
+
+/// Slide a served buffer's unread tail to the front and reset the pair —
+/// keeps `procDrainAt`'s append point inside the allocation (see the header
+/// on the cap-bounded block).
+fn procCompact(inner: *int, posOff: int, lenOff: int, bufOff: int) {
+    unsafe {
+        let pos = inner[posOff]
+        let len = inner[lenOff]
+        if (pos > 0) {
+            if (pos < len) {
+                var b = 0
+                while (b < len - pos) {
+                    putRawByte(inner[bufOff] as *int, b, rawByteAt(inner[bufOff] as *int, pos + b))
+                    b = b + 1
+                }
+            }
+            inner[lenOff] = len - pos
+            inner[posOff] = 0
+        }
+    }
+}
+
+/// One pre-exit drain pass over a pipe into the raw retain block: peek what
+/// waits, read it, and keep the first `cap` live bytes (overflow is read and
+/// discarded, never blocking the child — `drain`'s contract). The retain
+/// length lives in `inner[lenOff]` so several drains share one poll pass.
+fn procDrainAt(h: int, buf: *int, inner: *int, lenOff: int, chunk: *int, pN: *int, pAv: *int) {
+    unsafe {
+        if (h == 0) {
+            return
+        }
+        var go = true
+        while (go) {
+            pAv[0] = 0
+            win_peek_pipe(h, chunk, DRAIN_BYTES, pN, pAv)
+            let avail = dword(pAv[0])
+            if (avail == 0) {
+                return
+            }
+            var want = avail
+            if (want > DRAIN_BYTES) {
+                want = DRAIN_BYTES
+            }
+            pN[0] = 0
+            if (dword(win_read_file(h, chunk, want, pN, 0)) == 0) {
+                return
+            }
+            let n = dword(pN[0])
+            if (n == 0) {
+                return
+            }
+            let cap = inner[PROC_CAP]
+            var len = inner[lenOff]
+            var room = cap - len
+            if (room > 0) {
+                var take = n
+                if (take > room) {
+                    take = room
+                }
+                var b = 0
+                while (b < take) {
+                    putRawByte(buf, len + b, rawByteAt(chunk, b))
+                    b = b + 1
+                }
+                inner[lenOff] = len + take
+            }
+        }
+    }
+}
+
+/// The post-exit drain: blocking reads until a zero count or an error — the
+/// reference's join of a reader thread, in this thread's worth of code.
+fn procDrainFinalAt(h: int, buf: *int, inner: *int, lenOff: int, chunk: *int, pN: *int) {
+    unsafe {
+        if (h == 0) {
+            return
+        }
+        var go = true
+        while (go) {
+            pN[0] = 0
+            if (dword(win_read_file(h, chunk, DRAIN_BYTES, pN, 0)) == 0) {
+                return
+            }
+            let n = dword(pN[0])
+            if (n == 0) {
+                return
+            }
+            let cap = inner[PROC_CAP]
+            var len = inner[lenOff]
+            var room = cap - len
+            if (room > 0) {
+                var take = n
+                if (take > room) {
+                    take = room
+                }
+                var b = 0
+                while (b < take) {
+                    putRawByte(buf, len + b, rawByteAt(chunk, b))
+                    b = b + 1
+                }
+                inner[lenOff] = len + take
+            }
+        }
+    }
+}
+
+/// One full poll pass — the single-threaded stand-in for the two reader
+/// threads: move whatever waits on either pipe into its retain block
+/// (peeked, non-blocking), then once the child has been seen to exit, finish
+/// both pipes with blocking reads and flag EOF.
+fn procPoll(inner: *int) {
+    unsafe {
+        let chunk = inner[PROC_CHUNK] as *int
+        let pN = inner[PROC_PN] as *int
+        let pAv = inner[PROC_PAV] as *int
+        procCompact(inner, PROC_OUTPOS, PROC_OUTLEN, PROC_OUTB)
+        if (inner[PROC_HOUT] != 0) {
+            procDrainAt(inner[PROC_HOUT], inner[PROC_OUTB] as *int, inner, PROC_OUTLEN, chunk, pN, pAv)
+        }
+        procCompact(inner, PROC_ERRPOS, PROC_ERRLEN, PROC_ERRB)
+        if (inner[PROC_HERR] != 0) {
+            procDrainAt(inner[PROC_HERR], inner[PROC_ERRB] as *int, inner, PROC_ERRLEN, chunk, pN, pAv)
+        }
+        if (procExited(inner[PROC_HPROC])) {
+            if (inner[PROC_HOUT] != 0) {
+                procDrainFinalAt(inner[PROC_HOUT], inner[PROC_OUTB] as *int, inner, PROC_OUTLEN, chunk, pN)
+            }
+            if (inner[PROC_HERR] != 0) {
+                procDrainFinalAt(inner[PROC_HERR], inner[PROC_ERRB] as *int, inner, PROC_ERRLEN, chunk, pN)
+            }
+            inner[PROC_OUTEOF] = 1
+            inner[PROC_ERREOF] = 1
+        }
+    }
+}
+
+/// Serve up to `n` retained bytes as a fresh `List<byte>`, advancing the
+/// position and resetting the pair when the buffer is drained — `read
+/// _available`'s serve. `none` only when nothing remains and EOF was reached.
+fn procServe(inner: *int, posOff: int, lenOff: int, eofOff: int, bufOff: int, n: int) -> *int {
+    unsafe {
+        var cap = n
+        if (cap < 0) {
+            cap = 0
+        }
+        let pos = inner[posOff]
+        let len = inner[lenOff]
+        var avail = len - pos
+        var take = avail
+        if (cap < take) {
+            take = cap
+        }
+        var l = abiListNew(take)
+        var buf = inner[bufOff] as *int
+        var i = 0
+        while (i < take) {
+            abiListPush(l, newBox(PICKLE_CLASS_BOX_INT, rawByteAt(buf, pos + i)))
+            i = i + 1
+        }
+        inner[posOff] = pos + take
+        if (inner[posOff] == inner[lenOff]) {
+            inner[posOff] = 0
+            inner[lenOff] = 0
+        }
+        if (take == 0 && inner[eofOff] != 0) {
+            return 0 as *int
+        }
+        return l
+    }
+}
+
+/// The 32-byte `PStream` object owning a proc inner — the same shape
+/// `abi_stream.makeStream` builds: object header, stream class id,
+/// `STREAM_OBJECT_SIZE`, inner pointer at word 3.
+fn spawnStreamObject(inner: *int) -> *int {
+    unsafe {
+        var obj = alloc(int, 4)
+        obj[0] = 0
+        obj[1] = PICKLE_CLASS_STREAM
+        obj[2] = STREAM_OBJECT_SIZE
+        obj[3] = inner as int
+        abiRegisterObject(obj)
+        return obj
+    }
+}
+
+/// Release a proc stream's OS resources — `ProcInner::drop` in one function:
+/// kill and reap an un-waited child, then close every handle and drain block.
+/// Called by `abi_stream`'s `close` once the stream is marked closed, and
+/// never again (the idempotency comes from `CLOSED` at the call site).
+fn abiProcClose(inner: *int) -> bool {
+    unsafe {
+        let _ = win_terminate_process(inner[PROC_HPROC], 1)
+        let _ = win_wait_single(inner[PROC_HPROC], INFINITE_MS)
+        closeIf(inner[PROC_HPROC])
+        closeIf(inner[PROC_HTHREAD])
+        closeIf(inner[PROC_HOUT])
+        closeIf(inner[PROC_HIN])
+        closeIf(inner[PROC_HERR])
+        if (!(inner[PROC_OUTB] == 0)) {
+            free(inner[PROC_OUTB] as *int)
+            inner[PROC_OUTB] = 0
+        }
+        if (!(inner[PROC_ERRB] == 0)) {
+            free(inner[PROC_ERRB] as *int)
+            inner[PROC_ERRB] = 0
+        }
+        if (!(inner[PROC_CHUNK] == 0)) {
+            free(inner[PROC_CHUNK] as *int)
+            inner[PROC_CHUNK] = 0
+        }
+        if (!(inner[PROC_PN] == 0)) {
+            free(inner[PROC_PN] as *int)
+            inner[PROC_PN] = 0
+        }
+        if (!(inner[PROC_PAV] == 0)) {
+            free(inner[PROC_PAV] as *int)
+            inner[PROC_PAV] = 0
+        }
+        return true
+    }
+}
+
+/// `run_spawn(argv, cwd, envs, env_removes, max_out)`: start a child with all
+/// three standard streams piped and return a `Stream` handle to it — null for
+/// "could not be spawned". The child-side pipe ends close immediately; the
+/// parent holds the read ends and the stdin write end, and `proc_*` drives
+/// the child from the stream. `max_out` bounds each retained drain block,
+/// defaulting to the reference's 16 MiB.
+#[symbol("pickle_run_spawn")]
+fn abiRunSpawn(argv: List<string>, cwd: string?, envs: Map<string, string>?, envRemoves: List<string>?, maxOut: int?) -> *int {
+    unsafe {
+        if (len(argv) == 0) {
+            return 0 as *int
+        }
+        let prog = argv[0]
+        if (hasNul(prog)) {
+            return 0 as *int
+        }
+        let envR = buildEnvBlock(envs, envRemoves)
+        if (envR < 0) {
+            return 0 as *int
+        }
+        let envP = envR
+        var childPath: string? = none
+        if (let some(em) = envs) {
+            childPath = envsGetCi(em, "PATH")
+        }
+        let resolved = resolveProgram(prog, childPath)
+        if (resolved == 0 as *int) {
+            if (!(envP == 0)) {
+                free(envP as *int)
+            }
+            return 0 as *int
+        }
+        let cmdW = buildCommandLine(prog, argv)
+        if (cmdW == 0 as *int) {
+            free(resolved)
+            if (!(envP == 0)) {
+                free(envP as *int)
+            }
+            return 0 as *int
+        }
+        var cwdW: *int = 0 as *int
+        if (let some(d) = cwd) {
+            cwdW = wideBuf(d)
+        }
+        let si = alloc(int, 13)
+        var z = 0
+        while (z < 13) {
+            si[z] = 0
+            z = z + 1
+        }
+        si[0] = 104
+        let pi = alloc(int, 3)
+        z = 0
+        while (z < 3) {
+            pi[z] = 0
+            z = z + 1
+        }
+        var hOutR = 0
+        var hOutW = 0
+        var hErrR = 0
+        var hErrW = 0
+        var hInR = 0
+        var hInW = 0
+        var capOk = true
+        let sa = alloc(int, 3)
+        sa[0] = 24
+        sa[1] = 0
+        sa[2] = 1
+        let pr = alloc(int, 1)
+        let pw = alloc(int, 1)
+        pr[0] = 0
+        pw[0] = 0
+        if (dword(win_create_pipe(pr, pw, sa, 0)) == 0) {
+            capOk = false
+        }
+        if (capOk) {
+            hOutR = pr[0]
+            hOutW = pw[0]
+        }
+        pr[0] = 0
+        pw[0] = 0
+        if (capOk) {
+            if (dword(win_create_pipe(pr, pw, sa, 0)) == 0) {
+                capOk = false
+            }
+        }
+        if (capOk) {
+            hErrR = pr[0]
+            hErrW = pw[0]
+        }
+        pr[0] = 0
+        pw[0] = 0
+        if (capOk) {
+            if (dword(win_create_pipe(pr, pw, sa, 0)) == 0) {
+                capOk = false
+            }
+        }
+        if (capOk) {
+            hInR = pr[0]
+            hInW = pw[0]
+        }
+        free(pr)
+        free(pw)
+        if (capOk) {
+            if (dword(win_set_handle_information(hOutR, HANDLE_FLAG_INHERIT, 0)) == 0) {
+                capOk = false
+            }
+            if (dword(win_set_handle_information(hErrR, HANDLE_FLAG_INHERIT, 0)) == 0) {
+                capOk = false
+            }
+            if (dword(win_set_handle_information(hInW, HANDLE_FLAG_INHERIT, 0)) == 0) {
+                capOk = false
+            }
+        }
+        if (capOk) {
+            putUnit(si, 30, STARTF_USESTDHANDLES)
+            si[10] = hInR
+            si[11] = hOutW
+            si[12] = hErrW
+        }
+        free(sa)
+        var spawnOk = false
+        var hProc = 0
+        var hThread = 0
+        if (capOk) {
+            let rc = win_create_process_w(resolved, cmdW, 0, 0, 1, CREATE_UNICODE_ENVIRONMENT, envP, cwdW, si, pi)
+            spawnOk = !(dword(rc) == 0)
+            if (spawnOk) {
+                hProc = pi[0]
+                hThread = pi[1]
+            }
+            // The child's side of everything closes whether or not the spawn
+            // worked; `CreateProcessW` has its own copies either way.
+            closeIf(hOutW)
+            closeIf(hErrW)
+            closeIf(hInR)
+        }
+        free(si)
+        free(pi)
+        if (!(cmdW == 0 as *int)) {
+            free(cmdW)
+        }
+        if (!(resolved == 0 as *int)) {
+            free(resolved)
+        }
+        if (!(cwdW == 0 as *int)) {
+            free(cwdW)
+        }
+        if (!(envP == 0)) {
+            free(envP as *int)
+        }
+        if (!spawnOk) {
+            closeIf(hOutR)
+            closeIf(hErrR)
+            closeIf(hInW)
+            return 0 as *int
+        }
+        var cap = DEFAULT_MAX_OUT
+        if (let some(m) = maxOut) {
+            cap = m
+            if (cap < 0) {
+                cap = 0
+            }
+        }
+        let words = (cap + 8 + 7) / 8
+        var inner = alloc(int, PROC_INNER_WORDS)
+        z = 0
+        while (z < PROC_INNER_WORDS) {
+            inner[z] = 0
+            z = z + 1
+        }
+        inner[PROC_CLOSED] = 0
+        inner[PROC_KIND] = STREAM_PROC
+        inner[PROC_HPROC] = hProc
+        inner[PROC_HTHREAD] = hThread
+        inner[PROC_HOUT] = hOutR
+        inner[PROC_HIN] = hInW
+        inner[PROC_HERR] = hErrR
+        inner[PROC_CAP] = cap
+        inner[PROC_REAPED] = 0
+        inner[PROC_HASCODE] = 0
+        inner[PROC_CODE] = 0
+        inner[PROC_OUTB] = alloc(int, words) as int
+        inner[PROC_OUTPOS] = 0
+        inner[PROC_OUTLEN] = 0
+        inner[PROC_OUTEOF] = 0
+        inner[PROC_ERRB] = alloc(int, words) as int
+        inner[PROC_ERRPOS] = 0
+        inner[PROC_ERRLEN] = 0
+        inner[PROC_ERREOF] = 0
+        inner[PROC_CHUNK] = alloc(int, (DRAIN_BYTES + 7) / 8) as int
+        inner[PROC_PN] = alloc(int, 1) as int
+        inner[PROC_PAV] = alloc(int, 1) as int
+        return spawnStreamObject(inner)
+    }
+}
+
+/// `proc_wait(h)`: block until the child exits and reap it. Always `true`
+/// for a live handle (the reference answers `true` even on a failed wait);
+/// `false` for a null, closed, or foreign stream.
+#[symbol("pickle_proc_wait")]
+fn abiProcWait(h: *int) -> bool {
+    unsafe {
+        var inner = procInnerOf(h)
+        if (inner == 0 as *int) {
+            return false
+        }
+        if (inner[PROC_REAPED] != 0) {
+            return true
+        }
+        var exited = false
+        var go = true
+        while (go) {
+            procPoll(inner)
+            let rc = dword(win_wait_single(inner[PROC_HPROC], 2))
+            if (rc == 0) {
+                // Exited: the final drain (the reference's thread join) runs
+                // once more so nothing is left and EOF is set, whether or not
+                // the poll pass caught the exit moment.
+                if (inner[PROC_HOUT] != 0) {
+                    procDrainFinalAt(inner[PROC_HOUT], inner[PROC_OUTB] as *int, inner, PROC_OUTLEN, inner[PROC_CHUNK] as *int, inner[PROC_PN] as *int)
+                }
+                if (inner[PROC_HERR] != 0) {
+                    procDrainFinalAt(inner[PROC_HERR], inner[PROC_ERRB] as *int, inner, PROC_ERRLEN, inner[PROC_CHUNK] as *int, inner[PROC_PN] as *int)
+                }
+                inner[PROC_OUTEOF] = 1
+                inner[PROC_ERREOF] = 1
+                exited = true
+                go = false
+            } else {
+                if (rc == WAIT_FAILED_ANSWER) {
+                    go = false
+                }
+            }
+        }
+        if (exited) {
+            let pC = alloc(int, 1)
+            pC[0] = 0
+            if (dword(win_get_exit_code_process(inner[PROC_HPROC], pC)) != 0) {
+                inner[PROC_CODE] = dword(pC[0])
+                inner[PROC_HASCODE] = 1
+            }
+            free(pC)
+        }
+        inner[PROC_REAPED] = 1
+        return true
+    }
+}
+
+/// `proc_running(h)`: whether the child is still running. `false` for a
+/// finished-but-not-yet-reaped child (wait first to reap and read its code).
+#[symbol("pickle_proc_running")]
+fn abiProcRunning(h: *int) -> bool {
+    unsafe {
+        var inner = procInnerOf(h)
+        if (inner == 0 as *int) {
+            return false
+        }
+        if (inner[PROC_REAPED] != 0) {
+            return false
+        }
+        return !procExited(inner[PROC_HPROC])
+    }
+}
+
+/// `proc_code(h)`: the exit code as `int?` — meaningful only after `wait()`;
+/// `none` before a reap, on a signal death, and for a failed wait.
+#[symbol("pickle_proc_code")]
+fn abiProcCode(h: *int) -> *int {
+    unsafe {
+        var inner = procInnerOf(h)
+        if (inner == 0 as *int) {
+            return 0 as *int
+        }
+        if (inner[PROC_HASCODE] == 0) {
+            return 0 as *int
+        }
+        return newBox(PICKLE_CLASS_BOX_INT, inner[PROC_CODE])
+    }
+}
+
+/// `proc_kill(h)`: terminate the child (best effort). `bool` success.
+#[symbol("pickle_proc_kill")]
+fn abiProcKill(h: *int) -> bool {
+    unsafe {
+        var inner = procInnerOf(h)
+        if (inner == 0 as *int) {
+            return false
+        }
+        if (inner[PROC_REAPED] != 0) {
+            return false
+        }
+        return dword(win_terminate_process(inner[PROC_HPROC], 1)) != 0
+    }
+}
+
+/// `proc_out_read(h, n)`: poll up to `n` drained stdout bytes as a
+/// `List<byte>`, or `none` once the pipe is at EOF (and drained).
+#[symbol("pickle_proc_out_read")]
+fn abiProcOutRead(h: *int, n: int) -> *int {
+    unsafe {
+        var inner = procInnerOf(h)
+        if (inner == 0 as *int) {
+            return 0 as *int
+        }
+        procPoll(inner)
+        return procServe(inner, PROC_OUTPOS, PROC_OUTLEN, PROC_OUTEOF, PROC_OUTB, n)
+    }
+}
+
+/// `proc_err_read(h, n)`: poll up to `n` drained stderr bytes as a
+/// `List<byte>`, or `none` once the pipe is at EOF (and drained).
+#[symbol("pickle_proc_err_read")]
+fn abiProcErrRead(h: *int, n: int) -> *int {
+    unsafe {
+        var inner = procInnerOf(h)
+        if (inner == 0 as *int) {
+            return 0 as *int
+        }
+        procPoll(inner)
+        return procServe(inner, PROC_ERRPOS, PROC_ERRLEN, PROC_ERREOF, PROC_ERRB, n)
+    }
+}
+
+/// `proc_in_write(h, b)`: write `b` to the child's stdin, one slot at a time,
+/// stopping at the first null slot or failed byte; the bytes written. The
+/// reference's `write_slots` counts a successful single-byte write — the
+/// port reproduces that granularity through `WriteFile` per slot.
+#[symbol("pickle_proc_in_write")]
+fn abiProcInWrite(h: *int, bytes: *int) -> int {
+    unsafe {
+        var inner = procInnerOf(h)
+        if (inner == 0 as *int) {
+            return 0
+        }
+        if (inner[PROC_HIN] == 0) {
+            return 0
+        }
+        let n = abiListLen(bytes)
+        let pW = alloc(int, 1)
+        let one = alloc(int, 1)
+        var written = 0
+        var i = 0
+        var done = false
+        while (i < n && !done) {
+            var e = abiListGet(bytes, i)
+            if (e == 0 as *int) {
+                done = true
+            }
+            if (!done) {
+                putRawByte(one, 0, boxBits(e) & 255)
+                pW[0] = 0
+                var ok = dword(win_write_file(inner[PROC_HIN], one, 1, pW, 0)) != 0
+                var wroteOne = ok && dword(pW[0]) > 0
+                if (wroteOne) {
+                    written = written + 1
+                }
+                if (!wroteOne) {
+                    done = true
+                }
+            }
+            i = i + 1
+        }
+        free(pW)
+        free(one)
+        return written
+    }
+}
+
+/// `proc_in_close(h)`: close the child's stdin. `bool` success; always `true`
+/// for a live handle, whether or not stdin was already closed.
+#[symbol("pickle_proc_in_close")]
+fn abiProcInClose(h: *int) -> bool {
+    unsafe {
+        var inner = procInnerOf(h)
+        if (inner == 0 as *int) {
+            return false
+        }
+        if (inner[PROC_HIN] != 0) {
+            closeIf(inner[PROC_HIN])
+            inner[PROC_HIN] = 0
+        }
+        return true
+    }
+}

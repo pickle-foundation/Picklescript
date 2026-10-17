@@ -1,0 +1,133 @@
+module runtime.abi_class_extra_test
+
+import { abiClassName, abiClassRegister, classParentOf } from runtime.abi_class_extra
+import { abiRuntimeInit } from runtime.abi_runtime
+import { abiStrLen, abiStrCmp, abiStrFromByte, abiStrConcat } from runtime.abi_string
+import { STR_BYTES_OFF } from runtime.layout
+
+/// WHY THE REGISTRY TESTS BUILD STRINGS INSTEAD OF WRITING THEM. Same contract
+/// as `abi_string_test`: the ABI symbols take/return `*int`, so a test that
+/// needs a string object has to get it from a body that already returns `*int`
+/// - the identical path the compiler takes (`emit.rs:6548` hands `IrTy::Str`
+/// through unchanged). `abiClassName` returns the object; assertions compare it
+/// against a sibling built from single bytes with `abiStrFromByte`/`abiStrConcat`.
+fn b1(a: int) -> *int {
+    return abiStrFromByte(a)
+}
+fn b2(a: int, x: int) -> *int {
+    return abiStrConcat(b1(a), b1(x))
+}
+fn b3(a: int, x: int, y: int) -> *int {
+    return abiStrConcat(b2(a, x), b1(y))
+}
+fn b4(a: int, x: int, y: int, z: int) -> *int {
+    return abiStrConcat(b2(a, x), b2(y, z))
+}
+fn b5(a: int, x: int, y: int, z: int, w: int) -> *int {
+    return abiStrConcat(b4(a, x, y, z), b1(w))
+}
+fn b6(a: int, x: int, y: int, z: int, w: int, v: int) -> *int {
+    return abiStrConcat(b4(a, x, y, z), b2(w, v))
+}
+fn b8(a: int, x: int, y: int, z: int, w: int, v: int, u: int, t: int) -> *int {
+    return abiStrConcat(b4(a, x, y, z), b4(w, v, u, t))
+}
+
+/// Raw byte address of a string object's inline payload. `pickle_class_register`
+/// takes the same address the emitter hands it (`IrConst.StrAddr`), which is
+/// `obj + STR_BYTES_OFF` - see `abi_class_extra`'s header.
+fn plPtr(s: *int) -> *int {
+    unsafe {
+        return ((s as int) + STR_BYTES_OFF) as *int
+    }
+}
+
+test fn seeds_builtin_names() {
+    abiRuntimeInit()
+    expect(abiStrCmp(abiClassName(0), b6(115, 116, 114, 105, 110, 103))).toBe(0)  // string
+    expect(abiStrCmp(abiClassName(1), b4(76, 105, 115, 116))).toBe(0)            // List
+    expect(abiStrCmp(abiClassName(2), b3(77, 97, 112))).toBe(0)                  // Map
+    expect(abiStrCmp(abiClassName(3), b3(105, 110, 116))).toBe(0)                // int
+    expect(abiStrCmp(abiClassName(4), b5(102, 108, 111, 97, 116))).toBe(0)       // float
+    expect(abiStrCmp(abiClassName(5), b4(98, 111, 111, 108))).toBe(0)            // bool
+    expect(abiStrCmp(abiClassName(6), b4(99, 104, 97, 114))).toBe(0)             // char
+    expect(abiStrCmp(abiClassName(7), b4(101, 110, 117, 109))).toBe(0)           // enum
+    expect(abiStrCmp(abiClassName(8), b5(116, 117, 112, 108, 101))).toBe(0)      // tuple
+    expect(abiStrCmp(abiClassName(9), b6(115, 116, 114, 101, 97, 109))).toBe(0)  // stream
+}
+
+test fn register_assigns_next_id_and_roundtrips_the_name() {
+    abiRuntimeInit()
+    var nm = b4(72, 101, 114, 111)  // Hero
+    var id = abiClassRegister(plPtr(nm), 4, 1, 0, 0, 0, 0)
+    expect(id >= 10).toBe(true)
+    expect(abiStrCmp(abiClassName(id), nm)).toBe(0)
+}
+
+test fn register_hands_out_distinct_consecutive_ids() {
+    abiRuntimeInit()
+    var first = abiClassRegister(plPtr(b2(88, 89)), 2, 0, 0, 0, 0, 0)  // XY
+    var prev = first
+    var i = 0
+    while (i < 5) {
+        var more = abiClassRegister(plPtr(b2(65, 66)), 2, 0, 0, 0, 0, 0)  // AB
+        expect(more).toBe(prev + 1)
+        expect(abiStrCmp(abiClassName(more), b2(65, 66))).toBe(0)
+        prev = more
+        i = i + 1
+    }
+}
+
+test fn name_unknown_id_returns_object_literal() {
+    abiRuntimeInit()
+    // Negative id: native's None arm.
+    var neg = abiClassName(0 - 1)
+    expect(abiStrLen(neg)).toBe(8)
+    expect(abiStrCmp(neg, b8(60, 111, 98, 106, 101, 99, 116, 62))).toBe(0)  // <object>
+    // Past the registered range: also the None arm, never a grow-alloc of the
+    // huge id (the guard reads the count BEFORE any capacity work).
+    var big = abiClassName(2147483647)
+    expect(abiStrLen(big)).toBe(8)
+    expect(abiStrCmp(big, b8(60, 111, 98, 106, 101, 99, 116, 62))).toBe(0)
+    // A name is never null: it is always a fresh managed string.
+    expect((neg as int) != 0).toBe(true)
+    expect((big as int) != 0).toBe(true)
+}
+
+test fn runtime_init_is_idempotent() {
+    abiRuntimeInit()
+    var id1 = abiClassRegister(plPtr(b2(88, 89)), 2, 0, 0, 0, 0, 0)  // XY
+    // A second init must not re-seed over the top or reset the counter.
+    abiRuntimeInit()
+    expect(abiStrCmp(abiClassName(3), b3(105, 110, 116))).toBe(0)  // int
+    var id2 = abiClassRegister(plPtr(b2(65, 66)), 2, 0, 0, 0, 0, 0)
+    expect(id2).toBe(id1 + 1)
+}
+
+test fn register_stores_the_parent_and_unregistered_parents_read_zero() {
+    abiRuntimeInit()
+    var ani = abiClassRegister(plPtr(b3(65, 110, 105)), 3, 0, 0, 0, 0, 0)     // Ani
+    var dog = abiClassRegister(plPtr(b2(68, 111)), 2, 0, 0, 0, 0, ani)         // Do
+    expect(classParentOf(dog)).toBe(ani)
+    // Root class, seeded builtins, never-registered, negative: all 0 - the
+    // native `class_parents.get` miss arm, and never a grow-alloc.
+    expect(classParentOf(ani)).toBe(0)
+    expect(classParentOf(3)).toBe(0)
+    expect(classParentOf(ani + 5)).toBe(0)
+    expect(classParentOf(2147483647)).toBe(0)
+    expect(classParentOf(0 - 1)).toBe(0)
+}
+
+test fn register_grows_beyond_the_initial_table() {
+    abiRuntimeInit()
+    // INITIAL_NAME_WORDS = 32 words = 10 records at stride 3; the seed uses
+    // exactly those 10, so the first growth happens at record 10. Register 20
+    // to force several doublings.
+    var i = 0
+    while (i < 20) {
+        var nm = b2(88, i + 1)  // Distinct name per id so the roundtrip proves the right record.
+        var id = abiClassRegister(plPtr(nm), 2, 0, 0, 0, 0, 0)
+        expect(abiStrCmp(abiClassName(id), nm)).toBe(0)
+        i = i + 1
+    }
+}

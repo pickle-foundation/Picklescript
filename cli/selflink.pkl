@@ -1,0 +1,520 @@
+module cli.selflink
+
+import { DiagnosticSink } from compiler.diag
+import { sortStrings, hashOf, stampOf, ensureDir } from compiler.cache
+import { scanDefs, select, sectionKept, canonSecName, emptyInts, isCrtImp, strFrom } from compiler.linklib
+import { CoffObj, coffRead, blobFrom } from compiler.objread
+import { newObjs, lowerProgram, lowerProgramEx, lowerModuleObj, lowerModuleObjEx, lowerModuleObjBytes, lowerModuleObjExBytes, linkExe } from cli.buildlib
+
+/// §17.1 probe: link a program against runtime members lowered from
+/// `pickle/runtime/*.pkl` instead of the Rust-built `combined.lib`, and make
+/// the linker print the exact symbol set Pickle cannot yet supply.
+///
+/// Usage: pickle-cli run pickle/cli/selflink.pkl -- <target> <outExe> [rtDir]
+/// Default rtDir is `pickle/runtime`. Non-test `.pkl` members are lowered in
+/// sorted order (scanDefs is last-wins per name, so order is part of the
+/// result), the program object always comes first, and the probe reports the
+/// full unresolved list — that list is the real work order for a Pickle-only
+/// runtime, measured per program shape rather than guessed.
+///
+/// Split objects also need one shared class-id space: a single emitter hands
+/// out `10 + tableIndex`, but once program and members are separate objects
+/// each would hand out `10 + 0` for its own first class while
+/// `pickle_class_register` assigns ids sequentially in *registration* order.
+/// The probe therefore links in two phases: lower everything with default
+/// salts to learn the defs and per-object class-table sizes, select the
+/// member set, then re-lower the chosen members with cumulative salts and a
+/// unique `pkl_setup_*` symbol each, and re-lower the program so its
+/// preamble calls those setup functions — class registrations, rooted
+/// globals, and static initializers — in exactly the order the ids assume.
+
+fn hasSuffix(s: string, suf: string) -> bool {
+    let sb = bytes(s)
+    let fb = bytes(suf)
+    if (len(fb) > len(sb)) {
+        return false
+    }
+    var i = 0
+    while (i < len(fb)) {
+        if (sb[len(sb) - len(fb) + i] != fb[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+fn emptyStrs() -> List<string> {
+    var l = [""]
+    l.pop()
+    l
+}
+
+/// Normalize `\` to `/`: `list_dir` returns native separators, but the loader
+/// keys imported files by their resolved (`/`-joined) path. A root lowered with
+/// a `\` path is then loaded a SECOND time when its own importers reach it —
+/// the loader sees a different key — and every declaration arrives twice as
+/// E0201 (this is what happened to the `abi_list`/`abi_string` import cycle).
+fn slashes(p: string) -> string {
+    let bs = bytes(p)
+    var out = ""
+    var i = 0
+    while (i < len(bs)) {
+        if ((bs[i] as int) == 92) {
+            out = out + "/"
+        } else {
+            out = out + "{bs[i] as char}"
+        }
+        i = i + 1
+    }
+    out
+}
+
+/// A COFF-safe symbol for one member's setup function: `pkl_setup_` plus the
+/// member path with every non-alphanumeric byte replaced by `_`. Derived from
+/// the path alone so the linking program can compute it before the member is
+/// re-lowered, and unique per member so nothing binds to the wrong copy.
+fn setupSymbol(path: string) -> string {
+    let bs = bytes(path)
+    var out = "pkl_setup_"
+    var i = 0
+    while (i < len(bs)) {
+        let c = bs[i] as int
+        if ((c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57)) {
+            out = out + "{bs[i] as char}"
+        } else {
+            out = out + "_"
+        }
+        i = i + 1
+    }
+    out
+}
+
+/// Insertion sort: `select` discovers members in BFS order, but the object
+/// list must keep the original sorted-member order or scanDefs' last-wins
+/// duplicate rule resolves differently between the two lowering phases.
+fn sortIntsSmall(xs: List<int>) {
+    var i = 1
+    while (i < len(xs)) {
+        let v = xs[i]
+        var j = i - 1
+        while (j >= 0 && xs[j] > v) {
+            xs[j + 1] = xs[j]
+            j = j - 1
+        }
+        xs[j + 1] = v
+        i = i + 1
+    }
+}
+
+fn printDiags(sinks: DiagnosticSink) {
+    let ds = sinks.diagnostics
+    var i = 0
+    while (i < len(ds)) {
+        let d = ds[i]
+        var sp = "none"
+        if (let some(s0) = d.span) {
+            sp = "(" + str(s0.start) + "," + str(s0.end) + ")"
+        }
+        var code = ""
+        if (let some(c) = d.code) {
+            code = c + " "
+        }
+        println("DIAG " + code + d.message + " span=" + sp)
+        i = i + 1
+    }
+}
+
+fn main() {
+    let argv = args()
+    var mapOnly = false
+    var pos = 0
+    var clean = emptyStrs()
+    var i = 0
+    while (i < len(argv)) {
+        if (argv[i] == "--map") {
+            mapOnly = true
+        } else {
+            clean.push(argv[i])
+        }
+        i = i + 1
+    }
+    pos = len(clean)
+    if (pos < 2) {
+        println("SELFLINK NO ARGS: <target> <outExe> [rtDir] [--map]")
+        return
+    }
+    let target = clean[0]
+    let outExe = clean[1]
+    var rtDir = "pickle/runtime"
+    if (pos > 2) {
+        rtDir = clean[2]
+    }
+
+    let srcOpt = read_file(target)
+    if (let some(src) = srcOpt) {
+        runLink(target, src, outExe, rtDir, mapOnly)
+    } else {
+        println("SELFLINK FAIL: cannot read source " + target)
+    }
+}
+
+fn runLink(target: string, src: string, outExe: string, rtDir: string, mapOnly: bool) {
+    let sinks = DiagnosticSink()
+    let programOpt = lowerProgram(target, src, sinks)
+    if (let some(program) = programOpt) {
+        var members = emptyStrs()
+        let dirOpt = list_dir(rtDir)
+        if (let some(files) = dirOpt) {
+            for (f in files) {
+                let fp = slashes(f)
+                if (hasSuffix(fp, ".pkl") && !hasSuffix(fp, "_test.pkl") && !hasSuffix(fp, "/fs.pkl")) {
+                    // fs.pkl declares the `Fs` interface but no implementing
+                    // class — it is a seam the program (or its tests) binds, so
+                    // as a standalone root it fails codegen. Its callers pull it
+                    // in through their own closure; abi_fs.pkl carries the
+                    // `#[symbol]` bodies.
+                    members.push(fp)
+                }
+            }
+        }
+        sortStrings(members)
+
+        // Phase A: lower the program and every candidate member with default
+        // salts. This yields the defs the selection needs and each object's
+        // class-table size, which phase B turns into cumulative salts.
+        var aObjs = newObjs()
+        var aPaths = emptyStrs()
+        var aCounts = emptyInts()
+        aObjs.push(program.obj)
+        aPaths.push(target)
+
+        // Phase-A objects are target-independent (default salt, no setup), so
+        // they are cached on disk. The aggregate of the members' source stamps
+        // names the cache directory: editing any member — or the member set —
+        // selects a fresh directory, so a stale object can never be served, and
+        // nothing needs to be invalidated by hand. Without the cache a run
+        // re-lowers every candidate member (50+ full frontend/emit/x64 passes);
+        // with it, every program after the first pays for the chosen handful
+        // only.
+        var agg = ""
+        for (m in members) {
+            if (let some(st) = stampOf(m)) {
+                agg = agg + st + "\n"
+            }
+        }
+        let cacheDir = "tools/diff/selflink_cache/" + hashOf(agg)
+        ensureDir(cacheDir)
+
+        // Phase-B (salted + setup) objects are also persisted. A class-free
+        // member's bytes do not depend on `cidSalt` (nothing bakes a class id)
+        // and its setup symbol is derived from its path alone, so one cached
+        // object serves every program that selects it — the fixed-salt archive
+        // for the class-free stubs that dominate the runtime member set. A
+        // class-bearing member keeps the phase-A cache only and is re-lowered,
+        // because its bytes DO depend on the cumulative salt.
+        //
+        // The cache lives UNDER the phase-A agg directory (`cacheDir/b`), so
+        // editing any candidate member source — which re-names `cacheDir` via
+        // `stampOf` — also orphans every phase-B entry: the key is the source
+        // content, never the member path alone. A path-keyed key here would
+        // silently serve a lower-level STALE object for an edited member.
+        let bCacheDir = cacheDir + "/b"
+        ensureDir(bCacheDir)
+
+        var lowered = 0
+        var cached = 0
+        var failed = 0
+        for (m in members) {
+            let cacheFile = cacheDir + "/" + hashOf(m) + ".obj"
+            if (let some(text) = read_file(cacheFile)) {
+                aObjs.push(coffRead(m, blobFrom(text)))
+                aPaths.push(m)
+                aCounts.push(0)
+                cached = cached + 1
+            } else {
+                let msrcOpt = read_file(m)
+                if (let some(msrc) = msrcOpt) {
+                    let msinks = DiagnosticSink()
+                    let mobjOpt = lowerModuleObjBytes(m, msrc, msinks)
+                    if (let some(mobj) = mobjOpt) {
+                        write_file(cacheFile, strFrom(mobj.bytes))
+                        aObjs.push(coffRead(m, mobj.bytes))
+                        aPaths.push(m)
+                        aCounts.push(mobj.classCount)
+                        lowered = lowered + 1
+                    } else {
+                        failed = failed + 1
+                        println("SELFLINK LOWER FAIL: " + m)
+                        printDiags(msinks)
+                    }
+                } else {
+                    failed = failed + 1
+                    println("SELFLINK READ FAIL: " + m)
+                }
+            }
+        }
+        println("SELFLINK members=" + str(len(members)) + " lowered=" + str(lowered) + " cached=" + str(cached) + " failed=" + str(failed))
+
+        // Selection over the phase-A objects: the member set the link needs
+        // and the work order (anything no candidate member can define — that
+        // list is terminal, phase B adds no new definitions for it).
+        let definitionsA = OrderedMap<string, int>("", 0)
+        scanDefs(aObjs, definitionsA)
+        let chosen = emptyInts()
+        let unresolved = emptyStrs()
+        select(aObjs, definitionsA, chosen, unresolved)
+        var u = 0
+        while (u < len(unresolved)) {
+            println("SELFLINK UNRESOLVED " + unresolved[u])
+            u = u + 1
+        }
+        if (len(unresolved) > 0) {
+            println("SELFLINK FAIL: " + str(len(unresolved)) + " unresolved symbols (listed above)")
+            return
+        }
+        sortIntsSmall(chosen)
+
+        // Phase B: re-lower the chosen members with cumulative class-id salts
+        // (program table first, then each member) and a unique setup symbol,
+        // then re-lower the program so its preamble calls them in that same
+        // order — registrations, rooted globals, static initializers.
+        //
+        // The setup bodies introduce externs phase A never saw (a member's
+        // `pkl_setup_*` calls `pickle_class_register`, which may live in a
+        // member nothing else selected), so the selection runs to a fixpoint:
+        // re-select over the phase-B objects, fold any newly required member
+        // back into the chosen set — which restarts the salt assignment, since
+        // salts follow ascending member order — and try again.
+        var extraSetups = emptyStrs()
+        var bObjs = newObjs()
+        var settled = false
+        var rounds = 0
+        while (!settled && rounds < 8) {
+            rounds = rounds + 1
+            extraSetups = emptyStrs()
+            let bMembers = newObjs()
+            var salt = program.classCount
+            var ci = 0
+            while (ci < len(chosen)) {
+                let slot = chosen[ci]
+                let mp = aPaths[slot + 1]
+                let sym = setupSymbol(mp)
+                let clsA = aCounts[slot + 1]
+                let bCacheFile = bCacheDir + "/" + hashOf("B0|" + mp) + ".obj"
+                var served = false
+                if (clsA == 0) {
+                    if (let some(cachedB) = read_file(bCacheFile)) {
+                        bMembers.push(coffRead(mp, blobFrom(cachedB)))
+                        extraSetups.push(sym)
+                        ci = ci + 1
+                        served = true
+                    }
+                }
+                if (!served) {
+                    let msrcBOpt = read_file(mp)
+                    if (let some(msrcB) = msrcBOpt) {
+                        let msinksB = DiagnosticSink()
+                        let mobjBOpt = lowerModuleObjExBytes(mp, msrcB, msinksB, salt, sym)
+                        if (let some(mobjB) = mobjBOpt) {
+                            if (clsA == 0) {
+                                write_file(bCacheFile, strFrom(mobjB.bytes))
+                            }
+                            bMembers.push(coffRead(mp, mobjB.bytes))
+                            extraSetups.push(sym)
+                            salt = salt + mobjB.classCount
+                            ci = ci + 1
+                        } else {
+                            println("SELFLINK RELOWER FAIL: " + mp)
+                            printDiags(msinksB)
+                            return
+                        }
+                    } else {
+                        println("SELFLINK READ FAIL: " + mp)
+                        return
+                    }
+                }
+            }
+
+            let sinksB = DiagnosticSink()
+            let programBOpt = lowerProgramEx(target, src, sinksB, extraSetups)
+            if (let none = programBOpt) {
+                printDiags(sinksB)
+                println("SELFLINK FAIL: program did not re-lower with setups")
+                return
+            }
+            if (let some(programB) = programBOpt) {
+                bObjs = newObjs()
+                bObjs.push(programB.obj)
+                var mi = 0
+                while (mi < len(bMembers)) {
+                    bObjs.push(bMembers[mi])
+                    mi = mi + 1
+                }
+
+                let definitionsB = OrderedMap<string, int>("", 0)
+                scanDefs(bObjs, definitionsB)
+                let chosenB = emptyInts()
+                let unresolvedB = emptyStrs()
+                select(bObjs, definitionsB, chosenB, unresolvedB)
+                if (len(unresolvedB) == 0) {
+                    settled = true
+                } else {
+                    var grew = false
+                    var ub = 0
+                    while (ub < len(unresolvedB)) {
+                        let nm = unresolvedB[ub]
+                        var slot2 = -1
+                        if (let some(sl) = definitionsA.get(nm)) {
+                            slot2 = sl
+                        }
+                        if (slot2 < 0) {
+                            println("SELFLINK UNRESOLVED " + nm)
+                            println("SELFLINK FAIL: setup round needs a symbol no candidate member defines")
+                            return
+                        }
+                        var have = false
+                        var ch = 0
+                        while (ch < len(chosen)) {
+                            if (chosen[ch] == slot2) {
+                                have = true
+                            }
+                            ch = ch + 1
+                        }
+                        if (!have) {
+                            chosen.push(slot2)
+                            grew = true
+                        }
+                        ub = ub + 1
+                    }
+                    if (!grew) {
+                        // Every unresolved name maps to a member already in the
+                        // set, yet its definition never reached the phase-B
+                        // objects — the set can't shrink further by growing.
+                        var ug = 0
+                        while (ug < len(unresolvedB)) {
+                            println("SELFLINK UNRESOLVED " + unresolvedB[ug])
+                            ug = ug + 1
+                        }
+                        println("SELFLINK FAIL: setup round stuck")
+                        return
+                    }
+                    sortIntsSmall(chosen)
+                }
+            }
+        }
+        if (!settled) {
+            println("SELFLINK FAIL: setup selection did not settle")
+            return
+        }
+        println("SELFLINK chosen=" + str(len(chosen)) + " setups=" + str(len(extraSetups)) + " classBase=" + str(program.classCount))
+
+        if (mapOnly) {
+            // The linked bytes are the phase-B objects, so the map must be
+            // their layout, not phase A's — gdb crash offsets land here.
+            let bPaths = emptyStrs()
+            bPaths.push(target)
+            var pi = 0
+            while (pi < len(chosen)) {
+                bPaths.push(aPaths[chosen[pi] + 1])
+                pi = pi + 1
+            }
+            printMap(bObjs, bPaths)
+            return
+        }
+
+        let errOpt = linkExe(bObjs, outExe, program.overrides)
+        if (let some(err) = errOpt) {
+            println("SELFLINK FAIL: " + err)
+        } else {
+            println("SELFLINK OK: " + outExe + " objects=" + str(len(bObjs)))
+        }
+    } else {
+        printDiags(sinks)
+        println("SELFLINK FAIL: target did not lower to COFF")
+    }
+}
+
+/// Reproduce `mergeAll`'s `.text` chunk layout for the objects the linker would
+/// actually choose, and print every `.text` symbol at its merged offset. GDB
+/// reports crash addresses as `imageBase + 0x1000 + preText(0x40) + mergedOff`,
+/// so `mergedOff = va - 0x140000000 - 0x1040` names the faulting function.
+fn printMap(objects: List<CoffObj>, objPaths: List<string>) {
+    let definitions = OrderedMap<string, int>("", 0)
+    scanDefs(objects, definitions)
+    let chosen = emptyInts()
+    let unresolved = emptyStrs()
+    select(objects, definitions, chosen, unresolved)
+    var u = 0
+    while (u < len(unresolved)) {
+        println("MAP UNRESOLVED " + unresolved[u])
+        u = u + 1
+    }
+
+    var use = emptyInts()
+    use.push(0)
+    var c = 0
+    while (c < len(chosen)) {
+        use.push(chosen[c] + 1)
+        c = c + 1
+    }
+
+    var textCur = 0
+    var gi = 0
+    while (gi < len(use)) {
+        let o = objects[use[gi]]
+        var textSec = -1
+        var si = 0
+        while (si < len(o.secs)) {
+            if (sectionKept(o, si) && canonSecName(o.secs[si].name) == ".text") {
+                textSec = si
+            }
+            si = si + 1
+        }
+        if (textSec >= 0) {
+            while (textCur % 16 != 0) {
+                textCur = textCur + 1
+            }
+            let base = textCur
+            let ln = len(o.secs[textSec].raw)
+            textCur = base + ln
+            println("MAP USE " + str(gi) + " " + objPaths[use[gi]] + " text=" + str(base) + " len=" + str(ln))
+        } else {
+            println("MAP USE " + str(gi) + " " + objPaths[use[gi]] + " text=none")
+        }
+        gi = gi + 1
+    }
+
+    // Second pass with the bases recomputed the same way (cheap; keeps the
+    // first pass readable).
+    textCur = 0
+    gi = 0
+    while (gi < len(use)) {
+        let o = objects[use[gi]]
+        var textSec = -1
+        var si = 0
+        while (si < len(o.secs)) {
+            if (sectionKept(o, si) && canonSecName(o.secs[si].name) == ".text") {
+                textSec = si
+            }
+            si = si + 1
+        }
+        if (textSec >= 0) {
+            while (textCur % 16 != 0) {
+                textCur = textCur + 1
+            }
+            let base = textCur
+            let ln = len(o.secs[textSec].raw)
+            textCur = base + ln
+            var sy = 0
+            while (sy < len(o.syms)) {
+                let s = o.syms[sy]
+                if (s.sec >= 1 && s.sec <= len(o.secs) && sectionKept(o, s.sec - 1) && s.name != "" && !isCrtImp(s.name) && canonSecName(o.secs[s.sec - 1].name) == ".text") {
+                    println("MAP SYM " + str(base + s.value) + " " + objPaths[use[gi]] + " " + s.name)
+                }
+                sy = sy + 1
+            }
+        }
+        gi = gi + 1
+    }
+}

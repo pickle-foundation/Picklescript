@@ -1,0 +1,142 @@
+module runtime.layout_test
+
+import { HEADER, STR_LEN_OFF, STR_BYTES_OFF, LIST_LEN_OFF, LIST_CAP_OFF,
+         LIST_DATA_OFF, MAP_LEN_OFF, MAP_CAP_OFF, MAP_ENTRIES_OFF,
+         BOX_PAYLOAD_OFF, BOX_PAYLOAD, BOX_OBJECT_SIZE, ENUM_TAG_OFF,
+         ENUM_FIELDS_OFF, ENUM_HEADER_SLOTS, TUPLE_LEN_OFF, TUPLE_FIELDS_OFF,
+         STREAM_INNER_OFF, STREAM_OBJECT_SIZE, STRING_PAYLOAD, LIST_PAYLOAD,
+         MAP_PAYLOAD, ENUM_BASE_PAYLOAD, LIST_OBJECT_SIZE, MAP_OBJECT_SIZE,
+         align8, classObjectSize, classSlotOffset, classFieldCountFromSize,
+         enumObjectSize, enumFieldCountFromSize, tupleObjectSize,
+         stringObjectSize, managedMaskWordCount, userClassMaskWords } from runtime.layout
+
+test fn header_is_24() {
+    expect(HEADER).toBe(24)
+}
+
+test fn builtin_offset_constants() {
+    expect(STR_LEN_OFF).toBe(24)
+    expect(STR_BYTES_OFF).toBe(32)
+    expect(LIST_LEN_OFF).toBe(24)
+    expect(LIST_CAP_OFF).toBe(32)
+    expect(LIST_DATA_OFF).toBe(40)
+    expect(MAP_LEN_OFF).toBe(24)
+    expect(MAP_CAP_OFF).toBe(32)
+    expect(MAP_ENTRIES_OFF).toBe(40)
+    expect(BOX_PAYLOAD_OFF).toBe(24)
+    expect(BOX_PAYLOAD).toBe(8)
+    expect(BOX_OBJECT_SIZE).toBe(32)
+    expect(ENUM_TAG_OFF).toBe(24)
+    expect(ENUM_FIELDS_OFF).toBe(32)
+    expect(ENUM_HEADER_SLOTS).toBe(1)
+    expect(TUPLE_LEN_OFF).toBe(24)
+    expect(TUPLE_FIELDS_OFF).toBe(32)
+    expect(STREAM_INNER_OFF).toBe(24)
+    expect(STREAM_OBJECT_SIZE).toBe(32)
+}
+
+test fn every_builtin_offset_is_8_aligned() {
+    expect(STR_LEN_OFF % 8).toBe(0)
+    expect(STR_BYTES_OFF % 8).toBe(0)
+    expect(LIST_LEN_OFF % 8).toBe(0)
+    expect(LIST_CAP_OFF % 8).toBe(0)
+    expect(LIST_DATA_OFF % 8).toBe(0)
+    expect(MAP_LEN_OFF % 8).toBe(0)
+    expect(MAP_CAP_OFF % 8).toBe(0)
+    expect(MAP_ENTRIES_OFF % 8).toBe(0)
+    expect(BOX_PAYLOAD_OFF % 8).toBe(0)
+    expect(ENUM_TAG_OFF % 8).toBe(0)
+    expect(ENUM_FIELDS_OFF % 8).toBe(0)
+    expect(TUPLE_LEN_OFF % 8).toBe(0)
+    expect(TUPLE_FIELDS_OFF % 8).toBe(0)
+    expect(STREAM_INNER_OFF % 8).toBe(0)
+}
+
+test fn payload_and_object_sizes() {
+    expect(STRING_PAYLOAD).toBe(8)
+    expect(LIST_PAYLOAD).toBe(24)
+    expect(MAP_PAYLOAD).toBe(24)
+    expect(ENUM_BASE_PAYLOAD).toBe(16)
+    expect(LIST_OBJECT_SIZE).toBe(48)
+    expect(MAP_OBJECT_SIZE).toBe(48)
+}
+
+test fn align8_rounds_up_to_a_multiple_of_8() {
+    expect(align8(0)).toBe(0)
+    expect(align8(24)).toBe(24)
+    expect(align8(32)).toBe(32)
+    expect(align8(33)).toBe(40)
+    expect(align8(47)).toBe(48)
+    expect(align8(48)).toBe(48)
+}
+
+test fn class_object_size_is_header_plus_slots() {
+    expect(classObjectSize(0)).toBe(24)
+    expect(classObjectSize(1)).toBe(32)
+    expect(classObjectSize(3)).toBe(48)
+    expect(classObjectSize(10)).toBe(104)
+}
+
+test fn class_slot_offsets_are_strided() {
+    expect(classSlotOffset(0)).toBe(24)
+    expect(classSlotOffset(1)).toBe(32)
+    expect(classSlotOffset(3)).toBe(48)
+    expect(classSlotOffset(9)).toBe(96)
+}
+
+test fn class_field_count_inverts_the_size() {
+    expect(classFieldCountFromSize(24)).toBe(0)
+    expect(classFieldCountFromSize(32)).toBe(1)
+    expect(classFieldCountFromSize(48)).toBe(3)
+    expect(classFieldCountFromSize(40)).toBe(2)
+}
+
+test fn enum_object_size_includes_the_tag_slot() {
+    expect(enumObjectSize(0)).toBe(32)
+    expect(enumObjectSize(3)).toBe(56)
+    expect(enumObjectSize(5)).toBe(72)
+}
+
+test fn enum_field_count_is_derived_from_size() {
+    expect(enumFieldCountFromSize(24)).toBe(0)
+    expect(enumFieldCountFromSize(32)).toBe(0)
+    expect(enumFieldCountFromSize(40)).toBe(1)
+    expect(enumFieldCountFromSize(56)).toBe(3)
+    expect(enumFieldCountFromSize(72)).toBe(5)
+}
+
+test fn tuple_object_size_is_like_an_enum_without_tag() {
+    expect(tupleObjectSize(0)).toBe(32)
+    expect(tupleObjectSize(4)).toBe(64)
+}
+
+test fn string_object_size_aligns_inline_bytes() {
+    expect(stringObjectSize(0)).toBe(32)
+    expect(stringObjectSize(1)).toBe(40)
+    expect(stringObjectSize(8)).toBe(40)
+    expect(stringObjectSize(9)).toBe(48)
+}
+
+test fn managed_mask_uses_32_slots_per_word() {
+    expect(managedMaskWordCount(0)).toBe(0)
+    expect(managedMaskWordCount(1)).toBe(1)
+    expect(managedMaskWordCount(32)).toBe(1)
+    expect(managedMaskWordCount(33)).toBe(2)
+    expect(managedMaskWordCount(63)).toBe(2)
+    expect(managedMaskWordCount(64)).toBe(2)
+    expect(managedMaskWordCount(65)).toBe(3)
+}
+
+test fn user_class_mask_words_mark_every_slot_managed() {
+    expect(len(userClassMaskWords(0))).toBe(0)
+    var three = userClassMaskWords(3)
+    expect(len(three)).toBe(1)
+    expect(three[0]).toBe(7)
+    var oneWord = userClassMaskWords(32)
+    expect(len(oneWord)).toBe(1)
+    expect(oneWord[0]).toBe(4294967295)
+    var twoWords = userClassMaskWords(33)
+    expect(len(twoWords)).toBe(2)
+    expect(twoWords[0]).toBe(4294967295)
+    expect(twoWords[1]).toBe(1)
+}

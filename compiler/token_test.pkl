@@ -1,0 +1,168 @@
+module compiler.token_test
+
+import { keywordTok, parseIntLiteral, parseHexStr, containsDotE, stripLeadSpace, trimEndStr, dropFirstStr, isDigitCp, isAlphaCp, isAlnumCp, isHexCp, hexValCp, cpLen, kindName, Tok } from compiler.token
+
+test fn keyword_tok_maps_keywords() {
+    match (keywordTok("fn")) {
+        case some(k) -> match (k) {
+            case Tok.Fn -> expect(true).toBe(true)
+            case _ -> expect(true).toBe(false)
+        }
+        case none -> expect(true).toBe(false)
+    }
+    match (keywordTok("import")) {
+        case some(k) -> match (k) {
+            case Tok.Import -> expect(true).toBe(true)
+            case _ -> expect(true).toBe(false)
+        }
+        case none -> expect(true).toBe(false)
+    }
+    match (keywordTok("from")) {
+        case some(k) -> match (k) {
+            case Tok.From -> expect(true).toBe(true)
+            case _ -> expect(true).toBe(false)
+        }
+        case none -> expect(true).toBe(false)
+    }
+    match (keywordTok("walrus")) {
+        case some(k) -> expect(true).toBe(false)
+        case none -> expect(true).toBe(true)
+    }
+}
+
+test fn int_literal_parsing() {
+    match (parseIntLiteral("42")) {
+        case some(v) -> expect(v).toBe(42)
+        case none -> expect(true).toBe(false)
+    }
+    match (parseIntLiteral("-7")) {
+        case some(v) -> expect(v).toBe(-7)
+        case none -> expect(true).toBe(false)
+    }
+    match (parseIntLiteral("1_000")) {
+        case some(v) -> expect(v).toBe(1000)
+        case none -> expect(true).toBe(false)
+    }
+    match (parseIntLiteral("0xFF")) {
+        case some(v) -> expect(v).toBe(255)
+        case none -> expect(true).toBe(false)
+    }
+    match (parseIntLiteral("0b101")) {
+        case some(v) -> expect(v).toBe(5)
+        case none -> expect(true).toBe(false)
+    }
+    match (parseIntLiteral("0o17")) {
+        case some(v) -> expect(v).toBe(15)
+        case none -> expect(true).toBe(false)
+    }
+    match (parseIntLiteral("0x")) {
+        case some(v) -> expect(true).toBe(false)
+        case none -> expect(true).toBe(true)
+    }
+    match (parseIntLiteral("12z")) {
+        case some(v) -> expect(true).toBe(false)
+        case none -> expect(true).toBe(true)
+    }
+    match (parseIntLiteral("12345678901234567890123")) {
+        case some(v) -> expect(true).toBe(false)
+        case none -> expect(true).toBe(true)
+    }
+}
+
+test fn hex_str_parsing() {
+    match (parseHexStr("41")) {
+        case some(v) -> expect(v).toBe(0x41)
+        case none -> expect(true).toBe(false)
+    }
+    match (parseHexStr("4e2d")) {
+        case some(v) -> expect(v).toBe(0x4E2D)
+        case none -> expect(true).toBe(false)
+    }
+    match (parseHexStr("")) {
+        case some(v) -> expect(true).toBe(false)
+        case none -> expect(true).toBe(true)
+    }
+    match (parseHexStr("12g")) {
+        case some(v) -> expect(true).toBe(false)
+        case none -> expect(true).toBe(true)
+    }
+    match (parseHexStr("D800")) {
+        case some(v) -> expect(true).toBe(false)
+        case none -> expect(true).toBe(true)
+    }
+    match (parseHexStr("110000")) {
+        case some(v) -> expect(true).toBe(false)
+        case none -> expect(true).toBe(true)
+    }
+    match (parseHexStr("10FFFF")) {
+        case some(v) -> expect(v).toBe(0x10FFFF)
+        case none -> expect(true).toBe(false)
+    }
+}
+
+test fn string_scanning_helpers() {
+    expect(containsDotE("3.14")).toBe(true)
+    expect(containsDotE("1e5")).toBe(true)
+    expect(containsDotE("42")).toBe(false)
+    expect(stripLeadSpace(" hi")).toBe("hi")
+    expect(stripLeadSpace("hi")).toBe("hi")
+    expect(trimEndStr("ab  \t")).toBe("ab")
+    expect(trimEndStr("ab")).toBe("ab")
+    expect(dropFirstStr("abc")).toBe("bc")
+    expect(dropFirstStr("a")).toBe("")
+    expect(dropFirstStr("")).toBe("")
+}
+
+test fn codepoint_predicates() {
+    expect(isDigitCp('2' as int)).toBe(true)
+    expect(isDigitCp('x' as int)).toBe(false)
+    expect(isAlphaCp('a' as int)).toBe(true)
+    expect(isAlphaCp('Z' as int)).toBe(true)
+    expect(isAlnumCp('9' as int)).toBe(true)
+    expect(isAlnumCp('_' as int)).toBe(false)
+    expect(isHexCp('f' as int)).toBe(true)
+    expect(isHexCp('F' as int)).toBe(true)
+    expect(isHexCp('g' as int)).toBe(false)
+    expect(hexValCp('A' as int)).toBe(10)
+    expect(hexValCp('f' as int)).toBe(15)
+    expect(hexValCp('0' as int)).toBe(0)
+    expect(hexValCp('z' as int)).toBe(-1)
+    expect(cpLen(0x24)).toBe(1)
+    expect(cpLen(0xC2)).toBe(2)
+    expect(cpLen(0xE4)).toBe(3)
+    expect(cpLen(0xF0)).toBe(4)
+}
+
+test fn kind_name_labels() {
+    expect(kindName(Tok.Fn)).toBe("Fn")
+    expect(kindName(Tok.Ident("x"))).toBe("Ident")
+    expect(kindName(Tok.Number)).toBe("Number")
+}
+
+test fn exception_keywords_lex_as_keywords() {
+    // `try`/`catch`/`finally`/`throw` must be keywords, not identifiers, or
+    // the parser can never see them as statement heads.
+    match (keywordTok("try")) {
+        case some(k) -> expect(kindName(k)).toBe("Try")
+        case none -> expect(true).toBe(false)
+    }
+    match (keywordTok("catch")) {
+        case some(k) -> expect(kindName(k)).toBe("Catch")
+        case none -> expect(true).toBe(false)
+    }
+    match (keywordTok("finally")) {
+        case some(k) -> expect(kindName(k)).toBe("Finally")
+        case none -> expect(true).toBe(false)
+    }
+    match (keywordTok("throw")) {
+        case some(k) -> expect(kindName(k)).toBe("Throw")
+        case none -> expect(true).toBe(false)
+    }
+}
+
+test fn exception_keyword_names_round_trip() {
+    expect(kindName(Tok.Try)).toBe("Try")
+    expect(kindName(Tok.Catch)).toBe("Catch")
+    expect(kindName(Tok.Finally)).toBe("Finally")
+    expect(kindName(Tok.Throw)).toBe("Throw")
+}

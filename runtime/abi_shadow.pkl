@@ -1,0 +1,126 @@
+module runtime.abi_shadow
+
+/// Port of the `runtime/src/shadow.rs` frame-list head, via the Win32 TLS
+/// builtins (`win_tls_alloc` / `win_tls_get` / `win_tls_set`), the per-thread
+/// storage this language does not otherwise have.
+///
+/// WHY TLS AND WHY THIS SHAPE. The reference keeps each OS thread's shadow-list
+/// head in that thread's `GcThread` node, found through a Rust `thread_local!`
+/// handle into a process-wide registry guarded by a mutex. This port keeps only
+/// the one piece of state that is inherently per-thread - the top-of-stack
+/// pointer - in a Win32 TLS slot; the thread registry and the `GcThread` nodes
+/// are NOT ported.
+///
+/// WHEN THE CHAIN MUST BE READ. A collector walks the shadow list from the
+/// head to find an object pointer's frame. The chain is only safe to read by a
+/// reader that uses the SAME head this body writes. Two images are qualified:
+///   - the selflink (`sl_climain.map.txt` ships none of `pickle_gc_*`), where
+///     the native collector is absent, so the chain is written correctly and
+///     consumed by nothing; and
+///   - `runtime.abi_gc`'s ported collect, which reads this head once per cycle
+///     (`abiShadowHead`) and marks every frame walkable from it - the phase-2c
+///     shadow-stack root (see that module's roots divergence). The native
+///     registry and lock are still not ported (recorded below as divergences);
+///     a qualified image collects on its own thread, so the single chain is the
+///     whole root set.
+/// The lock-step build against `combined.lib` is NOT qualified: that library
+/// still links the native collector, which walks the Rust `GcThread` registry
+/// (`THREAD_HEAD` -> `GcThread.frames`) and cannot see a head that lives only
+/// in Win32 TLS. A lock-step AOT program that allocates enough to trip the
+/// adaptive GC threshold then takes a use-after-free on a live frame - observed
+/// as 0xC0000005 on a depth-30 x 2000-iteration recursion with a live list. In
+/// `abi_gc`-importing images the native collector never runs (the ported
+/// `pickle_gc_collect` owns the cycle), so the split cannot surface there.
+/// `collector.pkl` (the modelled collector) reads the same TLS head and is the
+/// shape the ported collector follows.
+///
+/// WHY THE BODY STAYS ZERO-CELL. `x64.pkl::pushShadow` emits
+/// `call pickle_shadow_push` only when `plan.ncells > 0` (line 864), and the
+/// `popShadow()` call at the `Return` term is gated the same way (line 1590).
+/// A body with no managed locals therefore cannot instrument itself. This
+/// body's locals are all `int`, the one global it touches is a scalar `var`,
+/// and the TLS builtins return `Int`, so it has zero managed cells. That is the
+/// property the 2026-10-03 attempt lacked - it stored the chain in a managed
+/// list and re-entered itself until the stack died. If this ever regresses, the
+/// failure mode is the same loud stack overflow, not silent corruption.
+///
+/// THE LAYOUT IS THE REFERENCE'S. The emitter's frame pointer is the base of a
+/// `ShadowFrame`: header is 16 bytes with `prev` at word 0 and `slot_count` at
+/// word 2 (writer tracks them at `shadowBytes`, `shadowBytes - 8`), and slots
+/// follow at `+16 + 8*i`. `frame[0]` is therefore exactly the reference's
+/// `prev` field, and `frame[slot]` is never touched here - slot spilling is
+/// `pickle_shadow_set` / `pickle_shadow_get`, which stay Rust and are exercised
+/// only by a program whose safepoints spill managed locals.
+///
+/// TLS INDEX. Allocated lazily on the first push and kept in a scalar top-level
+/// `var`, which is image data valid from process entry - the `abi_statics`
+/// `cellsBase`/`cellsCap` pattern, the only mutable module storage a runtime
+/// body may reach. `-1` is spelled `TLS_OUT_OF_INDEXES`; `TlsAlloc` never
+/// returns it, so it is a safe "not yet allocated" sentinel. A freshly
+/// allocated index may legitimately be 0 and must not be mistaken for unset.
+///
+/// DIVERGENCES (all recorded, none currently observable in a qualified image):
+///   - No registry and no lock: the reference serialises push/pop against
+///     concurrent collection. Nothing collects in a qualified image today, and
+///     a non-qualified image (native collector + TLS head) is a documented
+///     channel split, not a running configuration.
+///   - No LIFO-order check on pop (the reference asserts the popped frame is
+///     the head). The emitter always pops exactly the frames it pushed, so the
+///     assert is a debugger aid, not a runtime contract.
+///   - Pop clears the popped frame's `prev` (matches the reference); the chain
+///     itself cannot be inspected from Pickle, so the proof is behavioural:
+///     a deep-nesting probe runs byte-identical to the native oracle and a
+///     large recursion does not overflow, which a re-entrant body would.
+///
+/// THE JIT CAVEAT. Like `abi_exception`, this channel can split under
+/// `pickle-cli run`: the JIT may execute the Pickle body while another side
+/// still reads Rust state. It is safe for AOT builds and for the selflink.
+/// The selflink image is the only one exercised end-to-end (no native
+/// collector, so no GC can free a live frame); lock-step AOT covers the body's
+/// mechanical correctness at small volumes but must not be pushed past the GC
+/// threshold. Byte-parity probes therefore run against the selflink.
+
+/// The Win32 TLS index holding this thread's shadow-frame list head, or
+/// `-1` (`TLS_OUT_OF_INDEXES`) before the first push.
+var shadowTlsSlot: int = -1
+
+/// ABI: push `frame` onto the current thread's shadow stack.
+#[symbol("pickle_shadow_push")]
+fn abiShadowPush(frame: *int) {
+    unsafe {
+        var slot = shadowTlsSlot
+        if (slot == -1) {
+            slot = win_tls_alloc()
+            shadowTlsSlot = slot
+        }
+        frame[0] = win_tls_get(slot)
+        let _ = win_tls_set(slot, (frame as int))
+    }
+}
+
+/// ABI: pop `frame`, which the emitter guarantees is the current head of this
+/// thread's stack.
+#[symbol("pickle_shadow_pop")]
+fn abiShadowPop(frame: *int) {
+    unsafe {
+        var slot = shadowTlsSlot
+        if (slot != -1) {
+            var prev = frame[0]
+            let _ = win_tls_set(slot, prev)
+            frame[0] = 0
+        }
+    }
+}
+
+/// ABI-read: the current thread's shadow-frame chain head (a `ShadowFrame`
+/// base), or 0 when nothing has been pushed on this thread yet. The ported
+/// collector (`runtime.abi_gc`) reads this once per cycle and walks the chain
+/// through `frame[0]` (`prev`), sharing exactly the head the ported push/pop
+/// write. Zero-cell like the rest of this module (one scalar read).
+fn abiShadowHead() -> int {
+    var slot = shadowTlsSlot
+    if (slot == -1) {
+        return 0
+    }
+    return win_tls_get(slot)
+}

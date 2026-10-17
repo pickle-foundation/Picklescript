@@ -1,0 +1,1293 @@
+module compiler.history
+
+//! Compiler history: the public API surface of a module, as a snapshot the
+//! CLI can diff across git commits.
+//!
+//! `pickle history` shows `User.name: string -> string?` with the commit that
+//! did it, `pickle builds` shows pass/fail per commit, and `pickle explain
+//! E0308 --history` finds the commit where a code first fired. This module
+//! only knows how to *read a program* and turn it into a comparable surface;
+//! git walking, caching, and rendering live in the CLI.
+//!
+//! The surface is deliberately flat: every field, method, constructor,
+//! property, enum variant, top-level function, const, and type becomes its
+//! own `PublicItem`, keyed by `(kind, name)`.
+
+import * from compiler.ast
+import { strLt, subStr } from compiler.front
+import { parseHexStr, cpLen, decodeCp } from compiler.token
+
+/// One comparable element of a module's surface.
+class PublicItem {
+    var kind: string
+    var name: string
+    var vis: string
+    var sig: string
+
+    constructor(kind: string, name: string, vis: string, sig: string) {
+        this.kind = kind
+        this.name = name
+        this.vis = vis
+        this.sig = sig
+    }
+}
+
+/// Render a written type expression back to PickleScript text.
+fn typeExprToStr(ty: TypeExpr) -> string {
+    match (ty.kind) {
+        case TypeExprKind.Path(parts) -> joinDots(parts)
+        case TypeExprKind.Generic(inner, args) -> "{typeExprToStr(inner)}<{joinTypeExprs(args)}>"
+        case TypeExprKind.Pointer(inner) -> "*{typeExprToStr(inner)}"
+        case TypeExprKind.Ref(inner) -> "&{typeExprToStr(inner)}"
+        case TypeExprKind.Option(inner) -> "{typeExprToStr(inner)}?"
+        case TypeExprKind.Tuple(parts) -> "({joinTypeExprs(parts)})"
+        case TypeExprKind.Fn(params, ret, isAsync) -> {
+            var prefix = ""
+            if (isAsync) {
+                prefix = "async "
+            }
+            match (ret) {
+                case some(r) -> "{prefix}({joinTypeExprs(params)}) -> {typeExprToStr(r)}"
+                case none -> "{prefix}({joinTypeExprs(params)})"
+            }
+        }
+        case TypeExprKind.Infer -> "_"
+    }
+}
+
+fn joinDots(parts: List<string>) -> string {
+    var s = ""
+    var i = 0
+    while (i < len(parts)) {
+        if (i > 0) {
+            s += "."
+        }
+        s += parts[i]
+        i = i + 1
+    }
+    s
+}
+
+fn joinTypeExprs(l: List<TypeExpr>) -> string {
+    var s = ""
+    var i = 0
+    while (i < len(l)) {
+        if (i > 0) {
+            s += ", "
+        }
+        s += typeExprToStr(l[i])
+        i = i + 1
+    }
+    s
+}
+
+fn genericsOf(generics: List<GenericParam>) -> string {
+    if (len(generics) == 0) {
+        return ""
+    }
+    var names = ""
+    var i = 0
+    while (i < len(generics)) {
+        if (i > 0) {
+            names += ", "
+        }
+        names += generics[i].name
+        i = i + 1
+    }
+    "<{names}>"
+}
+
+/// One parameter, in call-contract text: `name: T`, or `T` when nameless.
+fn paramToStr(p: Param) -> string {
+    var ty = "_"
+    if (let some(t) = p.ty) {
+        ty = typeExprToStr(t)
+    }
+    if (p.rest) {
+        return "...{ty}"
+    }
+    if (p.name == "") {
+        return ty
+    }
+    "{p.name}: {ty}"
+}
+
+fn paramsToStr(params: List<Param>) -> string {
+    var ps = ""
+    var i = 0
+    while (i < len(params)) {
+        if (i > 0) {
+            ps += ", "
+        }
+        ps += paramToStr(params[i])
+        i = i + 1
+    }
+    "({ps})"
+}
+
+/// Full call-contract for a function-like: `max<T>(a: T, b: T) -> T`.
+fn fnSig(name: string, generics: List<GenericParam>, params: List<Param>, ret: TypeExpr?) -> string {
+    var s = name
+    s += genericsOf(generics)
+    s += paramsToStr(params)
+    if (let some(r) = ret) {
+        s += " -> "
+        s += typeExprToStr(r)
+    }
+    s
+}
+
+fn visOf(v: Visibility) -> string {
+    match (v) {
+        case Visibility.Public -> "pub"
+        case Visibility.Protected -> "prot"
+        case Visibility.Private -> "priv"
+        case Visibility.Default -> "def"
+    }
+}
+
+/// `User<T> extends Person implements Runnable` (or just `User<T>`).
+fn typeHead(name: string, generics: List<GenericParam>, extends: TypeExpr?, implements: List<TypeExpr>) -> string {
+    var s = name
+    s += genericsOf(generics)
+    if (let some(ex) = extends) {
+        s += " extends "
+        s += typeExprToStr(ex)
+    }
+    if (len(implements) > 0) {
+        s += " implements "
+        s += joinTypeExprs(implements)
+    }
+    s
+}
+
+/// Extract the surface of a parsed module. Only the AST is needed; bodies are
+/// irrelevant to the public contract. Items are sorted by `(kind, name)` so
+/// diffs are stable regardless of source order.
+fn extractSurface(program: Program) -> List<PublicItem> {
+    var out = emptyPublicItems()
+    var i = 0
+    while (i < len(program.items)) {
+        surfaceItem(out, program.items[i])
+        i = i + 1
+    }
+    sortedPublicItems(out)
+}
+
+fn pushItem(out: List<PublicItem>, item: PublicItem) {
+    var i = 0
+    while (i < len(out)) {
+        if (out[i].kind == item.kind && out[i].name == item.name) {
+            return
+        }
+        i = i + 1
+    }
+    out.push(item)
+}
+
+fn surfaceItem(out: List<PublicItem>, item: Item) {
+    match (item.kind) {
+        case ItemKind.Fn(f) -> {
+            var flags = ""
+            if (f.isAsync) {
+                flags = "async "
+            }
+            pushItem(out, PublicItem("fn", f.name, visOf(f.visibility), "{flags}{fnSig(f.name, f.generics, f.params, f.returnTy)}"))
+        }
+        case ItemKind.Test(f) -> {
+            pushItem(out, PublicItem("fn", f.name, visOf(f.visibility), "test {fnSig(f.name, f.generics, f.params, f.returnTy)}"))
+        }
+        case ItemKind.Class(c) -> {
+            pushItem(out, PublicItem("class", c.name, visOf(c.visibility), typeHead(c.name, c.generics, c.extends, c.implements)))
+            var i = 0
+            while (i < len(c.members)) {
+                surfaceMember(out, c.name, c.members[i])
+                i = i + 1
+            }
+        }
+        case ItemKind.Struct(s) -> {
+            pushItem(out, PublicItem("struct", s.name, visOf(s.visibility), typeHead(s.name, s.generics, none, s.implements)))
+            var i = 0
+            while (i < len(s.members)) {
+                surfaceMember(out, s.name, s.members[i])
+                i = i + 1
+            }
+        }
+        case ItemKind.Enum(e) -> {
+            pushItem(out, PublicItem("enum", e.name, visOf(e.visibility), typeHead(e.name, e.generics, none, e.implements)))
+            var i = 0
+            while (i < len(e.variants)) {
+                let v = e.variants[i]
+                var fields = ""
+                var j = 0
+                while (j < len(v.fields)) {
+                    if (j > 0) {
+                        fields += ", "
+                    }
+                    fields += "{v.fields[j].name}: {typeExprToStr(v.fields[j].ty)}"
+                    j = j + 1
+                }
+                var sig = ""
+                if (len(v.fields) > 0) {
+                    sig = "({fields})"
+                }
+                pushItem(out, PublicItem("variant", "{e.name}.{v.name}", "def", sig))
+                i = i + 1
+            }
+        }
+        case ItemKind.Interface(i) -> {
+            pushItem(out, PublicItem("interface", i.name, visOf(i.visibility), typeHead(i.name, i.generics, none, i.extends)))
+            var k = 0
+            while (k < len(i.members)) {
+                surfaceInterfaceMember(out, i.name, i.members[k])
+                k = k + 1
+            }
+        }
+        case ItemKind.Const(c) -> {
+            var sig = c.name
+            if (let some(t) = c.ty) {
+                sig = "{c.name}: {typeExprToStr(t)}"
+            }
+pushItem(out, PublicItem("const", c.name, visOf(c.visibility), sig))
+       }
+       case ItemKind.Global(g) -> {
+           var gsig = g.name
+           if (let some(t) = g.ty) {
+               gsig = "{g.name}: {typeExprToStr(t)}"
+           }
+           pushItem(out, PublicItem("var", g.name, visOf(g.visibility), gsig))
+       }
+   }
+   }
+
+fn surfaceInterfaceMember(out: List<PublicItem>, owner: string, m: InterfaceMember) {
+    match (m) {
+        case InterfaceMember.Method(md) -> {
+            pushItem(out, PublicItem("imethod", "{owner}.{md.name}", visOf(md.visibility), fnSig(md.name, md.generics, md.params, md.returnTy)))
+        }
+        case InterfaceMember.Property(name, ty, span) -> {
+            pushItem(out, PublicItem("iprop", "{owner}.{name}", "def", "{name}: {typeExprToStr(ty)}"))
+        }
+        case InterfaceMember.Const(name, value, span) -> {
+            pushItem(out, PublicItem("iconst", "{owner}.{name}", "def", name))
+        }
+    }
+}
+
+fn surfaceMember(out: List<PublicItem>, owner: string, m: ClassMember) {
+    match (m) {
+        case ClassMember.Field(name, ty, init, visibility, isStatic, isConst, attrs, span) -> {
+            var flags = ""
+            if (isStatic) {
+                flags = "static "
+            }
+            if (isConst) {
+                flags += "const "
+            }
+            var tytext = ""
+            if (let some(t) = ty) {
+                tytext = ": {typeExprToStr(t)}"
+            }
+            pushItem(out, PublicItem("field", "{owner}.{name}", visOf(visibility), "{flags}{name}{tytext}"))
+        }
+        case ClassMember.Method(md) -> {
+            var flags = ""
+            if (md.isStatic) {
+                flags = "static "
+            }
+            if (md.isOverride) {
+                flags += "override "
+            }
+            if (md.isAsync) {
+                flags += "async "
+            }
+            pushItem(out, PublicItem("method", "{owner}.{md.name}", visOf(md.visibility), "{flags}{fnSig(md.name, md.generics, md.params, md.returnTy)}"))
+        }
+        case ClassMember.Constructor(c) -> {
+            pushItem(out, PublicItem("ctor", "{owner}.<init>", visOf(c.visibility), paramsToStr(c.params)))
+        }
+        case ClassMember.Property(p) -> {
+            var tytext = ""
+            if (let some(t) = p.ty) {
+                tytext = ": {typeExprToStr(t)}"
+            }
+            var flags = ""
+            if (p.isStatic) {
+                flags = "static "
+            }
+            var accessors = ""
+            match (p.get) {
+                case some(_) -> accessors += " get"
+                case none -> {}
+            }
+            match (p.set) {
+                case some(_) -> accessors += " set"
+                case none -> {}
+            }
+            pushItem(out, PublicItem("prop", "{owner}.{p.name}", visOf(p.visibility), "{flags}{p.name}{tytext}{accessors}"))
+        }
+        case ClassMember.Const(name, visibility, ty, value, span) -> {
+            var sig = name
+            if (let some(t) = ty) {
+                sig = "{name}: {typeExprToStr(t)}"
+            }
+            pushItem(out, PublicItem("const", "{owner}.{name}", visOf(visibility), sig))
+        }
+        case ClassMember.Init(b) -> {}
+        case ClassMember.Deinit(b) -> {}
+    }
+}
+
+/// Render every import in a module's dependency list (text form, as written).
+fn depsOf(program: Program) -> List<string> {
+    var out = [""]
+    out.pop()
+    var i = 0
+    while (i < len(program.imports)) {
+        let imp = program.imports[i]
+        var prefix = ""
+        if (imp.isPublic) {
+            prefix = "pub "
+        }
+        var text = ""
+        match (imp.kind) {
+            case ImportKind.Module(alias) -> {
+                match (alias) {
+                    case some(a) -> text = "{prefix}import {joinDots(imp.source)} as {a}"
+                    case none -> text = "{prefix}import {joinDots(imp.source)}"
+                }
+            }
+            case ImportKind.Items(items) -> {
+                if (len(items) == 1) {
+                    let it = items[0]
+                    match (it.alias) {
+                        case some(a) -> text = "{prefix}import {joinDots(it.path)} from {joinDots(imp.source)} as {a}"
+                        case none -> text = "{prefix}import {joinDots(it.path)} from {joinDots(imp.source)}"
+                    }
+                } else {
+                    var body = ""
+                    var j = 0
+                    while (j < len(items)) {
+                        if (j > 0) {
+                            body += ", "
+                        }
+                        match (items[j].alias) {
+                            case some(a) -> body += "{joinDots(items[j].path)} as {a}"
+                            case none -> body += joinDots(items[j].path)
+                        }
+                        j = j + 1
+                    }
+                    text = "{prefix}import"
+                    text += " {"
+                    text += " "
+                    text += body
+                    text += " "
+                    text += "} from "
+                    text += joinDots(imp.source)
+                }
+            }
+            case ImportKind.Wildcard -> text = "{prefix}import * from {joinDots(imp.source)}"
+        }
+        out.push(text)
+        i = i + 1
+    }
+    sortStrings(out)
+    out
+}
+
+fn itemLess(a: PublicItem, b: PublicItem) -> bool {
+    if (strLt(a.kind, b.kind)) {
+        return true
+    }
+    if (strLt(b.kind, a.kind)) {
+        return false
+    }
+    strLt(a.name, b.name)
+}
+
+/// Selection sort (surface lists are small; no index-write assumptions).
+fn sortedPublicItems(l: List<PublicItem>) -> List<PublicItem> {
+    var src = l
+    var out = emptyPublicItems()
+    while (len(src) > 0) {
+        var mi = 0
+        var i = 1
+        while (i < len(src)) {
+            if (itemLess(src[i], src[mi])) {
+                mi = i
+            }
+            i = i + 1
+        }
+        out.push(src[mi])
+        var next = emptyPublicItems()
+        var k = 0
+        while (k < len(src)) {
+            if (k != mi) {
+                next.push(src[k])
+            }
+            k = k + 1
+        }
+        src = next
+    }
+    out
+}
+
+fn sortStrings(l: List<string>) {
+    var i = 1
+    while (i < len(l)) {
+        var j = i
+        while (j > 0 && strLt(l[j], l[j - 1])) {
+            let tmp = l[j - 1]
+            l[j - 1] = l[j]
+            l[j] = tmp
+            j = j - 1
+        }
+        i = i + 1
+    }
+}
+
+/// A change between two surfaces of the same module.
+class SurfaceChange {
+    var status: string
+    var kind: string
+    var name: string
+    var before: string?
+    var after: string?
+
+    constructor(status: string, kind: string, name: string, before: string?, after: string?) {
+        this.status = status
+        this.kind = kind
+        this.name = name
+        this.before = before
+        this.after = after
+    }
+}
+
+fn findItem(items: List<PublicItem>, kind: string, name: string) -> PublicItem? {
+    var i = 0
+    while (i < len(items)) {
+        if (items[i].kind == kind && items[i].name == name) {
+            return items[i]
+        }
+        i = i + 1
+    }
+    none
+}
+
+/// Guarded diff of two surfaces: every item that differs, keyed by
+/// `(kind, name)` and sorted for stable rendering.
+fn diffSurfaces(before: List<PublicItem>, after: List<PublicItem>) -> List<SurfaceChange> {
+    var keys = emptyPublicItems()
+    var i = 0
+    while (i < len(before)) {
+        pushItem(keys, PublicItem(before[i].kind, before[i].name, "", ""))
+        i = i + 1
+    }
+    i = 0
+    while (i < len(after)) {
+        pushItem(keys, PublicItem(after[i].kind, after[i].name, "", ""))
+        i = i + 1
+    }
+    keys = sortedPublicItems(keys)
+    var changes = emptyChanges()
+    i = 0
+    while (i < len(keys)) {
+        let b = findItem(before, keys[i].kind, keys[i].name)
+        let a = findItem(after, keys[i].kind, keys[i].name)
+        match (b) {
+            case none -> {
+                match (a) {
+                    case some(aa) -> changes.push(SurfaceChange("+", keys[i].kind, keys[i].name, none, aa.sig))
+                    case none -> {}
+                }
+            }
+            case some(bb) -> {
+                match (a) {
+                    case none -> changes.push(SurfaceChange("-", keys[i].kind, keys[i].name, bb.sig, none))
+                    case some(aa) -> {
+                        if (bb.sig != aa.sig) {
+                            changes.push(SurfaceChange("~", keys[i].kind, keys[i].name, bb.sig, aa.sig))
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    changes
+}
+
+/// A plain-text label for a changed signature, when the difference is
+/// structural enough to name (`string -> string?` is "made nullable").
+fn transitLabel(before: string, after: string) -> string? {
+    if (!strHas(before, "?") && strHas(after, "?")) {
+        let stripped = strReplaceAll(after, "?", "")
+        if (before == stripped) {
+            return "made nullable"
+        }
+    }
+    if (strHas(before, "?") && !strHas(after, "?") && strReplaceAll(before, "?", "") == after) {
+        return "no longer optional"
+    }
+    none
+}
+
+fn strHas(s: string, sub: string) -> bool {
+    let bs = bytes(s)
+    let tb = bytes(sub)
+    if (len(tb) == 0) {
+        return true
+    }
+    if (len(tb) > len(bs)) {
+        return false
+    }
+    var i = 0
+    while (i + len(tb) <= len(bs)) {
+        var j = 0
+        var ok = true
+        while (j < len(tb)) {
+            if (bs[i + j] != tb[j]) {
+                ok = false
+                break
+            }
+            j = j + 1
+        }
+        if (ok) {
+            return true
+        }
+        i = i + 1
+    }
+    false
+}
+
+fn strReplaceAll(s: string, sub: string, rep: string) -> string {
+    var out = ""
+    var i = 0
+    let bs = bytes(s)
+    let tb = bytes(sub)
+    if (len(tb) == 0) {
+        return s
+    }
+    while (i < len(bs)) {
+        var matches = false
+        if (i + len(tb) <= len(bs)) {
+            var j = 0
+            var ok = true
+            while (j < len(tb)) {
+                if (bs[i + j] != tb[j]) {
+                    ok = false
+                    break
+                }
+                j = j + 1
+            }
+            matches = ok
+        }
+        if (matches) {
+            out += rep
+            i = i + len(tb)
+        } else {
+            out += "{bs[i] as char}"
+            i = i + 1
+        }
+    }
+    out
+}
+
+/// A stable FNV-1a 64-bit hash of snapshot content (hex). The compiler has no
+/// hash crate and the std DefaultHasher is not stable across releases, so for
+/// the history cache this deterministic hash is preferred.
+fn fnv1a64(bs: List<byte>) -> string {
+    var h: int = -3750763034362895579
+    var i = 0
+    while (i < len(bs)) {
+        h = (h ^ (bs[i] as int)) * 1099511628211
+        i = i + 1
+    }
+    fnvHex(h)
+}
+
+fn fnvHex(h0: int) -> string {
+    var h = h0
+    var out = ""
+    var i = 0
+    while (i < 16) {
+        let d = h & 15
+        out = "{hexDigit(d)}{out}"
+        h = h >> 4
+        i = i + 1
+    }
+    out
+}
+
+fn hexDigit(d: int) -> string {
+    if (d < 10) {
+        return "{d}"
+    }
+    "{cps(97 + (d - 10))}"
+}
+
+fn hex4(cp: int) -> string {
+    var n = cp
+    var out = ""
+    var i = 0
+    while (i < 4) {
+        let d = n & 15
+        out = "{hexDigit(d)}{out}"
+        n = n >> 4
+        i = i + 1
+    }
+    out
+}
+
+/// A codepoint as a single-character string.
+fn cps(cp: int) -> string {
+    "{(cp as char)}"
+}
+
+/// JSON string escaping (mirror of `diag::json_string`): quotes always, other
+/// ASCII control characters as `\uXXXX`; non-ASCII passes through raw.
+fn jsonString(s: string) -> string {
+    var out = cps(34)
+    let bs = bytes(s)
+    var i = 0
+    while (i < len(bs)) {
+        let c = decodeCp(bs, i)
+        let l = cpLen(bs[i] as int)
+        if (c == 34) {
+            out += cps(92)
+            out += cps(34)
+        } else if (c == 92) {
+            out += cps(92)
+            out += cps(92)
+        } else if (c == 10) {
+            out += cps(92)
+            out += cps(110)
+        } else if (c == 13) {
+            out += cps(92)
+            out += cps(114)
+        } else if (c == 9) {
+            out += cps(92)
+            out += cps(116)
+        } else if (c == 8) {
+            out += cps(92)
+            out += cps(98)
+        } else if (c == 12) {
+            out += cps(92)
+            out += cps(102)
+        } else if (c < 32) {
+            out += cps(92)
+            out += cps(117)
+            out += hex4(c)
+        } else {
+            out += cps(decodeCp(bs, i))
+        }
+        i = i + l
+    }
+    out += cps(34)
+    out
+}
+
+// ---- Minimal JSON values for the history cache (mirrors the Rust `json`
+// module: only the shapes the snapshot writer ever emits need to parse). ----
+
+enum JVal {
+    Null
+    Bool(b: bool)
+    Num(t: string)
+    Str(s: string)
+    Arr(items: List<JVal>)
+    Obj(map: Map<string, JVal>)
+}
+
+class JsonParser {
+    var src: string
+    var bs: List<byte>
+    var i: int
+
+    constructor(src: string) {
+        this.src = src
+        this.bs = bytes(src)
+        this.i = 0
+    }
+
+    fn atEnd() -> bool {
+        this.i >= len(this.bs)
+    }
+
+    fn peek() -> int? {
+        if (this.atEnd()) {
+            return none
+        }
+        this.bs[this.i] as int
+    }
+
+    fn ws() {
+        while (true) {
+            match (this.peek()) {
+                case some(c) -> {
+                    if (c == 32 || c == 9 || c == 13 || c == 10) {
+                        this.i = this.i + 1
+                    } else {
+                        return
+                    }
+                }
+                case none -> { return }
+            }
+        }
+    }
+
+    fn at(k: string) -> bool {
+        let t = bytes(k)
+        let n = len(t)
+        if (this.i + n > len(this.bs)) {
+            return false
+        }
+        var j = 0
+        while (j < n) {
+            if (this.bs[this.i + j] != t[j]) {
+                return false
+            }
+            j = j + 1
+        }
+        true
+    }
+
+    fn parse() -> JVal? {
+        this.ws()
+        let v = this.value()
+        this.ws()
+        if (this.i != len(this.bs)) {
+            return none
+        }
+        v
+    }
+
+    fn value() -> JVal? {
+        match (this.peek()) {
+            case some(0x7B) -> {
+                this.i = this.i + 1
+                return this.object()
+            }
+            case some(0x5B) -> {
+                this.i = this.i + 1
+                return this.array()
+            }
+            case some(0x22) -> {
+                if (let some(ss) = this.string()) {
+                    return JVal.Str(ss)
+                }
+                return none
+            }
+            case some(c) -> {
+                if (c == 116) {
+                    if (this.at("true")) {
+                        this.i = this.i + 4
+                        return JVal.Bool(true)
+                    }
+                    return none
+                }
+                if (c == 102) {
+                    if (this.at("false")) {
+                        this.i = this.i + 5
+                        return JVal.Bool(false)
+                    }
+                    return none
+                }
+                if (c == 110) {
+                    if (this.at("null")) {
+                        this.i = this.i + 4
+                        return JVal.Null
+                    }
+                    return none
+                }
+                if (c == 45 || (c >= 48 && c <= 57)) {
+                    return this.number()
+                }
+                return none
+            }
+            case none -> { return none }
+        }
+    }
+
+    fn number() -> JVal? {
+        let start = this.i
+        var digits = 0
+        match (this.peek()) {
+            case some(45) -> this.i = this.i + 1
+            case _ -> {}
+        }
+        while (true) {
+            match (this.peek()) {
+                case some(c) -> {
+                    if (c >= 48 && c <= 57) {
+                        this.i = this.i + 1
+                        digits = digits + 1
+                    } else {
+                        break
+                    }
+                }
+                case none -> { break }
+            }
+        }
+        if (digits == 0) {
+            return none
+        }
+        JVal.Num(subStr(this.src, start, this.i - start))
+    }
+
+    fn object() -> JVal? {
+        let m = {"::seed::": JVal.Null}
+        this.ws()
+        match (this.peek()) {
+            case some(0x7D) -> {
+                this.i = this.i + 1
+                m.remove("::seed::")
+                return JVal.Obj(m)
+            }
+            case _ -> {}
+        }
+        while (true) {
+            this.ws()
+            match (this.string()) {
+                case none -> { return none }
+                case some(key) -> {
+                    this.ws()
+                    match (this.peek()) {
+                        case some(0x3A) -> this.i = this.i + 1
+                        case _ -> { return none }
+                    }
+                    this.ws()
+                    match (this.value()) {
+                        case none -> { return none }
+                        case some(val) -> m[key] = val
+                    }
+                    this.ws()
+                    match (this.peek()) {
+                        case some(0x2C) -> this.i = this.i + 1
+                        case some(0x7D) -> {
+                            this.i = this.i + 1
+                            m.remove("::seed::")
+                            return JVal.Obj(m)
+                        }
+                        case _ -> { return none }
+                    }
+                }
+            }
+        }
+    }
+
+    fn array() -> JVal? {
+        var items = [JVal.Null]
+        items.pop()
+        this.ws()
+        match (this.peek()) {
+            case some(0x5D) -> {
+                this.i = this.i + 1
+                return JVal.Arr(items)
+            }
+            case _ -> {}
+        }
+        while (true) {
+            this.ws()
+            match (this.value()) {
+                case none -> { return none }
+                case some(v) -> items.push(v)
+            }
+            this.ws()
+            match (this.peek()) {
+                case some(0x2C) -> this.i = this.i + 1
+                case some(0x5D) -> {
+                    this.i = this.i + 1
+                    return JVal.Arr(items)
+                }
+                case _ -> { return none }
+            }
+        }
+    }
+
+    fn string() -> string? {
+        match (this.peek()) {
+            case some(0x22) -> this.i = this.i + 1
+            case _ -> { return none }
+        }
+        var out = ""
+        while (true) {
+            match (this.peek()) {
+                case none -> { return none }
+                case some(0x22) -> {
+                    this.i = this.i + 1
+                    return out
+                }
+                case some(c) -> {
+                    this.i = this.i + 1
+                    let piece = this.charPiece(c)
+                    match (piece) {
+                        case some(p) -> out += p
+                        case none -> { return none }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Decode the character at `this.i - 1` (already consumed) into a JSON
+    /// string fragment; unknown escapes and malformed `\u` sequences fail
+    /// closed with none.
+    fn charPiece(c: int) -> string? {
+        if (c == 92) {
+            match (this.peek()) {
+                case none -> { return none }
+                case some(esc) -> {
+                    this.i = this.i + 1
+                    return this.escPiece(esc)
+                }
+            }
+        }
+        if (c >= 128) {
+            let l = cpLen(c)
+            let start = this.i - 1
+            let cp = decodeCp(this.bs, start)
+            this.i = this.i + l - 1
+            return cps(cp)
+        }
+        cps(c)
+    }
+
+    fn escPiece(esc: int) -> string? {
+        if (esc == 0x22) {
+            return cps(34)
+        }
+        if (esc == 0x5C) {
+            return cps(92)
+        }
+        if (esc == 0x2F) {
+            return cps(47)
+        }
+        if (esc == 98) {
+            return cps(8)
+        }
+        if (esc == 102) {
+            return cps(12)
+        }
+        if (esc == 110) {
+            return cps(10)
+        }
+        if (esc == 114) {
+            return cps(13)
+        }
+        if (esc == 116) {
+            return cps(9)
+        }
+        if (esc == 117) {
+            if (this.i + 4 > len(this.bs)) {
+                return none
+            }
+            let hx = subStr(this.src, this.i, 4)
+            this.i = this.i + 4
+            match (parseHexStr(hx)) {
+                case some(cpv) -> { return cps(cpv) }
+                case none -> { return none }
+            }
+        }
+        none
+    }
+}
+
+fn strOf(v: JVal) -> string? {
+    match (v) {
+        case JVal.Str(s) -> s
+        case _ -> none
+    }
+}
+
+fn boolOf(v: JVal) -> bool? {
+    match (v) {
+        case JVal.Bool(b) -> b
+        case _ -> none
+    }
+}
+
+fn strKey(m: Map<string, JVal>, k: string) -> string? {
+    match (m.get(k)) {
+        case some(v) -> strOf(v)
+        case none -> none
+    }
+}
+
+fn strKeyOr(m: Map<string, JVal>, k: string, fallback: string) -> string {
+    match (strKey(m, k)) {
+        case some(v) -> v
+        case none -> fallback
+    }
+}
+
+fn strListOf(v: JVal) -> List<string> {
+    var out = [""]
+    out.pop()
+    match (v) {
+        case JVal.Arr(arr) -> {
+            var i = 0
+            while (i < len(arr)) {
+                match (arr[i]) {
+                    case JVal.Str(s) -> out.push(s)
+                    case _ -> {}
+                }
+                i = i + 1
+            }
+        }
+        case _ -> {}
+    }
+    out
+}
+
+fn validKind(k: string) -> bool {
+    k == "fn" || k == "class" || k == "struct" || k == "enum" || k == "interface" || k == "field" || k == "method" || k == "ctor" || k == "prop" || k == "const" || k == "variant" || k == "imethod" || k == "iprop" || k == "iconst"
+}
+
+fn validVis(v: string) -> bool {
+    v == "pub" || v == "prot" || v == "priv" || v == "def"
+}
+
+fn itemsOf(m: Map<string, JVal>) -> List<PublicItem> {
+    var out = emptyPublicItems()
+    match (m.get("items")) {
+        case some(v) -> {
+            match (v) {
+                case JVal.Arr(arr) -> {
+                    var i = 0
+                    while (i < len(arr)) {
+                        match (arr[i]) {
+                            case JVal.Obj(o) -> {
+                                match (strKey(o, "kind")) {
+                                    case some(kind) -> {
+                                        match (strKey(o, "name")) {
+                                            case some(name) -> {
+                                                match (strKey(o, "vis")) {
+                                                    case some(vis) -> {
+                                                        match (strKey(o, "sig")) {
+                                                            case some(sig) -> {
+                                                                if (validKind(kind) && validVis(vis)) {
+                                                                    out.push(PublicItem(kind, name, vis, sig))
+                                                                }
+                                                            }
+                                                            case none -> {}
+                                                        }
+                                                    }
+                                                    case none -> {}
+                                                }
+                                            }
+                                            case none -> {}
+                                        }
+                                    }
+                                    case none -> {}
+                                }
+                            }
+                            case _ -> {}
+                        }
+                        i = i + 1
+                    }
+                }
+                case _ -> {}
+            }
+        }
+        case none -> {}
+    }
+    out
+}
+
+/// A full per-file snapshot of one commit: the surface, its deps, and the
+/// build outcome.
+class Snapshot {
+    var commit: string
+    var short: string
+    var date: string
+    var message: string
+    var file: string
+    var hash: string
+    var sha: string
+    var ok: bool
+    var codes: List<string>
+    var deps: List<string>
+    var items: List<PublicItem>
+
+    constructor(commit: string, short: string, date: string, message: string, file: string, hash: string, ok: bool, codes: List<string>, deps: List<string>, items: List<PublicItem>) {
+        this.commit = commit
+        this.short = short
+        this.date = date
+        this.message = message
+        this.file = file
+        this.hash = hash
+        this.ok = ok
+        this.codes = codes
+        this.deps = deps
+        this.items = items
+        this.sha = ""
+    }
+
+    /// Full-snapshot JSON (the `symbols.db` line).
+    fn toJson() -> string {
+        var o = cps(123)
+        o += jsonString("commit")
+        o += cps(58)
+        o += jsonString(this.commit)
+        o += cps(44)
+        o += jsonString("short")
+        o += cps(58)
+        o += jsonString(this.short)
+        o += cps(44)
+        o += jsonString("date")
+        o += cps(58)
+        o += jsonString(this.date)
+        o += cps(44)
+        o += jsonString("message")
+        o += cps(58)
+        o += jsonString(this.message)
+        o += cps(44)
+        o += jsonString("file")
+        o += cps(58)
+        o += jsonString(this.file)
+        o += cps(44)
+        o += jsonString("hash")
+        o += cps(58)
+        o += jsonString(this.hash)
+        o += cps(44)
+        o += jsonString("sha")
+        o += cps(58)
+        o += jsonString(this.sha)
+        o += cps(44)
+        o += jsonString("ok")
+        o += cps(58)
+        if (this.ok) {
+            o += "true"
+        } else {
+            o += "false"
+        }
+        o += cps(44)
+        o += jsonString("codes")
+        o += cps(58)
+        o += stringArrayJson(this.codes)
+        o += cps(44)
+        o += jsonString("deps")
+        o += cps(58)
+        o += stringArrayJson(this.deps)
+        o += cps(44)
+        o += jsonString("items")
+        o += cps(58)
+        o += itemsJson(this.items)
+        o += cps(125)
+        o
+    }
+
+    /// Parse a `symbols.db` line back into a snapshot; malformed lines fail
+    /// closed (none), never fabricating a snapshot.
+    static fn fromJson(line: string) -> Snapshot? {
+        let p = JsonParser(line)
+        let v = p.parse()
+        match (v) {
+            case some(jv) -> {
+                match (jv) {
+                    case JVal.Obj(m) -> {
+                        if (let some(commit) = strKey(m, "commit")) {
+                            if (let some(short) = strKey(m, "short")) {
+                                if (let some(date) = strKey(m, "date")) {
+                                    if (let some(message) = strKey(m, "message")) {
+                                        if (let some(file) = strKey(m, "file")) {
+                                            if (let some(hash) = strKey(m, "hash")) {
+                                                match (m.get("ok")) {
+                                                    case some(okv) -> {
+                                                        match (boolOf(okv)) {
+                                                            case some(ok) -> {
+                                                                match (m.get("codes")) {
+                                                                    case some(cd) -> {
+                                                                        match (m.get("deps")) {
+                                                                            case some(dp) -> {
+                                                                                let codes = strListOf(cd)
+                                                                                let deps = strListOf(dp)
+                                                                                let items = itemsOf(m)
+                                                                                let sha = strKeyOr(m, "sha", "")
+                                                                                let s = Snapshot(commit, short, date, message, file, hash, ok, codes, deps, items)
+                                                                                s.sha = sha
+                                                                                return s
+                                                                            }
+                                                                            case none -> { return none }
+                                                                        }
+                                                                    }
+                                                                    case none -> { return none }
+                                                                }
+                                                            }
+                                                            case none -> { return none }
+                                                        }
+                                                    }
+                                                    case none -> { return none }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        return none
+                    }
+                    case _ -> { return none }
+                }
+            }
+            case none -> { return none }
+        }
+    }
+}
+
+fn stringArrayJson(vals: List<string>) -> string {
+    var o = cps(91)
+    var i = 0
+    while (i < len(vals)) {
+        if (i > 0) {
+            o += cps(44)
+        }
+        o += jsonString(vals[i])
+        i = i + 1
+    }
+    o += cps(93)
+    o
+}
+
+fn itemsJson(items: List<PublicItem>) -> string {
+    var o = cps(91)
+    var i = 0
+    while (i < len(items)) {
+        if (i > 0) {
+            o += cps(44)
+        }
+        o += cps(123)
+        o += jsonString("kind")
+        o += cps(58)
+        o += jsonString(items[i].kind)
+        o += cps(44)
+        o += jsonString("name")
+        o += cps(58)
+        o += jsonString(items[i].name)
+        o += cps(44)
+        o += jsonString("vis")
+        o += cps(58)
+        o += jsonString(items[i].vis)
+        o += cps(44)
+        o += jsonString("sig")
+        o += cps(58)
+        o += jsonString(items[i].sig)
+        o += cps(125)
+        i = i + 1
+    }
+    o += cps(93)
+    o
+}
+
+fn emptyPublicItems() -> List<PublicItem> {
+    var l = [PublicItem("", "", "", "")]
+    l.pop()
+    l
+}
+
+fn emptyChanges() -> List<SurfaceChange> {
+    var l = [SurfaceChange("", "", "", none, none)]
+    l.pop()
+    l
+}

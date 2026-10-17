@@ -1,0 +1,66 @@
+module runtime.abi_threads_test
+
+import { abiThreadSpawn, abiThreadJoin, abiThreadFinished, abiThreadPanicMessage, abiThreadCount, abiThreadCurrent, abiThreadSleepMs, abiThreadYield } from runtime.abi_threads
+
+/// The unit suite for the thread port bodies.
+///
+/// The single-thread divergence is the point under test: a spawn runs its body
+/// inline (the "no peer" world `threads.rs:403` documents for the freestanding
+/// build), and every task answer is derived from the one spawn counter. All
+/// assertions are relative - "current count + 1", "the handle this spawn got"
+/// - never absolute, because the runtime suite runs tests in an unspecified
+/// order.
+///
+/// NO TEST COVERS A TIME-VISIBLE SLEEP. `abiThreadSleepMs` terminates (the
+/// clamp bounds it at 60000ms); the sleep bodies just assert the call returns.
+///
+/// The body effect is observed through `recordSpawn`, not through a captured
+/// binding: a lambda is captured by value and cannot mutate the enclosing
+/// binding (E0900), so a closure body here only *_calls_* - the recording
+/// happens inside a plain module function.
+var seenSpawn: int = 0
+
+fn recordSpawn() -> void {
+    seenSpawn = seenSpawn + 1
+}
+
+test fn current_reports_the_unregistered_thread() {
+    expect(abiThreadCurrent()).toBe(0)
+}
+
+test fn yield_is_a_noop() {
+    abiThreadYield()
+}
+
+test fn sleep_terminates_for_the_extremes() {
+    abiThreadSleepMs(-5)
+    abiThreadSleepMs(0)
+    abiThreadSleepMs(1)
+    abiThreadSleepMs(70000)
+}
+
+test fn the_empty_world_answers_match_the_nostd_reference() {
+    expect(abiThreadCount()).toBe(0)
+    expect(abiThreadFinished(0)).toBe(false)
+    expect(abiThreadFinished(-1)).toBe(false)
+    expect(abiThreadFinished(999)).toBe(false)
+    expect(abiThreadPanicMessage(0) == 0 as *int).toBe(true)
+    expect(abiThreadJoin(0)).toBe(true)
+    expect(abiThreadJoin(-7)).toBe(true)
+}
+
+test fn spawn_runs_inline_in_handle_order() {
+    var before = abiThreadCount()
+    var h0 = abiThreadSpawn(fn () { recordSpawn() })
+    expect(h0).toBe(before)
+    expect(abiThreadCount()).toBe(before + 1)
+    expect(seenSpawn).toBe(before + 1)
+    expect(abiThreadFinished(h0)).toBe(true)
+    expect(abiThreadJoin(h0)).toBe(true)
+    expect(abiThreadPanicMessage(h0) == 0 as *int).toBe(true)
+    var h1 = abiThreadSpawn(fn () {})
+    expect(h1).toBe(before + 1)
+    expect(abiThreadCount()).toBe(before + 2)
+    expect(abiThreadFinished(h1)).toBe(true)
+    expect(abiThreadFinished(h1 + 5)).toBe(false)
+}

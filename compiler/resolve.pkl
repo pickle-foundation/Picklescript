@@ -1,0 +1,1580 @@
+module compiler.resolve
+
+import * from compiler.ast
+import { Span, Diagnostic, DiagnosticSink } from compiler.diag
+import * from compiler.ty
+
+class ParamInfo {
+    var name: string
+    var ty: Ty
+    var hasDefault: bool
+    var rest: bool
+    var span: Span
+
+    constructor(name: string, ty: Ty, hasDefault: bool, rest: bool, span: Span) {
+        this.name = name
+        this.ty = ty
+        this.hasDefault = hasDefault
+        this.rest = rest
+        this.span = span
+    }
+}
+
+class CallableInfo {
+    var name: string
+    var span: Span
+    var visibility: Visibility
+    var isAsync: bool
+    var isStatic: bool
+    var isOverride: bool
+    var isAbstract: bool
+    var operator: string?
+    var generics: List<string>
+    var params: List<ParamInfo>
+    var ret: Ty
+
+    constructor(name: string, span: Span, visibility: Visibility, isAsync: bool, isStatic: bool, isOverride: bool, isAbstract: bool, operator: string?, generics: List<string>, params: List<ParamInfo>, ret: Ty) {
+        this.name = name
+        this.span = span
+        this.visibility = visibility
+        this.isAsync = isAsync
+        this.isStatic = isStatic
+        this.isOverride = isOverride
+        this.isAbstract = isAbstract
+        this.operator = operator
+        this.generics = generics
+        this.params = params
+        this.ret = ret
+    }
+}
+
+class FieldInfo {
+    var name: string
+    var visibility: Visibility
+    var isStatic: bool
+    var mutable: bool
+    var const_: bool
+    var manual: bool
+    var ty: Ty
+    var span: Span
+
+    constructor(name: string, visibility: Visibility, isStatic: bool, mutable: bool, const_: bool, manual: bool, ty: Ty, span: Span) {
+        this.name = name
+        this.visibility = visibility
+        this.isStatic = isStatic
+        this.mutable = mutable
+        this.const_ = const_
+        this.manual = manual
+        this.ty = ty
+        this.span = span
+    }
+}
+
+class PropertyInfo {
+    var name: string
+    var visibility: Visibility
+    var isStatic: bool
+    var ty: Ty
+    var hasGet: bool
+    var hasSet: bool
+    var span: Span
+
+    constructor(name: string, visibility: Visibility, isStatic: bool, ty: Ty, hasGet: bool, hasSet: bool, span: Span) {
+        this.name = name
+        this.visibility = visibility
+        this.isStatic = isStatic
+        this.ty = ty
+        this.hasGet = hasGet
+        this.hasSet = hasSet
+        this.span = span
+    }
+}
+
+class CtorInfo {
+    var span: Span
+    var visibility: Visibility
+    var params: List<ParamInfo>
+
+    constructor(span: Span, visibility: Visibility, params: List<ParamInfo>) {
+        this.span = span
+        this.visibility = visibility
+        this.params = params
+    }
+}
+
+class NamedCtorInfo {
+    var name: string
+    var ctor: CtorInfo
+
+    constructor(name: string, ctor: CtorInfo) {
+        this.name = name
+        this.ctor = ctor
+    }
+}
+
+class ClassTable {
+    var name: string
+    var span: Span
+    var visibility: Visibility
+    var generics: List<string>
+    var extends: Ty?
+    var implements: List<Ty>
+    var fields: List<FieldInfo>
+    var methods: List<CallableInfo>
+    var properties: List<PropertyInfo>
+    var ctor: CtorInfo?
+    var namedCtors: List<NamedCtorInfo>
+    var consts: List<FieldInfo>
+
+    constructor(name: string, span: Span, visibility: Visibility, generics: List<string>, extends: Ty?, implements: List<Ty>, fields: List<FieldInfo>, methods: List<CallableInfo>, properties: List<PropertyInfo>, ctor: CtorInfo?, namedCtors: List<NamedCtorInfo>, consts: List<FieldInfo>) {
+        this.name = name
+        this.span = span
+        this.visibility = visibility
+        this.generics = generics
+        this.extends = extends
+        this.implements = implements
+        this.fields = fields
+        this.methods = methods
+        this.properties = properties
+        this.ctor = ctor
+        this.namedCtors = namedCtors
+        this.consts = consts
+    }
+}
+
+class EnumTable {
+    var name: string
+    var span: Span
+    var visibility: Visibility
+    var generics: List<string>
+    var implements: List<Ty>
+    var variants: List<EnumVariantInfo>
+
+    constructor(name: string, span: Span, visibility: Visibility, generics: List<string>, implements: List<Ty>, variants: List<EnumVariantInfo>) {
+        this.name = name
+        this.span = span
+        this.visibility = visibility
+        this.generics = generics
+        this.implements = implements
+        this.variants = variants
+    }
+}
+
+class EnumVariantInfo {
+    var name: string
+    var fields: List<Ty>
+    var span: Span
+
+    constructor(name: string, fields: List<Ty>, span: Span) {
+        this.name = name
+        this.fields = fields
+        this.span = span
+    }
+}
+
+class InterfaceMemberInfo {
+    var span: Span
+    var name: string
+    var isProperty: bool
+    var ty: Ty
+    var params: List<ParamInfo>
+
+    constructor(span: Span, name: string, isProperty: bool, ty: Ty, params: List<ParamInfo>) {
+        this.span = span
+        this.name = name
+        this.isProperty = isProperty
+        this.ty = ty
+        this.params = params
+    }
+}
+
+class InterfaceTable {
+    var name: string
+    var span: Span
+    var visibility: Visibility
+    var generics: List<string>
+    var extends: List<Ty>
+    var members: List<InterfaceMemberInfo>
+
+    constructor(name: string, span: Span, visibility: Visibility, generics: List<string>, extends: List<Ty>, members: List<InterfaceMemberInfo>) {
+        this.name = name
+        this.span = span
+        this.visibility = visibility
+        this.generics = generics
+        this.extends = extends
+        this.members = members
+    }
+}
+
+enum TypeTableEntry {
+    Class(t: ClassTable)
+    Struct(t: ClassTable)
+    Enum(t: EnumTable)
+    Interface(t: InterfaceTable)
+}
+
+fn entryName(e: TypeTableEntry) -> string {
+    match (e) {
+        case TypeTableEntry.Class(t) -> t.name
+        case TypeTableEntry.Struct(t) -> t.name
+        case TypeTableEntry.Interface(t) -> t.name
+        case TypeTableEntry.Enum(t) -> t.name
+    }
+}
+
+fn entryGenerics(e: TypeTableEntry) -> List<string> {
+    match (e) {
+        case TypeTableEntry.Class(t) -> t.generics
+        case TypeTableEntry.Struct(t) -> t.generics
+        case TypeTableEntry.Interface(t) -> t.generics
+        case TypeTableEntry.Enum(t) -> t.generics
+    }
+}
+
+fn entryKindName(e: TypeTableEntry) -> string {
+    match (e) {
+        case TypeTableEntry.Class(_) -> "class"
+        case TypeTableEntry.Struct(_) -> "struct"
+        case TypeTableEntry.Enum(_) -> "enum"
+        case TypeTableEntry.Interface(_) -> "interface"
+    }
+}
+
+enum ItemKindDecl {
+    Class(c: ClassDecl)
+    Struct(s: StructDecl)
+    Enum(e: EnumDecl)
+    Interface(i: InterfaceDecl)
+}
+
+class MethodSig {
+    var name: string
+    var params: List<ParamInfo>
+    var ret: Ty
+    var isStatic: bool
+
+    constructor(name: string, params: List<ParamInfo>, ret: Ty, isStatic: bool) {
+        this.name = name
+        this.params = params
+        this.ret = ret
+        this.isStatic = isStatic
+    }
+}
+
+class PendingFn {
+    var f: FnDecl
+    var isTest: bool
+
+    constructor(f: FnDecl, isTest: bool) {
+        this.f = f
+        this.isTest = isTest
+    }
+}
+
+class MemberTables {
+    var fields: List<FieldInfo>
+    var methods: List<CallableInfo>
+    var properties: List<PropertyInfo>
+    var ctor: CtorInfo?
+    var namedCtors: List<NamedCtorInfo>
+    var consts: List<FieldInfo>
+
+    constructor(fields: List<FieldInfo>, methods: List<CallableInfo>, properties: List<PropertyInfo>, ctor: CtorInfo?, namedCtors: List<NamedCtorInfo>, consts: List<FieldInfo>) {
+        this.fields = fields
+        this.methods = methods
+        this.properties = properties
+        this.ctor = ctor
+        this.namedCtors = namedCtors
+        this.consts = consts
+    }
+}
+
+class ResolvedProgram {
+    var types: Map<string, TypeTableEntry>
+    var fns: Map<string, List<CallableInfo>>
+    var consts: List<FieldInfo>
+    /// Top-level `var` slots. Kept apart from `consts` because `const` is
+    /// inlined at each use site while a global needs a real data symbol.
+    var globals: List<FieldInfo>
+    var importAliases: Map<string, List<string>>
+    var modulePath: List<string>
+
+    constructor(types: Map<string, TypeTableEntry>, fns: Map<string, List<CallableInfo>>, consts: List<FieldInfo>, globals: List<FieldInfo>, importAliases: Map<string, List<string>>, modulePath: List<string>) {
+        this.types = types
+        this.fns = fns
+        this.consts = consts
+        this.globals = globals
+        this.importAliases = importAliases
+        this.modulePath = modulePath
+    }
+
+    fn resolveTy(te: TypeExpr, generics: List<string>, diags: DiagnosticSink) -> Ty {
+        TypeCtx(diags, this.types, this.importAliases).resolveTy(te, generics)
+    }
+}
+
+class Resolver {
+    var diags: DiagnosticSink
+    var types: Map<string, TypeTableEntry>
+    var fns: Map<string, List<CallableInfo>>
+    var consts: List<FieldInfo>
+    var globals: List<FieldInfo>
+    var importAliases: Map<string, List<string>>
+    var modulePath: List<string>
+
+    constructor(diags: DiagnosticSink) {
+        this.diags = diags
+        this.types = emptyMapTypes()
+        this.fns = emptyMapFns()
+        this.consts = emptyFieldInfos()
+        this.globals = emptyFieldInfos()
+        this.importAliases = emptyMapAliases()
+        this.modulePath = emptyStrs()
+    }
+
+    fn resolve( prog: Program) -> ResolvedProgram {
+        this.modulePath = emptyStrs()
+        if (let some(m) = prog.modDecl) {
+            this.modulePath = m.path
+        }
+
+        this.declareBuiltins()
+        this.declarePreludeInterfaces()
+
+        for (imp in prog.imports) {
+            match (imp.kind) {
+                case ImportKind.Module(al) -> {
+                    var alias = ""
+                    if (let some(a) = al) {
+                        alias = a
+                    } else if (len(imp.source) > 0) {
+                        alias = imp.source[len(imp.source) - 1]
+                    }
+                    if (this.importAliases.has(alias)) {
+                        this.diags.emit(Diagnostic.errorAt(imp.span, "duplicate import alias `" + alias + "`").withCode("E0202"))
+                    }
+                    this.importAliases[alias] = imp.source
+                }
+                case _ -> {}
+            }
+        }
+
+        var nmap = emptyMapSpans()
+        var pendingFn: List<PendingFn> = emptyPendingFns()
+        var pendingConst: List<ConstDecl> = emptyConstDecls()
+    var pendingGlobal: List<GlobalDecl> = emptyGlobalDecls()
+        var pendingKind: List<ItemKindDecl> = emptyItemKindDecls()
+
+        for (item in prog.items) {
+            var name = ""
+            var kind: ItemKindDecl? = none
+            match (item.kind) {
+                case ItemKind.Fn(f) -> {
+                    name = f.name
+                    kind = none
+                }
+                case ItemKind.Class(c) -> {
+                    name = c.name
+                    kind = ItemKindDecl.Class(c)
+                }
+                case ItemKind.Struct(s) -> {
+                    name = s.name
+                    kind = ItemKindDecl.Struct(s)
+                }
+                case ItemKind.Enum(e) -> {
+                    name = e.name
+                    kind = ItemKindDecl.Enum(e)
+                }
+                case ItemKind.Interface(i) -> {
+                    name = i.name
+                    kind = ItemKindDecl.Interface(i)
+                }
+                case ItemKind.Const(c) -> {
+                    name = c.name
+                    kind = none
+                }
+                case ItemKind.Global(g) -> {
+                    name = g.name
+                    kind = none
+                }
+                case ItemKind.Test(f) -> {
+                    name = f.name
+                    kind = none
+                }
+            }
+            if (nmap.has(name)) {
+                let first = nmap[name]
+                this.diags.emit(Diagnostic.errorAt(item.span, "duplicate declaration `" + name + "`").withCode("E0201").noteAt(first, "first declared here"))
+                continue
+            }
+            nmap[name] = item.span
+
+            if (let some(k) = kind) {
+                this.registerKindShell(k)
+                pendingKind.push(k)
+            } else {
+                match (item.kind) {
+                    case ItemKind.Fn(f) -> pendingFn.push(PendingFn(f, false))
+                    case ItemKind.Test(f) -> pendingFn.push(PendingFn(f, true))
+                    case ItemKind.Const(c) -> pendingConst.push(c)
+                    case ItemKind.Global(g) -> pendingGlobal.push(g)
+                    case _ -> {}
+                }
+            }
+        }
+
+        for (p in pendingFn) {
+            this.declareFn(p.f, p.isTest)
+        }
+        for (c in pendingConst) {
+            this.declareConst(c)
+        }
+        for (g in pendingGlobal) {
+            this.declareGlobal(g)
+        }
+        for (k in pendingKind) {
+            this.fillKind(k)
+        }
+
+        this.postChecks()
+
+        ResolvedProgram(this.types, this.fns, this.consts, this.globals, this.importAliases, this.modulePath)
+    }
+
+    fn registerKindShell( k: ItemKindDecl) {
+        match (k) {
+            case ItemKindDecl.Class(c) -> this.registerClassShell(c)
+            case ItemKindDecl.Struct(s) -> this.registerStructShell(s)
+            case ItemKindDecl.Enum(e) -> this.registerEnumShell(e)
+            case ItemKindDecl.Interface(i) -> this.registerInterfaceShell(i)
+        }
+    }
+
+    fn fillKind( k: ItemKindDecl) {
+        match (k) {
+            case ItemKindDecl.Class(c) -> this.fillClass(c)
+            case ItemKindDecl.Struct(s) -> this.fillStruct(s)
+            case ItemKindDecl.Enum(e) -> this.fillEnum(e)
+            case ItemKindDecl.Interface(i) -> this.fillInterface(i)
+        }
+    }
+
+    fn declareFn( f: FnDecl, isTest: bool) {
+        let generics = genericsOfDecl(f.generics)
+        let params = this.resolveParams(f.params, generics)
+        let ret = this.resolveRet(f.returnTy, generics)
+        let c = CallableInfo(f.name, f.span, f.visibility, f.isAsync, true, false, false, none, generics, params, ret)
+        if (this.fns.has(f.name)) {
+            this.fns[f.name].push(c)
+        } else {
+            this.fns[f.name] = [c]
+        }
+        let _ = isTest
+    }
+
+    fn declareBuiltins() {
+        let span = Span(0, 0)
+        let bs = emptyCallableInfos()
+        bs.push(mkBuiltin(span, "print", [anyParam(span, "args")], Ty.Empty))
+        bs.push(mkBuiltin(span, "println", [anyParam(span, "args")], Ty.Empty))
+        bs.push(mkBuiltin(span, "len", [anyParam(span, "items")], Ty.Int))
+        bs.push(mkBuiltin(span, "abs", [anyParam(span, "x")], Ty.Unknown))
+        bs.push(mkBuiltin(span, "min", [anyParam(span, "bounds")], Ty.Unknown))
+        bs.push(mkBuiltin(span, "max", [anyParam(span, "bounds")], Ty.Unknown))
+        bs.push(mkBuiltin(span, "clamp", [anyParam(span, "bounds")], Ty.Unknown))
+        bs.push(mkBuiltin(span, "str", [anyParam(span, "x")], Ty.String))
+        bs.push(mkBuiltin(span, "range", [anyParam(span, "bounds")], Ty.List(Ty.Int)))
+        bs.push(mkBuiltin(span, "read_file", [anyParam(span, "path")], Ty.Option(Ty.String)))
+        bs.push(mkBuiltin(span, "write_file", [anyParam(span, "path"), anyParam(span, "text")], Ty.Bool))
+        bs.push(mkBuiltin(span, "file_exists", [anyParam(span, "path")], Ty.Bool))
+        bs.push(mkBuiltin(span, "delete", [anyParam(span, "path")], Ty.Bool))
+        bs.push(mkBuiltin(span, "mkdir", [anyParam(span, "path")], Ty.Bool))
+        bs.push(mkBuiltin(span, "list_dir", [anyParam(span, "path")], Ty.Option(Ty.List(Ty.String))))
+        bs.push(mkBuiltin(span, "bytes", [anyParam(span, "s")], Ty.List(Ty.Byte)))
+        bs.push(mkBuiltin(span, "stream_open_read", [anyParam(span, "path")], Ty.Option(Ty.Stream)))
+        bs.push(mkBuiltin(span, "stream_open_write", [anyParam(span, "path")], Ty.Option(Ty.Stream)))
+        bs.push(mkBuiltin(span, "stream_open_append", [anyParam(span, "path")], Ty.Option(Ty.Stream)))
+        bs.push(mkBuiltin(span, "stdout_stream", emptyParamInfos(), Ty.Stream))
+        bs.push(mkBuiltin(span, "stderr_stream", emptyParamInfos(), Ty.Stream))
+        bs.push(mkBuiltin(span, "args", emptyParamInfos(), Ty.List(Ty.String)))
+        bs.push(mkBuiltin(span, "run_cmd", [anyParam(span, "argv"), anyParam(span, "cwd"), anyParam(span, "envs"), anyParam(span, "env_removes"), anyParam(span, "stdin_bytes"), anyParam(span, "max_out"), anyParam(span, "timeout_ms"), anyParam(span, "inherit_io")], Ty.Option(Ty.Tuple([Ty.Option(Ty.Int), Ty.String, Ty.String, Ty.Bool]))))
+        bs.push(mkBuiltin(span, "run_spawn", [anyParam(span, "argv"), anyParam(span, "cwd"), anyParam(span, "envs"), anyParam(span, "env_removes"), anyParam(span, "max_out")], Ty.Option(Ty.Stream)))
+        bs.push(mkBuiltin(span, "proc_wait", [anyParam(span, "h")], Ty.Bool))
+        bs.push(mkBuiltin(span, "proc_running", [anyParam(span, "h")], Ty.Bool))
+        bs.push(mkBuiltin(span, "proc_code", [anyParam(span, "h")], Ty.Option(Ty.Int)))
+        bs.push(mkBuiltin(span, "proc_kill", [anyParam(span, "h")], Ty.Bool))
+        bs.push(mkBuiltin(span, "proc_out_read", [anyParam(span, "h"), anyParam(span, "n")], Ty.Option(Ty.List(Ty.Byte))))
+        bs.push(mkBuiltin(span, "proc_err_read", [anyParam(span, "h"), anyParam(span, "n")], Ty.Option(Ty.List(Ty.Byte))))
+        bs.push(mkBuiltin(span, "proc_in_write", [anyParam(span, "h"), anyParam(span, "b")], Ty.Int))
+        bs.push(mkBuiltin(span, "proc_in_close", [anyParam(span, "h")], Ty.Bool))
+        bs.push(mkBuiltin(span, "current_dir", emptyParamInfos(), Ty.Option(Ty.String)))
+        bs.push(mkBuiltin(span, "exit", emptyParamInfos(), Ty.Empty))
+        bs.push(mkBuiltin(span, "captureBegin", emptyParamInfos(), Ty.Empty))
+        bs.push(mkBuiltin(span, "captureTake", emptyParamInfos(), Ty.Option(Ty.String)))
+        // --- Tasks ---
+        //
+        // A task handle is a plain `int` naming a row in the runtime's task
+        // table, and a task body is a zero-argument `fn` value (a closure
+        // object). These are the raw handles; the `std.thread` module wraps them
+        // in classes, so the builtin names are prefixed rather than competing
+        // with the friendly ones.
+        bs.push(mkBuiltin(span, "thread_spawn", [anyParam(span, "body")], Ty.Int))
+        bs.push(mkBuiltin(span, "thread_join", [anyParam(span, "task")], Ty.Bool))
+        bs.push(mkBuiltin(span, "thread_finished", [anyParam(span, "task")], Ty.Bool))
+        bs.push(mkBuiltin(span, "thread_message", [anyParam(span, "task")], Ty.Option(Ty.String)))
+        bs.push(mkBuiltin(span, "thread_count", emptyParamInfos(), Ty.Int))
+        bs.push(mkBuiltin(span, "thread_current", emptyParamInfos(), Ty.Int))
+        bs.push(mkBuiltin(span, "sleep_ms", [anyParam(span, "ms")], Ty.Empty))
+        bs.push(mkBuiltin(span, "thread_yield", emptyParamInfos(), Ty.Empty))
+        // `win_sleep` lowers to an `__imp_Sleep` extern (`VOID Sleep(DWORD)`):
+        // a `#[symbol]` body can occupy the `pickle_thread_sleep_ms` slot with
+        // real wall-clock sleep and no Rust shim.
+        bs.push(mkBuiltin(span, "win_sleep", [anyParam(span, "ms")], Ty.Empty))
+        // --- Win32 imports ---
+        //
+        // `win_thread_id` lowers to an `__imp_GetCurrentThreadId` extern. The
+        // linker already exempts every `__imp_*` symbol from archive
+        // resolution (`linklib::externReqs`) and mints a KERNEL32.dll import
+        // entry for it (`pelink::buildExe`), so this is the front-end half of a
+        // path the back end had all along: a Pickle runtime body can reach the
+        // OS without a Rust shim.
+        //
+        // This is what makes TLS reachable. `shadow::push_frame` needs a
+        // per-thread handle, and `__declspec(thread)` would need new codegen;
+        // Win32's thread-local storage (`TlsAlloc`/`TlsGetValue`) is an
+        // ordinary import instead, so the shadow stack can be ported once this
+        // exists.
+        bs.push(mkBuiltin(span, "win_thread_id", emptyParamInfos(), Ty.Int))
+        // Win32 thread-local storage, reachable as ordinary imports, so a
+        // Pickle body can get a per-thread slot without `__declspec(thread)`
+        // and therefore without any new codegen. This is what `push_frame`
+        // needs: the reference keeps the current thread's `GcThread*` in a
+        // `thread_local!`.
+        //
+        // `Tls*` rather than `Fls*`: both hand out the same slots, but setting
+        // a value through `FlsSetValue` faults during teardown in this
+        // environment (reproduced with plain P/Invoke, no Pickle involved),
+        // while `TlsSetValue` exits cleanly.
+        bs.push(mkBuiltin(span, "win_tls_alloc", emptyParamInfos(), Ty.Int))
+        bs.push(mkBuiltin(span, "win_tls_get", [anyParam(span, "slot")], Ty.Int))
+        bs.push(mkBuiltin(span, "win_tls_set", [anyParam(span, "slot"), anyParam(span, "value")], Ty.Int))
+        // Process termination as an import. This exists so a `#[symbol]` body
+        // can occupy the `pickle_exit` slot without the Rust implementation
+        // behind it: the reference both flushes and exits, and only the flush
+        // half needs the runtime. A body in a module the JIT never imports
+        // keeps the reference behaviour there.
+            bs.push(mkBuiltin(span, "win_exit", [anyParam(span, "code")], Ty.Empty))
+            // The process heap as an import triple, so a `#[symbol]` body can
+            // occupy `pickle_raw_alloc` / `pickle_raw_free` without a Rust shim.
+            // `HeapAlloc(GetProcessHeap(), 0, n)` is what Rust's `System`
+            // allocator uses on Windows, which is what makes the two
+            // implementations' pointers interchangeable.
+            bs.push(mkBuiltin(span, "win_get_process_heap", emptyParamInfos(), Ty.Int))
+            bs.push(mkBuiltin(span, "win_heap_alloc", [anyParam(span, "heap"), anyParam(span, "flags"), anyParam(span, "size")], Ty.Int))
+                bs.push(mkBuiltin(span, "win_heap_free", [anyParam(span, "heap"), anyParam(span, "flags"), anyParam(span, "ptr")], Ty.Empty))
+                // The filesystem entry points, so a `#[symbol]` body can own
+                // the whole `fs.rs` surface. All twelve are KERNEL32, which is
+                // the DLL `win_import_addr` and `pelink::isShellImp` already
+                // fall back to, so no link-side table learns these names.
+                bs.push(mkBuiltin(span, "win_get_file_attributes_w", [anyParam(span, "path")], Ty.Int))
+                bs.push(mkBuiltin(span, "win_delete_file_w", [anyParam(span, "path")], Ty.Int))
+                bs.push(mkBuiltin(span, "win_remove_directory_w", [anyParam(span, "path")], Ty.Int))
+                bs.push(mkBuiltin(span, "win_create_directory_w", [anyParam(span, "path"), anyParam(span, "sec")], Ty.Int))
+                // `(0, NULL)` is the sizing call: it returns the UTF-16 units
+                // a real call would need, counting the terminator.
+                bs.push(mkBuiltin(span, "win_get_current_directory_w", [anyParam(span, "cap"), anyParam(span, "buf")], Ty.Int))
+                bs.push(mkBuiltin(span, "win_create_file_w", [anyParam(span, "name"), anyParam(span, "access"), anyParam(span, "share"), anyParam(span, "sec"), anyParam(span, "disp"), anyParam(span, "flags"), anyParam(span, "tmpl")], Ty.Int))
+                bs.push(mkBuiltin(span, "win_read_file", [anyParam(span, "handle"), anyParam(span, "buf"), anyParam(span, "n"), anyParam(span, "pRead"), anyParam(span, "ov")], Ty.Int))
+                bs.push(mkBuiltin(span, "win_write_file", [anyParam(span, "handle"), anyParam(span, "buf"), anyParam(span, "n"), anyParam(span, "pWritten"), anyParam(span, "ov")], Ty.Int))
+                bs.push(mkBuiltin(span, "win_close_handle", [anyParam(span, "handle")], Ty.Int))
+                bs.push(mkBuiltin(span, "win_find_first_file_w", [anyParam(span, "pattern"), anyParam(span, "data")], Ty.Int))
+                bs.push(mkBuiltin(span, "win_find_next_file_w", [anyParam(span, "handle"), anyParam(span, "data")], Ty.Int))
+                bs.push(mkBuiltin(span, "win_find_close", [anyParam(span, "handle")], Ty.Int))
+                // The console handles Rust's `nostd::console_write` /
+                // `console_error_write` write to. `STD_OUTPUT_HANDLE` is
+                // `(DWORD)-11` and `STD_ERROR_HANDLE` is `(DWORD)-12`; both fit
+                // in an `int` and both are KERNEL32, so the FS block's note
+                // about `win_import_addr` applies here too.
+                bs.push(mkBuiltin(span, "win_get_std_handle", [anyParam(span, "which")], Ty.Int))
+                // The command line, so a `#[symbol]` body can own the
+                // `pickle_args` slot without a Rust shim: `GetCommandLineW`
+                // (KERNEL32) hands back the process's own UTF-16 line, and
+                // `CommandLineToArgvW` - the one name `pelink::isShellImp`
+                // routes to SHELL32 - splits it into a null-terminated
+                // `LPWSTR*` that `LocalFree` (KERNEL32) releases.
+                bs.push(mkBuiltin(span, "win_get_command_line_w", emptyParamInfos(), Ty.Int))
+                bs.push(mkBuiltin(span, "win_command_line_to_argv_w", [anyParam(span, "cmdline"), anyParam(span, "pargs")], Ty.Int))
+                bs.push(mkBuiltin(span, "win_local_free", [anyParam(span, "mem")], Ty.Empty))
+                // Process spawning, so `run_cmd` can own child creation
+                // without a Rust shim: `CreateProcessW` takes the resolved
+                // application, the mutable command line, both attribute
+                // blocks (always null here), the inherit flag, the creation
+                // flags, the environment block, the working directory, and
+                // the `STARTUPINFO`/`PROCESS_INFORMATION` out-structs. The
+                // pipe and handle calls wire the three stdio streams
+                // inheritable-side-first; the wait/exit calls implement the
+                // timeout and status capture; and the environment/module/
+                // directory queries feed the environment block and the
+                // `resolve_exe` search path.
+                bs.push(mkBuiltin(span, "win_create_process_w", [anyParam(span, "app"), anyParam(span, "cmdline"), anyParam(span, "procAttr"), anyParam(span, "threadAttr"), anyParam(span, "inherit"), anyParam(span, "flags"), anyParam(span, "env"), anyParam(span, "cwd"), anyParam(span, "si"), anyParam(span, "pi")], Ty.Int))
+                bs.push(mkBuiltin(span, "win_create_pipe", [anyParam(span, "pRead"), anyParam(span, "pWrite"), anyParam(span, "sec"), anyParam(span, "size")], Ty.Int))
+                bs.push(mkBuiltin(span, "win_set_handle_information", [anyParam(span, "handle"), anyParam(span, "mask"), anyParam(span, "flags")], Ty.Int))
+                bs.push(mkBuiltin(span, "win_wait_single", [anyParam(span, "handle"), anyParam(span, "ms")], Ty.Int))
+                bs.push(mkBuiltin(span, "win_get_exit_code_process", [anyParam(span, "handle"), anyParam(span, "pCode")], Ty.Int))
+                bs.push(mkBuiltin(span, "win_terminate_process", [anyParam(span, "handle"), anyParam(span, "code")], Ty.Int))
+                bs.push(mkBuiltin(span, "win_peek_pipe", [anyParam(span, "handle"), anyParam(span, "buf"), anyParam(span, "n"), anyParam(span, "pRead"), anyParam(span, "pAvail")], Ty.Int))
+                bs.push(mkBuiltin(span, "win_get_environment_strings_w", emptyParamInfos(), Ty.Int))
+                bs.push(mkBuiltin(span, "win_free_environment_strings_w", [anyParam(span, "block")], Ty.Int))
+                bs.push(mkBuiltin(span, "win_get_module_file_name_w", [anyParam(span, "module"), anyParam(span, "buf"), anyParam(span, "size")], Ty.Int))
+                bs.push(mkBuiltin(span, "win_get_system_directory_w", [anyParam(span, "buf"), anyParam(span, "size")], Ty.Int))
+                bs.push(mkBuiltin(span, "win_get_windows_directory_w", [anyParam(span, "buf"), anyParam(span, "size")], Ty.Int))
+                bs.push(mkBuiltin(span, "win_tick_ms64", emptyParamInfos(), Ty.Int))
+        // --- Garbage collection ---
+        //
+        // The delegation point from Pickle into the live collector. Named
+        // `gcCollect`, not `collect`, because `runtime.collector` and
+        // `runtime.gc` already define their own `collect`.
+        bs.push(mkBuiltin(span, "gcCollect", [boolParam(span, "force")], Ty.Empty))
+        // The collector's OBSERVABLE contract. `gcCollect` alone cannot be
+        // driven from Pickle end-to-end because the auto-collect trigger is
+        // invisible: nothing in the language can observe bytes-since-GC, ask
+        // whether a collection is due, read the collection count, or pin the
+        // threshold. These three expose the existing `pickle_gc_*` counters
+        // (gc.rs:714/720/727) so a Pickle-side runtime can own the decision
+        // instead of mirroring it.
+        bs.push(mkBuiltin(span, "gcAllocationsSinceGc", emptyParamInfos(), Ty.Int))
+        // BYTES, not a count. `maybe_collect` compares `BYTES_SINCE_GC` against
+        // `AUTO_THRESHOLD`, so this - not `gcAllocationsSinceGc` - is what a
+        // self-hosted runtime reads to own the trigger.
+        bs.push(mkBuiltin(span, "gcBytesSinceGc", emptyParamInfos(), Ty.Int))
+        bs.push(mkBuiltin(span, "gcCollectionCount", emptyParamInfos(), Ty.Int))
+        bs.push(mkBuiltin(span, "gcSetThreshold", [intParam(span, "bytes")], Ty.Empty))
+        // --- Synchronisation ---
+        //
+        // Mutex/cond/semaphore/atomic/once handles are `int`s too. A handle is 0
+        // for `none` and names a row in the runtime's primitive table; using one
+        // as the wrong kind of primitive is a runtime error, not a silent
+        // confusion, because the primitives live in one table.
+        bs.push(mkBuiltin(span, "mutex_new", emptyParamInfos(), Ty.Int))
+        bs.push(mkBuiltin(span, "mutex_lock", [anyParam(span, "m")], Ty.Empty))
+        bs.push(mkBuiltin(span, "mutex_trylock", [anyParam(span, "m")], Ty.Bool))
+        bs.push(mkBuiltin(span, "mutex_unlock", [anyParam(span, "m")], Ty.Empty))
+        bs.push(mkBuiltin(span, "cond_new", emptyParamInfos(), Ty.Int))
+        bs.push(mkBuiltin(span, "cond_signal", [anyParam(span, "c")], Ty.Empty))
+        bs.push(mkBuiltin(span, "cond_broadcast", [anyParam(span, "c")], Ty.Empty))
+        bs.push(mkBuiltin(span, "cond_wait", [anyParam(span, "c"), anyParam(span, "m")], Ty.Empty))
+        bs.push(mkBuiltin(span, "sem_new", [anyParam(span, "permits")], Ty.Int))
+        bs.push(mkBuiltin(span, "sem_acquire", [anyParam(span, "s"), anyParam(span, "n")], Ty.Empty))
+        bs.push(mkBuiltin(span, "sem_try_acquire", [anyParam(span, "s"), anyParam(span, "n")], Ty.Bool))
+        bs.push(mkBuiltin(span, "sem_release", [anyParam(span, "s"), anyParam(span, "n")], Ty.Empty))
+        bs.push(mkBuiltin(span, "atomic_new", [anyParam(span, "value")], Ty.Int))
+        bs.push(mkBuiltin(span, "atomic_load", [anyParam(span, "a")], Ty.Int))
+        bs.push(mkBuiltin(span, "atomic_store", [anyParam(span, "a"), anyParam(span, "value")], Ty.Empty))
+        bs.push(mkBuiltin(span, "atomic_add", [anyParam(span, "a"), anyParam(span, "delta")], Ty.Int))
+        bs.push(mkBuiltin(span, "atomic_cas", [anyParam(span, "a"), anyParam(span, "expected"), anyParam(span, "value")], Ty.Bool))
+        bs.push(mkBuiltin(span, "once_new", emptyParamInfos(), Ty.Int))
+        bs.push(mkBuiltin(span, "once_done", [anyParam(span, "o")], Ty.Bool))
+        bs.push(mkBuiltin(span, "once_run", [anyParam(span, "o"), anyParam(span, "body")], Ty.Bool))
+        // --- Channels ---
+        //
+        // A channel is an `int` handle like the other synchronisation objects.
+        // A v1 channel carries raw integers (the runtime stores the scalar
+        // bits in the ring and boxes them only on receive), so the element is
+        // `int` both ways and the `value` slot is statically an `int`;
+        // `channel_recv` is a definite value, `channel_try_recv` is `none`.
+        bs.push(mkBuiltin(span, "channel_new", [anyParam(span, "cap")], Ty.Int))
+        bs.push(mkBuiltin(span, "channel_cap", [anyParam(span, "ch")], Ty.Int))
+        bs.push(mkBuiltin(span, "channel_len", [anyParam(span, "ch")], Ty.Int))
+        bs.push(mkBuiltin(span, "channel_send", [anyParam(span, "ch"), intParam(span, "value")], Ty.Empty))
+        bs.push(mkBuiltin(span, "channel_try_send", [anyParam(span, "ch"), intParam(span, "value")], Ty.Bool))
+        bs.push(mkBuiltin(span, "channel_recv", [anyParam(span, "ch")], Ty.Int))
+        bs.push(mkBuiltin(span, "channel_try_recv", [anyParam(span, "ch")], Ty.Option(Ty.Int)))
+        bs.push(mkBuiltin(span, "channel_close", [anyParam(span, "ch")], Ty.Empty))
+bs.push(mkBuiltin(span, "channel_closed", [anyParam(span, "ch")], Ty.Bool))
+          // --- Bit reinterpret + class names ---
+          //
+          // Both exist for the `pickle_print_obj` port in
+          // `pickle/runtime/abi_console.pkl`.
+          //
+          // `f64FromBits` has no source-level spelling and so cannot be written
+          // as user code: `x as float` is a *numeric* conversion, not a bitcast
+          // (verified - `1072693248 as float` yields `1072693248`, not `0.5`).
+          // It is the exact inverse of the boxing side, which stores
+          // `v.to_bits()`.
+          bs.push(mkBuiltin(span, "f64FromBits", [intParam(span, "bits")], Ty.Float))
+          // The user-class fallback arm of `pickle_print_obj` needs the
+          // collector's descriptor-name lookup, which had no symbol to call.
+          // Returns a `string` object, or `none` when the id has no descriptor.
+          bs.push(mkBuiltin(span, "className", [intParam(span, "classId")], Ty.String))
+          bs.push(mkBuiltin(span, "assert", [anyParam(span, "args")], Ty.Empty))
+        for (c in bs) {
+            if (this.fns.has(c.name)) {
+                this.fns[c.name].push(c)
+            } else {
+                this.fns[c.name] = [c]
+            }
+        }
+    }
+
+    fn declarePreludeInterfaces() {
+        let span = Span(0, 0)
+        let tvar = Ty.Var("T")
+        let iterable = InterfaceTable("Iterable", span, Visibility.Public, ["T"], emptyTys(), [InterfaceMemberInfo(span, "iterator", false, Ty.Interface("Iterator", [tvar]), emptyParamInfos())])
+        this.types["Iterable"] = TypeTableEntry.Interface(iterable)
+        let iterator = InterfaceTable("Iterator", span, Visibility.Public, ["T"], emptyTys(), [InterfaceMemberInfo(span, "next", false, Ty.Option(tvar), emptyParamInfos())])
+        this.types["Iterator"] = TypeTableEntry.Interface(iterator)
+    }
+
+    fn declareConst( c: ConstDecl) {
+        var ct = Ty.Unknown
+        if (let some(t) = c.ty) {
+            ct = this.resolveTy(t, emptyStrs())
+        }
+        this.consts.push(FieldInfo(c.name, c.visibility, true, false, true, false, ct, c.span))
+    }
+
+    /// A top-level `var` occupies real storage, so it is tracked in its own
+    /// table rather than `consts` (which is inlined at use sites). Keeping the
+    /// two separate is what lets the emitter decide "copy a literal" vs
+    /// "emit a load from a data symbol".
+fn declareGlobal( g: GlobalDecl) {
+   var gt = Ty.Unknown
+   if (let some(t) = g.ty) {
+   gt = this.resolveTy(t, emptyStrs())
+   } else {
+   gt = inferGlobalTy(g.value)
+   }
+   this.globals.push(FieldInfo(g.name, g.visibility, true, true, false, false, gt, g.span))
+   }
+
+/// Type of a top-level `var` declared without a `: T` annotation.
+///
+/// Inference is deliberately limited to an integer literal (optionally
+/// negated) because that is the only initializer shape the emitter can turn
+/// into static data; anything else resolves to `Unknown` and is reported as
+/// unsupported later, at codegen, rather than silently guessing.
+fn inferGlobalTy(value: Expr) -> Ty {
+   match (value.kind) {
+   case ExprKind.Lit(Lit.Int(_)) -> Ty.Int
+   case ExprKind.Unary(_, operand) -> match (operand.kind) {
+   case ExprKind.Lit(Lit.Int(_)) -> Ty.Int
+   case _ -> Ty.Unknown
+   }
+   case _ -> Ty.Unknown
+   }
+   }
+
+    fn typeCtx() -> TypeCtx {
+        TypeCtx(this.diags, this.types, this.importAliases)
+    }
+
+    fn resolveTy( te: TypeExpr, generics: List<string>) -> Ty {
+        this.typeCtx().resolveTy(te, generics)
+    }
+
+    fn resolveParam( p: Param, generics: List<string>) -> ParamInfo {
+        let ctx = this.typeCtx()
+        var pt = Ty.Unknown
+        if (let some(t) = p.ty) {
+            pt = ctx.resolveTy(t, generics)
+        }
+        let hasDefault = if (let some(_) = p.default) { true } else { false }
+        ParamInfo(p.name, pt, hasDefault, p.rest, p.span)
+    }
+
+    fn resolveParams( params: List<Param>, generics: List<string>) -> List<ParamInfo> {
+        var out = emptyParamInfos()
+        for (p in params) {
+            out.push(this.resolveParam(p, generics))
+        }
+        out
+    }
+
+    fn resolveRet( rt: TypeExpr?, generics: List<string>) -> Ty {
+        let ctx = this.typeCtx()
+        if (let some(t) = rt) {
+            ctx.resolveTy(t, generics)
+        } else {
+            Ty.Empty
+        }
+    }
+
+    fn initExprTy( e: Expr, generics: List<string>) -> Ty? {
+        match (e.kind) {
+            case ExprKind.Lit(l) -> match (l) {
+                case Lit.String(_) -> Ty.String
+                case Lit.Int(_) -> Ty.Int
+                case Lit.Float(_) -> Ty.Float
+                case Lit.Char(_) -> Ty.Char
+                case Lit.Bool(_) -> Ty.Bool
+                case Lit.None -> Ty.None
+            }
+            case ExprKind.Array(items) -> {
+                var elem = Ty.Unknown
+                if (len(items) > 0) {
+                    if (let some(t) = this.initExprTy(items[0], generics)) {
+                        elem = t
+                    }
+                }
+                Ty.List(elem)
+            }
+            case ExprKind.Map(entries) -> {
+                var kt = Ty.Unknown
+                var vt = Ty.Unknown
+                if (len(entries) > 0) {
+                    if (let some(t) = this.initExprTy(entries[0].key, generics)) {
+                        kt = t
+                    }
+                    if (let some(t) = this.initExprTy(entries[0].value, generics)) {
+                        vt = t
+                    }
+                }
+                Ty.Map(kt, vt)
+            }
+            case ExprKind.Tuple(parts) -> {
+                let ts = emptyTys()
+                for (i in parts) {
+                    if (let some(t) = this.initExprTy(i, generics)) {
+                        ts.push(t)
+                    } else {
+                        ts.push(Ty.Unknown)
+                    }
+                }
+                Ty.Tuple(ts)
+            }
+            case ExprKind.Call(callee, args) -> match (callee.kind) {
+                case ExprKind.GenericCall(n, tas) -> if (len(tas) > 0) {
+                    this.resolveTy(tas[0], generics)
+                } else {
+                    none
+                }
+                case ExprKind.Ident(n) -> match (this.types.get(n)) {
+                    case some(e) -> match (e) {
+                        case TypeTableEntry.Class(t) -> if (len(t.generics) == 0) {
+                            Ty.Class(n, emptyTys())
+                        } else {
+                            none
+                        }
+                        case TypeTableEntry.Struct(t) -> if (len(t.generics) == 0) {
+                            Ty.Struct(n, emptyTys())
+                        } else {
+                            none
+                        }
+                        case TypeTableEntry.Enum(t) -> if (len(t.generics) == 0) {
+                            Ty.Enum(n, emptyTys())
+                        } else {
+                            none
+                        }
+                        case _ -> none
+                    }
+                    case none -> none
+                }
+                case _ -> none
+            }
+            case _ -> none
+        }
+    }
+
+    fn registerClassShell( c: ClassDecl) {
+        let generics = genericsOfDecl(c.generics)
+        this.types[c.name] = TypeTableEntry.Class(ClassTable(c.name, c.span, c.visibility, generics, none, emptyTys(), emptyFieldInfos(), emptyCallableInfos(), emptyPropertyInfos(), none, emptyNamedCtorInfos(), emptyFieldInfos()))
+    }
+
+    fn registerStructShell( s: StructDecl) {
+        let generics = genericsOfDecl(s.generics)
+        this.types[s.name] = TypeTableEntry.Struct(ClassTable(s.name, s.span, s.visibility, generics, none, emptyTys(), emptyFieldInfos(), emptyCallableInfos(), emptyPropertyInfos(), none, emptyNamedCtorInfos(), emptyFieldInfos()))
+    }
+
+    fn registerEnumShell( e: EnumDecl) {
+        let generics = genericsOfDecl(e.generics)
+        this.types[e.name] = TypeTableEntry.Enum(EnumTable(e.name, e.span, e.visibility, generics, emptyTys(), emptyVariantInfos()))
+    }
+
+    fn registerInterfaceShell( i: InterfaceDecl) {
+        let generics = genericsOfDecl(i.generics)
+        this.types[i.name] = TypeTableEntry.Interface(InterfaceTable(i.name, i.span, i.visibility, generics, emptyTys(), emptyIfaceMemberInfos()))
+    }
+
+    fn fillClass( c: ClassDecl) {
+        let generics = genericsOfDecl(c.generics)
+        var ext: Ty? = none
+        if (let some(e) = c.extends) {
+            ext = this.resolveTy(e, generics)
+        }
+        if (let some(t) = ext) {
+            if (!isClassTy(t)) {
+                this.diags.emit(Diagnostic.errorAt(c.span, "`" + c.name + "` may only extend a class").withCode("E0220"))
+            }
+        }
+        let imp = emptyTys()
+        for (t in c.implements) {
+            imp.push(this.resolveTy(t, generics))
+        }
+        let members = this.resolveClassMembers(c.members, generics, c.name)
+        if (this.types.has(c.name)) {
+            match (this.types[c.name]) {
+                case TypeTableEntry.Class(t) -> {
+                    t.extends = ext
+                    t.implements = imp
+                    t.fields = members.fields
+                    t.methods = members.methods
+                    t.properties = members.properties
+                    t.ctor = members.ctor
+                    t.namedCtors = members.namedCtors
+                    t.consts = members.consts
+                }
+                case _ -> {}
+            }
+        }
+    }
+
+    fn fillStruct( s: StructDecl) {
+        let generics = genericsOfDecl(s.generics)
+        let imp = emptyTys()
+        for (t in s.implements) {
+            imp.push(this.resolveTy(t, generics))
+        }
+        let members = this.resolveClassMembers(s.members, generics, s.name)
+        if (this.types.has(s.name)) {
+            match (this.types[s.name]) {
+                case TypeTableEntry.Struct(t) -> {
+                    t.implements = imp
+                    t.fields = members.fields
+                    t.methods = members.methods
+                    t.properties = members.properties
+                    t.ctor = members.ctor
+                    t.namedCtors = members.namedCtors
+                    t.consts = members.consts
+                }
+                case _ -> {}
+            }
+        }
+    }
+
+    fn fillEnum( e: EnumDecl) {
+        let generics = genericsOfDecl(e.generics)
+        let imp = emptyTys()
+        for (t in e.implements) {
+            imp.push(this.resolveTy(t, generics))
+        }
+        let variants = emptyVariantInfos()
+        for (v in e.variants) {
+            let tys = emptyTys()
+            for (f in v.fields) {
+                tys.push(this.resolveTy(f.ty, generics))
+            }
+            variants.push(EnumVariantInfo(v.name, tys, v.span))
+        }
+        if (this.types.has(e.name)) {
+            match (this.types[e.name]) {
+                case TypeTableEntry.Enum(t) -> {
+                    t.implements = imp
+                    t.variants = variants
+                }
+                case _ -> {}
+            }
+        }
+    }
+
+    fn fillInterface( i: InterfaceDecl) {
+        let generics = genericsOfDecl(i.generics)
+        let extends = emptyTys()
+        for (t in i.extends) {
+            extends.push(this.resolveTy(t, generics))
+        }
+        let members = emptyIfaceMemberInfos()
+        for (m in i.members) {
+            match (m) {
+                case InterfaceMember.Method(md) -> members.push(InterfaceMemberInfo(md.span, md.name, false, this.resolveRet(md.returnTy, generics), this.resolveParams(md.params, generics)))
+                case InterfaceMember.Property(name, ty, span) -> members.push(InterfaceMemberInfo(span, name, true, this.resolveTy(ty, generics), emptyParamInfos()))
+                case InterfaceMember.Const(name, value, span) -> members.push(InterfaceMemberInfo(span, name, true, Ty.Unknown, emptyParamInfos()))
+            }
+        }
+        if (this.types.has(i.name)) {
+            match (this.types[i.name]) {
+                case TypeTableEntry.Interface(t) -> {
+                    t.extends = extends
+                    t.members = members
+                }
+                case _ -> {}
+            }
+        }
+    }
+
+    fn resolveClassMembers( members: List<ClassMember>, generics: List<string>, className: string) -> MemberTables {
+        var fields = emptyFieldInfos()
+        var methods = emptyCallableInfos()
+        var properties = emptyPropertyInfos()
+        var ctor: CtorInfo? = none
+        var namedCtors = emptyNamedCtorInfos()
+        var consts = emptyFieldInfos()
+        var seen = emptyStrs()
+        var hasDeinit = false
+
+        for (m in members) {
+            match (m) {
+                case ClassMember.Field(name, ty, init, visibility, isStatic, isConst, attrs, span) -> {
+                    this.recordMember(seen, className, name, span)
+                    var ft = Ty.Unknown
+                    if (let some(t) = ty) {
+                        ft = this.resolveTy(t, generics)
+                    } else if (let some(e) = init) {
+                        if (let some(t2) = this.initExprTy(e, generics)) {
+                            ft = t2
+                        }
+                    }
+                    fields.push(FieldInfo(name, visibility, isStatic, !isConst, isConst, hasAttr(attrs, "manualAlloc"), ft, span))
+                }
+                case ClassMember.Const(name, visibility, ty, value, span) -> {
+                    this.recordMember(seen, className, name, span)
+                    var ct = Ty.Unknown
+                    if (let some(t) = ty) {
+                        ct = this.resolveTy(t, generics)
+                    }
+                    consts.push(FieldInfo(name, visibility, true, false, true, false, ct, span))
+                }
+                case ClassMember.Method(md) -> {
+                    this.recordMember(seen, className, md.name, md.span)
+                    let mg = genericsOfDecl(md.generics)
+                    methods.push(CallableInfo(md.name, md.span, md.visibility, md.isAsync, md.isStatic, md.isOverride, if (let some(_) = md.body) { false } else { true }, md.operator, mg, this.resolveParams(md.params, generics), this.resolveRet(md.returnTy, generics)))
+                }
+                case ClassMember.Constructor(cd) -> {
+                    let info = CtorInfo(cd.span, cd.visibility, this.resolveParams(cd.params, generics))
+                    if (let some(n) = cd.name) {
+                        this.recordMember(seen, className, n, cd.span)
+                        namedCtors.push(NamedCtorInfo(n, info))
+                    } else {
+                        if (let some(_) = ctor) {
+                            this.diags.emit(Diagnostic.errorAt(cd.span, "`" + className + "` already has a constructor").withCode("E0204"))
+                        }
+                        ctor = info
+                    }
+                }
+                case ClassMember.Property(p) -> {
+                    this.recordMember(seen, className, p.name, p.span)
+                    var pt = Ty.Unknown
+                    if (let some(t) = p.ty) {
+                        pt = this.resolveTy(t, generics)
+                    }
+                    let hasGet = if (let some(_) = p.get) { true } else { false }
+                    let hasSet = if (let some(_) = p.set) { true } else { false }
+                    properties.push(PropertyInfo(p.name, p.visibility, p.isStatic, pt, hasGet, hasSet, p.span))
+                }
+                case ClassMember.Init(_) -> {}
+                case ClassMember.Deinit(b) -> {
+                    if (hasDeinit) {
+                        this.diags.emit(Diagnostic.errorAt(b.span, "`" + className + "` already has a `deinit` block").withCode("E0205"))
+                    } else {
+                        hasDeinit = true
+                    }
+                }
+            }
+        }
+
+        MemberTables(fields, methods, properties, ctor, namedCtors, consts)
+    }
+
+    fn recordMember( seen: List<string>, className: string, name: string, span: Span) {
+        if (anyStr(seen, name)) {
+            this.diags.emit(Diagnostic.errorAt(span, "duplicate member `" + name + "` in `" + className + "`").withCode("E0203"))
+        } else {
+            seen.push(name)
+        }
+    }
+
+    fn postChecks() {
+        var classes = emptyClassTables()
+        let entries = this.types.values()
+        for (v in entries) {
+            match (v) {
+                case TypeTableEntry.Class(c) -> classes.push(c)
+                case _ -> {}
+            }
+        }
+        for (c in classes) {
+            if (let some(t) = c.extends) {
+                if (let some(parent) = named(t)) {
+                    this.checkInheritance(c, parent)
+                }
+            }
+        }
+    }
+
+    fn checkInheritance( c: ClassTable, parent: string) {
+        match (this.types.get(parent)) {
+            case some(e) -> match (e) {
+                case TypeTableEntry.Class(pclass) -> {
+                    let pname = pclass.name
+                    let parentMethods = this.collectMethodsRec(pname, emptyStrs())
+                    for (m in c.methods) {
+                        var found: MethodSig? = none
+                        for (s in parentMethods) {
+                            if (s.name == m.name) {
+                                found = s
+                            }
+                        }
+                        if (let some(pm) = found) {
+                            if (pm.isStatic != m.isStatic) {
+                                this.diags.emit(Diagnostic.errorAt(m.span, "`" + c.name + " `" + m.name + "` is `" + (if (m.isStatic) { "static" } else { "instance" }) + "` but `" + pname + "." + pm.name + "` is an " + (if (pm.isStatic) { "static" } else { "instance" }) + " method; a redeclaration must keep the same kind").withCode("E0224"))
+                                continue
+                            }
+                        }
+                        if (let some(pm) = found) {
+                            if (m.isOverride) {
+                                if (!sigCompatible(pm.params, pm.ret, m.params, m.ret)) {
+                                    this.diags.emit(Diagnostic.errorAt(m.span, "`" + c.name + " " + m.name + "` does not override `" + pname + " " + m.name + "`; signature mismatch").withCode("E0221").note("an override must match the parent's parameter and return types exactly"))
+                                }
+                            } else {
+                                this.diags.emit(Diagnostic.errorAt(m.span, "method `" + m.name + "` hides `" + pname + "." + pm.name + "` without `override`").withCode("E0222").note("add `override` to override the inherited method, or rename this method"))
+                            }
+                        } else {
+                            if (m.isOverride) {
+                                this.diags.emit(Diagnostic.errorAt(m.span, "`override` method `" + m.name + "` has no matching method in `" + pname + "` or its parents").withCode("E0223"))
+                            }
+                        }
+                    }
+                }
+                case _ -> {
+                    this.diags.emit(Diagnostic.errorAt(c.span, "`" + c.name + "` cannot inherit from non-class type `" + parent + "`").withCode("E0220"))
+                }
+            }
+            case none -> {
+                this.diags.emit(Diagnostic.errorAt(c.span, "`" + c.name + "` cannot inherit from non-class type `" + parent + "`").withCode("E0220"))
+            }
+        }
+    }
+
+    fn collectMethodsRec( cls: string, visited: List<string>) -> List<MethodSig> {
+        if (anyStr(visited, cls)) {
+            return emptyMethodSigs()
+        }
+        visited.push(cls)
+        var out = emptyMethodSigs()
+        match (this.types.get(cls)) {
+            case some(e) -> match (e) {
+                case TypeTableEntry.Class(t) -> {
+                    for (m in t.methods) {
+                        out.push(MethodSig(m.name, m.params, m.ret, m.isStatic))
+                    }
+                    if (let some(ext) = t.extends) {
+                        if (let some(parent) = named(ext)) {
+                            let sub = this.collectMethodsRec(parent, visited)
+                            for (s in sub) {
+                                out.push(s)
+                            }
+                        }
+                    }
+                }
+                case _ -> {}
+            }
+            case none -> {}
+        }
+        out
+    }
+}
+
+class TypeCtx {
+    var diags: DiagnosticSink
+    var types: Map<string, TypeTableEntry>
+    var importAliases: Map<string, List<string>>
+
+    constructor(diags: DiagnosticSink, types: Map<string, TypeTableEntry>, importAliases: Map<string, List<string>>) {
+        this.diags = diags
+        this.types = types
+        this.importAliases = importAliases
+    }
+
+    fn resolveTy( te: TypeExpr, generics: List<string>) -> Ty {
+        match (te.kind) {
+            case TypeExprKind.Path(p) -> this.resolvePath(p, generics, te.span)
+            case TypeExprKind.Generic(base, args) -> {
+                let bare = this.resolveTy(base, generics)
+                let argTys = emptyTys()
+                for (a in args) {
+                    argTys.push(this.resolveTy(a, generics))
+                }
+                this.instantiate(bare, argTys, te.span)
+            }
+            case TypeExprKind.Option(inner) -> optOf(this.resolveTy(inner, generics))
+            case TypeExprKind.Tuple(items) -> {
+                if (len(items) == 1) {
+                    this.resolveTy(items[0], generics)
+                } else {
+                    let ps = emptyTys()
+                    for (t in items) {
+                        ps.push(this.resolveTy(t, generics))
+                    }
+                    Ty.Tuple(ps)
+                }
+            }
+            case TypeExprKind.Fn(params, ret, isAsync) -> {
+                let ps = emptyTys()
+                for (t in params) {
+                    ps.push(this.resolveTy(t, generics))
+                }
+                var r = Ty.Empty
+                if (let some(rr) = ret) {
+                    r = this.resolveTy(rr, generics)
+                }
+                let _ = isAsync
+                Ty.Fn(ps, r)
+            }
+            case TypeExprKind.Pointer(inner) -> Ty.Ptr(this.resolveTy(inner, generics))
+            case TypeExprKind.Ref(inner) -> Ty.Ref(this.resolveTy(inner, generics))
+            case TypeExprKind.Infer -> Ty.Unknown
+        }
+    }
+
+    fn bareType( entry: TypeTableEntry) -> Ty {
+        match (entry) {
+            case TypeTableEntry.Class(t) -> Ty.Class(t.name, varsOf(t.generics))
+            case TypeTableEntry.Struct(t) -> Ty.Struct(t.name, varsOf(t.generics))
+            case TypeTableEntry.Enum(t) -> Ty.Enum(t.name, varsOf(t.generics))
+            case TypeTableEntry.Interface(t) -> Ty.Interface(t.name, varsOf(t.generics))
+        }
+    }
+
+    fn resolvePath( path: List<string>, generics: List<string>, span: Span) -> Ty {
+        if (len(path) == 1) {
+            if (path[0] == "List") {
+                return Ty.List(Ty.Unknown)
+            }
+            if (path[0] == "Map") {
+                return Ty.Map(Ty.Unknown, Ty.Unknown)
+            }
+            if (path[0] == "Stream") {
+                return Ty.Stream
+            }
+            for (g in generics) {
+                if (g == path[0]) {
+                    return Ty.Var(g)
+                }
+            }
+            if (let some(t) = primitive(path[0])) {
+                return t
+            }
+        }
+        if (len(path) == 1) {
+            if (this.types.has(path[0])) {
+                return this.bareType(this.types[path[0]])
+            }
+        } else if (this.importAliases.has(path[0])) {
+            let last = path[len(path) - 1]
+            if (this.types.has(last)) {
+                return this.bareType(this.types[last])
+            }
+        }
+        this.diags.emit(Diagnostic.errorAt(span, "unknown type `" + renderPath(path) + "`").withCode("E0210").note("expected a class, struct, enum, interface, or built-in type"))
+        Ty.Unknown
+    }
+
+    fn instantiate( bare: Ty, args: List<Ty>, span: Span) -> Ty {
+        var name = ""
+        var expected = emptyStrs()
+        match (bare) {
+            case Ty.List(_) -> {
+                if (len(args) > 0) {
+                    let e = args[0]
+                    if (holdsRef(e)) {
+                        this.diags.emit(Diagnostic.errorAt(span, "lists of `&T` references are not supported yet").withCode("E0213"))
+                    }
+                }
+                if (len(args) > 0) {
+                    return Ty.List(args[0])
+                } else {
+                    return Ty.List(Ty.Unknown)
+                }
+            }
+            case Ty.Map(_, _) -> {
+                var k = Ty.Unknown
+                var v = Ty.Unknown
+                if (len(args) > 0) {
+                    k = args[0]
+                }
+                if (len(args) > 1) {
+                    v = args[1]
+                }
+                return Ty.Map(k, v)
+            }
+            case Ty.Class(n, _) -> {
+                name = n
+                expected = this.genericsOf(n)
+            }
+            case Ty.Struct(n, _) -> {
+                name = n
+                expected = this.genericsOf(n)
+            }
+            case Ty.Enum(n, _) -> {
+                name = n
+                expected = this.genericsOf(n)
+            }
+            case Ty.Interface(n, _) -> {
+                name = n
+                expected = this.genericsOf(n)
+            }
+            case _ -> {
+                this.diags.emit(Diagnostic.errorAt(span, "type is not generic").withCode("E0211"))
+                return bare
+            }
+        }
+        if (len(args) != len(expected)) {
+            this.diags.emit(Diagnostic.errorAt(span, "wrong number of type arguments for `" + name + "`: expected " + str(len(expected)) + ", found " + str(len(args))).withCode("E0212").note("declared generic parameters: " + renderList(expected)))
+        }
+        match (bare) {
+            case Ty.Class(n, _) -> Ty.Class(n, args)
+            case Ty.Struct(n, _) -> Ty.Struct(n, args)
+            case Ty.Enum(n, _) -> Ty.Enum(n, args)
+            case Ty.Interface(n, _) -> Ty.Interface(n, args)
+            case other -> other
+        }
+    }
+
+    fn genericsOf( name: string) -> List<string> {
+        if (this.types.has(name)) {
+            entryGenerics(this.types[name])
+        } else {
+            emptyStrs()
+        }
+    }
+}
+
+fn anyParam(span: Span, name: string) -> ParamInfo {
+    ParamInfo(name, Ty.Unknown, false, true, span)
+}
+
+fn intParam(span: Span, name: string) -> ParamInfo {
+    ParamInfo(name, Ty.Int, false, false, span)
+}
+
+fn boolParam(span: Span, name: string) -> ParamInfo {
+    ParamInfo(name, Ty.Bool, false, false, span)
+}
+
+fn mkBuiltin(span: Span, name: string, params: List<ParamInfo>, ret: Ty) -> CallableInfo {
+    var ps = emptyParamInfos()
+    for (p in params) {
+        p.rest = true
+        ps.push(p)
+    }
+    CallableInfo(name, span, Visibility.Public, false, true, false, false, none, emptyStrs(), ps, ret)
+}
+
+fn genericsOfDecl(gs: List<GenericParam>) -> List<string> {
+    var out = emptyStrs()
+    for (g in gs) {
+        out.push(g.name)
+    }
+    out
+}
+
+fn hasAttr(attrs: List<Attribute>, name: string) -> bool {
+    for (a in attrs) {
+        if (a.name == name) {
+            return true
+        }
+    }
+    false
+}
+
+fn anyStr(xs: List<string>, s: string) -> bool {
+    for (x in xs) {
+        if (x == s) {
+            return true
+        }
+    }
+    false
+}
+
+fn renderPath(path: List<string>) -> string {
+    var out = ""
+    var i = 0
+    while (i < len(path)) {
+        if (i > 0) {
+            out += "."
+        }
+        out += path[i]
+        i = i + 1
+    }
+    out
+}
+
+fn renderList(items: List<string>) -> string {
+    if (len(items) == 0) {
+        "none"
+    } else {
+        var out = ""
+        var i = 0
+        while (i < len(items)) {
+            if (i > 0) {
+                out += ", "
+            }
+            out += items[i]
+            i = i + 1
+        }
+        out
+    }
+}
+
+fn sigCompatible(pp: List<ParamInfo>, pret: Ty, cp: List<ParamInfo>, cret: Ty) -> bool {
+    if (len(pp) != len(cp)) {
+        return false
+    }
+    var i = 0
+    while (i < len(pp)) {
+        if (!tyEq(pp[i].ty, cp[i].ty)) {
+            return false
+        }
+        i = i + 1
+    }
+    tyEq(pret, cret)
+}
+
+fn emptyParamInfos() -> List<ParamInfo> {
+    var l = [ParamInfo("", Ty.Bool, false, false, Span(0, 0))]
+    l.pop()
+    l
+}
+
+fn emptyCallableInfos() -> List<CallableInfo> {
+    var l = [mkBuiltin(Span(0, 0), "", emptyParamInfos(), Ty.Bool)]
+    l.pop()
+    l
+}
+
+fn emptyFieldInfos() -> List<FieldInfo> {
+    var l = [FieldInfo("", Visibility.Public, false, false, false, false, Ty.Bool, Span(0, 0))]
+    l.pop()
+    l
+}
+
+fn emptyPropertyInfos() -> List<PropertyInfo> {
+    var l = [PropertyInfo("", Visibility.Public, false, Ty.Bool, false, false, Span(0, 0))]
+    l.pop()
+    l
+}
+
+fn emptyNamedCtorInfos() -> List<NamedCtorInfo> {
+    var l = [NamedCtorInfo("", CtorInfo(Span(0, 0), Visibility.Public, emptyParamInfos()))]
+    l.pop()
+    l
+}
+
+fn emptyVariantInfos() -> List<EnumVariantInfo> {
+    var l = [EnumVariantInfo("", emptyTys(), Span(0, 0))]
+    l.pop()
+    l
+}
+
+fn varsOf(gs: List<string>) -> List<Ty> {
+    var out = emptyTys()
+    var i = 0
+    while (i < len(gs)) {
+        out.push(Ty.Var(gs[i]))
+        i = i + 1
+    }
+    out
+}
+
+fn emptyIfaceMemberInfos() -> List<InterfaceMemberInfo> {
+    var l = [InterfaceMemberInfo(Span(0, 0), "", false, Ty.Bool, emptyParamInfos())]
+    l.pop()
+    l
+}
+
+fn emptyMethodSigs() -> List<MethodSig> {
+    var l = [MethodSig("", emptyParamInfos(), Ty.Bool, false)]
+    l.pop()
+    l
+}
+
+fn emptyClassTables() -> List<ClassTable> {
+    var l = [ClassTable("", Span(0, 0), Visibility.Public, emptyStrs(), none, emptyTys(), emptyFieldInfos(), emptyCallableInfos(), emptyPropertyInfos(), none, emptyNamedCtorInfos(), emptyFieldInfos())]
+    l.pop()
+    l
+}
+
+fn emptyPendingFns() -> List<PendingFn> {
+    var l = [PendingFn(FnDecl("", Span(0, 0), Visibility.Public, false, emptyGenericParams(), emptyParams(), none, none), false)]
+    l.pop()
+    l
+}
+
+fn emptyConstDecls() -> List<ConstDecl> {
+   var l = [ConstDecl("", Visibility.Public, none, Expr(Span(0, 0), ExprKind.Ident("x")), Span(0, 0))]
+   l.pop()
+   l
+   }
+
+fn emptyGlobalDecls() -> List<GlobalDecl> {
+   var l = [GlobalDecl("", Visibility.Public, none, Expr(Span(0, 0), ExprKind.Ident("x")), Span(0, 0))]
+   l.pop()
+   l
+   }
+
+fn emptyItemKindDecls() -> List<ItemKindDecl> {
+    var l = [ItemKindDecl.Class(ClassDecl("", Span(0, 0), Visibility.Public, emptyGenericParams(), none, emptyTypeExprs(), emptyProcMembers()))]
+    l.pop()
+    l
+}
+
+fn emptyMapTypes() -> Map<string, TypeTableEntry> {
+    let m = {"::seed::": TypeTableEntry.Enum(EnumTable("", Span(0, 0), Visibility.Public, emptyStrs(), emptyTys(), emptyVariantInfos()))}
+    m.remove("::seed::")
+    m
+}
+
+fn emptyMapFns() -> Map<string, List<CallableInfo>> {
+    let m = {"::seed::": emptyCallableInfos()}
+    m.remove("::seed::")
+    m
+}
+
+fn emptyMapAliases() -> Map<string, List<string>> {
+    let m = {"::seed::": emptyStrs()}
+    m.remove("::seed::")
+    m
+}
+
+fn emptyMapSpans() -> Map<string, Span> {
+    let m = {"::seed::": Span(0, 0)}
+    m.remove("::seed::")
+    m
+}
+
+fn primitive(name: string) -> Ty? {
+    if (name == "bool") {
+        Ty.Bool
+    } else if (name == "char") {
+        Ty.Char
+    } else if (name == "byte") {
+        Ty.Byte
+    } else if (name == "int" || name == "i64") {
+        Ty.Int
+    } else if (name == "float" || name == "f64") {
+        Ty.Float
+    } else if (name == "string") {
+        Ty.String
+    } else if (name == "void") {
+        Ty.Empty
+    } else {
+        none
+    }
+}
+
+fn holdsRef(t: Ty) -> bool {
+    match (t) {
+        case Ty.Ref(_) -> true
+        case Ty.Option(x) -> match (x) {
+            case Ty.Ref(_) -> true
+            case _ -> false
+        }
+        case _ -> false
+    }
+}
+
+fn isClassTy(t: Ty) -> bool {
+    match (t) {
+        case Ty.Class(_, _) -> true
+        case _ -> false
+    }
+}

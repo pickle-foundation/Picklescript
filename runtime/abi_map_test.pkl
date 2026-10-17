@@ -1,0 +1,666 @@
+module runtime.abi_map_test
+
+/// Behavioral tests for the ported map ABI bodies, mirroring `runtime/src/map.rs`'s own
+/// `mod tests` case for case, plus pins for the 64-bit hash arithmetic.
+///
+/// The hash pins come from an INDEPENDENT reference implementation of FNV-1a, not from
+/// the Rust map. That distinction matters: if they came from the Rust side they would
+/// only prove the table agrees with itself, while these prove the ported FNV-1a,
+/// the `(h ^ x) * PRIME` mix and the two's-complement negation of the out-of-range
+/// constants all reproduce the standard algorithm. `0xCBF29CE484222325` is written as
+/// `(0 - 0x340D631B7BDDDCDB)` because Pickle rejects literals above `i64::MAX`.
+
+import { abiMapNew, abiMapSet, abiMapGet, abiMapGetBoxed, abiMapHas, abiMapRemove } from runtime.abi_map
+import { abiMapLen, abiMapKeys, abiMapValues, keyHash, keyEq, deepHash, mapNew, entriesCount, needsGrow, isLiveKey, occupiedCount } from runtime.abi_map
+import { LEN_WORD, CAP_WORD, ENTRIES_WORD, GOLDEN, CYCLIC_HASH } from runtime.abi_map
+import { abiBoxI64, abiUnboxI64, abiBoxBool, newBox } from runtime.abi_box
+import { abiListLen, abiListGet, abiListPush, listNew } from runtime.abi_list
+import { abiStrFromI64, abiStrLen, newStr, byteInto } from runtime.abi_string
+import { PICKLE_CLASS_MAP, PICKLE_CLASS_BOX_INT, PICKLE_CLASS_BOX_BOOL } from runtime.object
+import { HEADER } from runtime.layout
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Build a string object from explicit byte values (Pickle string literals are `string`,
+/// not the `*int` raw object the ABI takes).
+fn mkStr(b0: int, b1: int, b2: int, b3: int, b4: int) -> *int {
+    var o = newStr(5)
+    byteInto(o, 0, b0)
+    byteInto(o, 1, b1)
+    byteInto(o, 2, b2)
+    byteInto(o, 3, b3)
+    byteInto(o, 4, b4)
+    return o
+}
+
+fn mkAlpha() -> *int { return mkStr(97, 108, 112, 104, 97) }
+fn mkBeta() -> *int { return mkStr(98, 101, 116, 97, 32) }
+
+/// A user class instance with `n` boxed-int slots, like `make_obj` in the native tests.
+fn mkObj(classId: int, slots: List<int>) -> *int {
+    unsafe {
+        var o = alloc(int, 3 + len(slots))
+        o[0] = 0
+        o[1] = classId
+        o[2] = HEADER + len(slots) * 8
+        var i = 0
+        while (i < len(slots)) {
+            o[3 + i] = abiBoxI64(slots[i]) as int
+            i = i + 1
+        }
+        return o
+    }
+}
+
+/// An enum object: tag plus `n` boxed-int fields (`enum_new(tag, n)`).
+fn mkEnum(tag: int, n: int) -> *int {
+    return newBox(7, tag)
+}
+
+/// A list of boxed ints, like `list_of(&[...])` in the native tests.
+fn listOf(vals: List<int>) -> *int {
+    var l = listNew(0)
+    var i = 0
+    while (i < len(vals)) {
+        abiListPush(l, abiBoxI64(vals[i]))
+        i = i + 1
+    }
+    return l
+}
+
+fn isNull(p: *int) -> bool { return (p as int) == 0 }
+
+// ---------------------------------------------------------------------------
+// 64-bit arithmetic pins
+// ---------------------------------------------------------------------------
+
+test fn fnv1a_matches_the_reference_implementation() {
+    // Independently computed FNV-1a over these exact bytes.
+    expect(keyHash(mkAlpha())).toBe(-8447022563750764501)
+    // mkBeta is "beta" space-padded out to the 5-byte helper's arity, which is why
+    // this is not the hash of the 4-byte "beta".
+    expect(keyHash(mkBeta())).toBe(795837917815194981)
+    // A 5-byte all-NUL string is NOT the empty string: two extra FNV rounds.
+    expect(keyHash(mkStr(0, 0, 0, 0, 0))).toBe(-1964607543390246577)
+    // The empty string is the bare offset basis.
+    expect(keyHash(newStr(0))).toBe(-3750763034362895579)
+}
+
+test fn fnv1a_is_case_and_length_sensitive() {
+    // Same bytes in a different order must not collide.
+    expect(keyHash(mkStr(97, 98, 99, 0, 0))).toBe(7181009592312429571)
+    expect(keyHash(mkStr(99, 98, 97, 0, 0))).toBe(7433921410713404571)
+    expect(keyHash(mkStr(97, 98, 99, 0, 0)) != keyHash(mkStr(99, 98, 97, 0, 0))).toBe(true)
+    expect(keyHash(mkStr(97, 108, 112, 104, 97)) != keyHash(mkStr(97, 108, 112, 104, 98))).toBe(true)
+}
+
+test fn boxed_scalar_key_hash_mixes_class_and_payload() {
+    // boxed(class, bits) = mix(mix(FNV_OFFSET, class), bits), pinned per case.
+    expect(keyHash(abiBoxI64(0))).toBe(591640642936787734)
+    expect(keyHash(abiBoxI64(1))).toBe(591641742448415945)
+    expect(keyHash(abiBoxI64(100))).toBe(591750594099608834)
+    expect(keyHash(abiBoxI64(200))).toBe(591579070285607918)
+    expect(keyHash(abiBoxI64(-5))).toBe(-591646140494928789)
+    expect(keyHash(abiBoxI64(-1))).toBe(-591641742448415945)
+    // The class id is mixed in, so an equal payload in another box class is a different key.
+    expect(keyHash(abiBoxBool(true))).toBe(585902291750289875)
+    expect(keyHash(abiBoxBool(true)) != keyHash(abiBoxI64(1))).toBe(true)
+}
+
+test fn none_key_hashes_to_the_golden_constant() {
+    // A null key and the stored `none` marker are one identity, hashed as GOLDEN.
+    expect(keyHash(0 as *int)).toBe(GOLDEN)
+    expect(keyHash(0 as *int)).toBe(-7046029254386353131)
+}
+
+test fn cyclic_hash_constant_is_stable() {
+    expect(CYCLIC_HASH).toBe(3387441590996828161)
+}
+
+test fn a_revisited_ancestor_reports_the_cyclic_hash() {
+    // A list that refers to itself: deepHash must detect the revisit rather than
+    // recurse forever, and report cyclic = true.
+    var selfRef = listNew(0)
+    abiListPush(selfRef, selfRef)
+    var path: List<int> = [0]
+    path.pop()
+    let (h, cyclic) = deepHash(selfRef, path)
+    expect(cyclic).toBe(true)
+    // The *inner* revisit reports CYCLIC_HASH, but the outer call keeps mixing: its
+    // result is mix(FNV_OFFSET, PICKLE_CLASS_LIST) then mix(that, CYCLIC_HASH).
+    // Pinning the composed value checks both that the revisit was detected and that
+    // the cyclic marker is propagated upward rather than swallowed.
+    expect(h).toBe(-1819398542068248969)
+}
+
+test fn cyclic_keys_fall_back_to_root_identity() {
+    // Two *distinct* self-referential lists are different keys, even though both are
+    // "a list containing itself" -- identity is the only strength-safe comparison.
+    var a = listNew(0)
+    abiListPush(a, a)
+    var b = listNew(0)
+    abiListPush(b, b)
+    expect(keyEq(a, a)).toBe(true)
+    expect(keyEq(a, b)).toBe(false)
+}
+
+test fn equal_acyclic_structures_hash_identically() {
+    // The property the whole hash is built to guarantee.
+    expect(keyHash(listOf([1, 2, 3]))).toBe(keyHash(listOf([1, 2, 3])))
+    expect(keyHash(listOf([1, 2, 3])) != keyHash(listOf([3, 2, 1]))).toBe(true)
+    expect(keyHash(listOf([1, 2])) != keyHash(listOf([1, 2, 3]))).toBe(true)
+    // Nesting: a list of lists.
+    var inner = listOf([7])
+    var outer = listNew(0)
+    abiListPush(outer, inner)
+    var outerB = listNew(0)
+    abiListPush(outerB, listOf([7]))
+    expect(keyHash(outer)).toBe(keyHash(outerB))
+}
+
+// ---------------------------------------------------------------------------
+// Basic table operations (native: insert_lookup_remove)
+// ---------------------------------------------------------------------------
+
+test fn insert_lookup_remove() {
+    var m = mapNew(0)
+    var k1 = mkAlpha()
+    var k2 = mkBeta()
+    var v1 = abiBoxI64(11)
+    var v2 = abiBoxI64(22)
+    expect(isNull(mapGet(m, k1))).toBe(true)
+    expect(isNull(mapSet(m, k1, v1))).toBe(true)
+    expect(mapGet(m, k1) as int).toBe(v1 as int)
+    expect(isNull(mapGet(m, k2))).toBe(true)
+    expect(isNull(mapSet(m, k2, v2))).toBe(true)
+    expect(mapGet(m, k2) as int).toBe(v2 as int)
+    expect(abiMapLen(m)).toBe(2)
+    // Overwrite returns the old value and replaces it.
+    var v3 = abiBoxI64(33)
+    expect(mapSet(m, k1, v3) as int).toBe(v1 as int)
+    expect(mapGet(m, k1) as int).toBe(v3 as int)
+    expect(abiMapLen(m)).toBe(2)
+    // Remove.
+    expect(mapRemove(m, k2) as int).toBe(v2 as int)
+    expect(isNull(mapGet(m, k2))).toBe(true)
+    expect(abiMapLen(m)).toBe(1)
+}
+
+test fn many_keys_grow() {
+    // 500 string keys: forces several rehashes (16 -> 32 -> ... -> 1024).
+    var m = mapNew(0)
+    var i = 0
+    while (i < 500) {
+        abiMapSet(m, abiStrFromI64(i), abiBoxI64(i * 7))
+        i = i + 1
+    }
+    var j = 0
+    while (j < 500) {
+        expect(abiUnboxI64(abiMapGet(m, abiStrFromI64(j)))).toBe(j * 7)
+        j = j + 1
+    }
+    expect(abiMapLen(m)).toBe(500)
+}
+
+test fn a_fresh_table_reports_zero_live_entries() {
+    // Regression: `alloc` returns uninitialised memory (a fresh alloc(8) reads back with
+    // all eight words non-zero), and an open-addressing table treats "this slot is
+    // non-zero" as "this slot holds a live entry". Before the table was zeroed
+    // explicitly, `entriesCount` on a brand-new map reported 16 live entries, so
+    // `needsGrow` fired on the very first insert and `findSlot` probed an unreadable key.
+    unsafe {
+        var m = mapNew(0)
+        var entries = m[ENTRIES_WORD] as *int
+        var cap = m[CAP_WORD]
+        expect(entriesCount(entries, cap)).toBe(0)
+        expect(needsGrow(entries, cap)).toBe(false)
+        // Every slot must genuinely read null, not merely "not crash".
+        var i = 0
+        while (i < cap) {
+            expect(entries[i * 2]).toBe(0)
+            expect(entries[i * 2 + 1]).toBe(0)
+            i = i + 1
+        }
+    }
+}
+
+test fn a_rehashed_table_is_zeroed_before_reuse() {
+    // Same invariant one rehash later: the fresh table must be zeroed before entries are
+    // re-probed into it, or `map_len` and the probe chains disagree with the contents.
+    var m = mapNew(0)
+    var i = 0
+    while (i < 100) {
+        abiMapSet(m, abiStrFromI64(i), abiBoxI64(i))
+        i = i + 1
+    }
+    unsafe {
+        var entries = m[ENTRIES_WORD] as *int
+        expect(entriesCount(entries, m[CAP_WORD])).toBe(abiMapLen(m))
+        var live = 0
+        var j = 0
+        while (j < m[CAP_WORD]) {
+            if (isLiveKey(entries[j * 2])) {
+                live = live + 1
+                // A live slot carries a real value pointer.
+                expect(entries[j * 2 + 1] != 0).toBe(true)
+            } else {
+                // A free slot must be fully zeroed -- both halves. A stale key in one
+                // half with a zeroed value is exactly what corrupts `entriesCount`.
+                expect(entries[j * 2]).toBe(0)
+                expect(entries[j * 2 + 1]).toBe(0)
+            }
+            j = j + 1
+        }
+        expect(live).toBe(100)
+    }
+}
+
+test fn capacity_is_rounded_up_to_a_power_of_two() {
+    // `find_slot` masks with `cap - 1`, so the table MUST be a power of two.
+    unsafe {
+        var m = mapNew(0)
+        expect(m[CAP_WORD]).toBe(16)
+        expect(m[LEN_WORD]).toBe(0)
+        expect((m[ENTRIES_WORD] as int) != 0).toBe(true)
+        // A request below INITIAL_CAP is floored to it.
+        var s = mapNew(4)
+        expect(s[CAP_WORD]).toBe(16)
+        // A request above it rounds up.
+        var t = mapNew(20)
+        expect(t[CAP_WORD]).toBe(32)
+        var u = mapNew(64)
+        expect(u[CAP_WORD]).toBe(64)
+        // Header is class id MAP and size MAP_OBJECT_SIZE.
+        expect(m[1]).toBe(PICKLE_CLASS_MAP)
+        expect(m[2]).toBe(48)
+    }
+}
+
+test fn growth_doubles_capacity_and_preserves_every_entry() {
+    // Rehash must re-probe every live entry, not just rehash in place: a plain copy
+    // would strand entries whose new home is a different slot.
+    var m = mapNew(0)
+    var i = 0
+    while (i < 40) {
+        abiMapSet(m, abiStrFromI64(i), abiBoxI64(i))
+        i = i + 1
+    }
+    unsafe {
+        // needsGrow is checked BEFORE each insert against `(occupied + 1) >= cap * 0.7`,
+        // so the sequence is 16 -> 32 (at 12 inserts) -> 64 (at 23), and the 40th insert
+        // leaves capacity at 64 holding 40 entries. Simulating that rule gives 64, not
+        // 128 -- an off-by-one here reads as "capacity is too small", which it is not.
+        expect(m[CAP_WORD]).toBe(64)
+    }
+    var j = 0
+    while (j < 40) {
+        expect(abiUnboxI64(abiMapGet(m, abiStrFromI64(j)))).toBe(j)
+        j = j + 1
+    }
+    expect(abiMapLen(m)).toBe(40)
+}
+
+test fn tombstones_count_toward_growth() {
+    // Regression: `needsGrow` once counted LIVE entries only, so the tombstones left by
+    // `mapRemove` could fill every probe slot while the live count stayed low. The next
+    // insert then called `findSlot` on a table with no empty slot to stop on and probed
+    // forever. This is the smallest form of the real sequence (grow / churn / grow /
+    // churn / grow); it hung the harness before `occupiedCount` was folded into
+    // `needsGrow`.
+    var m = mapNew(0)
+    var i = 0
+    while (i < 61) {
+        abiMapSet(m, abiStrFromI64(i), abiBoxI64(i))
+        i = i + 1
+    }
+    var a = 15
+    while (a < 45) {
+        abiMapRemove(m, abiStrFromI64(a))
+        a = a + 1
+    }
+    i = 61
+    while (i < 91) {
+        abiMapSet(m, abiStrFromI64(i), abiBoxI64(i))
+        i = i + 1
+    }
+    a = 45
+    while (a < 75) {
+        abiMapRemove(m, abiStrFromI64(a))
+        a = a + 1
+    }
+    i = 91
+    while (i < 121) {
+        abiMapSet(m, abiStrFromI64(i), abiBoxI64(i))
+        i = i + 1
+    }
+    a = 75
+    while (a < 105) {
+        abiMapRemove(m, abiStrFromI64(a))
+        a = a + 1
+    }
+    i = 121
+    while (i < 129) {
+        abiMapSet(m, abiStrFromI64(i), abiBoxI64(i))
+        i = i + 1
+    }
+
+    expect(abiMapLen(m)).toBe(39)
+    unsafe {
+        var entries = m[ENTRIES_WORD] as *int
+        var cap = m[CAP_WORD]
+        // A saturated table has no empty slot; `findSlot` needs one to terminate.
+        expect(occupiedCount(entries, cap) < cap).toBe(true)
+        // Survivors reachable, removed keys gone.
+        expect(abiUnboxI64(abiMapGet(m, abiStrFromI64(5)))).toBe(5)
+        expect(abiUnboxI64(abiMapGet(m, abiStrFromI64(128)))).toBe(128)
+        expect(isNull(mapGet(m, abiStrFromI64(20)))).toBe(true)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Boxed keys (native: boxed_int_keys)
+// ---------------------------------------------------------------------------
+
+test fn boxed_int_keys() {
+    var m = mapNew(0)
+    var k1 = abiBoxI64(100)
+    var k2 = abiBoxI64(200)
+    var k3 = abiBoxI64(-5)
+    var v1 = abiBoxI64(11)
+    var v2 = abiBoxI64(22)
+    var v3 = abiBoxI64(33)
+    expect(isNull(mapGet(m, k1))).toBe(true)
+    abiMapSet(m, k1, v1)
+    abiMapSet(m, k2, v2)
+    abiMapSet(m, k3, v3)
+    expect(mapGet(m, k1) as int).toBe(v1 as int)
+    expect(mapGet(m, k2) as int).toBe(v2 as int)
+    expect(mapGet(m, k3) as int).toBe(v3 as int)
+    expect(abiMapLen(m)).toBe(3)
+    // Overwrite; the int identity (payload + class) must still match.
+    var v2b = abiBoxI64(99)
+    abiMapSet(m, k2, v2b)
+    expect(mapGet(m, k2) as int).toBe(v2b as int)
+    expect(abiMapLen(m)).toBe(3)
+    // A second box with the same payload is the same key.
+    expect(mapGet(m, abiBoxI64(200)) as int).toBe(v2b as int)
+    // A string is never equal to a box key.
+    expect(isNull(mapGet(m, abiStrFromI64(200)))).toBe(true)
+    // Remove by payload identity.
+    expect(mapRemove(m, abiBoxI64(100)) as int).toBe(v1 as int)
+    expect(isNull(mapGet(m, abiBoxI64(100)))).toBe(true)
+    expect(abiMapLen(m)).toBe(2)
+}
+
+test fn the_none_key_is_a_usable_key() {
+    // A null key becomes the `none` marker, which is a real, retrievable entry.
+    var m = mapNew(0)
+    var v = abiBoxI64(5)
+    abiMapSet(m, 0 as *int, v)
+    expect(abiMapLen(m)).toBe(1)
+    expect(mapGet(m, 0 as *int) as int).toBe(v as int)
+    expect(abiMapHas(m, 0 as *int)).toBe(true)
+    // `map_keys` surfaces it back to callers as null, the `T?` representation.
+    var keys = abiMapKeys(m)
+    expect(abiListLen(keys)).toBe(1)
+    expect(abiListGet(keys, 0) as int).toBe(0)
+    // A `none` key is not equal to any other key, and hashes as GOLDEN.
+    expect(keyEq(0 as *int, 0 as *int)).toBe(true)
+    expect(keyEq(0 as *int, abiBoxI64(0))).toBe(false)
+    // Removing it works too.
+    expect(mapRemove(m, 0 as *int) as int).toBe(v as int)
+    expect(abiMapLen(m)).toBe(0)
+}
+
+test fn none_key_does_not_collide_with_a_real_entry() {
+    // The marker substitution must not make `none` and some real key share a slot.
+    var m = mapNew(0)
+    abiMapSet(m, 0 as *int, abiBoxI64(1))
+    abiMapSet(m, abiBoxI64(2), abiBoxI64(2))
+    abiMapSet(m, mkAlpha(), abiBoxI64(3))
+    expect(abiMapLen(m)).toBe(3)
+    expect(abiUnboxI64(abiMapGet(m, 0 as *int))).toBe(1)
+    expect(abiUnboxI64(abiMapGet(m, abiBoxI64(2)))).toBe(2)
+    expect(abiUnboxI64(abiMapGet(m, mkAlpha()))).toBe(3)
+}
+
+// ---------------------------------------------------------------------------
+// Composite keys (native: composite_keys, class_and_enum_keys, rehash)
+// ---------------------------------------------------------------------------
+
+test fn composite_list_keys_compare_structurally() {
+    var m = mapNew(0)
+    var k1 = listOf([1, 2, 3])
+    var k2 = listOf([4, 5])
+    abiMapSet(m, k1, abiBoxI64(100))
+    abiMapSet(m, k2, abiBoxI64(200))
+    // A *distinct* list with equal contents is the same key (structural).
+    expect(abiUnboxI64(mapGet(m, listOf([1, 2, 3])))).toBe(100)
+    expect(abiUnboxI64(mapGet(m, listOf([4, 5])))).toBe(200)
+    expect(abiMapLen(m)).toBe(2)
+    // Different contents are different keys.
+    expect(isNull(mapGet(m, listOf([1, 2])))).toBe(true)
+    expect(isNull(mapGet(m, listOf([1, 2, 4])))).toBe(true)
+}
+
+test fn nested_list_keys() {
+    var m = mapNew(0)
+    var inner = listOf([7])
+    var outer = listNew(0)
+    abiListPush(outer, inner)
+    abiMapSet(m, outer, abiBoxI64(99))
+    var outerB = listNew(0)
+    abiListPush(outerB, listOf([7]))
+    expect(abiUnboxI64(mapGet(m, outerB))).toBe(99)
+}
+
+test fn rehash_with_composite_keys() {
+    // 40 composite keys: forces a rehash, then every key must still be found.
+    var m = mapNew(0)
+    var a = 0
+    while (a < 40) {
+        abiMapSet(m, listOf([a, a * 2]), abiBoxI64(a * 100))
+        a = a + 1
+    }
+    var b = 0
+    while (b < 40) {
+        expect(abiUnboxI64(abiMapGet(m, listOf([b, b * 2])))).toBe(b * 100)
+        b = b + 1
+    }
+    expect(abiMapLen(m)).toBe(40)
+    // Remove by a structurally-equal key.
+    expect(abiUnboxI64(mapRemove(m, listOf([7, 14])))).toBe(700)
+    expect(isNull(mapGet(m, listOf([7, 14])))).toBe(true)
+    expect(abiMapLen(m)).toBe(39)
+}
+
+test fn class_keys_compare_by_class_and_slots() {
+    var m = mapNew(0)
+    var base = 100
+    var a = mkObj(base, [1, 2])
+    var b = mkObj(base, [1, 2])
+    abiMapSet(m, a, abiBoxI64(7))
+    // Two class instances with equal fields are the same key.
+    expect(abiUnboxI64(abiMapGet(m, b))).toBe(7)
+    // Same class, different fields -> different key.
+    expect(isNull(abiMapGet(m, mkObj(base, [1, 3])))).toBe(true)
+    // A different class id never matches, even with identical slots.
+    expect(isNull(abiMapGet(m, mkObj(base + 1, [1, 2])))).toBe(true)
+}
+
+test fn enum_keys_compare_by_tag_and_payload() {
+    var m = mapNew(0)
+    var e1 = mkEnum(0, 0)
+    var e1b = mkEnum(0, 0)
+    abiMapSet(m, e1, abiBoxI64(55))
+    expect(abiUnboxI64(abiMapGet(m, e1b))).toBe(55)
+    // Different tag is a different key.
+    expect(isNull(abiMapGet(m, mkEnum(1, 0)))).toBe(true)
+    expect(abiMapLen(m)).toBe(1)
+}
+
+test fn a_map_used_as_a_key_matches_regardless_of_inner_order() {
+    // Inner entries combine by addition when hashed, so insertion order cannot matter.
+    var m = mapNew(0)
+    var inner1 = mapNew(0)
+    abiMapSet(inner1, abiStrFromI64(1), abiBoxI64(10))
+    abiMapSet(inner1, abiStrFromI64(2), abiBoxI64(20))
+    var inner2 = mapNew(0)
+    abiMapSet(inner2, abiStrFromI64(2), abiBoxI64(20))
+    abiMapSet(inner2, abiStrFromI64(1), abiBoxI64(10))
+    expect(keyHash(inner1)).toBe(keyHash(inner2))
+    expect(keyEq(inner1, inner2)).toBe(true)
+    // And they work as keys of an outer map.
+    abiMapSet(m, inner1, abiBoxI64(1))
+    expect(abiUnboxI64(abiMapGet(m, inner2))).toBe(1)
+}
+
+test fn tuple_keys_compare_by_arity_and_fields() {
+    var m = mapNew(0)
+    var t1 = tupleOf(2, 10, 20)
+    abiMapSet(m, t1, abiBoxI64(1))
+    expect(abiUnboxI64(abiMapGet(m, tupleOf(2, 10, 20)))).toBe(1)
+    expect(isNull(abiMapGet(m, tupleOf(2, 10, 21)))).toBe(true)
+    expect(isNull(abiMapGet(m, tupleOf(1, 10, 0)))).toBe(true)
+}
+
+/// Build a tuple object with `n` boxed-int fields, mirroring `tuple_new`.
+fn tupleOf(n: int, a: int, b: int) -> *int {
+    unsafe {
+        var t = alloc(int, 4 + n)
+        t[0] = 0
+        t[1] = 8
+        t[2] = 32 + n * 8
+        t[3] = n
+        t[4] = abiBoxI64(a) as int
+        if (n > 1) { t[5] = abiBoxI64(b) as int }
+        return t
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tombstones
+// ---------------------------------------------------------------------------
+
+test fn removal_leaves_a_tombstone_that_does_not_break_the_probe_chain() {
+    // Open addressing with tombstones: entries after a removed one live in the same
+    // probe chain, so a body that cleared the slot instead of tombstoning it would
+    // strand them and every lookup past the hole would miss.
+    var m = mapNew(0)
+    var i = 0
+    while (i < 12) {
+        abiMapSet(m, abiStrFromI64(i), abiBoxI64(i))
+        i = i + 1
+    }
+    // Remove every other key.
+    var r = 0
+    while (r < 12) {
+        if (r % 2 == 0) {
+            expect(abiUnboxI64(mapRemove(m, abiStrFromI64(r)))).toBe(r)
+        }
+        r = r + 2
+    }
+    expect(abiMapLen(m)).toBe(6)
+    // The survivors are all still reachable.
+    var s = 1
+    while (s < 12) {
+        expect(abiUnboxI64(abiMapGet(m, abiStrFromI64(s)))).toBe(s)
+        expect(abiMapHas(m, abiStrFromI64(s))).toBe(true)
+        s = s + 2
+    }
+    // The removed ones are gone, and re-inserting one works.
+    var t = 0
+    while (t < 12) {
+        if (t % 2 == 0) { expect(abiMapHas(m, abiStrFromI64(t))).toBe(false) }
+        t = t + 2
+    }
+    abiMapSet(m, abiStrFromI64(0), abiBoxI64(1000))
+    expect(abiUnboxI64(abiMapGet(m, abiStrFromI64(0)))).toBe(1000)
+    expect(abiMapLen(m)).toBe(7)
+}
+
+test fn removal_of_an_absent_key_is_a_null_and_does_not_change_len() {
+    var m = mapNew(0)
+    abiMapSet(m, abiStrFromI64(1), abiBoxI64(1))
+    expect(isNull(mapRemove(m, abiStrFromI64(999)))).toBe(true)
+    expect(abiMapLen(m)).toBe(1)
+    expect(isNull(mapRemove(m, mkAlpha()))).toBe(true)
+    expect(abiMapLen(m)).toBe(1)
+}
+
+// ---------------------------------------------------------------------------
+// ABI entry points (native: abi_roundtrip_boxed_ints)
+// ---------------------------------------------------------------------------
+
+test fn abi_roundtrip_boxed_ints() {
+    var m = abiMapNew(0)
+    var k1 = mkAlpha()
+    var k2 = mkBeta()
+    abiMapSet(m, k1, abiBoxI64(7))
+    abiMapSet(m, k2, abiBoxI64(-3))
+    expect(abiMapHas(m, k1)).toBe(true)
+    expect(abiMapHas(m, mkStr(103, 97, 109, 109, 97))).toBe(false)
+    expect(abiMapLen(m)).toBe(2)
+    // `get_boxed` returns the default for an absent key rather than null.
+    var default = abiBoxI64(0)
+    expect(abiUnboxI64(abiMapGetBoxed(m, k1, default))).toBe(7)
+    expect(abiUnboxI64(abiMapGetBoxed(m, mkStr(103, 97, 109, 109, 97), default))).toBe(0)
+    // `get` returns null for an absent key.
+    expect(isNull(abiMapGet(m, mkStr(103, 97, 109, 109, 97)))).toBe(true)
+    // Snapshots.
+    expect(abiListLen(abiMapKeys(m))).toBe(2)
+    expect(abiListLen(abiMapValues(m))).toBe(2)
+}
+
+test fn snapshots_exclude_tombstones_and_match_length() {
+    var m = mapNew(0)
+    var i = 0
+    while (i < 20) {
+        abiMapSet(m, abiStrFromI64(i), abiBoxI64(i))
+        i = i + 1
+    }
+    var r = 0
+    while (r < 20) {
+        if (r % 3 == 0) { mapRemove(m, abiStrFromI64(r)) }
+        r = r + 3
+    }
+    var n = abiMapLen(m)
+    expect(abiListLen(abiMapKeys(m))).toBe(n)
+    expect(abiListLen(abiMapValues(m))).toBe(n)
+    // Every surviving key is present exactly once in the snapshot.
+    var ks = abiMapKeys(m)
+    var i2 = 0
+    while (i2 < n) {
+        var k = abiListGet(ks, i2)
+        expect(abiMapHas(m, k)).toBe(true)
+        i2 = i2 + 1
+    }
+}
+
+test fn values_snapshot_holds_the_values_not_the_keys() {
+    var m = mapNew(0)
+    abiMapSet(m, abiStrFromI64(1), abiBoxI64(111))
+    abiMapSet(m, abiStrFromI64(2), abiBoxI64(222))
+    var vs = abiMapValues(m)
+    expect(abiListLen(vs)).toBe(2)
+    // The values are the boxed ints, not the string keys.
+    var total = 0
+    var i = 0
+    while (i < abiListLen(vs)) {
+        total = total + abiUnboxI64(abiListGet(vs, i))
+        i = i + 1
+    }
+    expect(total).toBe(333)
+}
+
+test fn an_empty_map_answers_every_query() {
+    var m = abiMapNew(0)
+    expect(abiMapLen(m)).toBe(0)
+    expect(abiMapHas(m, mkAlpha())).toBe(false)
+    expect(isNull(abiMapGet(m, mkAlpha()))).toBe(true)
+    expect(abiListLen(abiMapKeys(m))).toBe(0)
+    expect(abiListLen(abiMapValues(m))).toBe(0)
+    expect(abiUnboxI64(abiMapGetBoxed(m, mkAlpha(), abiBoxI64(42)))).toBe(42)
+}

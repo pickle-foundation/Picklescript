@@ -1,0 +1,126 @@
+module runtime.classes
+
+/// Port of `runtime/src/class.rs`: user-class instance semantics.
+///
+/// The ABI stays native:
+///   - `pickle_class_register(...)` copies a name/mask into stable heap and
+///     returns the assigned class id (>= PICKLE_CLASS_USER_BASE).
+///   - `pickle_class_new(class_id, slot_count)` allocates a zeroed instance.
+///   - `pickle_obj_slot_get` / `pickle_obj_slot_set` read/write field slots.
+///   - `pickle_class_is` / `pickle_class_cast`, `pickle_class_implements` /
+///     `pickle_iface_method` / `pickle_iface_cast` walk the runtime tables.
+///
+/// What a self-hosted runtime owns is the CONTRACT: the raw-id and slot-count
+/// clamps, the slot bounds rules (OOB reads are `none`, OOB writes are
+/// no-ops), the parent-chain walk that powers `is`, the interface membership
+/// and nearest-implementation walks, and the cast panic messages.
+
+import { PICKLE_CLASS_USER_BASE } from runtime.object
+
+/// `pickle_class_new` clamps a raw id below PICKLE_CLASS_USER_BASE up to the
+/// base, then allocates with the result.
+fn classIdOf(rawClassId: int) -> int {
+    if (rawClassId < PICKLE_CLASS_USER_BASE) {
+        PICKLE_CLASS_USER_BASE
+    } else {
+        rawClassId
+    }
+}
+
+/// `pickle_class_new` treats a negative slot count as zero.
+fn slotCountOf(rawSlotCount: int) -> int {
+    if (rawSlotCount < 0) {
+        0
+    } else {
+        rawSlotCount
+    }
+}
+
+/// Mirror of `pickle_obj_slot_get`: a slot read is `none` when the index is
+/// negative or past the field window; otherwise the held value. (An in-range
+/// zeroed slot reads as null at the ABI; the pickle model reads written
+/// fields.)
+fn slotGet(fields: List<int>, index: int) -> int? {
+    if (index < 0) {
+        return none
+    }
+    if (index >= len(fields)) {
+        return none
+    }
+    fields[index]
+}
+
+/// Mirror of `pickle_obj_slot_set`: a slot write outside the field window is
+/// silently ignored (the compiler emits only statically-known indices).
+fn slotSet(fields: List<int>, index: int, value: int) {
+    if (index < 0) {
+        return
+    }
+    if (index >= len(fields)) {
+        return
+    }
+    fields[index] = value
+}
+
+/// Mirror of `class_is` / `pickle_class_is`: `cid` reaches `target` by walking
+/// the parent chain (parent 0 terminates). An instance is its own class and
+/// every ancestor.
+fn classIdIs(cid: int, target: int, parentOf: fn (int) -> int) -> bool {
+    var cur = cid
+    while (true) {
+        if (cur == target) {
+            return true
+        }
+        var parent = parentOf(cur)
+        if (parent == 0) {
+            return false
+        }
+        cur = parent
+    }
+}
+
+/// Mirror of `class_implements` / `pickle_class_implements`: `cid` (or an
+/// ancestor) carries interface bucket `ifaceId`; an unknown/`0` interface is
+/// never "implemented".
+fn implementsIface(cid: int, ifaceId: int, hasIface: fn (int, int) -> bool, parentOf: fn (int) -> int) -> bool {
+    if (ifaceId <= 0) {
+        return false
+    }
+    var cur = cid
+    while (true) {
+        if (hasIface(cur, ifaceId)) {
+            return true
+        }
+        var parent = parentOf(cur)
+        if (parent == 0) {
+            return false
+        }
+        cur = parent
+    }
+}
+
+/// Mirror of `iface_method`: the nearest implementation of interface
+/// `ifaceId` method `methodIndex` along the parent chain, or `none` when no
+/// ancestor implements the interface (or the interface is unknown / `0`).
+fn ifaceMethodAt(cid: int, ifaceId: int, methodIndex: int, methodOf: fn (int, int, int) -> int?, parentOf: fn (int) -> int) -> int? {
+    if (ifaceId <= 0) {
+        return none
+    }
+    var cur = cid
+    while (true) {
+        if (let some(tag) = methodOf(cur, ifaceId, methodIndex)) {
+            return tag
+        }
+        var parent = parentOf(cur)
+        if (parent == 0) {
+            return none
+        }
+        cur = parent
+    }
+}
+
+/// Panic raised by `pickle_class_cast` on a failed `x as T`.
+const CAST_CLASS_MESSAGE: string = "pickle: invalid class cast"
+
+/// Panic raised by `pickle_iface_cast` on a failed `x as I`.
+const CAST_INTERFACE_MESSAGE: string = "pickle: invalid interface cast"

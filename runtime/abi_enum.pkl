@@ -1,0 +1,250 @@
+module runtime.abi_enum
+
+/// Sovereign builtin-enum ABI bodies, ported from `runtime/src/enum.rs`.
+///
+/// Companion to `runtime.abi_tuple`, which has the same shape: a header, one word
+/// that describes the payload, then the payload slots themselves. The difference is
+/// what that word means - a tuple stores an element count, an enum stores the
+/// variant tag - and that an enum recovers its field count from the stored `size`
+/// instead of keeping it.
+///
+/// Layout is `runtime.layout`, mirroring `runtime/src/layout.rs`:
+///   - 24-byte header at words 0/1/2 (`next`, `class_id`/`flags`, `size`)
+///   - the variant tag (`i64`) at word 3, `ENUM_TAG_OFF`
+///   - the payload fields from word 4, `ENUM_FIELDS_OFF`
+///   - `enum_object_size(n)` = 32 + n*8 bytes, so `4 + n` words in all
+///
+/// The tag is NOT a managed pointer - it is a plain discriminant sitting where a
+/// list would hold its first element - so the collector traces only the fields
+/// after it. That is why the payload fields start one word past the tag rather
+/// than at `HEADER`.
+///
+/// KNOWN LIMITATION - like every other ported aggregate, enums come from `alloc`,
+/// which the GC does not track: correct, never reclaimed.
+///
+/// GAP - `enum_set_field` asserts `index < n` and panics with "pickle: enum field
+/// index out of bounds". Callers pass *constant* indices into a freshly
+/// constructed enum of matching width, so a program cannot reach it. The check is
+/// left out rather than turned into a silently ignored store; porting it needs a
+/// callable panic primitive (Pickle source cannot declare an extern - see
+/// PICKLE_AUDIT.md 18.0), the same GAP as `runtime.abi_tuple`.
+///
+/// SIGNEDNESS - `field_count` and `index` are `usize` at the ABI boundary and `int`
+/// here. Natively a negative value would reinterpret as an enormous `usize`; here
+/// it stays negative. The compiler emits constant field counts and indices, so the
+/// case is unreachable - and the negative guards below turn a would-be wild read
+/// into the documented out-of-range result.
+
+import { PICKLE_CLASS_ENUM, PICKLE_CLASS_BOX_INT, PICKLE_CLASS_BOX_BOOL, PICKLE_CLASS_BOX_CHAR, PICKLE_CLASS_BOX_FLOAT, PICKLE_CLASS_STRING } from runtime.object
+import { HEADER, ENUM_TAG_OFF, ENUM_FIELDS_OFF, enumObjectSize, enumFieldCountFromSize } from runtime.layout
+import { boxBits } from runtime.abi_box
+import { abiStrCmp } from runtime.abi_string
+// The enum payload comes from `alloc(int, n)`, so the raw-allocation slots must
+// travel with it. See `abi_raw.pkl`.
+import { abiRawAlloc, abiRegisterObject } from runtime.abi_raw
+
+/// Word index of the variant tag. `ENUM_TAG_OFF` is a byte offset (24).
+const TAG_WORD: int = ENUM_TAG_OFF / 8
+/// Word index of payload field 0. `ENUM_FIELDS_OFF` is a byte offset (32).
+const FIELDS_WORD: int = ENUM_FIELDS_OFF / 8
+
+/// The runtime class id in an object's header word 1.
+fn classOf(obj: *int) -> int {
+    unsafe {
+        return obj[1]
+    }
+}
+
+/// True when two managed references are the same object.
+fn ptrEq(a: *int, b: *int) -> bool {
+    unsafe {
+        return (a as int) == (b as int)
+    }
+}
+
+/// True when a managed reference is null.
+fn isNull(p: *int) -> bool {
+    unsafe {
+        return (p as int) == 0
+    }
+}
+
+/// The payload field count of an enum object. Mirrors `layout::enum_field_count`,
+/// which derives the count from the stored byte size with a saturating subtract.
+fn enumFieldCount(obj: *int) -> int {
+    unsafe {
+        return enumFieldCountFromSize(obj[2])
+    }
+}
+
+/// The variant tag stored in an enum object. Mirrors `layout::enum_tag`.
+fn tagOf(obj: *int) -> int {
+    unsafe {
+        return obj[TAG_WORD]
+    }
+}
+
+/// Read payload field `index`, assuming it is in bounds.
+fn fieldAt(obj: *int, index: int) -> *int {
+    unsafe {
+        return obj[FIELDS_WORD + index] as *int
+    }
+}
+
+/// Create an enum object holding `tag` and `fieldCount` null payload fields.
+/// Mirrors `enum.rs::enum_new` -> `enum_init`: write the header and the tag, then
+/// zero every payload field so an uninitialised slot is never traced. The fields
+/// are written explicitly because `alloc` does not zero memory (see
+/// `runtime.abi_list` and the `zeroed` helper in `runtime.abi_map`).
+fn enumNew(tag: int, fieldCount: int) -> *int {
+    unsafe {
+        var obj = alloc(int, FIELDS_WORD + fieldCount)
+        obj[0] = 0
+        obj[1] = PICKLE_CLASS_ENUM
+        obj[2] = enumObjectSize(fieldCount)
+        obj[TAG_WORD] = tag
+        var i = 0
+        while (i < fieldCount) {
+            obj[FIELDS_WORD + i] = 0
+            i = i + 1
+        }
+        abiRegisterObject(obj)
+        return obj
+    }
+}
+
+/// Create an enum object with `tag` and `fieldCount` null payload fields.
+/// Mirrors `pickle_enum_new`.
+#[symbol("pickle_enum_new")]
+fn abiEnumNew(tag: int, fieldCount: int) -> *int {
+    return enumNew(tag, fieldCount)
+}
+
+/// The variant tag. Mirrors `pickle_enum_tag`.
+#[symbol("pickle_enum_tag")]
+fn abiEnumTag(obj: *int) -> int {
+    return tagOf(obj)
+}
+
+/// A payload field; null when the index is out of bounds. Mirrors
+/// `pickle_enum_field`, whose out-of-range result is the null pointer.
+#[symbol("pickle_enum_field")]
+fn abiEnumField(obj: *int, index: int) -> *int {
+    if (index < 0 || index >= enumFieldCount(obj)) {
+        return 0 as *int
+    }
+    return fieldAt(obj, index)
+}
+
+/// Write a payload field. Mirrors `pickle_enum_set_field`; its bounds assert is the
+/// documented GAP above, since callers pass constant indices into a matching enum.
+#[symbol("pickle_enum_set_field")]
+fn abiEnumSetField(obj: *int, index: int, value: *int) {
+    unsafe {
+        if (index < 0 || index >= enumFieldCount(obj)) {
+            return
+        }
+        obj[FIELDS_WORD + index] = value as int
+    }
+}
+
+/// IEEE-754 binary64 exponent field, `0x7FF0000000000000`. Exponent all ones marks
+/// a NaN or an infinity.
+const F64_EXPONENT: int = 0x7FF0000000000000
+/// IEEE-754 binary64 significand field, `0x000FFFFFFFFFFFFF`. A NaN has a non-zero
+/// significand, an infinity has zero.
+const F64_SIGNIFICAND: int = 0x000FFFFFFFFFFFFF
+/// Every bit of a binary64 except the sign, `0x7FFFFFFFFFFFFFFF`.
+const F64_MAGNITUDE: int = 0x7FFFFFFFFFFFFFFF
+
+/// True when a boxed float's bit pattern is a NaN.
+fn isNanBits(bits: int) -> bool {
+    return (bits & F64_EXPONENT) == F64_EXPONENT && (bits & F64_SIGNIFICAND) != 0
+}
+
+/// `f64::from_bits(a) == f64::from_bits(b)`, decided on the bit patterns alone.
+///
+/// `enum.rs` compares a boxed float payload by f64 *value*, and the port has no
+/// float<->bits bitcast (`runtime.abi_box` records that GAP), so the comparison is
+/// reconstructed from the integers. Three IEEE-754 facts make it exact:
+///   - NaN is unequal to everything, including its own bit pattern, so any NaN
+///     operand answers false.
+///   - two non-NaN patterns denote equal values exactly when the patterns match,
+///     so that alone settles almost every pair.
+///   - the single remaining exception is `+0.0` versus `-0.0`: distinct patterns,
+///     equal value, differing only in the sign bit.
+fn f64ValueEq(bitsA: int, bitsB: int) -> bool {
+    if (isNanBits(bitsA)) {
+        return false
+    }
+    if (isNanBits(bitsB)) {
+        return false
+    }
+    if (bitsA == bitsB) {
+        return true
+    }
+    return (bitsA & F64_MAGNITUDE) == 0 && (bitsB & F64_MAGNITUDE) == 0
+}
+
+/// Equality of a single managed payload slot. Mirrors `enum.rs::enum_field_eq`.
+fn enumFieldEq(a: *int, b: *int) -> bool {
+    if (ptrEq(a, b)) {
+        return true
+    }
+    if (isNull(a) || isNull(b)) {
+        return false
+    }
+    var ca = classOf(a)
+    var cb = classOf(b)
+    if (ca != cb) {
+        return false
+    }
+    if (ca == PICKLE_CLASS_BOX_INT || ca == PICKLE_CLASS_BOX_BOOL || ca == PICKLE_CLASS_BOX_CHAR) {
+        return boxBits(a) == boxBits(b)
+    }
+    if (ca == PICKLE_CLASS_BOX_FLOAT) {
+        return f64ValueEq(boxBits(a), boxBits(b))
+    }
+    if (ca == PICKLE_CLASS_STRING) {
+        return abiStrCmp(a, b) == 0
+    }
+    if (ca == PICKLE_CLASS_ENUM) {
+        return enumEq(a, b)
+    }
+    return false
+}
+
+/// Structural equality of two enum objects: same tag and pairwise-equal payload
+/// fields. Mirrors `pickle_enum_eq`.
+fn enumEq(a: *int, b: *int) -> bool {
+    if (ptrEq(a, b)) {
+        return true
+    }
+    if (isNull(a) || isNull(b)) {
+        return false
+    }
+    if (classOf(a) != PICKLE_CLASS_ENUM || classOf(b) != PICKLE_CLASS_ENUM) {
+        return false
+    }
+    if (tagOf(a) != tagOf(b)) {
+        return false
+    }
+    var count = enumFieldCount(a)
+    if (count != enumFieldCount(b)) {
+        return false
+    }
+    var i = 0
+    while (i < count) {
+        if (!enumFieldEq(fieldAt(a, i), fieldAt(b, i))) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+/// Structural equality of two enum objects. Mirrors `pickle_enum_eq`.
+#[symbol("pickle_enum_eq")]
+fn abiEnumEq(a: *int, b: *int) -> bool {
+    return enumEq(a, b)
+}

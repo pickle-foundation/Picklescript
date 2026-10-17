@@ -1,0 +1,126 @@
+module runtime.bstr_test
+
+import { BStr, bstr, bstrOf, bstrFrom, concat } from runtime.bstr
+
+fn isNone(x: int?) -> bool {
+    if (let some(v) = x) {
+        return false
+    }
+    true
+}
+
+test fn length_bytes_roundtrip() {
+    let b = bstrOf("abc")
+    expect(b.byteLength()).toBe(3)
+    expect(len(b.toBytes())).toBe(3)
+    expect(b.toString()).toBe("abc")
+    expect(b.isShared()).toBe(false)
+}
+
+test fn empty_and_from_bytes() {
+    let e = bstr()
+    expect(e.byteLength()).toBe(0)
+    expect(e.scalarCount()).toBe(0)
+    expect(e.toString()).toBe("")
+    let bs = bytes("xy")
+    let f = bstrFrom(bs)
+    expect(f.toString()).toBe("xy")
+}
+
+test fn scalar_cache_counts_utf8() {
+    let b = bstrOf("héllo")
+    expect(b.byteLength()).toBe(6)
+    expect(b.scalarCount()).toBe(5)
+    expect(b.scalarCount()).toBe(5)
+}
+
+test fn byte_write_dirties_scalar_cache() {
+    let b = bstrOf("é")
+    expect(b.scalarCount()).toBe(1)
+    b.setByte(0, 'a' as byte)
+    expect(b.scalarCount()).toBe(2)
+    expect(b.toString()[0] as int).toBe('a' as int)
+}
+
+test fn slice_aliases_parent() {
+    let b = bstrOf("hello")
+    let s = b.slice(0, 3)
+    expect(s.isShared()).toBe(true)
+    expect(s.toString()).toBe("hel")
+    expect(b.byteLength()).toBe(5)
+    expect(s.byteLength()).toBe(3)
+}
+
+test fn set_on_shared_view_copies() {
+    let b = bstrOf("hello")
+    let s = b.slice(0, 3)
+    s.setByte(0, 'H' as byte)
+    expect(s.isShared()).toBe(false)
+    expect(s.toString()).toBe("Hel")
+    expect(b.toString()).toBe("hello")
+}
+
+test fn push_byte_detaches_view() {
+    let b = bstrOf("ab")
+    let s = b.slice(0, 1)
+    s.pushByte('c' as byte)
+    expect(s.toString()).toBe("ac")
+    expect(b.toString()).toBe("ab")
+}
+
+test fn append_merges_and_keeps_window() {
+    let b = bstr()
+    b.appendStr("hé")
+    b.appendStr("llo")
+    expect(b.toString()).toBe("héllo")
+    expect(b.byteLength()).toBe(6)
+    expect(b.scalarCount()).toBe(5)
+}
+
+test fn concat_copies_inputs() {
+    let a = bstrOf("ab")
+    let c = concat(a, bstrOf("cd"))
+    expect(c.toString()).toBe("abcd")
+    expect(c.isShared()).toBe(false)
+    expect(a.toString()).toBe("ab")
+}
+
+test fn slice_clamps() {
+    let b = bstrOf("hello")
+    expect(b.slice(-3, 99).toString()).toBe("hello")
+    expect(b.slice(1, 1).toString()).toBe("")
+    expect(b.slice(4, 1).toString()).toBe("")
+}
+
+test fn scalar_slice_walks_boundaries() {
+    let b = bstrOf("héllo")
+    expect(b.sliceScalars(1, 2).toString()).toBe("él")
+    expect(b.sliceScalars(0, 5).toString()).toBe("héllo")
+    expect(b.sliceScalars(9, 1).toString()).toBe("")
+}
+
+test fn hash_matches_fnv_golden() {
+    expect(bstrOf("").hashCode()).toBe(-3750763034362895579)
+    expect(bstrOf("a").hashCode()).toBe(-5808556873153909620)
+    expect(bstrOf("abc").hashCode()).toBe(-1792535898324117685)
+    expect(bstrOf("hello").hashCode()).toBe(-6615550055289275125)
+    expect(bstrOf("é").hashCode()).toBe(775207407765167617)
+}
+
+test fn equals_is_content_based() {
+    expect(bstrOf("abc").equals(bstrOf("abc"))).toBe(true)
+    let b = bstrOf("hello")
+    expect(b.slice(0, 3).equals(bstrOf("hel"))).toBe(true)
+    expect(b.slice(0, 3).equals(b)).toBe(false)
+}
+
+test fn decode_cp_at() {
+    let b = bstrOf("é")
+    if (let some(cp) = b.decodeCpAt(0)) {
+        expect(cp).toBe(233)
+    } else {
+        expect(0).toBe(1)
+    }
+    expect(isNone(b.decodeCpAt(1))).toBe(true)
+    expect(isNone(b.decodeCpAt(3))).toBe(true)
+}

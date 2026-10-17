@@ -1,0 +1,42 @@
+module runtime.os
+
+/// Port of `runtime/src/os.rs`: `exit(code)` and `args()` semantics.
+///
+/// The argument vector and the process handle stay native:
+///   - `pickle_args_set(argc, argv)` — captures the vector at startup
+///     (program name excluded), reset between test-module runs.
+///   - `pickle_args()` — a fresh `List<string>` of `argv[1..]`.
+///   - `pickle_exit(code)` — flushes buffered output, then terminates.
+///
+/// What a self-hosted runtime owns is the CONTRACT: `exit` clamps the code to
+/// the `i32` range a host process status accepts, and `args()` never aliases
+/// its store (every call returns an independent copy, so mutating the result
+/// cannot corrupt the captured vector).
+
+/// `pickle_exit` clamps to `i32::MIN` ..= `i32::MAX` before terminating.
+const EXIT_CODE_MIN: int = -2147483648
+const EXIT_CODE_MAX: int = 2147483647
+
+fn exitCodeOf(code: int) -> int {
+    if (code < EXIT_CODE_MIN) {
+        return EXIT_CODE_MIN
+    }
+    if (code > EXIT_CODE_MAX) {
+        return EXIT_CODE_MAX
+    }
+    code
+}
+
+/// The `args()` copy contract: return a fresh list holding the same strings
+/// as the captured store, so the caller may push/pop freely without touching
+/// the runtime's owned vector.
+fn snapshotStrings(stored: List<string>) -> List<string> {
+    var out = ["x"]
+    out.pop()
+    var i = 0
+    while (i < len(stored)) {
+        out.push(stored[i])
+        i = i + 1
+    }
+    out
+}

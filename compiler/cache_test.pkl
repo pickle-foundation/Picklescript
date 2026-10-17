@@ -1,0 +1,165 @@
+module compiler.cache_test
+
+import { fingerprint, lookup, store, recordedDeps, hashOf, lessBytes, sortStrings, emptyStrs } from compiler.cache
+
+/// A directory only this test uses. Entries are content-keyed, so a leftover
+/// file from a previous run is harmless; the tests that need a path to be absent
+/// delete it by name.
+fn scratch(name: string) -> string {
+    let dir = "target/pickle-test-cache/" + name
+    // `write_file` does not create parents, and a stamp of an unwritten file
+    // would make every test below pass for the wrong reason.
+    mkdir("target/pickle-test-cache")
+    mkdir(dir)
+    dir
+}
+
+/// The fingerprint, or a value no real fingerprint can equal, so a missing one
+/// fails the comparison instead of quietly comparing equal to another `none`.
+fn fingerprintOf(kind: string, deps: List<string>) -> string {
+    fingerprint(kind, deps) ?? "<no fingerprint>"
+}
+
+fn write(path: string, text: string) -> string {
+    write_file(path, text)
+    path
+}
+
+fn depsOf(paths: List<string>) -> List<string> {
+    var out = emptyStrs()
+    for (p in paths) {
+        out.push(p)
+    }
+    out
+}
+
+fn one(p: string) -> List<string> {
+    depsOf([p])
+}
+
+/// An absent optional reads as this, so a miss and a wrong value are told apart
+/// by a failing comparison rather than by a crash.
+fn orNone(v: string?) -> string {
+    v ?? "<none>"
+}
+
+fn orNoDeps(v: List<string>?) -> int {
+    len(v ?? emptyStrs())
+}
+
+test fn hash_is_stable_and_content_sensitive() {
+    expect(hashOf("pickle") == hashOf("pickle")).toBe(true)
+    expect(hashOf("pickle") == hashOf("picklec")).toBe(false)
+    // The digest becomes a file name, so it has to be non-empty text.
+    expect(len(hashOf("pickle")) > 0).toBe(true)
+}
+
+test fn stamps_sort_bytewise() {
+    var xs = emptyStrs()
+    xs.push("b 1 x")
+    xs.push("a 1 x")
+    sortStrings(xs)
+    // Sorting is what makes the fingerprint independent of the order the loader
+    // happened to read imports in.
+    expect(xs[0] == "a 1 x").toBe(true)
+    expect(xs[1] == "b 1 x").toBe(true)
+    expect(lessBytes("a", "b")).toBe(true)
+    expect(lessBytes("b", "a")).toBe(false)
+    expect(lessBytes("ab", "abc")).toBe(true)
+}
+
+test fn fingerprint_ignores_dependency_order() {
+    let dir = scratch("order")
+    let a = write(dir + "/a.pkl", "a")
+    let b = write(dir + "/b.pkl", "b")
+    expect(fingerprintOf("irx", depsOf([a, b])) == fingerprintOf("irx", depsOf([b, a]))).toBe(true)
+}
+
+test fn fingerprint_needs_every_input() {
+    let dir = scratch("missing")
+    let a = write(dir + "/a.pkl", "a")
+    expect(fingerprint("irx", one(a))).toExist()
+    // A lowering whose inputs cannot all be read in full must not reuse one that
+    // could.
+    expect(fingerprint("irx", depsOf([a, dir + "/gone.pkl"]))).not().toExist()
+}
+
+test fn fingerprint_tracks_content_not_metadata() {
+    let dir = scratch("content")
+    let a = write(dir + "/a.pkl", "one")
+    let before = fingerprintOf("irx", one(a))
+    write(a, "two")
+    expect(before == fingerprintOf("irx", one(a))).toBe(false)
+}
+
+test fn fingerprint_separates_payload_kinds() {
+    let dir = scratch("kinds")
+    let a = write(dir + "/a.pkl", "a")
+    // The `ir` and `irx` renderings of one program must never collide.
+    expect(fingerprintOf("ir", one(a)) == fingerprintOf("irx", one(a))).toBe(false)
+}
+
+test fn store_then_lookup_returns_the_payload() {
+    let dir = scratch("roundtrip")
+    let a = write(dir + "/a.pkl", "one")
+    store(dir, "irx", dir + "/entry.pkl", one(a), "irx body\n")
+    expect(orNone(lookup(dir, "irx", one(a)))).toBe("irx body\n")
+    // A different kind is a different entry, not a wrong hit.
+    expect(orNone(lookup(dir, "ir", one(a)))).toBe("<none>")
+}
+
+test fn lookup_misses_when_a_source_changes() {
+    let dir = scratch("stale")
+    let a = write(dir + "/a.pkl", "one")
+    store(dir, "irx", dir + "/entry.pkl", one(a), "first\n")
+    expect(orNone(lookup(dir, "irx", one(a)))).toBe("first\n")
+    write(a, "two")
+    expect(orNone(lookup(dir, "irx", one(a)))).toBe("<none>")
+}
+
+test fn recorded_deps_round_trips_and_replaces() {
+    let dir = scratch("deps")
+    let a = write(dir + "/a.pkl", "one")
+    let b = write(dir + "/b.pkl", "two")
+    let entry = dir + "/entry.pkl"
+    let sidecar = dir + "/" + hashOf(entry) + ".deps"
+    delete(sidecar)
+    expect(orNoDeps(recordedDeps(dir, entry))).toBe(0)
+    store(dir, "irx", entry, depsOf([a, b]), "p\n")
+    expect(orNoDeps(recordedDeps(dir, entry))).toBe(2)
+    // An import removed must not leave the old list behind: the next run has to
+    // see the smaller set, or it keeps reading a file it no longer needs.
+    store(dir, "irx", entry, one(a), "q\n")
+    expect(orNoDeps(recordedDeps(dir, entry))).toBe(1)
+}
+
+/// The runtime has no atomic rename, so an interrupted write leaves a file whose
+/// header still matches but whose payload stops early. Serving that would hand
+/// the caller a truncated module, so the length in the header is what decides.
+test fn lookup_rejects_a_truncated_entry() {
+    let dir = scratch("torn")
+    let a = write(dir + "/a.pkl", "one")
+    let deps = one(a)
+    let entry = dir + "/entry.pkl"
+    store(dir, "irx", entry, deps, "irx body\n")
+    expect(orNone(lookup(dir, "irx", deps))).toBe("irx body\n")
+    if (let some(want) = fingerprint("irx", deps)) {
+        // Same header, a length no payload can match.
+        write_file(dir + "/" + hashOf(want) + ".txt", str(999) + "\n" + want + "\n\nirx body\n")
+    }
+    expect(orNone(lookup(dir, "irx", deps))).toBe("<none>")
+}
+
+test fn lookup_rejects_a_foreign_header() {
+    let dir = scratch("foreign")
+    let a = write(dir + "/a.pkl", "one")
+    let b = write(dir + "/b.pkl", "b")
+    // An entry filed under this key whose header describes other inputs: the file
+    // name is only a hint, the header decides.
+    if (let some(mine) = fingerprint("irx", one(a))) {
+        if (let some(theirs) = fingerprint("irx", one(b))) {
+            write_file(dir + "/" + hashOf(mine) + ".txt", str(2) + "\n" + theirs + "\n\nhi")
+        }
+    }
+    expect(orNone(lookup(dir, "irx", one(a)))).toBe("<none>")
+}

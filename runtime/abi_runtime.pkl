@@ -1,0 +1,41 @@
+module runtime.abi_runtime
+
+/// Port of `runtime/src/lib.rs::pickle_runtime_init` as a real `#[symbol]`
+/// body: the GC-three slice alongside `abi_class_extra.pkl`.
+///
+/// Native does four things at process bring-up: install the panic hook,
+/// initialise the collector, register the ten builtin descriptors, and (on a
+/// freestanding Windows exe) scrape the real command line. Idempotent; runs
+/// from the PE startup trampoline before the compiled `pickle_main`, so the
+/// builtin descriptors exist before the injected `pickle_class_register` calls
+/// in `main`'s entry block.
+///
+/// WHAT THIS PORTS. The observable, in-image effect is the builtin descriptor
+/// registration: ids 0-9 must answer `pickle_class_name` with "string", "List",
+/// "Map", "int", "float", "bool", "char", "enum", "tuple", "stream" (this is
+/// what makes `abi_console`'s user-class/stream print fallback correct). The
+/// panic hook and collector have nothing to install in the port (the panic
+/// slice is a ported channel with its own state; there is no collector in a
+/// qualified image yet - see the open-GC note in `abi_console.pkl`). The
+/// command-line scrape is already ported separately: `abi_args` self-captures
+/// `GetCommandLineW` (see the header note in `abi_process.pkl`), so a
+/// `runtime_init` that also scraped would double-capture.
+///
+/// IDEMPOTENT exactly like native: a scalar flag, set after the first seed.
+/// Re-seeding would be harmless (identical overwrites) but would leak one
+/// marker string per call, so the flag is also a realism guard.
+
+import { seedBuiltins } from runtime.abi_class_extra
+
+/// Set once the builtin class names are seeded; image data, valid from entry.
+var runtimeInited: int = 0
+
+#[symbol("pickle_runtime_init")]
+fn abiRuntimeInit() -> int {
+    if (runtimeInited == 1) {
+        return 0
+    }
+    seedBuiltins()
+    runtimeInited = 1
+    return 0
+}

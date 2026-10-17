@@ -1,0 +1,586 @@
+module compiler.emit_test
+
+import { sanitizeSymbol, isAsciiAlnum, paramsLen, boundParams, scopeContainsFrom, scopeBind, patternBinds, thisCallExpr, namedCtorDelegation, ctorSuperDelegation, staticFieldSlot, staticFieldInfo, elemIr, tripleKey, pairKey, instKey, lambdaKey, isSomeInt, hasStr, ifaceOf, IfaceRef, textOf, allTextParts, joinText, strLess, bytesOf, splitOff, NameRef, irTyTag, irTysEqual, intListsEqual, strListHas, exprKindIdentName, kindDbg, binaryOpcode, assignOpcode, cmpTypesCompatible, flipCmp, binOpName, floatVal, seedClassTable } from compiler.emit
+import { Span } from compiler.diag
+import { f64ToBits } from compiler.x64
+import { StrPart, BinOp, UnOp, AssignOp, Expr, ExprKind, Pattern, Lit, Param, Block, Stmt, FnBody, emptyStrs, emptyParams, emptyAttrs, emptyBlock, Visibility } from compiler.ast
+import { IrBinOp, binOpRepr, IrTy, emptyIrTys } from compiler.ir
+import { Ty, emptyTys } from compiler.ty
+import { FieldInfo } from compiler.resolve
+
+fn makeSpan(s: int, e: int) -> Span {
+    Span(s, e)
+}
+
+fn someInt(v: int) -> int? {
+    v
+}
+
+fn identExpr(name: string) -> Expr {
+    Expr(makeSpan(0, 0), ExprKind.Ident(name))
+}
+
+fn callExpr(callee: Expr) -> Expr {
+    Expr(makeSpan(0, 0), ExprKind.Call(callee, emptyCallArgs()))
+}
+
+fn thisCallExprTest() -> Expr {
+    callExpr(Expr(makeSpan(0, 0), ExprKind.This))
+}
+
+fn superCallExprTest() -> Expr {
+    callExpr(Expr(makeSpan(0, 0), ExprKind.Super))
+}
+
+fn emptyCallArgs() -> List<CallArg> {
+    var l = [CallArg(someStr(""), identExpr("x"), false, makeSpan(0, 0))]
+    l.pop()
+    l
+}
+
+fn someStr(s: string) -> string? {
+    s
+}
+
+fn lambdaExpr() -> Expr {
+    Expr(makeSpan(0, 0), ExprKind.Lambda(emptyParams(), none, false, FnBody.Block(emptyBlock())))
+}
+
+fn lambdaExprTwo() -> Expr {
+    let p1 = Param("a", none, none, false, emptyAttrs(), makeSpan(0, 0))
+    let p2 = Param("b", none, none, false, emptyAttrs(), makeSpan(0, 0))
+    Expr(makeSpan(0, 0), ExprKind.Lambda([p1, p2], none, false, FnBody.Block(emptyBlock())))
+}
+
+fn stmtBlock(s: Stmt) -> Block {
+    var stmts: List<Stmt> = [s]
+    Block(stmts, none, makeSpan(0, 0))
+}
+
+fn tailExprBlock(e: Expr) -> Block {
+    var t: List<Stmt> = [Stmt.Empty(makeSpan(0, 0))]
+    t.pop()
+    Block(t, someExpr(e), makeSpan(0, 0))
+}
+
+fn someExpr(e: Expr) -> Expr? {
+    e
+}
+
+test fn sanitize_symbol() {
+    expect(sanitizeSymbol("List<int>")).toBe("List_int_")
+    expect(sanitizeSymbol("a, b (c)")).toBe("a__b__c_")
+    expect(sanitizeSymbol("abc")).toBe("abc")
+    expect(sanitizeSymbol("!!!")).toBe("___")
+    expect(sanitizeSymbol("")).toBe("_")
+}
+
+test fn ascii_alnum() {
+    expect(isAsciiAlnum(bytes("a")[0])).toBe(true)
+    expect(isAsciiAlnum(bytes("Z")[0])).toBe(true)
+    expect(isAsciiAlnum(bytes("0")[0])).toBe(true)
+    expect(isAsciiAlnum(bytes("9")[0])).toBe(true)
+    expect(isAsciiAlnum(bytes(".")[0])).toBe(false)
+    expect(isAsciiAlnum(bytes("[")[0])).toBe(false)
+}
+
+test fn params_len() {
+    expect(paramsLen(lambdaExpr())).toBe(0)
+    expect(paramsLen(lambdaExprTwo())).toBe(2)
+    expect(paramsLen(identExpr("x"))).toBe(0)
+}
+
+test fn bound_params() {
+    let p1 = Param("a", none, none, false, emptyAttrs(), makeSpan(0, 0))
+    let p2 = Param("b", none, none, false, emptyAttrs(), makeSpan(0, 0))
+    let m = boundParams([p1, p2])
+    expect(m.has("a")).toBe(true)
+    expect(m.has("b")).toBe(true)
+    expect(m.has("c")).toBe(false)
+    let m0 = boundParams(emptyParams())
+    expect(len(m0)).toBe(0)
+}
+
+test fn scope_helpers() {
+    var sc: List<Map<string, bool>> = [{"a": true}, {"b": true}]
+    expect(scopeContainsFrom(sc, 0, "a")).toBe(true)
+    expect(scopeContainsFrom(sc, 0, "b")).toBe(true)
+    expect(scopeContainsFrom(sc, 0, "c")).toBe(false)
+    expect(scopeContainsFrom(sc, 1, "b")).toBe(true)
+    expect(scopeContainsFrom(sc, 1, "a")).toBe(false)
+    var sc2: List<Map<string, bool>> = [{"a": true}]
+    scopeBind(sc2, "x")
+    expect(hasStr(sc2[len(sc2) - 1].keys(), "x")).toBe(true)
+}
+
+test fn pattern_binds() {
+    var bs = patternBinds(Pattern.Binding("x", none))
+    expect(len(bs)).toBe(1)
+    expect(bs[0]).toBe("x")
+    var bs2 = patternBinds(Pattern.Wildcard)
+    expect(len(bs2)).toBe(0)
+    var bs3 = patternBinds(Pattern.Tuple([Pattern.Binding("a", none), Pattern.Binding("b", none)]))
+    expect(len(bs3)).toBe(2)
+    expect(strListHas(bs3, "a")).toBe(true)
+    expect(strListHas(bs3, "b")).toBe(true)
+    var bs4 = patternBinds(Pattern.Literal(Lit.Int(1)))
+    expect(len(bs4)).toBe(0)
+}
+
+test fn this_call_expr() {
+    match (thisCallExpr(thisCallExprTest())) {
+        case some(_) -> expect(true).toBe(true)
+        case none -> expect(true).toBe(false)
+    }
+    match (thisCallExpr(identExpr("f"))) {
+        case some(_) -> expect(true).toBe(false)
+        case none -> expect(true).toBe(true)
+    }
+}
+
+test fn emit_named_ctor_delegation() {
+    let tail = tailExprBlock(thisCallExprTest())
+    match (namedCtorDelegation(tail)) {
+        case some(_) -> expect(true).toBe(true)
+        case none -> expect(true).toBe(false)
+    }
+    let empty = emptyBlock()
+    match (namedCtorDelegation(empty)) {
+        case some(_) -> expect(true).toBe(false)
+        case none -> expect(true).toBe(true)
+    }
+    let other = tailExprBlock(identExpr("f"))
+    match (namedCtorDelegation(other)) {
+        case some(_) -> expect(true).toBe(false)
+        case none -> expect(true).toBe(true)
+    }
+    let stmtD = stmtBlock(Stmt.Expr(thisCallExprTest()))
+    match (namedCtorDelegation(stmtD)) {
+        case some(_) -> expect(true).toBe(true)
+        case none -> expect(true).toBe(false)
+    }
+}
+
+test fn ctor_super_delegation() {
+    let stmt = stmtBlock(Stmt.Expr(superCallExprTest()))
+    match (ctorSuperDelegation(stmt)) {
+        case some(_) -> expect(true).toBe(true)
+        case none -> expect(true).toBe(false)
+    }
+    let empty = emptyBlock()
+    match (ctorSuperDelegation(empty)) {
+        case some(_) -> expect(true).toBe(false)
+        case none -> expect(true).toBe(true)
+    }
+    let notSuper = stmtBlock(Stmt.Expr(identExpr("f")))
+    match (ctorSuperDelegation(notSuper)) {
+        case some(_) -> expect(true).toBe(false)
+        case none -> expect(true).toBe(true)
+    }
+}
+
+test fn static_field_helpers() {
+    let t = seedClassTable()
+    t.fields = emptyFieldInfosLocal()
+    t.fields.push(FieldInfo("a", Visibility.Public, true, false, false, false, Ty.Int, makeSpan(0, 0)))
+    t.fields.push(FieldInfo("b", Visibility.Public, false, false, false, false, Ty.Int, makeSpan(0, 0)))
+    t.fields.push(FieldInfo("c", Visibility.Public, true, false, false, false, Ty.Int, makeSpan(0, 0)))
+    match (staticFieldSlot(t, "a")) {
+        case some(i) -> expect(i).toBe(0)
+        case none -> expect(true).toBe(false)
+    }
+    match (staticFieldSlot(t, "c")) {
+        case some(i) -> expect(i).toBe(1)
+        case none -> expect(true).toBe(false)
+    }
+    match (staticFieldSlot(t, "b")) {
+        case some(i) -> expect(true).toBe(false)
+        case none -> expect(true).toBe(true)
+    }
+    match (staticFieldInfo(t, "c")) {
+        case some(f) -> expect(f.name).toBe("c")
+        case none -> expect(true).toBe(false)
+    }
+    match (staticFieldInfo(t, "b")) {
+        case some(f) -> expect(true).toBe(false)
+        case none -> expect(true).toBe(true)
+    }
+}
+
+fn emptyFieldInfosLocal() -> List<FieldInfo> {
+    var l = [FieldInfo("x", Visibility.Public, false, false, false, false, Ty.Int, makeSpan(0, 0))]
+    l.pop()
+    l
+}
+
+test fn elem_ir() {
+    expect(irTyTag(elemIr(Ty.Int))).toBe(irTyTag(IrTy.Int))
+    expect(irTyTag(elemIr(Ty.Byte))).toBe(irTyTag(IrTy.Int))
+    expect(irTyTag(elemIr(Ty.Float))).toBe(irTyTag(IrTy.Float))
+    expect(irTyTag(elemIr(Ty.String))).toBe(irTyTag(IrTy.Str))
+    expect(irTyTag(elemIr(Ty.Char))).toBe(irTyTag(IrTy.Char))
+    expect(irTyTag(elemIr(Ty.Bool))).toBe(irTyTag(IrTy.Bool))
+    expect(irTyTag(elemIr(Ty.List(Ty.Int)))).toBe(irTyTag(IrTy.Ptr))
+    expect(irTyTag(elemIr(Ty.Option(Ty.Int)))).toBe(irTyTag(IrTy.Ptr))
+}
+
+test fn keys() {
+    expect(pairKey("a", "b")).toBe("a|b")
+    expect(tripleKey("a", "b", "c")).toBe("a|b|c")
+    expect(instKey("f", [Ty.Int, Ty.String])).toBe("f<int, string>")
+    expect(lambdaKey(someInt(3), makeSpan(1, 5))).toBe("@3|1:5")
+    expect(lambdaKey(none, makeSpan(1, 5))).toBe("-|1:5")
+}
+
+test fn is_some_int_and_has_str() {
+    expect(isSomeInt(someInt(1))).toBe(true)
+    expect(isSomeInt(none)).toBe(false)
+    expect(hasStr(["a", "b"], "a")).toBe(true)
+    expect(hasStr(["a", "b"], "c")).toBe(false)
+}
+
+test fn iface_of() {
+    match (ifaceOf(Ty.Interface("I", emptyTys()))) {
+        case some(r) -> {
+            expect(r.name).toBe("I")
+            expect(len(r.args)).toBe(0)
+        }
+        case none -> expect(true).toBe(false)
+    }
+    match (ifaceOf(Ty.Ref(Ty.Interface("J", [Ty.Int])))) {
+        case some(r) -> {
+            expect(r.name).toBe("J")
+            expect(len(r.args)).toBe(1)
+        }
+        case none -> expect(true).toBe(false)
+    }
+    match (ifaceOf(Ty.Int)) {
+        case some(_) -> expect(true).toBe(false)
+        case none -> expect(true).toBe(true)
+    }
+}
+
+test fn str_part_helpers() {
+    match (textOf(StrPart.Text("hi"))) {
+        case some(t) -> expect(t).toBe("hi")
+        case none -> expect(true).toBe(false)
+    }
+    match (textOf(StrPart.Expr(identExpr("x")))) {
+        case some(_) -> expect(true).toBe(false)
+        case none -> expect(true).toBe(true)
+    }
+    expect(allTextParts([StrPart.Text("a"), StrPart.Text("b")])).toBe(true)
+    expect(allTextParts([StrPart.Text("a"), StrPart.Expr(identExpr("x"))])).toBe(false)
+    expect(joinText([StrPart.Text("a"), StrPart.Text("b")])).toBe("ab")
+    expect(joinText([StrPart.Text("a"), StrPart.Expr(identExpr("x")), StrPart.Text("c")])).toBe("ac")
+}
+
+test fn str_less_bytes() {
+    expect(strLess("a", "b")).toBe(true)
+    expect(strLess("b", "a")).toBe(false)
+    expect(strLess("ab", "abc")).toBe(true)
+    expect(strLess("abc", "ab")).toBe(false)
+    expect(strLess("a", "a")).toBe(false)
+    var bs = bytesOf("ab")
+    expect(len(bs)).toBe(2)
+    expect(bs[0]).toBe(97)
+    expect(bs[1]).toBe(98)
+    expect(len(bytesOf(""))).toBe(0)
+}
+
+test fn split_off() {
+    var xs = [NameRef("a", makeSpan(0, 0)), NameRef("b", makeSpan(0, 0)), NameRef("c", makeSpan(0, 0))]
+    let tail = splitOff(xs, 1)
+    expect(len(tail)).toBe(2)
+    expect(tail[0].name).toBe("b")
+    expect(tail[1].name).toBe("c")
+    expect(len(xs)).toBe(1)
+    expect(xs[0].name).toBe("a")
+}
+
+test fn ir_ty_equality() {
+    expect(irTyTag(IrTy.Bool)).toBe(0)
+    expect(irTyTag(IrTy.Char)).toBe(1)
+    expect(irTyTag(IrTy.Int)).toBe(2)
+    expect(irTyTag(IrTy.Float)).toBe(3)
+    expect(irTyTag(IrTy.Str)).toBe(4)
+    expect(irTyTag(IrTy.Unit)).toBe(5)
+    expect(irTyTag(IrTy.Ptr)).toBe(6)
+    expect(irTysEqual([IrTy.Int, IrTy.Str], [IrTy.Int, IrTy.Str])).toBe(true)
+    expect(irTysEqual([IrTy.Int], [IrTy.Float])).toBe(false)
+    expect(irTysEqual([IrTy.Int], [IrTy.Int, IrTy.Int])).toBe(false)
+    var a = [97, 98]
+    var b = [97, 99]
+    expect(intListsEqual(a, a)).toBe(true)
+    expect(intListsEqual(a, b)).toBe(false)
+}
+
+test fn expr_kind_helpers() {
+    match (exprKindIdentName(identExpr("foo"))) {
+        case some(n) -> expect(n).toBe("foo")
+        case none -> expect(true).toBe(false)
+    }
+    match (exprKindIdentName(thisCallExprTest())) {
+        case some(_) -> expect(true).toBe(false)
+        case none -> expect(true).toBe(true)
+    }
+    expect(kindDbg(identExpr("n"))).toBe("ident:n")
+    expect(kindDbg(Expr(makeSpan(0, 0), ExprKind.Member(identExpr("o"), "f")))).toBe("member:.f")
+    expect(kindDbg(thisCallExprTest())).toBe("call")
+    expect(kindDbg(Expr(makeSpan(0, 0), ExprKind.This))).toBe("this")
+    expect(kindDbg(Expr(makeSpan(0, 0), ExprKind.Binary(BinOp.Add, identExpr("a"), identExpr("b"))))).toBe("binop")
+}
+
+test fn opcodes() {
+    expect(binOpRepr(binaryOpcode(BinOp.Add))).toBe("add")
+    expect(binOpRepr(binaryOpcode(BinOp.Div))).toBe("div")
+    expect(binOpRepr(binaryOpcode(BinOp.Lt))).toBe("lt")
+    expect(binOpRepr(binaryOpcode(BinOp.Eq))).toBe("eq")
+    expect(binOpRepr(binaryOpcode(BinOp.And))).toBe("add")
+    expect(binOpRepr(assignOpcode(AssignOp.Add))).toBe("add")
+    expect(binOpRepr(assignOpcode(AssignOp.Shr))).toBe("shr")
+    expect(binOpRepr(assignOpcode(AssignOp.Assign))).toBe("add")
+}
+
+test fn cmp_and_flip() {
+    expect(cmpTypesCompatible(2, 2)).toBe(true)
+    expect(cmpTypesCompatible(-1, 2)).toBe(true)
+    expect(cmpTypesCompatible(2, -1)).toBe(true)
+    expect(cmpTypesCompatible(2, 3)).toBe(true)
+    expect(cmpTypesCompatible(2, 4)).toBe(false)
+    expect(binOpRepr(flipCmp(IrBinOp.Eq, true))).toBe("ne")
+    expect(binOpRepr(flipCmp(IrBinOp.Ne, true))).toBe("eq")
+    expect(binOpRepr(flipCmp(IrBinOp.Gt, true))).toBe("le")
+    expect(binOpRepr(flipCmp(IrBinOp.Ge, true))).toBe("lt")
+    expect(binOpRepr(flipCmp(IrBinOp.Lt, true))).toBe("ge")
+    expect(binOpRepr(flipCmp(IrBinOp.Le, true))).toBe("gt")
+    expect(binOpRepr(flipCmp(IrBinOp.Add, true))).toBe("add")
+    expect(binOpRepr(flipCmp(IrBinOp.Eq, false))).toBe("eq")
+}
+
+test fn emit_bin_op_names() {
+    expect(binOpName(BinOp.Range)).toBe("Range")
+    expect(binOpName(BinOp.In)).toBe("In")
+    expect(binOpName(BinOp.Is)).toBe("Is")
+    expect(binOpName(BinOp.Pow)).toBe("Pow")
+}
+
+test fn float_val() {
+    let v1 = floatVal("1.5")
+    let v2 = floatVal("-2.25")
+    let v3 = floatVal("0")
+    let v4 = floatVal("3")
+    expect(v1 > 1.4 && v1 < 1.6).toBe(true)
+    expect(v2 > -2.3 && v2 < -2.2).toBe(true)
+    expect(v3 == 0.0).toBe(true)
+    expect(v4 > 2.9 && v4 < 3.1).toBe(true)
+}
+
+// Source float literals must match Rust's `text.parse::<f64>()` bit for bit.
+// The old scaling shortcut (`mant as float` times `10.0^|scale|`) needed three
+// separate roundings and collapsed both ends of the range: every literal with
+// `scale < -308` produced `0.0` because `10.0^|scale|` overflowed to `inf`, and
+// `scale > 0` overflowed to `inf` for large magnitudes. Asserted on exact bits
+// so the value cannot be merely "close".
+test fn float_val_bits_match_rust_parse() {
+    expect(f64ToBits(floatVal("0"))).toBe(0)
+    expect(f64ToBits(floatVal("0.5"))).toBe(4602678819172646912)
+    expect(f64ToBits(floatVal("1"))).toBe(4607182418800017408)
+    expect(f64ToBits(floatVal("-1.5"))).toBe(-4613937818241073152)
+    // Negative zero keeps its sign; `0.0 - 0.0` would have lost it. i64::MIN is
+    // not writable as a literal, so it is spelled out.
+    expect(f64ToBits(floatVal("-0.0"))).toBe(0 - 9223372036854775807 - 1)
+    expect(f64ToBits(floatVal("1e300"))).toBe(9094988921128908188)
+    expect(f64ToBits(floatVal("1.0e300"))).toBe(9094988921128908188)
+    expect(f64ToBits(floatVal("1e308"))).toBe(9214871658872686752)
+    expect(f64ToBits(floatVal("1.7976931348623157e308"))).toBe(9218868437227405311)
+    // Overflow past f64::MAX saturates to +inf, as Rust's parse does.
+    expect(f64ToBits(floatVal("1.7976931348623159e308"))).toBe(9218868437227405312)
+    // Subnormals: the range the old code returned 0.0 for.
+    expect(f64ToBits(floatVal("1e-308"))).toBe(2024022533073106)
+    expect(f64ToBits(floatVal("1e-320"))).toBe(2024)
+    expect(f64ToBits(floatVal("1.0e-320"))).toBe(2024)
+    expect(f64ToBits(floatVal("1e-323"))).toBe(2)
+    expect(f64ToBits(floatVal("5e-324"))).toBe(1)
+    expect(f64ToBits(floatVal("7e-324"))).toBe(1)
+    expect(f64ToBits(floatVal("4.9406564584124654e-324"))).toBe(1)
+    // Smallest normal, and its immediate neighbour below.
+    expect(f64ToBits(floatVal("2.2250738585072014e-308"))).toBe(4503599627370496)
+    expect(f64ToBits(floatVal("2.2250738585072011e-308"))).toBe(4503599627370495)
+    // A wide digit count with a deep exponent needs the guard bits too.
+    expect(f64ToBits(floatVal("123456789e-320"))).toBe(249879322797)
+}
+
+// Guards the specific mechanism: no power of ten large enough to overflow may
+// be materialised. `10.0^324` is `inf`, so the old code divided by `inf`.
+test fn float_val_subnormals_are_not_zero() {
+    expect(floatVal("5e-324") == 0.0).toBe(false)
+    expect(floatVal("1e-320") == 0.0).toBe(false)
+    expect(floatVal("1e-310") == 0.0).toBe(false)
+    expect(floatVal("1.7976931348623157e308") == 1.0e400).toBe(false)
+    // Ordering still holds across the subnormal/normal boundary.
+    expect(floatVal("5e-324") < floatVal("1e-320")).toBe(true)
+    expect(floatVal("1e-320") < floatVal("2.2250738585072014e-308")).toBe(true)
+}
+// GENERATED from the Rust `str::parse::<f64>()` oracle by
+// tools\gen_float_oracle.ps1 then tools\gen_float_emit_block.ps1. Do not hand-edit.
+//
+// The two float bugs fixed in this file were both invisible to every other
+// test, because each had exactly one hand-picked assertion guarding it. This
+// table is the generalisation: every literal below is asserted bit-for-bit
+// against what Rust actually parses it to, so any future divergence in
+// irxParseFloat / floatVal shows up as a named failing literal instead of a
+// silent value change somewhere downstream.
+//
+// Coverage: the subnormal band (1e-324 .. 9e-308, 72 values), the
+// subnormal/normal boundary and its neighbours, 2^53 and neighbours where
+// not every integer is representable, 25-digit digit runs, deep exponents
+// with many mantissa digits, both saturation tails (Rust returns Ok(inf) and
+// Ok(0.0) rather than erroring), signed zero, negative values across the
+// whole range, and syntax forms Rust accepts (".5", "1.", "1E5", "1e+5").
+// Total: 143 literals.
+test fn float_val_matches_rust_oracle_table() {
+    expect(f64ToBits(floatVal("1e-324"))).toBe(0)
+    expect(f64ToBits(floatVal("5e-324"))).toBe(1)
+    expect(f64ToBits(floatVal("9e-324"))).toBe(2)
+    expect(f64ToBits(floatVal("1e-323"))).toBe(2)
+    expect(f64ToBits(floatVal("5e-323"))).toBe(10)
+    expect(f64ToBits(floatVal("9e-323"))).toBe(18)
+    expect(f64ToBits(floatVal("1e-322"))).toBe(20)
+    expect(f64ToBits(floatVal("5e-322"))).toBe(101)
+    expect(f64ToBits(floatVal("9e-322"))).toBe(182)
+    expect(f64ToBits(floatVal("1e-321"))).toBe(202)
+    expect(f64ToBits(floatVal("5e-321"))).toBe(1012)
+    expect(f64ToBits(floatVal("9e-321"))).toBe(1822)
+    expect(f64ToBits(floatVal("1e-320"))).toBe(2024)
+    expect(f64ToBits(floatVal("5e-320"))).toBe(10120)
+    expect(f64ToBits(floatVal("9e-320"))).toBe(18216)
+    expect(f64ToBits(floatVal("1e-319"))).toBe(20240)
+    expect(f64ToBits(floatVal("5e-319"))).toBe(101201)
+    expect(f64ToBits(floatVal("9e-319"))).toBe(182162)
+    expect(f64ToBits(floatVal("1e-318"))).toBe(202402)
+    expect(f64ToBits(floatVal("5e-318"))).toBe(1012011)
+    expect(f64ToBits(floatVal("9e-318"))).toBe(1821620)
+    expect(f64ToBits(floatVal("1e-317"))).toBe(2024023)
+    expect(f64ToBits(floatVal("5e-317"))).toBe(10120113)
+    expect(f64ToBits(floatVal("9e-317"))).toBe(18216203)
+    expect(f64ToBits(floatVal("1e-316"))).toBe(20240225)
+    expect(f64ToBits(floatVal("5e-316"))).toBe(101201127)
+    expect(f64ToBits(floatVal("9e-316"))).toBe(182162028)
+    expect(f64ToBits(floatVal("1e-315"))).toBe(202402253)
+    expect(f64ToBits(floatVal("5e-315"))).toBe(1012011267)
+    expect(f64ToBits(floatVal("9e-315"))).toBe(1821620280)
+    expect(f64ToBits(floatVal("1e-314"))).toBe(2024022533)
+    expect(f64ToBits(floatVal("5e-314"))).toBe(10120112665)
+    expect(f64ToBits(floatVal("9e-314"))).toBe(18216202798)
+    expect(f64ToBits(floatVal("1e-313"))).toBe(20240225331)
+    expect(f64ToBits(floatVal("5e-313"))).toBe(101201126654)
+    expect(f64ToBits(floatVal("9e-313"))).toBe(182162027977)
+    expect(f64ToBits(floatVal("1e-312"))).toBe(202402253307)
+    expect(f64ToBits(floatVal("5e-312"))).toBe(1012011266537)
+    expect(f64ToBits(floatVal("9e-312"))).toBe(1821620279766)
+    expect(f64ToBits(floatVal("1e-311"))).toBe(2024022533073)
+    expect(f64ToBits(floatVal("5e-311"))).toBe(10120112665366)
+    expect(f64ToBits(floatVal("9e-311"))).toBe(18216202797658)
+    expect(f64ToBits(floatVal("1e-310"))).toBe(20240225330731)
+    expect(f64ToBits(floatVal("5e-310"))).toBe(101201126653655)
+    expect(f64ToBits(floatVal("9e-310"))).toBe(182162027976580)
+    expect(f64ToBits(floatVal("1e-309"))).toBe(202402253307311)
+    expect(f64ToBits(floatVal("5e-309"))).toBe(1012011266536553)
+    expect(f64ToBits(floatVal("9e-309"))).toBe(1821620279765796)
+    expect(f64ToBits(floatVal("1e-308"))).toBe(2024022533073106)
+    expect(f64ToBits(floatVal("5e-308"))).toBe(9563655960053261)
+    expect(f64ToBits(floatVal("9e-308"))).toBe(13561249954155481)
+    expect(f64ToBits(floatVal("2e-323"))).toBe(4)
+    expect(f64ToBits(floatVal("3e-323"))).toBe(6)
+    expect(f64ToBits(floatVal("4e-323"))).toBe(8)
+    expect(f64ToBits(floatVal("6e-323"))).toBe(12)
+    expect(f64ToBits(floatVal("7e-323"))).toBe(14)
+    expect(f64ToBits(floatVal("8e-323"))).toBe(16)
+    expect(f64ToBits(floatVal("2e-322"))).toBe(40)
+    expect(f64ToBits(floatVal("3e-322"))).toBe(61)
+    expect(f64ToBits(floatVal("4e-322"))).toBe(81)
+    expect(f64ToBits(floatVal("6e-322"))).toBe(121)
+    expect(f64ToBits(floatVal("7e-322"))).toBe(142)
+    expect(f64ToBits(floatVal("8e-322"))).toBe(162)
+    expect(f64ToBits(floatVal("2e-321"))).toBe(405)
+    expect(f64ToBits(floatVal("3e-321"))).toBe(607)
+    expect(f64ToBits(floatVal("4e-321"))).toBe(810)
+    expect(f64ToBits(floatVal("6e-321"))).toBe(1214)
+    expect(f64ToBits(floatVal("7e-321"))).toBe(1417)
+    expect(f64ToBits(floatVal("8e-321"))).toBe(1619)
+    expect(f64ToBits(floatVal("2e-320"))).toBe(4048)
+    expect(f64ToBits(floatVal("3e-320"))).toBe(6072)
+    expect(f64ToBits(floatVal("4e-320"))).toBe(8096)
+    expect(f64ToBits(floatVal("6e-320"))).toBe(12144)
+    expect(f64ToBits(floatVal("7e-320"))).toBe(14168)
+    expect(f64ToBits(floatVal("8e-320"))).toBe(16192)
+    expect(f64ToBits(floatVal("1.23456789e-307"))).toBe(15254182324662292)
+    expect(f64ToBits(floatVal("1.23456789e-306"))).toBe(30326726974254105)
+    expect(f64ToBits(floatVal("1.23456789e-305"))).toBe(45412852169710479)
+    expect(f64ToBits(floatVal("1.23456789e-304"))).toBe(60143764932665971)
+    expect(f64ToBits(floatVal("1.23456789e-303"))).toBe(75179706165832464)
+    expect(f64ToBits(floatVal("1.23456789e-302"))).toBe(90334462767086314)
+    expect(f64ToBits(floatVal("1.23456789e-301"))).toBe(105036779110959525)
+    expect(f64ToBits(floatVal("1.23456789e-300"))).toBe(120036974820273166)
+    expect(f64ToBits(floatVal("2.2250738585072009e-308"))).toBe(4503599627370495)
+    expect(f64ToBits(floatVal("2.2250738585072011e-308"))).toBe(4503599627370495)
+    expect(f64ToBits(floatVal("2.2250738585072014e-308"))).toBe(4503599627370496)
+    expect(f64ToBits(floatVal("9007199254740992"))).toBe(4845873199050653696)
+    expect(f64ToBits(floatVal("9007199254740993"))).toBe(4845873199050653696)
+    expect(f64ToBits(floatVal("9007199254740994"))).toBe(4845873199050653697)
+    expect(f64ToBits(floatVal("9007199254740995"))).toBe(4845873199050653698)
+    expect(f64ToBits(floatVal("123456789012345678901234567890"))).toBe(5042042089369253694)
+    expect(f64ToBits(floatVal("0.1000000000000000000000001"))).toBe(4591870180066957722)
+    expect(f64ToBits(floatVal("0.1"))).toBe(4591870180066957722)
+    expect(f64ToBits(floatVal("0.2"))).toBe(4596373779694328218)
+    expect(f64ToBits(floatVal("0.3"))).toBe(4599075939470750515)
+    expect(f64ToBits(floatVal("0.5"))).toBe(4602678819172646912)
+    expect(f64ToBits(floatVal("1.5"))).toBe(4609434218613702656)
+    expect(f64ToBits(floatVal("2.5"))).toBe(4612811918334230528)
+    expect(f64ToBits(floatVal("3.5"))).toBe(4615063718147915776)
+    expect(f64ToBits(floatVal("123.456"))).toBe(4638387860618067575)
+    expect(f64ToBits(floatVal("3.14159265358979"))).toBe(4614256656552045841)
+    expect(f64ToBits(floatVal("1e23"))).toBe(4950912855330343670)
+    expect(f64ToBits(floatVal("1e290"))).toBe(8945421882333202015)
+    expect(f64ToBits(floatVal("1e295"))).toBe(9020517280031764984)
+    expect(f64ToBits(floatVal("1e300"))).toBe(9094988921128908188)
+    expect(f64ToBits(floatVal("1e305"))).toBe(9169955912700582330)
+    expect(f64ToBits(floatVal("1e307"))).toBe(9199863512903218227)
+    expect(f64ToBits(floatVal("1e308"))).toBe(9214871658872686752)
+    expect(f64ToBits(floatVal("1.7976931348623157e308"))).toBe(9218868437227405311)
+    expect(f64ToBits(floatVal("1.7976931348623156e308"))).toBe(9218868437227405310)
+    expect(f64ToBits(floatVal("8.98846567431158e307"))).toBe(9214364837600034816)
+    expect(f64ToBits(floatVal("1e309"))).toBe(9218868437227405312)
+    expect(f64ToBits(floatVal("1e400"))).toBe(9218868437227405312)
+    expect(f64ToBits(floatVal("2e308"))).toBe(9218868437227405312)
+    expect(f64ToBits(floatVal("1.8e308"))).toBe(9218868437227405312)
+    expect(f64ToBits(floatVal("1.7976931348623159e308"))).toBe(9218868437227405312)
+    expect(f64ToBits(floatVal("1e-325"))).toBe(0)
+    expect(f64ToBits(floatVal("1e-330"))).toBe(0)
+    expect(f64ToBits(floatVal("1e-400"))).toBe(0)
+    expect(f64ToBits(floatVal("-1e309"))).toBe(-4503599627370496)
+    expect(f64ToBits(floatVal("-1e400"))).toBe(-4503599627370496)
+    expect(f64ToBits(floatVal("-2e308"))).toBe(-4503599627370496)
+    expect(f64ToBits(floatVal("-1.8e308"))).toBe(-4503599627370496)
+    expect(f64ToBits(floatVal("-1.7976931348623159e308"))).toBe(-4503599627370496)
+    expect(f64ToBits(floatVal("-1e-325"))).toBe(0 - 9223372036854775807 - 1)
+    expect(f64ToBits(floatVal("-1e-330"))).toBe(0 - 9223372036854775807 - 1)
+    expect(f64ToBits(floatVal("-1e-400"))).toBe(0 - 9223372036854775807 - 1)
+    expect(f64ToBits(floatVal("-1e-320"))).toBe(-9223372036854773784)
+    expect(f64ToBits(floatVal("-5e-324"))).toBe(-9223372036854775807)
+    expect(f64ToBits(floatVal("-1.23456789e-305"))).toBe(-9177959184685065329)
+    expect(f64ToBits(floatVal("-1e300"))).toBe(-128383115725867620)
+    expect(f64ToBits(floatVal("-1.7976931348623157e308"))).toBe(-4503599627370497)
+    expect(f64ToBits(floatVal("-0.1"))).toBe(-4631501856787818086)
+    expect(f64ToBits(floatVal("-9007199254740993"))).toBe(-4377498837804122112)
+    expect(f64ToBits(floatVal("-0.0"))).toBe(0 - 9223372036854775807 - 1)
+    expect(f64ToBits(floatVal("0"))).toBe(0)
+    expect(f64ToBits(floatVal("1"))).toBe(4607182418800017408)
+    expect(f64ToBits(floatVal("1.0"))).toBe(4607182418800017408)
+    expect(f64ToBits(floatVal(".5"))).toBe(4602678819172646912)
+    expect(f64ToBits(floatVal("1."))).toBe(4607182418800017408)
+    expect(f64ToBits(floatVal("1E5"))).toBe(4681608360884174848)
+    expect(f64ToBits(floatVal("1e+5"))).toBe(4681608360884174848)
+    expect(f64ToBits(floatVal("0.0000000000000000000000001"))).toBe(4233087679066701273)
+}

@@ -1,0 +1,208 @@
+module cli.buildlib
+
+import { DiagnosticSink, Diagnostic } from compiler.diag
+import { IrModule } from compiler.ir
+import { frontend } from compiler.front
+import { emitIrEx, EmitOut } from compiler.emit
+import { x64LowerModule } from compiler.x64
+import { coffObjFor } from compiler.coff
+import { CoffObj, coffRead, arRead, blobFrom } from compiler.objread
+import { scanDefs, select, mergeAll, strFrom } from compiler.linklib
+import { buildExe, FailBox } from compiler.pelink
+import { OrderedMap } from std.collections.orderedmap
+
+fn newObjs() -> List<CoffObj> {
+    var objs = [CoffObj("seed")]
+    objs.pop()
+    objs
+}
+
+fn emptyInts() -> List<int> {
+    var nums = [0]
+    nums.pop()
+    nums
+}
+
+fn emptyStrs() -> List<string> {
+    var strs = [""]
+    strs.pop()
+    strs
+}
+
+fn hasMain(m: IrModule) -> bool {
+    for (f in m.funcs) {
+        if (f.isMain) {
+            return true
+        }
+    }
+    false
+}
+
+/// Lowered program object plus the ABI symbols it declared with `#[symbol]`,
+/// plus the class-table size its emitter assigned — a split link uses it to
+/// salt the next object's class ids against this object's table.
+class LoweredProgram {
+    var obj: CoffObj
+    var overrides: List<string>
+    var classCount: int
+
+    constructor(o: CoffObj, ov: List<string>, cc: int) {
+        this.obj = o
+        this.overrides = ov
+        this.classCount = cc
+    }
+}
+
+/// x64 + COFF for an already-emitted module: the shared tail of every lowering.
+fn finishLower(target: string, emitted: EmitOut, sinks: DiagnosticSink) -> LoweredProgram? {
+    if (let some(xout) = x64LowerModule(emitted.ir, sinks)) {
+        let objBytes = coffObjFor(emitted.ir, xout)
+        return LoweredProgram(coffRead(target, objBytes), emitted.overrides, emitted.classCount)
+    }
+    none
+}
+
+/// Lower one module (root file + its whole import closure) to a COFF object,
+/// with no entry-point requirement — the form a runtime-archive member takes.
+/// The closure lands in the object too, which is what makes an imported
+/// `#[symbol]` body actually reach the link: bodies ride in on the member that
+/// imports them.
+fn lowerModuleObj(target: string, src: string, sinks: DiagnosticSink) -> LoweredProgram? {
+    lowerModuleObjEx(target, src, sinks, 0, "")
+}
+
+/// Split-link form of `lowerModuleObj`: offset this object's user class ids
+/// by `cidSalt` (so run-time registration order matches the whole link) and,
+/// when `moduleSetupSymbol` is non-empty, synthesize a callable preamble
+/// function under that symbol for the linking program to call.
+fn lowerModuleObjEx(target: string, src: string, sinks: DiagnosticSink, cidSalt: int, moduleSetupSymbol: string) -> LoweredProgram? {
+    if (let some(loaded) = frontend(target, src, sinks)) {
+        if (let some(emitted) = emitIrEx(loaded.program, loaded.resolved, sinks, cidSalt, moduleSetupSymbol, emptyStrs())) {
+            return finishLower(target, emitted, sinks)
+        }
+    }
+    none
+}
+
+/// A module's raw COFF bytes plus its class-table size.
+///
+/// Phase-A (default-salt, no setup) objects are target-independent: they depend
+/// only on the module's source and its import closure, never on the program
+/// being linked. A split linker may therefore persist the bytes and rebuild the
+/// object on a later run with `coffRead`, skipping the frontend/emit/x64 work.
+class LoweredBytes {
+    var bytes: List<int>
+    var classCount: int
+
+    constructor(b: List<int>, cc: int) {
+        this.bytes = b
+        this.classCount = cc
+    }
+}
+
+/// `lowerModuleObj` that also hands back the object's bytes, for a caller that
+/// caches them. Same lowering, same result.
+fn lowerModuleObjBytes(target: string, src: string, sinks: DiagnosticSink) -> LoweredBytes? {
+    if (let some(loaded) = frontend(target, src, sinks)) {
+        if (let some(emitted) = emitIrEx(loaded.program, loaded.resolved, sinks, 0, "", emptyStrs())) {
+            if (let some(xout) = x64LowerModule(emitted.ir, sinks)) {
+                return LoweredBytes(coffObjFor(emitted.ir, xout), emitted.classCount)
+            }
+        }
+    }
+    none
+}
+
+/// `lowerModuleObjEx` that also hands back the object's bytes, for a caller that
+/// caches the salted/setup form. Same lowering, same result. A class-free
+/// member's bytes are independent of `cidSalt` (nothing bakes a class id), which
+/// is what lets the split linker reuse one cached object across every program.
+fn lowerModuleObjExBytes(target: string, src: string, sinks: DiagnosticSink, cidSalt: int, moduleSetupSymbol: string) -> LoweredBytes? {
+    if (let some(loaded) = frontend(target, src, sinks)) {
+        if (let some(emitted) = emitIrEx(loaded.program, loaded.resolved, sinks, cidSalt, moduleSetupSymbol, emptyStrs())) {
+            if (let some(xout) = x64LowerModule(emitted.ir, sinks)) {
+                return LoweredBytes(coffObjFor(emitted.ir, xout), emitted.classCount)
+            }
+        }
+    }
+    none
+}
+
+fn lowerProgram(target: string, src: string, sinks: DiagnosticSink) -> LoweredProgram? {
+    lowerProgramEx(target, src, sinks, emptyStrs())
+}
+
+/// Split-link form of `lowerProgram`: `extraSetups` are peer setup symbols
+/// called from this program's preamble after its globals are rooted and
+/// before its static initializers run.
+fn lowerProgramEx(target: string, src: string, sinks: DiagnosticSink, extraSetups: List<string>) -> LoweredProgram? {
+    if (let some(loaded) = frontend(target, src, sinks)) {
+        if (let some(emitted) = emitIrEx(loaded.program, loaded.resolved, sinks, 0, "", extraSetups)) {
+            // Mirrors the Rust AOT driver (`cli/src/main.rs`): a module with no
+            // `main` has no entry point, so linking it would produce an exe that
+            // cannot run. Bail before emitting the object rather than shipping it.
+            if (!hasMain(emitted.ir)) {
+                sinks.emit(Diagnostic.error("no `main` in this module; nothing to build"))
+                return none
+            }
+            return finishLower(target, emitted, sinks)
+        }
+    }
+    none
+}
+
+fn loadArchive(path: string) -> List<CoffObj>? {
+    if (let some(bytes) = read_file(path)) {
+        let archive = arRead(blobFrom(bytes))
+        var objects = newObjs()
+        var memberIndex = 0
+        while (memberIndex < len(archive.members)) {
+            let member = archive.members[memberIndex]
+            objects.push(coffRead(member.name, member.data))
+            memberIndex = memberIndex + 1
+        }
+        return objects
+    }
+    none
+}
+
+fn linkExe(objects: List<CoffObj>, outputPath: string, progOverrides: List<string>) -> string? {
+    let definitions = OrderedMap<string, int>("", 0)
+    scanDefs(objects, definitions)
+    let chosen = emptyInts()
+    let unresolved = emptyStrs()
+    select(objects, definitions, chosen, unresolved)
+    if (len(unresolved) > 0) {
+        var msg = "unresolved symbol: " + unresolved[0]
+        if (len(unresolved) > 1) {
+            var extra = emptyStrs()
+            var u = 1
+            while (u < len(unresolved)) {
+                extra.push(unresolved[u])
+                u = u + 1
+            }
+            var listed = ""
+            var k = 0
+            while (k < len(extra)) {
+                if (k > 0) {
+                    listed = listed + ", "
+                }
+                listed = listed + extra[k]
+                k = k + 1
+            }
+            msg = msg + " (+" + str(len(extra)) + " more: " + listed + ")"
+        }
+        return msg
+    }
+    if (let some(merged) = mergeAll(objects, chosen, "merged.obj", progOverrides)) {
+        let failure = FailBox()
+        if (let some(exeBytes) = buildExe(merged, "pickle_main", failure)) {
+            if (write_file(outputPath, strFrom(exeBytes))) {
+                return none
+            }
+            return "write failed"
+        }
+        return "PE link failed: " + failure.text
+    }
+    "merge failed"
+}

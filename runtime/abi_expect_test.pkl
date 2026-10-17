@@ -1,0 +1,335 @@
+module runtime.abi_expect_test
+
+import { abiExpectObjEq, abiExpectStrContains, abiExpectDisplay, abiTestFailObj, setCapture, setTask, takeCaptured, takeTaskPanic } from runtime.abi_expect
+import { abiStrFromByte, abiStrConcat, abiStrFromList, abiStrCmp, newStr, byteInto } from runtime.abi_string
+import { abiListNew, abiListLen, abiListGet, abiListPush } from runtime.abi_list
+import { abiBoxI64, abiBoxBool, abiBoxChar, abiBoxF64 } from runtime.abi_box
+import { abiTupleNew, abiTupleSetField } from runtime.abi_tuple
+import { abiMapNew, abiMapSet } from runtime.abi_map
+
+/// WHY THE TESTS BUILD STRINGS INSTEAD OF WRITING THEM.
+///
+/// Same reason as `abi_string_test.pkl`: `expect` bodies take the `*int` the IR
+/// carries and Pickle has no source-level `string` -> `*int` conversion
+/// (E0363 on the cast, E0308 on the argument). So every string below is built
+/// through `abiStrFromByte`, which is exactly the path the compiler takes.
+fn b1(a: int) -> *int {
+    return abiStrFromByte(a)
+}
+
+fn b2(a: int, b: int) -> *int {
+    return abiStrConcat(abiStrFromByte(a), abiStrFromByte(b))
+}
+
+fn b3(a: int, b: int, c: int) -> *int {
+    return abiStrConcat(b2(a, b), abiStrFromByte(c))
+}
+
+/// The empty string. NOT `bytes("")`: that spelling is `List<byte>`, not a
+/// string object, so E0308 rejects it at a `*int` parameter. The only way to
+/// obtain a zero-length string object is `abiStrFromList` over an empty list.
+fn b0() -> *int {
+    return abiStrFromList(abiListNew(0))
+}
+
+fn b4(a: int, b: int, c: int, d: int) -> *int {
+    return abiStrConcat(b3(a, b, c), abiStrFromByte(d))
+}
+
+/// A two-element list, built through the ported list body.
+fn list2(x: *int, y: *int) -> *int {
+    let l = abiListNew(2)
+    abiListPush(l, x)
+    abiListPush(l, y)
+    return l
+}
+
+/// A one-element list.
+fn list1(x: *int) -> *int {
+    let l = abiListNew(1)
+    abiListPush(l, x)
+    return l
+}
+
+test fn obj_eq_treats_null_as_a_value() {
+    // `none == none`, and a null is never equal to a non-null. This is the arm
+    // that needs `0 as *int`, since Pickle cannot write `none` into a `*int`.
+    expect(abiExpectObjEq(0 as *int, 0 as *int)).toBe(1)
+    expect(abiExpectObjEq(0 as *int, b1(97))).toBe(0)
+    expect(abiExpectObjEq(b1(97), 0 as *int)).toBe(0)
+}
+
+test fn obj_eq_accepts_identical_pointers() {
+    // The early `a == b` check. Only reachable for a non-string, non-list,
+    // non-box object, because the structural arms would agree anyway.
+    let s = b3(97, 98, 99)
+    expect(abiExpectObjEq(s, s)).toBe(1)
+}
+
+test fn obj_eq_compares_strings_by_content_not_address() {
+    let a = b3(97, 98, 99)
+    let b = b3(97, 98, 99)
+    // Distinct objects, equal contents.
+    expect((a as int) == (b as int)).toBe(false)
+    expect(abiExpectObjEq(a, b)).toBe(1)
+    expect(abiExpectObjEq(a, b4(97, 98, 99, 100))).toBe(0)
+    expect(abiExpectObjEq(a, b3(97, 98, 100))).toBe(0)
+}
+
+test fn obj_eq_compares_lists_element_wise() {
+    let a = list2(b1(97), b1(98))
+    let b = list2(b1(97), b1(98))
+    let c = list2(b1(97), b1(99))
+    expect(abiExpectObjEq(a, b)).toBe(1)
+    expect(abiExpectObjEq(a, c)).toBe(0)
+}
+
+test fn obj_eq_rejects_lists_of_different_length() {
+    let a = list2(b1(97), b1(98))
+    let b = list2(b1(97), b1(98))
+    abiListPush(b, b1(99))
+    expect(abiExpectObjEq(a, b)).toBe(0)
+}
+
+test fn obj_eq_recurses_through_nested_lists() {
+    // The self-call. If `abiExpectObjEq` inside its own body lowered to an
+    // extern, this would infinitely recurse or fail to link instead of
+    // comparing the innermost pairs.
+    let a = list2(list2(b1(97), b1(98)), b1(90))
+    let b = list2(list2(b1(97), b1(98)), b1(90))
+    let c = list2(list2(b1(97), b1(99)), b1(90))
+    expect(abiExpectObjEq(a, b)).toBe(1)
+    expect(abiExpectObjEq(a, c)).toBe(0)
+}
+
+test fn obj_eq_compares_boxed_scalars_by_payload_bits() {
+    expect(abiExpectObjEq(abiBoxI64(7), abiBoxI64(7))).toBe(1)
+    expect(abiExpectObjEq(abiBoxI64(7), abiBoxI64(8))).toBe(0)
+    expect(abiExpectObjEq(abiBoxBool(true), abiBoxBool(true))).toBe(1)
+    expect(abiExpectObjEq(abiBoxBool(true), abiBoxBool(false))).toBe(0)
+    expect(abiExpectObjEq(abiBoxChar(120), abiBoxChar(120))).toBe(1)
+    expect(abiExpectObjEq(abiBoxChar(120), abiBoxChar(121))).toBe(0)
+}
+
+test fn obj_eq_separates_box_flavours() {
+    // Native matches box flavours pairwise, so an int box and a char box with
+    // the same payload bits are NOT equal. This is the arm that would pass if
+    // `bothBoxes` had been collapsed to a single test.
+    expect(abiExpectObjEq(abiBoxI64(120), abiBoxChar(120))).toBe(0)
+    expect(abiExpectObjEq(abiBoxChar(120), abiBoxI64(120))).toBe(0)
+}
+
+test fn obj_eq_separates_mismatched_kinds() {
+    // The reference's final `_ => 0`: anything not covered above is unequal.
+    expect(abiExpectObjEq(b1(97), abiBoxI64(97))).toBe(0)
+    expect(abiExpectObjEq(b1(97), list2(b1(97), b1(98)))).toBe(0)
+}
+
+test fn str_contains_finds_a_substring() {
+    let hay = b4(104, 101, 108, 108)
+    expect(abiExpectStrContains(hay, b3(101, 108, 108))).toBe(1)
+    expect(abiExpectStrContains(hay, b1(101))).toBe(1)
+    expect(abiExpectStrContains(hay, b3(120, 121, 122))).toBe(0)
+}
+
+test fn str_contains_is_positional() {
+    // "ab" is in "abc" but "ba" is not. Guards against a search that ignores
+    // the start offset.
+    let hay = b3(97, 98, 99)
+    expect(abiExpectStrContains(hay, b2(97, 98))).toBe(1)
+    expect(abiExpectStrContains(hay, b2(98, 99))).toBe(1)
+    expect(abiExpectStrContains(hay, b2(98, 97))).toBe(0)
+}
+
+test fn str_contains_rejects_a_longer_needle() {
+    // Native returns 0 before searching when `ln > lh`. Verified by the length
+    // guard, not by a match failure: the needle is not present either way.
+    expect(abiExpectStrContains(b1(97), b3(97, 98, 99))).toBe(0)
+    expect(abiExpectStrContains(b1(97), b2(97, 98))).toBe(0)
+}
+
+test fn str_contains_treats_an_empty_needle_as_contained() {
+    // The reference returns 1 before looking at the haystack, so this holds for
+    // an empty haystack too.
+    expect(abiExpectStrContains(b3(97, 98, 99), b0())).toBe(1)
+    expect(abiExpectStrContains(b0(), b0())).toBe(1)
+}
+
+test fn str_contains_matches_an_empty_haystack_only_with_an_empty_needle() {
+    expect(abiExpectStrContains(b0(), b1(97))).toBe(0)
+}
+
+test fn str_contains_scans_multibyte_bytes_not_code_points() {
+    // "e-acute" is C3 A9. The search is over raw bytes, so a needle of the
+    // single byte C3 must match at offset 0.
+    let hay = b3(195, 169, 122)
+    expect(abiExpectStrContains(hay, b1(195))).toBe(1)
+    expect(abiExpectStrContains(hay, b2(195, 169))).toBe(1)
+    expect(abiExpectStrContains(hay, b1(169))).toBe(1)
+}
+
+test fn obj_eq_over_a_list_of_lists_uses_the_string_arm_at_the_leaves() {
+    // Leaves are strings, so the string arm is what actually terminates the
+    // recursion -- this checks the dispatch nests correctly through two levels
+    // rather than only through boxes.
+    let a = list2(list2(b1(97), b1(98)), list2(b1(99), b1(100)))
+    let b = list2(list2(b1(97), b1(98)), list2(b1(99), b1(100)))
+    let c = list2(list2(b1(97), b1(98)), list2(b1(99), b1(101)))
+    expect(abiExpectObjEq(a, b)).toBe(1)
+    expect(abiExpectObjEq(a, c)).toBe(0)
+}
+
+test fn obj_eq_on_an_empty_list_pair() {
+    // Length 0 == length 0 with no elements to compare, so the loop is skipped
+    // and the arm returns 1 without ever calling `list_get`.
+    let a = abiListNew(0)
+    let b = abiListNew(0)
+    expect(abiListLen(a)).toBe(0)
+    expect(abiExpectObjEq(a, b)).toBe(1)
+    abiListPush(b, b1(97))
+    expect(abiExpectObjEq(a, b)).toBe(0)
+}
+
+/// A string object from an explicit byte array, for spellings longer than the
+/// `b1..b4` builders. Same `newStr` + `byteInto` hand-off the rest of the suite
+/// already keeps, so an expectation reads as its bytes (e.g. `[91, 49, 93]`
+/// for `"[1]"`).
+fn bytesOf(codes: List<int>) -> *int {
+    var n = len(codes)
+    var p = newStr(n)
+    var i = 0
+    while (i < n) {
+        byteInto(p, i, codes[i])
+        i = i + 1
+    }
+    return p
+}
+
+/// Shortcut: `display(x)` compared against expected object spelling, so the
+/// test reads as "display renders X as Y".
+fn checkDisplay(x: *int, expected: *int) -> int {
+    return abiStrCmp(abiExpectDisplay(x), expected)
+}
+
+test fn display_renders_null_as_none() {
+    // The reference's `None => "none"`. `0 as *int` is the only spelling of
+    // null a `*int` parameter takes.
+    expect(checkDisplay(0 as *int, bytesOf([110, 111, 110, 101]))).toBe(0)
+}
+
+test fn display_renders_a_string_as_its_raw_bytes() {
+    expect(checkDisplay(b3(97, 98, 99), b3(97, 98, 99))).toBe(0)
+    expect(checkDisplay(b0(), b0())).toBe(0)
+    // A different string is NOT equal: the renderer read the whole payload.
+    expect(checkDisplay(b1(97), b3(97, 98, 99)) != 0).toBe(true)
+}
+
+test fn display_renders_an_int_list() {
+    let a = list2(abiBoxI64(1), abiBoxI64(2))
+    let e = bytesOf([91, 49, 44, 32, 50, 93])
+    expect(checkDisplay(a, e)).toBe(0)
+    // Multi-digit decimals are the `pickle_int_to_str` arm, not stacked digits:
+    // 123 over a two-element list keeps "," as the sole separator.
+    let m = list2(abiBoxI64(123), abiBoxI64(4))
+    expect(checkDisplay(m, bytesOf([91, 49, 50, 51, 44, 32, 52, 93]))).toBe(0)
+}
+
+test fn display_renders_an_empty_list() {
+    expect(checkDisplay(abiListNew(0), bytesOf([91, 93]))).toBe(0)
+}
+
+test fn display_renders_nested_lists() {
+    // `[[1], [2, 3]]`: recursion through two list generations, comma-space
+    // between each element and also between the nested arms.
+    let a = list2(list1(abiBoxI64(1)), list2(abiBoxI64(2), abiBoxI64(3)))
+    let e = bytesOf([91, 91, 49, 93, 44, 32, 91, 50, 44, 32, 51, 93, 93])
+    expect(checkDisplay(a, e)).toBe(0)
+}
+
+test fn display_renders_an_int_box() {
+    expect(checkDisplay(abiBoxI64(-7), bytesOf([45, 55]))).toBe(0)
+}
+
+test fn display_renders_a_float_box() {
+    // The `fmtF64(abiF64FromBits(bits))` arm must be byte-equal to Rust's
+    // shortest-round-trip float spelling.
+    expect(checkDisplay(abiBoxF64(1.5), bytesOf([49, 46, 53]))).toBe(0)
+    expect(checkDisplay(abiBoxF64(-2.25), bytesOf([45, 50, 46, 50, 53]))).toBe(0)
+}
+
+test fn display_renders_a_bool_list() {
+    // The boxed-bool arm spells true/false, and the list arm brackets it.
+    expect(checkDisplay(list1(abiBoxBool(true)), bytesOf([91, 116, 114, 117, 101, 93]))).toBe(0)
+    expect(checkDisplay(list1(abiBoxBool(false)), bytesOf([91, 102, 97, 108, 115, 101, 93]))).toBe(0)
+}
+
+test fn display_renders_a_char_box() {
+    // The reference pushes `box_bits(obj) as u8`, i.e. raw payload byte.
+    expect(checkDisplay(abiBoxChar(120), bytesOf([120]))).toBe(0)
+}
+
+test fn display_renders_a_tuple() {
+    // `(e, e)`: parens plus the same comma-space separator as lists.
+    let t = abiTupleNew(2)
+    abiTupleSetField(t, 0, abiBoxI64(1))
+    abiTupleSetField(t, 1, abiBoxI64(2))
+    expect(checkDisplay(t, bytesOf([40, 49, 44, 32, 50, 41]))).toBe(0)
+}
+
+test fn display_renders_a_map_as_length() {
+    // `Map(<len>)` reads the HEADER word as map_len; abiMapSet bumps it to 1.
+    let m = abiMapNew(1)
+    abiMapSet(m, abiBoxI64(5), abiBoxI64(7))
+    let e = bytesOf([77, 97, 112, 40, 49, 41])
+    expect(checkDisplay(m, e)).toBe(0)
+}
+
+test fn display_falls_through_to_class_name() {
+    // Everything else goes to `abiClassName(cid)` (`pickle_class_name`). A
+    // fresh map value is the newsest unknown-after-registration handled by the
+    // ported class store; what matters here is the fall-through arm runs.
+    let m = abiMapNew(0)
+    expect(abiStrCmp(abiExpectDisplay(m), abiExpectDisplay(m))).toBe(0)
+}
+
+test fn fail_records_in_capture_mode() {
+    // The capture channel: `setCapture(true)` mirrors `captureBegin`, the call
+    // records, `takeCaptured` mirrors `captureTake`. `abiTestFailObj` is called
+    // DIRECTLY (not through the emitted `assert`), so the native harness never
+    // sees a failure and the test still reports green.
+    setCapture(true)
+    let msg = b4(98, 111, 111, 109)
+    let _ = abiTestFailObj(msg)
+    let m = takeCaptured()
+    expect((m as int) != 0).toBe(true)
+    expect(abiStrCmp(m, msg)).toBe(0)
+    // Second take is empty: capture is cleared on take.
+    expect((takeCaptured() as int) == 0).toBe(true)
+    setCapture(false)
+}
+
+test fn fail_substitutes_assertion_failed_for_null() {
+    // The null arm: `to_string().unwrap_or(..)` in the reference spells
+    // "assertion failed" when no message is supplied.
+    setCapture(true)
+    let _ = abiTestFailObj(0 as *int)
+    let m = takeCaptured()
+    let e = bytesOf([97, 115, 115, 101, 114, 116, 105, 111, 110, 32, 102, 97, 105, 108, 101, 100])
+    expect(abiStrCmp(m, e)).toBe(0)
+    setCapture(false)
+}
+
+test fn fail_records_task_mode_first() {
+    // `record_recoverable` checks task mode before the capture flag, and the
+    // two slots are independent.
+    setTask(true)
+    setCapture(true)
+    let msg = b2(97, 98)
+    let _ = abiTestFailObj(msg)
+    let tp = takeTaskPanic()
+    expect(abiStrCmp(tp, msg)).toBe(0)
+    // Capture slot untouched: task won the record.
+    expect((takeCaptured() as int) == 0).toBe(true)
+    setTask(false)
+    setCapture(false)
+}

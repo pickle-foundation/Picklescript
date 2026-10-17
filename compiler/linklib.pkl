@@ -1,0 +1,482 @@
+module compiler.linklib
+
+import { CoffObj, CoffSection, CoffSym, CoffRel, isDropSec } from compiler.objread
+import { OrderedMap } from std.collections.orderedmap
+import { Set } from std.collections.set
+import { listHasStr } from compiler.check
+import { StringBuilder } from std.text.stringbuilder
+
+fn isCo(ob: CoffObj) -> bool {
+    ob.machine == 0x8664
+}
+
+fn canonSecName(nm: string) -> string {
+    if (len(nm) >= 6 && sliceRange(nm, 0, 6) == ".text$") {
+        return ".text"
+    }
+    if (len(nm) >= 7 && sliceRange(nm, 0, 7) == ".rdata$") {
+        return ".rdata"
+    }
+    nm
+}
+
+fn emptyInts() -> List<int> {
+    var l = [0]
+    l.pop()
+    l
+}
+
+fn emptyStrings() -> List<string> {
+    var l = [""]
+    l.pop()
+    l
+}
+
+fn emptyIntRows() -> List<List<int>> {
+    var l = [[0]]
+    l.pop()
+    l
+}
+
+fn sectionKept(o: CoffObj, si: int) -> bool {
+    if (!(si >= 0) || si >= len(o.secs)) {
+        return false
+    }
+    if (isDropSec(o.secs[si].name)) {
+        return false
+    }
+    true
+}
+
+fn isImportSym(name: string) -> bool {
+    if (len(name) >= 6 && sliceRange(name, 0, 6) == "__imp_") {
+        true
+    } else {
+        false
+    }
+}
+
+fn isCrtImp(nm: string) -> bool {
+    if (nm == "memcpy") {
+        return true
+    }
+    if (nm == "memmove") {
+        return true
+    }
+    if (nm == "memset") {
+        return true
+    }
+    false
+}
+
+fn externReqs(ob: CoffObj) -> Set<string> {
+    let req = Set<string>("")
+    var si = 0
+    while (si < len(ob.secs)) {
+        let cs = ob.secs[si]
+        if (!isDropSec(cs.name)) {
+            var rr = 0
+            while (rr < len(cs.relocs)) {
+                let rl = cs.relocs[rr]
+                if (rl.symIdx >= 0 && rl.symIdx < len(ob.mapIdx)) {
+                    let c = ob.mapIdx[rl.symIdx]
+                    if (c >= 0 && c < len(ob.syms)) {
+                        let s = ob.syms[c]
+                        if (s.sec == 0 && s.name != "" && !isImportSym(s.name)) {
+                            req.add(s.name)
+                        }
+                    }
+                }
+                rr = rr + 1
+            }
+        }
+        si = si + 1
+    }
+    req
+}
+
+/// Does `o` define `name` as a kept, out-of-line symbol?
+///
+/// Mirrors the predicate `scanDefs` uses, so a symbol accepted here is exactly
+/// one `scanDefs` would have recorded had it scanned this object.
+fn objDefines(o: CoffObj, name: string) -> bool {
+    var s = 0
+    while (s < len(o.syms)) {
+        let sy = o.syms[s]
+        if (sy.sec >= 1 && sy.sec <= len(o.secs) && sy.name == name && sectionKept(o, sy.sec - 1)) {
+            return true
+        }
+        s = s + 1
+    }
+    false
+}
+
+fn select(input: List<CoffObj>, defs: OrderedMap<string, int>, chosen: List<int>, bad: List<string>) {
+    let need = externReqs(input[0])
+    need.add("pickle_runtime_init")
+    need.add("pickle_flush")
+    var picked = Set<int>(0)
+    var changed = true
+    while (changed) {
+        changed = false
+        let have = need.toList()
+        var i = 0
+        while (i < len(have)) {
+            let nm = have[i]
+            if (let some(idx) = defs.get(nm)) {
+                if (!picked.contains(idx)) {
+                    picked.add(idx)
+                    chosen.push(idx)
+                    changed = true
+                    let more = externReqs(input[idx + 1])
+                    let moreL = more.toList()
+                    var m = 0
+                    while (m < len(moreL)) {
+                        need.add(moreL[m])
+                        m = m + 1
+                    }
+                }
+            }
+            i = i + 1
+        }
+    }
+    // `scanDefs` deliberately starts at index 1, so `defs` only ever holds
+    // symbols contributed by *archive members*. The program's own COFF is
+    // `input[0]` and `mergeAll` always merges it, so anything it defines is
+    // already in the output even though `defs` cannot say so. Without this
+    // check a program that defines e.g. `pickle_flush` is reported unresolved
+    // purely because it was too successful -- and `pickle_flush` /
+    // `pickle_runtime_init` are force-added to `need` above, so that false
+    // positive would turn into a spurious BUILD FAIL once the runtime archive
+    // stops shipping them.
+    let mainDefines = (len(input) > 0 && isCo(input[0]))
+    let have = need.toList()
+    var i = 0
+    while (i < len(have)) {
+        if (!defs.has(have[i])) {
+            if (!(mainDefines && objDefines(input[0], have[i]))) {
+                bad.push(have[i])
+            }
+        }
+        i = i + 1
+    }
+}
+
+/// `progOverrides` lists symbol names the program declared with `#[symbol]`,
+/// i.e. ABI entry points it intends to REPLACE. Only those may win a duplicate
+/// against the archive.
+///
+/// Do NOT derive this from "the program defines the name". A compiled program
+/// object already defines plenty of ordinary names that also exist in the
+/// archive (compiler-emitted helpers, `pickle_flush`), and redirecting an
+/// archive member's internal relocations onto those copies crashes every exe
+/// with 0xC0000005 - GATE12 34 to 3.
+fn mergeAll(input: List<CoffObj>, chosen: List<int>, outName: string, progOverrides: List<string>) -> CoffObj? {
+    let m = CoffObj(outName)
+    var use = emptyInts()
+    use.push(0)
+    var c = 0
+    while (c < len(chosen)) {
+        use.push(chosen[c] + 1)
+        c = c + 1
+    }
+
+    let sectionSlot = OrderedMap<string, int>("", 0)
+    m.secs.push(CoffSection(".text"))
+    sectionSlot.set(".text", 0)
+    var gi = 0
+    while (gi < len(use)) {
+        let o = input[use[gi]]
+        var si = 0
+        while (si < len(o.secs)) {
+            let cs = o.secs[si]
+            if (!isDropSec(cs.name)) {
+                let cn = canonSecName(cs.name)
+                if (!sectionSlot.has(cn)) {
+                    sectionSlot.set(cn, len(m.secs))
+                    m.secs.push(CoffSection(cn))
+                }
+            }
+            si = si + 1
+        }
+        gi = gi + 1
+    }
+
+    var memberSlots = emptyIntRows()
+    var chunkBase = emptyIntRows()
+    gi = 0
+    while (gi < len(use)) {
+        let o = input[use[gi]]
+        var secSlot = emptyInts()
+        var chunkOff = emptyInts()
+        var si = 0
+        while (si < len(o.secs)) {
+            if (sectionKept(o, si)) {
+                let cn = canonSecName(o.secs[si].name)
+                var slot = -1
+                if (let some(k) = sectionSlot.get(cn)) {
+                    slot = k
+                }
+                secSlot.push(slot)
+                chunkOff.push(0)
+            } else {
+                secSlot.push(-1)
+                chunkOff.push(0)
+            }
+            si = si + 1
+        }
+        memberSlots.push(secSlot)
+        chunkBase.push(chunkOff)
+        gi = gi + 1
+    }
+
+    gi = 0
+    while (gi < len(use)) {
+        let o = input[use[gi]]
+        let secSlot = memberSlots[gi]
+        let chunkOff = chunkBase[gi]
+        var si = 0
+        while (si < len(o.secs)) {
+            let cs = o.secs[si]
+            let slot = secSlot[si]
+            if (slot >= 0) {
+                let dst = m.secs[slot]
+                if (cs.isBss) {
+                    while (dst.sizeVirt % 16 != 0) {
+                        dst.sizeVirt = dst.sizeVirt + 1
+                    }
+                    let base = dst.sizeVirt
+                    var inn = cs.sizeVirt
+                    if (inn == 0) {
+                        inn = cs.sizeRaw
+                    }
+                    dst.sizeVirt = dst.sizeVirt + inn
+                    dst.isBss = true
+                    chunkOff[si] = base
+                } else {
+                    while (len(dst.raw) % 16 != 0) {
+                        dst.raw.push(0)
+                    }
+                    chunkOff[si] = len(dst.raw)
+                    var b = 0
+                    while (b < len(cs.raw)) {
+                        dst.raw.push(cs.raw[b])
+                        b = b + 1
+                    }
+                    dst.sizeRaw = len(dst.raw)
+                }
+            }
+            si = si + 1
+        }
+        gi = gi + 1
+    }
+
+    var symMap = emptyIntRows()
+    let defIndex = OrderedMap<string, int>("", 0)
+    gi = 0
+    while (gi < len(use)) {
+        let o = input[use[gi]]
+        var rowMap = emptyInts()
+        var sy = 0
+        while (sy < len(o.syms)) {
+            let s = o.syms[sy]
+            var idx = -1
+            if (s.sec >= 1 && s.sec <= len(o.secs) && sectionKept(o, s.sec - 1) && s.name != "" && !isCrtImp(s.name)) {
+                // Use index 0 of `use` for the program object (see mergeAll's
+                // caller). A #[symbol] fn in the program is meant to REPLACE
+                // the archive body, so a duplicate against the program must
+                // not emit a second definition - COFF would then bind the
+                // first one and the archive copy would silently win.
+                //
+                // Scope matters: only suppress against the program. Duplicates
+                // among archive members are legitimate (runtime helpers like
+                // pickle_static_get are defined by many members) and must keep
+                // their existing behaviour. Redirecting those is what made a
+                // previous first-wins attempt corrupt internal call sites and
+                // crash every exe with 0xC0000005.
+                if (!defIndex.has(s.name)) {
+                    let t = CoffSym()
+                    t.name = s.name
+                    t.value = s.value + chunkBase[gi][s.sec - 1]
+                    t.scl = s.scl
+                    t.nAux = 0
+                    t.sec = memberSlots[gi][s.sec - 1] + 1
+                    idx = len(m.syms)
+                    m.syms.push(t)
+                    defIndex.set(s.name, idx)
+                } else if (listHasStr(progOverrides, s.name)) {
+                    // Collides with a #[symbol] definition the program emitted.
+                    // The program is meant to REPLACE the archive body, so bind
+                    // the archive member's relocations to the program's copy and
+                    // do not emit a second definition - COFF binds the first, so
+                    // a duplicate body would silently lose to the archive.
+                    //
+                    // Leaving idx at -1 instead makes pelink fail the whole link
+                    // with "merge failed".
+                    if (let some(w) = defIndex.get(s.name)) {
+                        idx = w
+                    }
+                } else {
+                    // Duplicate between two archive members.
+                    //
+                    // CODE (`.text`): each member emits its own definition and
+                    // its relocations bind to that copy. Unchanged behaviour --
+                    // redirecting these is what made a previous first-wins
+                    // attempt corrupt the runtime (helpers like
+                    // pickle_static_get are defined by many members) and crash
+                    // every exe with 0xC0000005.
+                    //
+                    // MUTABLE DATA (`.data`/`.bss`): the per-member copy is
+                    // itself the bug. The native runtime keeps ONE process-global
+                    // per module `var` (e.g. the `pkl_global_*` counters behind
+                    // `gcAllocationsSinceGc`/`gcBytesSinceGc`), so a split link
+                    // must too: otherwise a counter bumped through one member's
+                    // copy of `pickle_raw_alloc` is never seen by another
+                    // member's accessor, and the GC reads a permanent zero.
+                    // Redirect the duplicate onto the first definition
+                    // (`defIndex`), exactly as an undefined reference is already
+                    // redirected below. Data has no call sites, so this cannot
+                    // reproduce the code-redirection crash.
+                    let dsn = canonSecName(o.secs[s.sec - 1].name)
+                    if ((dsn == ".data" || dsn == ".bss") && defIndex.has(s.name)) {
+                        if (let some(dd) = defIndex.get(s.name)) {
+                            idx = dd
+                        }
+                    } else {
+                        let t = CoffSym()
+                        t.name = s.name
+                        t.value = s.value + chunkBase[gi][s.sec - 1]
+                        t.scl = s.scl
+                        t.nAux = 0
+                        t.sec = memberSlots[gi][s.sec - 1] + 1
+                        idx = len(m.syms)
+                        m.syms.push(t)
+                    }
+                }
+            }
+            rowMap.push(idx)
+            sy = sy + 1
+        }
+        symMap.push(rowMap)
+        gi = gi + 1
+    }
+    let impIndex = OrderedMap<string, int>("", 0)
+    gi = 0
+    while (gi < len(use)) {
+        let o = input[use[gi]]
+        var sy = 0
+        while (sy < len(o.syms)) {
+            let s = o.syms[sy]
+            if (s.sec == 0 && s.name != "" && !defIndex.has(s.name)) {
+                let t = CoffSym()
+                t.name = s.name
+                t.sec = 0
+                t.nAux = 0
+                if (isImportSym(s.name) && !impIndex.has(s.name)) {
+                    impIndex.set(s.name, len(m.syms))
+                }
+                m.syms.push(t)
+            }
+            sy = sy + 1
+        }
+        gi = gi + 1
+    }
+    gi = 0
+    while (gi < len(use)) {
+        let o = input[use[gi]]
+        let secSlot = memberSlots[gi]
+        let chunkOff = chunkBase[gi]
+        let rowMap = symMap[gi]
+        var si = 0
+        while (si < len(o.secs)) {
+            let cs = o.secs[si]
+            let slot = secSlot[si]
+            if (slot >= 0) {
+                var rr = 0
+                while (rr < len(cs.relocs)) {
+                    let rl = cs.relocs[rr]
+                    var nIdx = -1
+                    if (rl.symIdx >= 0 && rl.symIdx < len(o.mapIdx)) {
+                        let orig = o.mapIdx[rl.symIdx]
+                        if (orig >= 0 && orig < len(o.syms)) {
+                            let s = o.syms[orig]
+                            if (isCrtImp(s.name) && s.name != "") {
+                                let impNm = "__imp_" + s.name
+                                if (impIndex.has(impNm)) {
+                                    if (let some(ix2) = impIndex.get(impNm)) {
+                                        nIdx = ix2
+                                    }
+                                } else {
+                                    let t2 = CoffSym()
+                                    t2.name = impNm
+                                    t2.sec = 0
+                                    t2.nAux = 0
+                                    nIdx = len(m.syms)
+                                    m.syms.push(t2)
+                                    impIndex.set(impNm, nIdx)
+                                }
+                            } else if (s.sec >= 1 && s.sec <= len(o.secs)) {
+                                if (!isDropSec(o.secs[s.sec - 1].name) && rowMap[orig] >= 0) {
+                                    nIdx = rowMap[orig]
+                                }
+                            } else if (s.sec == 0 && s.name != "") {
+                                if (defIndex.has(s.name)) {
+                                    if (let some(fd) = defIndex.get(s.name)) {
+                                        nIdx = fd
+                                    }
+                                } else if (isImportSym(s.name) && impIndex.has(s.name)) {
+                                    if (let some(ix) = impIndex.get(s.name)) {
+                                        nIdx = ix
+                                    }
+                                } else if (rowMap[orig] >= 0) {
+                                    nIdx = rowMap[orig]
+                                }
+                            }
+                        }
+                    }
+                    if (nIdx < 0) {
+                        return none
+                    }
+                    m.secs[slot].relocs.push(CoffRel(chunkOff[si] + rl.va, nIdx, rl.type))
+                    rr = rr + 1
+                }
+            }
+            si = si + 1
+        }
+        gi = gi + 1
+    }
+    var i5 = 0
+    while (i5 < len(m.syms)) {
+        m.mapIdx.push(i5)
+        i5 = i5 + 1
+    }
+    m
+}
+
+fn scanDefs(arObjs: List<CoffObj>, defs: OrderedMap<string, int>) {
+    var i = 1
+    while (i < len(arObjs)) {
+        let o = arObjs[i]
+        if (isCo(o)) {
+            var s = 0
+            while (s < len(o.syms)) {
+                let sy = o.syms[s]
+                if (sy.sec >= 1 && sy.sec <= len(o.secs) && sy.name != "" && sectionKept(o, sy.sec - 1)) {
+                    defs.set(sy.name, i - 1)
+                }
+                s = s + 1
+            }
+        }
+        i = i + 1
+    }
+}
+
+fn strFrom(bs: List<int>) -> string {
+    var sb = StringBuilder()
+    var i = 0
+    while (i < len(bs)) {
+        sb.appendByte(bs[i] as byte)
+        i = i + 1
+    }
+    sb.toString()
+}

@@ -1,0 +1,80 @@
+module runtime.strings_test
+
+import { int64ToString, stringConcat, stringGet, strFromBytes, charToUtf8, isScalarCp } from runtime.strings
+
+test fn int_format() {
+    expect(int64ToString(0)).toBe("0")
+    expect(int64ToString(42)).toBe("42")
+    expect(int64ToString(-7)).toBe("-7")
+    expect(int64ToString(9223372036854775807)).toBe("9223372036854775807")
+    var minI64 = (0 - 9223372036854775807) - 1
+    expect(int64ToString(minI64)).toBe("-9223372036854775808")
+}
+
+test fn int_format_more() {
+    expect(int64ToString(1000000)).toBe("1000000")
+    expect(int64ToString(-1000000)).toBe("-1000000")
+    expect(int64ToString(9)).toBe("9")
+    expect(int64ToString(-9)).toBe("-9")
+}
+
+test fn concat_contents() {
+    expect(stringConcat("foo", "bar")).toBe("foobar")
+    expect(stringConcat("", "")).toBe("")
+}
+
+test fn concat_null_is_empty() {
+    expect(stringConcat(none, "bar")).toBe("bar")
+    expect(stringConcat("foo", none)).toBe("foo")
+    expect(stringConcat(none, none)).toBe("")
+}
+
+test fn byte_at_roundtrip() {
+    var s = "hello"
+    expect(stringGet(s, 0)).toBe(104)
+    expect(stringGet(s, 1)).toBe(101)
+    expect(stringGet(s, 2)).toBe(108)
+    expect(stringGet(s, 4)).toBe(111)
+}
+
+test fn bytes_roundtrip() {
+    var s = strFromBytes(bytes("hello"))
+    expect(s).toBe("hello")
+    expect(len(bytes(s))).toBe(5)
+}
+
+test fn char_utf8_ascii() {
+    expect(charToUtf8(0x41)).toBe("A")
+    var bz: List<byte> = bytes("")
+    bz.push(0 as byte)
+    expect(charToUtf8(0)).toBe(str(bz))
+}
+
+test fn char_utf8_two_byte() {
+    expect(charToUtf8(0xE9)).toBe("é")
+    expect(charToUtf8(0x3B1)).toBe("α")
+}
+
+test fn char_utf8_three_byte() {
+    expect(charToUtf8(0x20AC)).toBe("€")
+    expect(charToUtf8(0x4E2D)).toBe("中")
+}
+
+test fn char_utf8_four_byte() {
+    expect(charToUtf8(0x1F600)).toBe("😀")
+}
+
+test fn char_utf8_non_scalar_is_replacement() {
+    expect(charToUtf8(0xD800)).toBe("�")
+    expect(charToUtf8(0xDFFF)).toBe("�")
+    expect(charToUtf8(-1)).toBe("�")
+    expect(charToUtf8(0x110000)).toBe("�")
+}
+
+test fn scalar_check() {
+    expect(isScalarCp(0x41)).toBe(true)
+    expect(isScalarCp(0x1F600)).toBe(true)
+    expect(isScalarCp(0xD800)).toBe(false)
+    expect(isScalarCp(0x110000)).toBe(false)
+    expect(isScalarCp(-1)).toBe(false)
+}

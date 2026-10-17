@@ -1,0 +1,311 @@
+module runtime.abi_list
+
+/// Sovereign list ABI bodies, ported from `runtime/src/list.rs`.
+///
+/// Third group of runtime functions written IN PICKLE that occupy real C ABI slots via
+/// `#[symbol]`, after `runtime.abi_string` and `runtime.abi_box`. These are the widest
+/// cluster in the extern surface measured by `tools/extern_surface.ps1`: `pickle_list_len`
+/// is referenced by 148 program shapes and `pickle_list_get` by 145.
+///
+/// This file was previously unportable, not merely unwritten. Every body below has to move
+/// an object address between a `*int` value and a word slot (`list[5] = data`, then
+/// `elem = data[i]`), and Pickle had no pointer<->int conversion, so none of it could be
+/// written. See PICKLE_AUDIT.md 17.1. The `*T as int` / `int as *T` raw-address cast makes
+/// the cluster expressible; assignment always stays explicit.
+///
+/// Layout is `runtime.layout`: 24-byte header (words 0/1/2 = next/class_id/size), then
+/// `len` at word 3, `cap` at word 4, and the `data` element pointer at word 5. A list is
+/// `LIST_OBJECT_SIZE` = 48 bytes = 6 words. Element slots hold *managed references*, so
+/// each store goes through the explicit `as int` cast.
+///
+/// The null pointer is word 0, so `0 as *int` is the null return the native `list_get` /
+/// `list_pop` produce on an out-of-range or empty list.
+///
+/// KNOWN LIMITATION - growth leaks the old span. The native `require_capacity` calls
+/// `raw_free` on the previous `data`; `alloc` memory is not GC-tracked and Pickle has no
+/// free primitive, so the old span is abandoned. Values stay correct, addresses stay valid
+/// (every access re-reads word 5), only reclaimed bytes are lost.
+///
+/// GAP - five panic paths are not reachable from compiler output and are therefore not
+/// expressed, rather than being faked into a different behavior:
+///   - `list_set` with `index >= len`   (`pickle: list index out of bounds`)
+///   - `list_remove` with `index >= n`  (`pickle: remove index out of bounds`)
+///   - `list_insert` with `index > n`   (`pickle: insert index out of bounds`)
+///   - `require_capacity` past `MAX_CAP` (`pickle: list capacity overflow`)
+///   - `list_sort` with an unknown kind (`pickle: invalid sort kind {n}`)
+/// The compiler bounds-checks every list index statically and only ever emits sort kinds
+/// 0/1/2, so a program cannot reach them; silently ignoring the write would diverge from
+/// a real panic, which is strictly worse. Porting them needs a *callable* panic primitive:
+/// `pickle_panic_cstr` exists natively, but Pickle source cannot declare an extern, which is
+/// the same wall recorded as 18.0. Recorded in PICKLE_AUDIT.md 17.1.
+///
+/// Sort kind 1 (float) is ported: `elem_lt` compares `pickle_unbox_f64`, and the box
+/// payload word already holds the f64 bits, so `f64FromBits` (the same reconstruction
+/// `abi_box.pkl` uses) recovers the value with no bitcast needed. Same reasoning that
+/// retired `abi_box.pkl`'s float GAP; the earlier note here was stale.
+
+import { PICKLE_CLASS_LIST } from runtime.object
+import { abiBoxI64 } from runtime.abi_box
+import { abiStrCmp } from runtime.abi_string
+// Both the list object and its element buffer come from `alloc(int, n)`, so
+// the raw-allocation slots must travel with them. See `abi_raw.pkl`.
+// `abiRegisterObject` is here for the list *object*; the element span is raw
+// backing, never registered.
+import { abiRawAlloc, abiRegisterObject } from runtime.abi_raw
+
+const LEN_WORD: int = 3
+const CAP_WORD: int = 4
+const DATA_WORD: int = 5
+const LIST_WORDS: int = 6
+const LIST_BYTES: int = 48
+
+/// Native `INITIAL_CAP`: the floor for both a fresh list and any growth step.
+const INITIAL_CAP: int = 8
+
+/// Sort kind for int/byte/char/bool payloads: compare raw payload bits.
+const SORT_INT: int = 0
+/// Sort kind for float payloads: compare the f64 reconstructed from the payload bits.
+const SORT_FLOAT: int = 1
+/// Sort kind for string payloads: compare inline bytes.
+const SORT_STR: int = 2
+
+/// Allocate an empty list holding at least `cap` elements.
+/// Mirrors `list.rs::list_new`: one object allocation, a zeroed length, the capacity
+/// floored at `INITIAL_CAP`, and a fresh zeroed element span.
+fn listNew(cap: int) -> *int {
+    unsafe {
+        var obj = alloc(int, LIST_WORDS)
+        var c = cap
+        if (c < INITIAL_CAP) {
+            c = INITIAL_CAP
+        }
+        var data = alloc(int, c)
+        obj[0] = 0
+        obj[1] = PICKLE_CLASS_LIST
+        obj[2] = LIST_BYTES
+        obj[LEN_WORD] = 0
+        obj[CAP_WORD] = c
+        obj[DATA_WORD] = data as int
+        abiRegisterObject(obj)
+        return obj
+    }
+}
+
+/// Grow the element span so it can hold `need` elements. Mirrors
+/// `list.rs::require_capacity`: double from the larger of the current capacity and
+/// `INITIAL_CAP`, copy the surviving prefix into the fresh span, then republish the new
+/// capacity and pointer.
+///
+/// TRAP - do not assume the fresh span is zeroed. `alloc` returns UNINITIALISED memory
+/// (measured: a fresh `alloc(8)` reads back with all eight words non-zero), exactly like
+/// the native `heap::raw_alloc`, which also skips zeroing. Native `list.rs` leaves those
+/// slots uninitialised too, so this matches -- but it means slots past the copied prefix
+/// hold garbage, not null. Every read of a list element is bounds-checked against `len`
+/// first, which is what keeps this safe. Do not add an unchecked read of a list slot.
+fn requireCapacity(list: *int, need: int) {
+    unsafe {
+        var cap = list[CAP_WORD]
+        if (cap >= need) {
+            return
+        }
+        var newCap = cap
+        if (newCap < INITIAL_CAP) {
+            newCap = INITIAL_CAP
+        }
+        while (newCap < need) {
+            newCap = newCap * 2
+        }
+        var oldData = list[DATA_WORD] as *int
+        var fresh = alloc(int, newCap)
+        if (oldData as int != 0) {
+            var preserve = cap
+            if (newCap < preserve) {
+                preserve = newCap
+            }
+            var i = 0
+            while (i < preserve) {
+                fresh[i] = oldData[i]
+                i = i + 1
+            }
+        }
+        list[CAP_WORD] = newCap
+        list[DATA_WORD] = fresh as int
+    }
+}
+
+/// Create an empty list with at least `cap` capacity.
+/// Mirrors `pickle_list_new`.
+#[symbol("pickle_list_new")]
+fn abiListNew(cap: int) -> *int {
+    return listNew(cap)
+}
+
+/// Number of elements. Mirrors `pickle_list_len`.
+#[symbol("pickle_list_len")]
+fn abiListLen(list: *int) -> int {
+    unsafe {
+        return list[LEN_WORD]
+    }
+}
+
+/// Bound-checked element read; returns null when out of bounds.
+/// Mirrors `pickle_list_get`, whose out-of-range result is the null pointer.
+#[symbol("pickle_list_get")]
+fn abiListGet(list: *int, index: int) -> *int {
+    unsafe {
+        if (index >= list[LEN_WORD]) {
+            return 0 as *int
+        }
+        var data = list[DATA_WORD] as *int
+        return data[index] as *int
+    }
+}
+
+/// Element write. Mirrors `pickle_list_set`; its out-of-bounds panic is the documented GAP
+/// above, since the compiler bounds-checks the index statically.
+#[symbol("pickle_list_set")]
+fn abiListSet(list: *int, index: int, value: *int) {
+    unsafe {
+        if (index >= list[LEN_WORD]) {
+            return
+        }
+        var data = list[DATA_WORD] as *int
+        data[index] = value as int
+    }
+}
+
+/// Append an element. Mirrors `pickle_list_push`.
+#[symbol("pickle_list_push")]
+fn abiListPush(list: *int, value: *int) {
+    unsafe {
+        var n = list[LEN_WORD]
+        requireCapacity(list, n + 1)
+        var data = list[DATA_WORD] as *int
+        data[n] = value as int
+        list[LEN_WORD] = n + 1
+    }
+}
+
+/// Remove and return the last element (null when empty).
+/// Mirrors `pickle_list_pop`.
+#[symbol("pickle_list_pop")]
+fn abiListPop(list: *int) -> *int {
+    unsafe {
+        var n = list[LEN_WORD]
+        if (n == 0) {
+            return 0 as *int
+        }
+        var data = list[DATA_WORD] as *int
+        var v = data[n - 1] as *int
+        list[LEN_WORD] = n - 1
+        return v
+    }
+}
+
+/// Remove the element at `index`, shifting the tail left; returns the element.
+/// Mirrors `pickle_list_remove`; its out-of-bounds panic is the documented GAP above.
+#[symbol("pickle_list_remove")]
+fn abiListRemove(list: *int, index: int) -> *int {
+    unsafe {
+        var n = list[LEN_WORD]
+        if (index >= n) {
+            return 0 as *int
+        }
+        var data = list[DATA_WORD] as *int
+        var v = data[index] as *int
+        var i = index
+        while (i < n - 1) {
+            data[i] = data[i + 1]
+            i = i + 1
+        }
+        list[LEN_WORD] = n - 1
+        return v
+    }
+}
+
+/// Insert `value` at `index`, shifting the tail right.
+/// Mirrors `pickle_list_insert`; its out-of-bounds panic is the documented GAP above.
+#[symbol("pickle_list_insert")]
+fn abiListInsert(list: *int, index: int, value: *int) {
+    unsafe {
+        var n = list[LEN_WORD]
+        if (index > n) {
+            return
+        }
+        requireCapacity(list, n + 1)
+        var data = list[DATA_WORD] as *int
+        var i = n
+        while (i > index) {
+            data[i] = data[i - 1]
+            i = i - 1
+        }
+        data[index] = value as int
+        list[LEN_WORD] = n + 1
+    }
+}
+
+/// Ascending order test between two boxed elements for a sort kind.
+/// Mirrors `list.rs::elem_lt`.
+fn elemLt(kind: int, a: *int, b: *int) -> bool {
+    unsafe {
+        if (kind == SORT_INT) {
+            return a[3] < b[3]
+        }
+        if (kind == SORT_FLOAT) {
+            return f64FromBits(a[3]) < f64FromBits(b[3])
+        }
+        if (kind == SORT_STR) {
+            return abiStrCmp(a, b) < 0
+        }
+        return false
+    }
+}
+
+/// In-place ascending order sort over boxed elements. Mirrors `pickle_list_sort`:
+/// insertion sort, stable for equal keys, so the result is byte-identical to the native
+/// body for every input including ones with duplicates.
+#[symbol("pickle_list_sort")]
+fn abiListSort(list: *int, kind: int) {
+    unsafe {
+        var n = list[LEN_WORD]
+        if (n < 2) {
+            return
+        }
+        var data = list[DATA_WORD] as *int
+        var i = 1
+        while (i < n) {
+            var key = data[i] as *int
+            var j = i
+            while (j > 0 && elemLt(kind, key, data[j - 1] as *int)) {
+                data[j] = data[j - 1]
+                j = j - 1
+            }
+            data[j] = key as int
+            i = i + 1
+        }
+    }
+}
+
+/// Build a `List<int>` from `[start, end)` stepping by `step`.
+/// Mirrors `pickle_range`: a zero step yields an empty list, a positive step walks while
+/// `v < end`, a negative step while `v > end`, and every element is a boxed `int`.
+#[symbol("pickle_range")]
+fn abiRange(start: int, end: int, step: int) -> *int {
+    var list = listNew(0)
+    if (step == 0) {
+        return list
+    }
+    var v = start
+    if (step > 0) {
+        while (v < end) {
+            abiListPush(list, abiBoxI64(v))
+            v = v + step
+        }
+    } else {
+        while (v > end) {
+            abiListPush(list, abiBoxI64(v))
+            v = v + step
+        }
+    }
+    return list
+}

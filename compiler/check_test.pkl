@@ -1,0 +1,402 @@
+module compiler.check_test
+
+import { containsStr, joinStrs, listHasStr, listRemoveStr, listHasTy, absDiffInt, spanKey, binOpName, unOpName, strPartsText, isNoneStr, isNoneExpr, classifyMessage, tyVars, isClassOrStruct, isThisCall, namedCtorDelegation, isListSortable, mergeFlowTypes, patternIntroducesBinding, emptyStrList, emptyTyList, checkProgram } from compiler.check
+import { Span, DiagnosticSink, Severity } from compiler.diag
+import { Lexer } from compiler.lexer
+import { parse } from compiler.parser
+import { Resolver } from compiler.resolve
+import { StrPart, BinOp, UnOp, Expr, ExprKind, Block, Stmt, Pattern, Lit, emptyStrs } from compiler.ast
+import { Ty, tyEq, optOf, emptyTys } from compiler.ty
+
+fn optTy(t: Ty) -> Ty? {
+    t
+}
+
+fn eqStr(s: string, t: string) -> bool {
+    s == t
+}
+
+fn eqTy(t: Ty?, u: Ty?) -> bool {
+    if (let none = t) {
+        if (let none = u) {
+            return true
+        }
+        return false
+    }
+    if (let some(a) = t) {
+        if (let some(b) = u) {
+            return tyEq(a, b)
+        }
+    }
+    false
+}
+
+fn makeSpan(s: int, e: int) -> Span {
+    Span(s, e)
+}
+
+fn makeThisCall(s: int, e: int) -> Expr {
+    let thisE = Expr(makeSpan(s, e), ExprKind.This)
+    Expr(makeSpan(s, e), ExprKind.Call(thisE, emptyCallArgs()))
+}
+
+fn emptyCallArgs() -> List<CallArg> {
+    var l = [CallArg(someString(""), Expr(makeSpan(0, 0), ExprKind.Ident("x")), false, makeSpan(0, 0))]
+    l.pop()
+    l
+}
+
+test fn contains_str() {
+    expect(containsStr("hello world", "world")).toBe(true)
+    expect(containsStr("hello world", "xyz")).toBe(false)
+    expect(containsStr("hello", "")).toBe(true)
+    expect(containsStr("abc", "abcd")).toBe(false)
+    expect(containsStr("abc", "abc")).toBe(true)
+    expect(containsStr("type mismatch in `x`", "type mismatch")).toBe(true)
+}
+
+test fn join_strs() {
+    expect(joinStrs(["a", "b", "c"], ", ")).toBe("a, b, c")
+    expect(joinStrs(["a"], ",")).toBe("a")
+    var l = emptyStrList()
+    expect(joinStrs(l, ",")).toBe("")
+    expect(joinStrs(["a", "b"], "")).toBe("ab")
+}
+
+test fn list_has_str() {
+    expect(listHasStr(["a", "b"], "a")).toBe(true)
+    expect(listHasStr(["a", "b"], "c")).toBe(false)
+    var l = emptyStrList()
+    expect(listHasStr(l, "x")).toBe(false)
+}
+
+test fn list_remove_str() {
+    var l = ["a", "b", "c"]
+    listRemoveStr(l, "b")
+    expect(len(l)).toBe(2)
+    expect(l[0]).toBe("a")
+    expect(l[1]).toBe("c")
+    listRemoveStr(l, "z")
+    expect(len(l)).toBe(2)
+}
+
+test fn list_has_ty() {
+    expect(listHasTy([Ty.Int], Ty.Int)).toBe(true)
+    expect(listHasTy([Ty.Int], Ty.Float)).toBe(false)
+    expect(listHasTy([Ty.String, Ty.Bool], Ty.Bool)).toBe(true)
+    var l = emptyTyList()
+    expect(listHasTy(l, Ty.Int)).toBe(false)
+}
+
+test fn abs_diff_int() {
+    expect(absDiffInt(3, 5)).toBe(2)
+    expect(absDiffInt(5, 3)).toBe(2)
+    expect(absDiffInt(-1, 1)).toBe(2)
+    expect(absDiffInt(0, 0)).toBe(0)
+}
+
+test fn span_key() {
+    expect(spanKey(makeSpan(3, 7))).toBe("3:7")
+    expect(spanKey(makeSpan(0, 0))).toBe("0:0")
+    expect(spanKey(makeSpan(12, 45))).toBe("12:45")
+}
+
+test fn bin_op_names() {
+    expect(binOpName(BinOp.Add)).toBe("Add")
+    expect(binOpName(BinOp.Sub)).toBe("Sub")
+    expect(binOpName(BinOp.Mul)).toBe("Mul")
+    expect(binOpName(BinOp.Div)).toBe("Div")
+    expect(binOpName(BinOp.Mod)).toBe("Mod")
+    expect(binOpName(BinOp.Pow)).toBe("Pow")
+    expect(binOpName(BinOp.Shl)).toBe("Shl")
+    expect(binOpName(BinOp.Shr)).toBe("Shr")
+    expect(binOpName(BinOp.BitAnd)).toBe("BitAnd")
+    expect(binOpName(BinOp.BitOr)).toBe("BitOr")
+    expect(binOpName(BinOp.BitXor)).toBe("BitXor")
+    expect(binOpName(BinOp.Lt)).toBe("Lt")
+    expect(binOpName(BinOp.Le)).toBe("Le")
+    expect(binOpName(BinOp.Gt)).toBe("Gt")
+    expect(binOpName(BinOp.Ge)).toBe("Ge")
+    expect(binOpName(BinOp.Eq)).toBe("Eq")
+    expect(binOpName(BinOp.Ne)).toBe("Ne")
+    expect(binOpName(BinOp.And)).toBe("And")
+    expect(binOpName(BinOp.Or)).toBe("Or")
+    expect(binOpName(BinOp.Range)).toBe("Range")
+    expect(binOpName(BinOp.RangeIncl)).toBe("RangeIncl")
+    expect(binOpName(BinOp.NullCoalesce)).toBe("NullCoalesce")
+    expect(binOpName(BinOp.Send)).toBe("Send")
+    expect(binOpName(BinOp.Is)).toBe("Is")
+    expect(binOpName(BinOp.In)).toBe("In")
+}
+
+test fn un_op_names() {
+    expect(unOpName(UnOp.Neg)).toBe("Neg")
+    expect(unOpName(UnOp.Not)).toBe("Not")
+    expect(unOpName(UnOp.BitNot)).toBe("BitNot")
+    expect(unOpName(UnOp.Deref)).toBe("Deref")
+    expect(unOpName(UnOp.AddrOf)).toBe("AddrOf")
+}
+
+test fn str_parts_text() {
+    var plain = [StrPart.Text("ab"), StrPart.Text("cd")]
+    expect(strPartsText(plain)).toBe("abcd")
+    var interp = [StrPart.Text("a"), StrPart.Expr(makeThisCall(0, 1))]
+    expect(strPartsText(interp)).toBe("")
+    var single = [StrPart.Text("x")]
+    expect(strPartsText(single)).toBe("x")
+}
+
+test fn is_none_helpers() {
+    expect(isNoneStr(someString("x"))).toBe(false)
+    expect(isNoneStr(none)).toBe(true)
+    expect(isNoneExpr(makeThisCall(0, 0))).toBe(false)
+    expect(isNoneExpr(none)).toBe(true)
+}
+
+test fn classify_messages() {
+    expect(classifyMessage("use of undeclared name `x`")).toBe("E0351")
+    expect(classifyMessage("type mismatch in `1 + 2`")).toBe("E0308")
+    expect(classifyMessage("cannot access member `foo` on")).toBe("E0420")
+    expect(classifyMessage("no member `bar`")).toBe("E0352")
+    expect(classifyMessage("`this` used outside of a class body")).toBe("E0361")
+    expect(classifyMessage("attempt to call a non-function")).toBe("E0411")
+    expect(classifyMessage("`alloc(T, count)` takes no arguments")).toBe("E0440")
+    expect(classifyMessage("may only be used inside an `unsafe` block")).toBe("E0520")
+    expect(classifyMessage("condition must be a `bool`")).toBe("E0340")
+    expect(classifyMessage("used outside of a loop")).toBe("E0320")
+    expect(classifyMessage("references are supported only as function parameter types")).toBe("E0700")
+    expect(classifyMessage("unknown attribute `#[foo]`")).toBe("E0400")
+    expect(classifyMessage("has no variant")).toBe("E0353")
+    expect(classifyMessage("cannot be constructed directly")).toBe("E0354")
+    expect(classifyMessage("unknown generic function `f`")).toBe("E0410")
+    expect(classifyMessage("cannot push")).toBe(none)
+    expect(classifyMessage("")).toBe(none)
+    expect(classifyMessage("result of a `#[manualAlloc]` function is owned by the caller")).toBe(none)
+}
+
+test fn ty_vars() {
+    let vs = tyVars(["T", "U"])
+    expect(len(vs)).toBe(2)
+    expect(tyEq(vs[0], Ty.Var("T"))).toBe(true)
+    expect(tyEq(vs[1], Ty.Var("U"))).toBe(true)
+}
+
+test fn is_class_or_struct() {
+    expect(isClassOrStruct(Ty.Class("A", emptyTys()))).toBe(true)
+    expect(isClassOrStruct(Ty.Struct("B", emptyTys()))).toBe(true)
+    expect(isClassOrStruct(Ty.Int)).toBe(false)
+    expect(isClassOrStruct(Ty.Enum("E", emptyTys()))).toBe(false)
+    expect(isClassOrStruct(Ty.String)).toBe(false)
+}
+
+test fn is_this_call() {
+    expect(isThisCall(makeThisCall(0, 0))).toBe(true)
+    let ident = Expr(makeSpan(0, 0), ExprKind.Ident("f"))
+    expect(isThisCall(ident)).toBe(false)
+}
+
+test fn named_ctor_delegation() {
+    let call = makeThisCall(0, 0)
+    let emptyBlock = Block(emptyStmtList(), none, makeSpan(0, 0))
+    match (namedCtorDelegation(emptyBlock)) {
+        case some(_) -> expect(true).toBe(false)
+        case none -> expect(true).toBe(true)
+    }
+    let tail = Block(emptyStmtList(), optExpr(call), makeSpan(0, 0))
+    match (namedCtorDelegation(tail)) {
+        case some(e) -> expect(isThisCall(e)).toBe(true)
+        case none -> expect(true).toBe(false)
+    }
+    let stmtOnly = Block(makeStmtList(), none, makeSpan(0, 0))
+    match (namedCtorDelegation(stmtOnly)) {
+        case some(e) -> expect(isThisCall(e)).toBe(true)
+        case none -> expect(true).toBe(false)
+    }
+    let twoStmts = Block(makeTwoStmtList(), none, makeSpan(0, 0))
+    match (namedCtorDelegation(twoStmts)) {
+        case some(_) -> expect(true).toBe(false)
+        case none -> expect(true).toBe(true)
+    }
+}
+
+/// `#[symbol(...)]` gate: only plain C identifiers may claim a linkable ABI
+/// symbol, because the value becomes a COFF symbol name verbatim. A name that
+/// is empty, starts with a digit, or contains a punctuation character can never
+/// resolve at link time, so it must be rejected before it reaches the backend.
+test fn is_abi_symbol() {
+    expect(isAbiSymbol("pickle_str_len")).toBe(true)
+    expect(isAbiSymbol("pkl_main")).toBe(true)
+    expect(isAbiSymbol("_priv")).toBe(true)
+    expect(isAbiSymbol("A0")).toBe(true)
+    expect(isAbiSymbol("")).toBe(false)
+    expect(isAbiSymbol("9bad")).toBe(false)
+    expect(isAbiSymbol("bad-name")).toBe(false)
+    expect(isAbiSymbol("bad name")).toBe(false)
+    expect(isAbiSymbol("bad.name")).toBe(false)
+    expect(isAbiSymbol("na!me")).toBe(false)
+}
+
+test fn is_list_sortable() {
+    expect(isListSortable(Ty.Int)).toBe(true)
+    expect(isListSortable(Ty.Float)).toBe(true)
+    expect(isListSortable(Ty.Byte)).toBe(true)
+    expect(isListSortable(Ty.Char)).toBe(true)
+    expect(isListSortable(Ty.Bool)).toBe(true)
+    expect(isListSortable(Ty.String)).toBe(true)
+    expect(isListSortable(Ty.List(Ty.Int))).toBe(false)
+    expect(isListSortable(Ty.Option(Ty.Int))).toBe(false)
+}
+
+test fn merge_flow_types() {
+    let r1 = mergeFlowTypes(Ty.Int, Ty.Int)
+    match (r1) {
+        case some(t) -> expect(tyEq(t, Ty.Int)).toBe(true)
+        case none -> expect(true).toBe(false)
+    }
+    let r2 = mergeFlowTypes(Ty.None, Ty.Int)
+    match (r2) {
+        case some(t) -> expect(tyEq(t, Ty.Option(Ty.Int))).toBe(true)
+        case none -> expect(true).toBe(false)
+    }
+    let r3 = mergeFlowTypes(Ty.Int, Ty.None)
+    match (r3) {
+        case some(t) -> expect(tyEq(t, Ty.Option(Ty.Int))).toBe(true)
+        case none -> expect(true).toBe(false)
+    }
+    let r4 = mergeFlowTypes(Ty.String, Ty.Int)
+    match (r4) {
+        case some(_) -> expect(true).toBe(false)
+        case none -> expect(true).toBe(true)
+    }
+    let r5 = mergeFlowTypes(Ty.Option(Ty.Int), Ty.Int)
+    match (r5) {
+        case some(t) -> expect(tyEq(t, Ty.Option(Ty.Int))).toBe(true)
+        case none -> expect(true).toBe(false)
+    }
+    let r6 = mergeFlowTypes(Ty.Unknown, Ty.Int)
+    match (r6) {
+        case some(t) -> expect(tyEq(t, Ty.Unknown)).toBe(true)
+        case none -> expect(true).toBe(false)
+    }
+}
+
+test fn pattern_introduces_binding() {
+    expect(patternIntroducesBinding(Pattern.Wildcard)).toBe(false)
+    expect(patternIntroducesBinding(Pattern.Binding("x", none))).toBe(true)
+    expect(patternIntroducesBinding(Pattern.Literal(Lit.Int(3)))).toBe(false)
+    expect(patternIntroducesBinding(Pattern.Tuple([Pattern.Wildcard, Pattern.Binding("y", none)]))).toBe(true)
+    expect(patternIntroducesBinding(Pattern.Tuple([Pattern.Wildcard, Pattern.Wildcard]))).toBe(false)
+    expect(patternIntroducesBinding(Pattern.Or([Pattern.Wildcard, Pattern.Literal(Lit.Bool(true))]))).toBe(false)
+    expect(patternIntroducesBinding(Pattern.Or([Pattern.Wildcard, Pattern.Binding("z", none)]))).toBe(true)
+}
+
+fn someString(s: string) -> string? {
+    s
+}
+
+fn optExpr(e: Expr) -> Expr? {
+    e
+}
+
+fn emptyStmtList() -> List<Stmt> {
+    var l = [Stmt.Empty(makeSpan(0, 0))]
+    l.pop()
+    l
+}
+
+fn makeStmtList() -> List<Stmt> {
+    [Stmt.Expr(makeThisCall(0, 0))]
+}
+
+fn makeTwoStmtList() -> List<Stmt> {
+    [Stmt.Expr(makeThisCall(0, 0)), Stmt.Expr(makeThisCall(0, 1))]
+}
+
+// ---- regression: `&&`/`||` must not re-check their operands -----------------
+//
+// `checkBinary` already computes `lt`/`rt` with `checkExpr(lhs)`/`checkExpr(rhs)`.
+// An earlier version *also* called `checkBoolCond` on both operands, so a
+// left-leaning `a || b || c` chain satisfied T(n) = 2*T(n-1). Measured on this
+// compiler: 20 terms took ~8.2s and 24 would have taken minutes, which is what
+// made `pickle/compiler/ir.pkl` (one 18-term `||` chain in `irxIsInstrHead`)
+// take ~12s to check and `emit.pkl` take minutes. The redundant walk also
+// re-emitted diagnostics the operands had already produced, so a nested error
+// appeared twice.
+
+fn checkSource(src: string) -> List<string> {
+    let toks = Lexer(bytes(src), 0, 0, none, range(0), 0).run()
+    let diags = DiagnosticSink()
+    var out = emptyStrList()
+    if (let some(prog) = parse(toks, diags)) {
+        let r = Resolver(diags)
+        checkProgram(prog, r.resolve(prog), diags)
+    }
+    for (d in diags.diagnostics) {
+        if (d.severity == Severity.Error) {
+            out.push(d.message)
+        }
+    }
+    out
+}
+
+fn countContaining(msgs: List<string>, needle: string) -> int {
+    var n = 0
+    for (m in msgs) {
+        if (containsStr(m, needle)) {
+            n = n + 1
+        }
+    }
+    n
+}
+
+// Pickle has no `\"` escape and `{` opens an interpolation, so a source snippet
+// containing a quote or a brace has to be assembled from chars.
+fn quote() -> string {
+    "{(34 as char)}"
+}
+
+fn obrace() -> string {
+    "{(123 as char)}"
+}
+
+fn cbrace() -> string {
+    "{(125 as char)}"
+}
+
+test fn logical_or_reports_each_operand_error_once() {
+    let ob = obrace()
+    let cb = cbrace()
+    let q = quote()
+    // Two bad operands: exactly one condition error each, nothing else.
+    let msgs = checkSource("fn main() " + ob + " let b = 1 || 2 " + cb)
+    expect(len(msgs)).toBe(2)
+    expect(countContaining(msgs, "condition must be a `bool`")).toBe(2)
+
+    // The inner error must appear exactly once: operands are checked once, so the
+    // boolean context does not duplicate a diagnostic they already produced.
+    let msgs = checkSource("fn main() " + ob + " let b = (1 + " + q + "x" + q + ") || true " + cb)
+    expect(countContaining(msgs, "operator `Add`")).toBe(1)
+    expect(countContaining(msgs, "condition must be a `bool`")).toBe(1)
+}
+
+test fn logical_chains_are_checked_once_per_operand() {
+    // The shape that used to blow up exponentially. What matters is the depth of
+    // the left-leaning `||` spine, so the same well-typed term is repeated: a
+    // reintroduced double-walk makes this 2^64 instead of 64.
+    let ob = obrace()
+    let cb = cbrace()
+    let q = quote()
+    let term = "s == " + q + "t" + q
+    var src = "fn pick(s: string) -> bool " + ob + " "
+    var i = 0
+    while (i < 64) {
+        if (i > 0) {
+            src = src + " || "
+        }
+        src = src + term
+        i = i + 1
+    }
+    src = src + " " + cb
+    let msgs = checkSource(src)
+    expect(len(msgs)).toBe(0)
+}

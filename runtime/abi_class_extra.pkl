@@ -1,0 +1,240 @@
+module runtime.abi_class_extra
+
+/// Port of `runtime/src/class.rs`'s registration/name ABI plus the descriptor
+/// table in `runtime/src/gc.rs`, as real `#[symbol]` bodies: the GC-three slice
+/// alongside `abi_runtime.pkl`.
+///
+/// WHAT THIS OWNS. `pickle_class_register`, `pickle_class_name`, the parent
+/// link, and the seeded builtin class names share ONE store, indexed by class
+/// id: a flat `alloc(int, n)` word block of `[name_ptr, name_len, parent]`
+/// triples, grown lazily. Scalar top-level vars are image data (valid from
+/// process entry), the same discipline as `abi_statics`, because the compiler
+/// injects the `pickle_class_register` calls at the TOP of `main`'s entry
+/// block - BEFORE `pkl_globals_init` and `pkl_static_init` - so no managed
+/// initializer has run when registration begins.
+///
+/// THE NAME POINTER. The emitter passes `IrConst.StrAddr(sid)`: an address
+/// into the module's own string-data blob, which is image-static and lives as
+/// long as the process. Native `class_register` COPIES defensively
+/// (`Box::leak`) because its caller's pointer may be transient; the port
+/// stores the StrAddr directly and records that as a divergence - a
+/// would-be defensive copy here costs an allocation for a pointer the emitter
+/// guarantees is stable.
+///
+/// WHAT IS NOT STORED (yet): `slot_count`, the managed mask, the owned mask,
+/// `finalizer`, and the interface buckets (those live in `abi_classpred`).
+/// No ported body reads them in this slice - the collector is a future slice.
+/// Kept out so the table stays `[name_ptr, name_len, parent]` per id rather
+/// than carrying words nothing consumes; the `slotCount` etc. arguments are
+/// therefore accepted and ignored, exactly as `pickle_class_register`'s
+/// native side effects beyond name/parent storage are ignored here. `parent`
+/// IS stored: `classParentOf` feeds the parent chain walks in
+/// `abi_classpred` (and later the collector), mirroring `gc.rs`'s
+/// `set_class_parent`/`class_parent`.
+///
+/// `pickle_class_name` ALWAYS returns a fresh managed `string`: the registered
+/// name, else the literal `<object>` - never null (a null return is a latent
+/// null-deref in `emitCstr`). Each fresh string is rebuilt from the stored
+/// name bytes via `abiStrFromBytes`, mirroring native
+/// `string_from_bytes(descriptor.name)`.
+
+import { abiStrFromBytes, newStr, newStrUnmanaged, byteInto } from runtime.abi_string
+import { STR_BYTES_OFF } from runtime.layout
+
+/// Word stride of one class record: `[name_ptr, name_len, parent]`.
+const NAME_STRIDE: int = 3
+
+/// First capacity in words (10 records before the first growth; the doubling
+/// loop carries any realistic class table - the self-hosted `Emitter` alone is
+/// one record).
+const INITIAL_NAME_WORDS: int = 32
+
+/// The record block, word-addressed. Image data (see header): readable at
+/// process entry, valid at every point the injected registrations run.
+var classNamesBase: int = 0
+/// Capacity of `classNamesBase`, in words. Lockstep with the base: `base == 0`
+/// exactly while `cap == 0`.
+var classNamesCap: int = 0
+/// Next class id to hand out. Starts at 10: ids 0-9 are the seeded builtins.
+var classNamesCount: int = 10
+
+/// Grow the record block so record `id`'s third word is in range: double
+/// until it fits, allocate fresh (unzeroed, like every `alloc`), copy the old
+/// words, zero the new tail so untouched records read `[0, 0, 0]` (an
+/// unregistered id must not pick up garbage), then release the old block. Safe
+/// to free: no external code can hold a pointer into the old block - callers
+/// receive the name *value*, never a registry address.
+fn ensureNameCap(id: int) {
+    if (NAME_STRIDE * id + 2 < classNamesCap) {
+        return
+    }
+    unsafe {
+        var cap = classNamesCap
+        if (cap == 0) {
+            cap = INITIAL_NAME_WORDS
+        }
+        while (NAME_STRIDE * id + 2 >= cap) {
+            cap = cap * 2
+        }
+        var fresh = alloc(int, cap)
+        var j = 0
+        while (j < classNamesCap) {
+            fresh[j] = (classNamesBase as *int)[j]
+            j = j + 1
+        }
+        var k = classNamesCap
+        while (k < cap) {
+            fresh[k] = 0
+            k = k + 1
+        }
+        if (classNamesBase != 0) {
+            free(classNamesBase as *int)
+        }
+        classNamesBase = fresh as int
+        classNamesCap = cap
+    }
+}
+
+/// Store `(namePtr, nameLen, parent)` for class `id`.
+fn setName(id: int, namePtr: *int, nameLen: int, parent: int) {
+    ensureNameCap(id)
+    unsafe {
+        (classNamesBase as *int)[NAME_STRIDE * id] = namePtr as int
+        (classNamesBase as *int)[NAME_STRIDE * id + 1] = nameLen
+        (classNamesBase as *int)[NAME_STRIDE * id + 2] = parent
+    }
+}
+
+/// Fresh managed `string` of the stored name for `id`, else `<object>` - the
+/// native descriptor-miss branch. Never returns null.
+fn nameFor(id: int) -> *int {
+    ensureNameCap(id)
+    unsafe {
+        var ptr = ((classNamesBase as *int)[NAME_STRIDE * id]) as *int
+        var len = (classNamesBase as *int)[NAME_STRIDE * id + 1]
+        if ((ptr as int) == 0) {
+            return objectLiteral()
+        }
+        return abiStrFromBytes(ptr, len)
+    }
+}
+
+/// Fresh managed `string` of the bytes "<object>". Built byte-by-byte like
+/// `abiStrBytes` (Pickle has no source syntax for a raw string-data address -
+/// `pkl_strdata_*` is reachable only via the `IrConst::StrAddr` the emitter
+/// synthesises for itself).
+fn objectLiteral() -> *int {
+    unsafe {
+        var p = newStr(8)
+        byteInto(p, 0, 60)
+        byteInto(p, 1, 111)
+        byteInto(p, 2, 98)
+        byteInto(p, 3, 106)
+        byteInto(p, 4, 101)
+        byteInto(p, 5, 99)
+        byteInto(p, 6, 116)
+        byteInto(p, 7, 62)
+        return p
+    }
+}
+
+/// Build a fresh managed `string` from up to 8 explicit bytes (the longest
+/// builtin name is 6, `<object>` is 8 - `abiStrBytes` caps at 5). One guarded
+/// `byteInto` per position, mirroring `abiStrBytes`. The block is UNMANAGED:
+/// it only backs a static descriptor name, which native never allocates
+/// through `Gc::alloc` (see `newStrUnmanaged`).
+fn bytesStr(n: int, b0: int, b1: int, b2: int, b3: int, b4: int, b5: int, b6: int, b7: int) -> *int {
+    unsafe {
+        var p = newStrUnmanaged(n)
+        byteInto(p, 0, b0)
+        if (n > 1) { byteInto(p, 1, b1) }
+        if (n > 2) { byteInto(p, 2, b2) }
+        if (n > 3) { byteInto(p, 3, b3) }
+        if (n > 4) { byteInto(p, 4, b4) }
+        if (n > 5) { byteInto(p, 5, b5) }
+        if (n > 6) { byteInto(p, 6, b6) }
+        if (n > 7) { byteInto(p, 7, b7) }
+        return p
+    }
+}
+
+/// Seed class `id` with the PAYLOAD address of an existing marker string.
+/// Marker objects come from `newStr` - raw `alloc` memory that is never freed,
+/// so the address is stable for the process, and `nameFor` copies out of it on
+/// every lookup exactly like native `string_from_bytes(descriptor.name)`.
+fn seedFromStr(id: int, s: *int, n: int) {
+    unsafe {
+        setName(id, ((s as int) + STR_BYTES_OFF) as *int, n, 0)
+    }
+}
+
+/// Build a marker string from bytes (with zero padding past `n`) and seed
+/// class `id` with its payload.
+fn seedFromBytes(id: int, n: int, b0: int, b1: int, b2: int, b3: int, b4: int, b5: int, b6: int, b7: int) {
+    var s = bytesStr(n, b0, b1, b2, b3, b4, b5, b6, b7)
+    seedFromStr(id, s, n)
+}
+
+/// Seed the ten builtin class names (ids 0-9). Runs from `abiRuntimeInit`,
+/// mirroring `BUILTIN_DESCRIPTORS` registration in
+/// `runtime/src/lib.rs::pickle_runtime_init`.
+fn seedBuiltins() {
+    seedFromBytes(0, 6, 115, 116, 114, 105, 110, 103, 0, 0)  // string
+    seedFromBytes(1, 4, 76, 105, 115, 116, 0, 0, 0, 0)       // List
+    seedFromBytes(2, 3, 77, 97, 112, 0, 0, 0, 0, 0)          // Map
+    seedFromBytes(3, 3, 105, 110, 116, 0, 0, 0, 0, 0)        // int
+    seedFromBytes(4, 5, 102, 108, 111, 97, 116, 0, 0, 0)     // float
+    seedFromBytes(5, 4, 98, 111, 111, 108, 0, 0, 0, 0)       // bool
+    seedFromBytes(6, 4, 99, 104, 97, 114, 0, 0, 0, 0)        // char
+    seedFromBytes(7, 4, 101, 110, 117, 109, 0, 0, 0, 0)      // enum
+    seedFromBytes(8, 5, 116, 117, 112, 108, 101, 0, 0, 0)    // tuple
+    seedFromBytes(9, 6, 115, 116, 114, 101, 97, 109, 0, 0)   // stream
+}
+
+/// Register one user-class descriptor: assign the next id (10 + registration
+/// count, matching the compile-time id order the emitter bakes into call
+/// sites), store its name AND its parent class id, and return the assigned
+/// id. The other descriptor words are not stored yet (see header). Mirrors
+/// `class.rs::register_class`'s assignment and copy; the copy is the
+/// documented divergence above.
+#[symbol("pickle_class_register")]
+fn abiClassRegister(namePtr: *int, nameLen: int, slotCount: int, mask: int, ownedMask: int, finalizer: int, parent: int) -> int {
+    var id = classNamesCount
+    setName(id, namePtr, nameLen, parent)
+    classNamesCount = classNamesCount + 1
+    return id
+}
+
+/// Name of a registered class as a fresh managed `string`; the literal
+/// `<object>` when `classId` has no descriptor (which folds native
+/// `class_name`'s None arm into the symbol). Mirrors `class.rs::pickle_class_name`,
+/// including its never-null contract.
+#[symbol("pickle_class_name")]
+fn abiClassName(classId: int) -> *int {
+    if (classId < 0) {
+        return objectLiteral()
+    }
+    if (classId >= classNamesCount) {
+        return objectLiteral()
+    }
+    return nameFor(classId)
+}
+
+/// Parent class id stored for `classId`, else 0. Mirrors `gc.rs`'s
+/// `class_parent`: an id past the registered range reads 0 (native
+/// `class_parents.get(id)` on a short vec), and before `abiRuntimeInit` runs
+/// every id reads 0 (native's vec is still empty). Pure read - unlike
+/// `nameFor` it never grows the block: a fabricated id must not allocate, so
+/// the cap check short-circuits before any index math can touch the base.
+/// Exported for `abi_classpred`'s parent-chain walks.
+fn classParentOf(classId: int) -> int {
+    if (classId < 0 || classId >= classNamesCount) {
+        return 0
+    }
+    if (NAME_STRIDE * classId + 2 >= classNamesCap) {
+        return 0
+    }
+    unsafe {
+        return (classNamesBase as *int)[NAME_STRIDE * classId + 2]
+    }
+}

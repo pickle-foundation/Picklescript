@@ -1,0 +1,591 @@
+module runtime.abi_expect
+
+/// Sovereign `expect` ABI bodies, ported from `runtime/src/test.rs`.
+///
+/// Companion to `runtime.abi_string` / `runtime.abi_console`. `expect(...)`
+/// lowers to these symbols, so every test in the ported suites depends on them.
+/// They are worth porting even though they are only reached from test code:
+/// `expect` is the assertion language itself, and a runtime that owns `expect`
+/// owns the ability to verify itself.
+///
+/// THE NULL QUESTION. All four natives here take `*const PickleObject`, so a
+/// `none` value legitimately arrives as a null pointer, and three of the four
+/// bodies branch on it. Pickle has no null pointer literal -- `*int` is not
+/// comparable to `none` and cannot be assigned `none` -- but the IR carries a
+/// raw address, so `0 as *int` is exactly that address. Verified by probe:
+/// `a == 0 as *int` and `a == b` both compile and behave correctly for `*int`
+/// params. This is the same reason `runtime.abi_list`'s `abiListGet` can return
+/// a null element pointer.
+///
+/// THE RECURSION QUESTION. `obj_eq` recurses through `obj_eq` on nested lists,
+/// so the body calls its own name. Verified by probe: a `#[symbol]` body calling
+/// its own function name resolves to the local function, NOT an extern entry --
+/// the artifact declares no extern for it and the recursion executes. So
+/// structural equality over an arbitrarily nested list is portable.
+///
+/// THE RECORD-VS-FATAL WALL IS CLOSED. `pickle_expect_display` and
+/// `pickle_test_fail_obj` are ported below, and with them the whole expect
+/// channel: on a failing expectation the emitter builds the `Expected:...`
+/// diff through these bodies and hands it to `pickle_test_fail_obj`, which
+/// records it (capture/task mode) or fatals. Capture/task state is image data
+/// (`_captureOn`, `_taskOn`, `_lastPanic`, `_taskPanic`), the `abi_statics`
+/// discipline: scalar globals are valid from process entry, so the ported
+/// bodies need no initializer. The setters/readers (`setCapture`, `setTask`,
+/// `takeCaptured`, `takeTaskPanic`) mirror `panic.rs`'s capture/task API and
+/// are exported for the test/probe drivers; the reference's own
+/// `pickle_test_capture_*` externs are NOT renamed here because no compiled
+/// shape calls them (the native harness drives them), and a sovereign harness
+/// will call these helpers instead.
+///
+/// THE RENDERER. `fmt_obj_to` writes bytes into a `Vec<u8>`; the port writes
+/// them into a `List<int>` (`fmtInto`/`regAppend*`) and materializes the
+/// string with `regToStr` (`newStr` + `byteInto`, the `fromCodes` hand-off in
+/// `abi_float`). Every arm mirrors the reference verbatim:
+///
+///   - null pointer -> "none"
+///   - string -> its inline bytes
+///   - list -> `[` elements `]`, elements recursive, ", " separators
+///   - map -> `Map(<len>)`, enum -> `Enum(<tag>)` (both the `HEADER` word)
+///   - tuple -> `(` fields `)` recursive
+///   - boxed scalars -> i64 decimal / `fmtF64(abiF64FromBits(bits))` / true|false
+///     / raw byte, each reading the box payload at `HEADER`
+///   - everything else -> `abiClassName(cid)` (the ported `pickle_class_name`,
+///     which already answers `<object>` for unknown ids like `gc.class_name`'s
+///     `None` arm)
+///
+/// The forwarding comments in each arm name the Rust line they reproduce, and
+/// the arms are kept one-to-one with `console.rs::fmt_obj_to` rather than
+/// merged, so a drift against the reference survives the review. The float arm
+/// reuses `abi_float::fmtF64`. Recursion reuses the `obj_eq` self-call rule.
+///
+/// THE FATAL PATH. With capture/task off, `pickle_test_fail_obj` must print
+/// `fatal: <msg>\n` to stderr and exit 1 (the `panic.rs::fatal` route, three
+/// `writeStderr` runs + `win_exit`) - the same byte contract
+/// `abi_panic.pkl` already keeps. `msg` is always non-null by construction
+/// (the null arm substitutes `assertion failed`, as the reference's
+/// `to_string` default does); the reference then reads the string OBJECT's
+/// inline payload through `abi_string`-style byte reads, never through
+/// `pickle_print_obj`.
+
+import { PICKLE_CLASS_STRING, PICKLE_CLASS_LIST, PICKLE_CLASS_MAP, PICKLE_CLASS_ENUM, PICKLE_CLASS_TUPLE, PICKLE_CLASS_BOX_INT, PICKLE_CLASS_BOX_FLOAT, PICKLE_CLASS_BOX_BOOL, PICKLE_CLASS_BOX_CHAR } from runtime.object
+import { HEADER, STR_BYTES_OFF } from runtime.layout
+import { abiListLen, abiListGet } from runtime.abi_list
+import { boxBits, abiF64FromBits } from runtime.abi_box
+import { abiStrCmp, abiStrFromI64, abiStrFromBytes, newStr, byteInto, rawByteAt } from runtime.abi_string
+import { fmtF64 } from runtime.abi_float
+import { abiTupleLen, abiTupleField } from runtime.abi_tuple
+import { abiClassName } from runtime.abi_class_extra
+import { writeStdout, writeStderr } from runtime.abi_stdio
+
+/// `class_id` is header word 1, per `runtime.abi_console`.
+const CLASS_ID_WORD: int = 1
+
+/// Every builtin compared here keeps its single length/bits field at `HEADER`
+/// (`STR_LEN_OFF`, `LIST_LEN_OFF`, `BOX_PAYLOAD_OFF`), so one word index reads
+/// the boxed bits as well as a list length.
+const PAYLOAD_WORD: int = HEADER / 8
+
+/// True when the two `*int`s are the same address, which is what the reference's
+/// `a == b` pointer comparison means. Kept as a named helper so the identity
+/// check reads as the identity check.
+fn samePtr(a: *int, b: *int) -> bool {
+    return a == b
+}
+
+/// True when the payload slot matches. The reference's boxed arm is
+/// `box_bits(a) == box_bits(b)`, and `boxBits` is the ported body of that same
+/// accessor, so this is a straight hand-off rather than a re-derivation.
+fn sameBits(a: *int, b: *int) -> bool {
+    return boxBits(a) == boxBits(b)
+}
+
+/// True for the four boxed-scalar class ids. Used to keep the boxed arm
+/// restricted to boxes at all; the flavour match is a separate `ca == cb`.
+fn isBoxId(cid: int) -> bool {
+    return cid == PICKLE_CLASS_BOX_INT || cid == PICKLE_CLASS_BOX_FLOAT || cid == PICKLE_CLASS_BOX_BOOL || cid == PICKLE_CLASS_BOX_CHAR
+}
+
+/// Port of `test.rs::pickle_expect_obj_eq`: structural equality for managed
+/// values.
+///
+/// `none == none`, strings compare by content, lists compare element-wise by
+/// recursion, and two boxes of the same flavour compare by payload bits. Any
+/// other pair -- including two boxes of *different* flavours -- is equal only
+/// when it is the same pointer, which the early identity check has already
+/// caught. So the final arm really is a flat "unequal".
+///
+/// The `(BOX_INT, BOX_INT) | (BOX_FLOAT, BOX_FLOAT) | ...` grouping in the
+/// reference is four arms written in one or-pattern because the body is
+/// identical. Flattened to an `or` chain over the class ids, which is the same
+/// test without needing the or-pattern to line up.
+///
+/// Returns 1 when equal, 0 otherwise. The reference returns `bool as i32`; the
+/// two arms are spelled as integer literals because that is the ABI shape the
+/// IR actually carries.
+#[symbol("pickle_expect_obj_eq")]
+fn abiExpectObjEq(a: *int, b: *int) -> int {
+    if (a == 0 as *int) {
+        if (b == 0 as *int) {
+            return 1
+        }
+        return 0
+    }
+    if (b == 0 as *int) {
+        return 0
+    }
+    if (samePtr(a, b)) {
+        return 1
+    }
+
+    unsafe {
+        var ca = a[CLASS_ID_WORD]
+        var cb = b[CLASS_ID_WORD]
+
+        if (ca == PICKLE_CLASS_STRING) {
+            if (cb == PICKLE_CLASS_STRING) {
+                // The reference compares the raw byte slices. `abiStrCmp` is
+                // three-way over exactly those bytes and returns 0 on a full
+                // match, so `== 0` is the content equality test.
+                if (abiStrCmp(a, b) == 0) {
+                    return 1
+                }
+                return 0
+            }
+            return 0
+        }
+
+        if (ca == PICKLE_CLASS_LIST) {
+            if (cb == PICKLE_CLASS_LIST) {
+                var la = abiListLen(a)
+                if (la != abiListLen(b)) {
+                    return 0
+                }
+                var i = 0
+                while (i < la) {
+                    var ea = abiListGet(a, i)
+                    var eb = abiListGet(b, i)
+                    if (abiExpectObjEq(ea, eb) == 0) {
+                        return 0
+                    }
+                    i = i + 1
+                }
+                return 1
+            }
+            return 0
+        }
+
+        // The reference spells this as four or-pattern arms, each pairing a box
+        // flavour WITH ITSELF:
+        //
+        //   (BOX_INT, BOX_INT) | (BOX_FLOAT, BOX_FLOAT) | (BOX_BOOL, BOX_BOOL)
+        //     | (BOX_CHAR, BOX_CHAR) => box_bits(a) == box_bits(b)
+        //
+        // so the flavours must be the SAME, not merely both boxes. Writing the
+        // guard as "both sides are some box" is wrong and the test suite caught
+        // it: `abiBoxI64(120)` and `abiBoxChar(120)` share payload bits but
+        // differ in class_id, and the reference returns 0. `ca == cb` over the
+        // four box ids reproduces the pairing.
+        if (isBoxId(ca) && ca == cb) {
+            if (sameBits(a, b)) {
+                return 1
+            }
+            return 0
+        }
+
+        return 0
+    }
+}
+
+/// Port of `test.rs::pickle_expect_str_contains`: 1 when `hay` contains
+/// `needle` as a substring.
+///
+/// The reference is `h.windows(n.len()).any(|w| w == n)`, i.e. a naive search
+/// over every start offset. Reproduced as one rather than "improved" to a
+/// two-way algorithm, because the observable behaviour is identical and the
+/// short version is the one that can be checked by eye.
+///
+/// The empty-needle arm is not decoration: the reference returns 1 *before*
+/// looking at `h`, so an empty needle is contained in every haystack including
+/// an empty one. `bytes("")` is the empty string object, which is how the tests
+/// spell that.
+///
+/// GAP: the reference has no null guard on either argument, so a null `hay` or
+/// `needle` dereferences null natively. `expect(...).toContain(...)` cannot
+/// produce one -- both sides are values, not options -- so the arm is left
+/// unreproduced rather than given a synthetic guard the reference lacks.
+#[symbol("pickle_expect_str_contains")]
+fn abiExpectStrContains(hay: *int, needle: *int) -> int {
+    unsafe {
+        var lh = hay[3]
+        var ln = needle[3]
+        if (ln > lh) {
+            return 0
+        }
+        if (ln == 0) {
+            return 1
+        }
+        var i = 0
+        var last = lh - ln
+        while (i <= last) {
+            var j = 0
+            var hit = true
+            while (j < ln) {
+                if (byteAt(hay, i + j) != byteAt(needle, j)) {
+                    hit = false
+                    break
+                }
+                j = j + 1
+            }
+            if (hit) {
+                return 1
+            }
+            i = i + 1
+        }
+        return 0
+    }
+}
+
+/// Byte `i` of a string object's inline payload. Same shift/mask as
+/// `runtime.abi_string`'s private `byteAt`; duplicated rather than imported
+/// because that one is not exported.
+fn byteAt(obj: *int, i: int) -> int {
+    unsafe {
+        return (obj[4 + (i >> 3)] >> ((i & 7) * 8)) & 255
+    }
+}
+
+/// ---------------------------------------------------------------------------
+/// THE RENDERER (`pickle_expect_display`)
+/// ---------------------------------------------------------------------------
+///
+/// The reference renderer is `console.rs::fmt_obj_to`, which appends the
+/// no-bounds check, byte-for-byte spelling of an object into a `Vec<u8>`.
+/// `fmtInto` re-carries it arm by arm over a `List<int>` accumulator, and
+/// `regToStr` materializes that accumulator into a string object with the
+/// `newStr` + `byteInto` hand-off (`fromCodes` in `abi_float`). `regAppend*`
+/// are the `regAppendObj` split-out equivalents: literal text goes through
+/// `regAppendLit` (the `&lit` + `STR_BYTES_OFF` raw-image contract, since
+/// literals carry no header word), and string objects go through
+/// `regAppendStr`, which is just a re-dispatch into the renderer's string arm.
+///
+/// The dispatch order and the shape of every arm below follow
+/// `fmt_obj_to` from first match to last; each arm names its reference line.
+/// The float arm needs `f64::from_bits`, and `f64FromBits` has no source-level
+/// spelling (`emit.rs` comment at the builtin), so it goes through the ported
+/// `abiF64FromBits` body of `pickle_f64_from_bits` -- same bits in, same float
+/// out. The fall-through arm reproduces `gc.class_name(map)` and its `None ->
+/// "<object>"`; `abiClassName`, the ported `pickle_class_name`, already
+/// answers `<object>` for an unknown id.
+
+/// Bytes of literal text appended from the raw code image. `&lit + STR_BYTES_OFF`
+/// is the literal payload (the `emitCstr` contract in `abi_console`), and the
+/// length is `len(lit)` -- never `lit[3]`, literals have no header.
+fn regAppendLit(vals: List<int>, lit: string) -> int {
+    unsafe {
+        var p = &lit
+        var base = (p as int) + STR_BYTES_OFF
+        var n = len(lit)
+        var i = 0
+        while (i < n) {
+            vals.push(rawByteAt(base as *int, i))
+            i = i + 1
+        }
+    }
+    return 0
+}
+
+/// The reference's `write_separator(", ")` between list and tuple fields.
+fn writeSep(vals: List<int>) -> int {
+    regAppendLit(vals, ", ")
+    return 0
+}
+
+/// A string OBJECT's inline payload appended into `vals` through the renderer's
+/// own string arm.
+fn regAppendStr(vals: List<int>, s: *int) -> int {
+    fmtInto(vals, s)
+    return 0
+}
+
+/// Append the decimal spelling of an integer, which is `abiStrFromI64` (`int ->
+/// string`, the SAME shape the reference's BOX_INT arm needs `pickle_int_to_str`
+/// to have).
+fn regAppendInt(vals: List<int>, v: int) -> int {
+    regAppendStr(vals, abiStrFromI64(v))
+    return 0
+}
+
+/// `fmt_obj_to`, arm for arm. Returns 0; calls `return 0` per arm so the reader
+/// can check the dispatch against `console.rs`'s match in one pass.
+fn fmtInto(vals: List<int>, obj: *int) -> int {
+    if (obj == 0 as *int) {
+        regAppendLit(vals, "none")
+        return 0
+    }
+    unsafe {
+        var cid = obj[CLASS_ID_WORD]
+
+        if (cid == PICKLE_CLASS_STRING) {
+            var n = obj[PAYLOAD_WORD]
+            var i = 0
+            while (i < n) {
+                vals.push(byteAt(obj, i))
+                i = i + 1
+            }
+            return 0
+        }
+
+        if (cid == PICKLE_CLASS_LIST) {
+            vals.push(91)
+            var n = abiListLen(obj)
+            var i = 0
+            while (i < n) {
+                if (i > 0) {
+                    writeSep(vals)
+                }
+                fmtInto(vals, abiListGet(obj, i))
+                i = i + 1
+            }
+            vals.push(93)
+            return 0
+        }
+
+        // `map_len` and `enum_tag` are both the HEADER word, so both arms ride
+        // the same index they already use for the boxed payload.
+        if (cid == PICKLE_CLASS_MAP) {
+            regAppendLit(vals, "Map(")
+            regAppendInt(vals, obj[PAYLOAD_WORD])
+            vals.push(41)
+            return 0
+        }
+
+        if (cid == PICKLE_CLASS_ENUM) {
+            regAppendLit(vals, "Enum(")
+            regAppendInt(vals, obj[PAYLOAD_WORD])
+            vals.push(41)
+            return 0
+        }
+
+        if (cid == PICKLE_CLASS_TUPLE) {
+            vals.push(40)
+            var n = abiTupleLen(obj)
+            var i = 0
+            while (i < n) {
+                if (i > 0) {
+                    writeSep(vals)
+                }
+                fmtInto(vals, abiTupleField(obj, i))
+                i = i + 1
+            }
+            vals.push(41)
+            return 0
+        }
+
+        if (cid == PICKLE_CLASS_BOX_INT) {
+            regAppendInt(vals, obj[PAYLOAD_WORD])
+            return 0
+        }
+
+        if (cid == PICKLE_CLASS_BOX_FLOAT) {
+            regAppendStr(vals, fmtF64(abiF64FromBits(obj[PAYLOAD_WORD])))
+            return 0
+        }
+
+        if (cid == PICKLE_CLASS_BOX_BOOL) {
+            if (obj[PAYLOAD_WORD] != 0) {
+                regAppendLit(vals, "true")
+            } else {
+                regAppendLit(vals, "false")
+            }
+            return 0
+        }
+
+        if (cid == PICKLE_CLASS_BOX_CHAR) {
+            vals.push(obj[PAYLOAD_WORD] & 255)
+            return 0
+        }
+
+        regAppendStr(vals, abiClassName(cid))
+        return 0
+    }
+}
+
+/// Materialize the byte accumulator into a string object. `newStr(n)` then one
+/// `byteInto` per byte is the `fromCodes` shape that avoids passing a `List`
+/// value where `*int` is required.
+fn regToStr(vals: List<int>) -> *int {
+    var n = len(vals)
+    var p = newStr(n)
+    var i = 0
+    while (i < n) {
+        byteInto(p, i, vals[i])
+        i = i + 1
+    }
+    return p
+}
+
+/// Port of `test.rs::pickle_expect_display`: the pretty spelling used in
+/// expect diffs. Returns the fresh string object; the caller (the emitted
+/// `expect` failure arm, or a test harness) reads it with the same
+/// string-object rules as `abi_print`.
+#[symbol("pickle_expect_display")]
+fn abiExpectDisplay(obj: *int) -> *int {
+    var vals = [0]
+    vals.pop()
+    fmtInto(vals, obj)
+    return regToStr(vals)
+}
+
+/// ---------------------------------------------------------------------------
+/// THE FAIL CHANNEL (`pickle_test_fail_obj`)
+/// ---------------------------------------------------------------------------
+///
+/// This closes the loop on the failing-expect path the emitter already emits:
+/// `pickle_test_fail_obj(msg)` is called with the built diff, records it when
+/// the panic handler is in capture/task mode, and otherwise prints
+/// `fatal: <msg>\n` to stderr and exits 1.
+///
+/// Capture/task state is four scalar image-data words below. They are read and
+/// written by these helpers only; the reference's own `pickle_test_capture_*`
+/// externs are harness drivers that a sovereign runtime must re-point at these
+/// setters, so the compiled expect channel itself stays untouched.
+///
+/// Note the NULL-guard ordering: the reference builds the message first
+/// (`to_string().unwrap_or("assertion failed")`), THEN records or fatals, and
+/// the two modes are mutually exclusive -- record wins when capture/task is on.
+/// The port keeps that order: `recordRecoverable` before `writeFatal`, not
+/// after.
+
+var _captureOn: int = 0
+var _taskOn: int = 0
+var _lastPanic: int = 0
+var _taskPanic: int = 0
+
+/// Switch the mirrored capture mode on/off. The `pickle_test_capture_begin`
+/// equivalent for ported test suns.
+fn setCapture(on: bool) -> int {
+    if (on) { _captureOn = 1 } else { _captureOn = 0 }
+    return 0
+}
+
+/// Switch the mirrored task mode on/off.
+fn setTask(on: bool) -> int {
+    if (on) { _taskOn = 1 } else { _taskOn = 0 }
+    return 0
+}
+
+/// Take and clear the last recorded capture-mode failure. `0 as *int` when
+/// nothing was recorded (the same hand-off `abiExpectObjEq` uses for null).
+fn takeCaptured() -> *int {
+    var m = _lastPanic
+    _lastPanic = 0
+    return m as *int
+}
+
+/// Take and clear the last recorded task-mode failure.
+fn takeTaskPanic() -> *int {
+    var m = _taskPanic
+    _taskPanic = 0
+    return m as *int
+}
+
+/// `panic.rs::record_recoverable`: task mode first, then the capture flag,
+/// recording the message pointer; returns false when neither is on.
+fn recordRecoverable(msg: *int) -> bool {
+    if (_taskOn != 0) {
+        _taskPanic = msg as int
+        return true
+    }
+    if (_captureOn != 0) {
+        _lastPanic = msg as int
+        return true
+    }
+    return false
+}
+
+/// ABI: `captureBegin()` from the ported test harness. Enters capture mode so a
+/// failing test body records a message instead of killing the process. Mirrors
+/// `panic.rs::pickle_test_capture_begin`; it does NOT clear a pending message,
+/// so a failure recorded before the begin (e.g. by a hook) survives until the
+/// harness' `captureTake()`. The emitter lowers `captureBegin()` to exactly this
+/// symbol (see `emit.pkl`), so a natively-linked harness needs no Rust runtime.
+#[symbol("pickle_test_capture_begin")]
+fn abiTestCaptureBegin() -> int {
+    setCapture(true)
+    return 0
+}
+
+/// ABI: `captureTake()` from the ported test harness. Returns the message of the
+/// most recent captured failure as a `string?` object pointer (null when none),
+/// or null when capture is off. Mirrors `panic.rs::pickle_test_capture_take`;
+/// consumes the record so a second read reports none.
+#[symbol("pickle_test_capture_take")]
+fn abiTestCaptureTake() -> *int {
+    if (_captureOn != 0) {
+        return takeCaptured()
+    }
+    return 0 as *int
+}
+
+/// String OBJECT's inline payload written to stdout. This is the print seam the
+/// parity probes use: `print(captureTake())` on the native side writes exactly
+/// these bytes (`print(string)` -> `pickle_print_obj` -> the same payload).
+fn printCaptured(obj: *int) -> int {
+    if (obj == 0 as *int) {
+        return 0
+    }
+    unsafe {
+        let _ = writeStdout((obj as int) + STR_BYTES_OFF, obj[3])
+    }
+    return 0
+}
+
+/// `panic.rs::fatal`: `fatal: ` + the message payload + `\n` on stderr, then
+/// `ExitProcess(1)`. The three `writeStderr` runs spell the exact byte contract
+/// `abi_panic.pkl` keeps.
+fn writeFatal(msg: *int) -> int {
+    unsafe {
+        var a = "fatal: "
+        var pa = &a
+        let _ = writeStderr((pa as int) + STR_BYTES_OFF, len("fatal: "))
+        let _ = writeStderr((msg as int) + STR_BYTES_OFF, msg[3])
+        var z = "\n"
+        var pz = &z
+        let _ = writeStderr((pz as int) + STR_BYTES_OFF, 1)
+    }
+    return 0
+}
+
+/// A fresh string OBJECT holding the bytes of a source literal. Needed exactly
+/// once (the null-message default) and kept as a named helper so the `&lit`
+/// + `abiStrFromBytes` raw-payload contract reads plainly.
+fn strFromLiteral(lit: string) -> *int {
+    unsafe {
+        var p = &lit
+        return abiStrFromBytes(((p as int) + STR_BYTES_OFF) as *int, len(lit))
+    }
+}
+
+/// Port of `test.rs::pickle_test_fail_obj`: record the failure or die.
+///
+/// The null arm builds `assertion failed`, matching the reference's
+/// `to_string().unwrap_or(..)`. On record the message pointer is stored
+/// as-is; on fatal the whole message payload goes to stderr, so the emitted
+/// `Expected:...` diff is preserved verbatim in both modes.
+///
+/// GAP: the reference reads the string bytes through a lossy UTF-8 conversion,
+/// which can only differ for hand-crafted invalid-UTF-8 assert messages; the
+/// port writes the raw bytes, matching the renderer's byte-for-byte spelling.
+#[symbol("pickle_test_fail_obj")]
+fn abiTestFailObj(obj: *int) -> int {
+    var msg = obj
+    if (msg == 0 as *int) {
+        msg = strFromLiteral("assertion failed")
+    }
+    if (recordRecoverable(msg)) {
+        return 0
+    }
+    writeFatal(msg)
+    win_exit(1)
+    return 0
+}

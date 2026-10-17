@@ -1,0 +1,124 @@
+module runtime.object
+
+/// Port of `runtime/src/object.rs` (pure, portable model).
+///
+/// The managed object representation stays native: a `PickleObject` header
+/// naming a class id, a per-class `ClassDescriptor`. What a self-hosted runtime
+/// can own is the REGISTRY: the builtin id layout below, user-class
+/// registration against a superclass, the name lookup, and the `is`/`as`
+/// hierarchy walk that `pickle_class_is` / `pickle_class_cast` implement.
+///
+/// Mirrors `object.rs` constants: string=0 list=1 map=2 box_int=3 box_float=4
+/// box_bool=5 box_char=6 enum=7 tuple=8 stream=9; user classes start at 10.
+/// State lives on a `ClassRegistry` instance (no module globals), the same
+/// discipline as `pickle/compiler`.
+
+const PICKLE_CLASS_STRING: int = 0
+const PICKLE_CLASS_LIST: int = 1
+const PICKLE_CLASS_MAP: int = 2
+const PICKLE_CLASS_BOX_INT: int = 3
+const PICKLE_CLASS_BOX_FLOAT: int = 4
+const PICKLE_CLASS_BOX_BOOL: int = 5
+const PICKLE_CLASS_BOX_CHAR: int = 6
+const PICKLE_CLASS_ENUM: int = 7
+const PICKLE_CLASS_TUPLE: int = 8
+const PICKLE_CLASS_STREAM: int = 9
+const PICKLE_CLASS_USER_BASE: int = 10
+const PICKLE_CLASS_FLAG_FINALIZER: int = 1
+
+class ClassDesc {
+    var name: string
+    var parent: int
+    var slotCount: int
+    var flags: int
+
+    constructor(name: string, parent: int, slotCount: int, flags: int) {
+        this.name = name
+        this.parent = parent
+        this.slotCount = slotCount
+        this.flags = flags
+    }
+}
+
+/// Class descriptor registry (mirror of the runtime's builtin descriptor table
+/// plus the `pickle_class_register` user side-table).
+class ClassRegistry {
+    var descs: List<ClassDesc>
+
+    constructor() {
+        this.descs = [ClassDesc("seed", 0, 0, 0)]
+        this.descs.pop()
+        this.reset()
+    }
+
+    /// Restore the builtin table (mirror of `pickle_runtime_reset` semantics
+    /// for class ids: ids baked into call sites must start from the same base).
+    fn reset() {
+        this.descs = [ClassDesc("seed", 0, 0, 0)]
+        this.descs.pop()
+        this.descs.push(ClassDesc("string", 0, 0, 0))
+        this.descs.push(ClassDesc("List", 0, 0, 0))
+        this.descs.push(ClassDesc("Map", 0, 0, 0))
+        this.descs.push(ClassDesc("i64", 0, 0, 0))
+        this.descs.push(ClassDesc("f64", 0, 0, 0))
+        this.descs.push(ClassDesc("bool", 0, 0, 0))
+        this.descs.push(ClassDesc("char", 0, 0, 0))
+        this.descs.push(ClassDesc("enum", 0, 0, 0))
+        this.descs.push(ClassDesc("tuple", 0, 0, 0))
+        this.descs.push(ClassDesc("stream", 0, 0, 0))
+    }
+
+    /// Register a user class and return its assigned id (10, 11, ...). Mirror
+    /// of `pickle_class_register`: `parent` is 0 for a root, else a class id.
+    fn register(name: string, slotCount: int, flags: int, parent: int) -> int {
+        var id = len(this.descs)
+        this.descs.push(ClassDesc(name, parent, slotCount, flags))
+        id
+    }
+
+    /// Class name for an id, or none when out of range. Mirror of
+    /// `gc.class_name(class_id)`.
+    fn className(id: int) -> string? {
+        var d = this.desc(id)
+        if (let some(dd) = d) {
+            return dd.name
+        }
+        none
+    }
+
+    /// Superclass id of `id`, or 0 for a root / invalid id.
+    fn parent(id: int) -> int {
+        var d = this.desc(id)
+        if (let some(dd) = d) {
+            return dd.parent
+        }
+        0
+    }
+
+    fn desc(id: int) -> ClassDesc? {
+        if (id < 0) {
+            return none
+        }
+        if (id >= len(this.descs)) {
+            return none
+        }
+        this.descs[id]
+    }
+
+    /// Mirror of `pickle_class_is`: `child` is `w`, or an ancestor of `w` up
+    /// the registered parent chain. A root (parent 0) terminates the walk.
+    fn isSub(child: int, w: int) -> bool {
+        var cur = child
+        if (cur == w) {
+            return true
+        }
+        while (cur != 0) {
+            var p = this.parent(cur)
+            if (p == w) {
+                return true
+            }
+            cur = p
+        }
+        false
+    }
+}

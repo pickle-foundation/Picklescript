@@ -1,0 +1,304 @@
+module runtime.shadow_test
+
+import { ShadowFrame, ShadowRegistry, GcThread, FRAME_HEADER_BYTES, FRAME_HEADER_SLOTS, FRAME_PREV_SLOT, FRAME_COUNT_SLOT, FRAME_FIRST_SLOT, frameSlotOffset, frameBytes, emptyFrames, emptyThreads } from runtime.shadow
+
+fn reg() -> ShadowRegistry {
+    ShadowRegistry()
+}
+
+/// A real frame with `slotCount` slots, registered to the current thread so it
+/// can be pushed. The caller destroys it.
+fn frameOn(reg: ShadowRegistry, slotCount: int) -> ShadowFrame {
+    reg.newFrame(slotCount)
+}
+
+test fn frame_header_is_16_bytes() {
+    expect(FRAME_HEADER_BYTES).toBe(16)
+    expect(FRAME_HEADER_SLOTS).toBe(2)
+    expect(FRAME_PREV_SLOT).toBe(0)
+    expect(FRAME_COUNT_SLOT).toBe(1)
+    expect(FRAME_FIRST_SLOT).toBe(2)
+}
+
+test fn slot_offsets_follow_the_header() {
+    expect(frameSlotOffset(0)).toBe(16)
+    expect(frameSlotOffset(1)).toBe(24)
+    expect(frameSlotOffset(2)).toBe(32)
+    expect(frameSlotOffset(7)).toBe(72)
+}
+
+test fn frame_bytes_covers_header_plus_slots() {
+    expect(frameBytes(0)).toBe(16)
+    expect(frameBytes(1)).toBe(24)
+    expect(frameBytes(2)).toBe(32)
+    expect(frameBytes(8)).toBe(80)
+}
+
+test fn fresh_frame_is_zeroed() {
+    let r = reg()
+    let f = frameOn(r, 3)
+    // debug_check_zeroed / assert_ptr_empty: a prologue's frame is zeroed stack
+    // memory, and a fresh frame must satisfy that.
+    expect(len(f.dirtySlots())).toBe(0)
+    expect(f.prev()).toBe(0)
+    expect(f.storedCount()).toBe(3)
+    f.destroy()
+}
+
+test fn slots_roundtrip() {
+    // Mirrors `shadow.rs::tests::slots_roundtrip`: push a real frame, stuff the
+    // slots with the same deliberately-fake addresses the native test uses
+    // (0x11/0x22), read them back, then pop.
+    let r = reg()
+    r.registerThread()
+    let f = frameOn(r, 2)
+    r.pushFrame(f)
+    f.setSlot(0, 0x11)
+    f.setSlot(1, 0x22)
+    expect(f.slot(0)).toBe(0x11)
+    expect(f.slot(1)).toBe(0x22)
+    expect(f.dirtySlots()).toBe([0, 1])
+    expect(r.popFrame(f)).toBe(true)
+    expect(r.frameDepth()).toBe(0)
+    f.destroy()
+}
+
+test fn slot_writes_land_at_the_8_byte_stride() {
+    // The raw-composition risk check: the slot index must address real memory
+    // at FRAME_HEADER_BYTES + 8*i, not merely agree with the model. Reading the
+    // backing words directly proves the stride against the live runtime.
+    //
+    // The frame deliberately has one more slot than is written, so the "no
+    // bleed" check below reads an in-bounds word. A frame is sized to exactly
+    // 2 + slotCount words and `*int` indexing is unchecked, so reading one past
+    // the end returns adjacent heap -- this test was originally written that
+    // way and read garbage.
+    unsafe {
+        let r = reg()
+        let f = frameOn(r, 4)
+        f.setSlot(0, 0xA1)
+        f.setSlot(1, 0xB2)
+        f.setSlot(2, 0xC3)
+        // Header words are untouched by slot writes.
+        expect(f.p[FRAME_PREV_SLOT]).toBe(0)
+        expect(f.p[FRAME_COUNT_SLOT]).toBe(4)
+        // Word 2 is slot 0, word 3 is slot 1, word 4 is slot 2: contiguous.
+        expect(f.p[2]).toBe(0xA1)
+        expect(f.p[3]).toBe(0xB2)
+        expect(f.p[4]).toBe(0xC3)
+        // Word 5 is slot 3, which was never written: no bleed.
+        expect(f.p[5]).toBe(0)
+        expect(f.dirtySlots()).toBe([0, 1, 2])
+        f.destroy()
+    }
+}
+
+test fn stored_count_is_carried_in_the_header() {
+    let r = reg()
+    let f = frameOn(r, 5)
+    expect(f.storedCount()).toBe(5)
+    expect(f.slotCount).toBe(5)
+    f.setStoredCount(4)
+    expect(f.storedCount()).toBe(4)
+    // The field is the port's own bookkeeping and does not follow the header.
+    expect(f.slotCount).toBe(5)
+    f.destroy()
+}
+
+test fn clear_zeroes_header_and_slots() {
+    let r = reg()
+    let f = frameOn(r, 3)
+    f.setPrev(9)
+    f.setSlot(0, 0x11)
+    f.setSlot(2, 0x22)
+    f.clear()
+    expect(f.prev()).toBe(0)
+    expect(len(f.dirtySlots())).toBe(0)
+    expect(f.storedCount()).toBe(3)
+    f.destroy()
+}
+
+test fn frames_are_lifo() {
+    let r = reg()
+    r.registerThread()
+    let a = frameOn(r, 1)
+    let b = frameOn(r, 1)
+    let c = frameOn(r, 1)
+    r.pushFrame(a)
+    expect(r.frameDepth()).toBe(1)
+    expect(a.prev()).toBe(0)
+    r.pushFrame(b)
+    r.pushFrame(c)
+    expect(r.frameDepth()).toBe(3)
+    // Each frame records the frame it was pushed on top of.
+    expect(b.prev()).toBe(a.id)
+    expect(c.prev()).toBe(b.id)
+    expect(a.prev()).toBe(0)
+    r.popFrame(c)
+    r.popFrame(b)
+    r.popFrame(a)
+    expect(r.frameDepth()).toBe(0)
+    a.destroy()
+    b.destroy()
+    c.destroy()
+}
+
+test fn pop_out_of_order_is_refused_and_leaves_the_stack() {
+    let r = reg()
+    r.registerThread()
+    let a = frameOn(r, 1)
+    let b = frameOn(r, 1)
+    r.pushFrame(a)
+    r.pushFrame(b)
+    // pop_frame asserts the ordering natively; the port reports it.
+    expect(r.popFrame(a)).toBe(false)
+    expect(r.frameDepth()).toBe(2)
+    expect(r.popFrame(b)).toBe(true)
+    expect(r.frameDepth()).toBe(1)
+    expect(r.popFrame(a)).toBe(true)
+    expect(r.frameDepth()).toBe(0)
+    a.destroy()
+    b.destroy()
+}
+
+test fn pop_clears_the_recorded_prev() {
+    let r = reg()
+    r.registerThread()
+    let a = frameOn(r, 1)
+    let b = frameOn(r, 1)
+    r.pushFrame(a)
+    r.pushFrame(b)
+    expect(b.prev()).toBe(a.id)
+    r.popFrame(b)
+    expect(b.prev()).toBe(0)
+    a.destroy()
+    b.destroy()
+}
+
+test fn pop_on_an_empty_stack_is_refused() {
+    let r = reg()
+    r.registerThread()
+    let a = frameOn(r, 1)
+    expect(r.popFrame(a)).toBe(false)
+    expect(r.frameDepth()).toBe(0)
+    a.destroy()
+}
+
+test fn push_without_registration_does_nothing() {
+    let r = reg()
+    let a = frameOn(r, 1)
+    // current_thread is null until register_thread, so push_frame registers it
+    // natively; the port only pushes for a registered thread.
+    r.pushFrame(a)
+    expect(r.frameDepth()).toBe(0)
+    expect(a.prev()).toBe(0)
+    a.destroy()
+}
+
+test fn register_is_idempotent_and_ids_start_at_one() {
+    let r = reg()
+    // ensure_registered_locked: 0 means "no thread", so ids start at 1.
+    expect(r.currentThread()).toBe(none)
+    let a = r.registerThread()
+    expect(a.id).toBe(1)
+    expect(r.threadCount()).toBe(1)
+    let b = r.registerThread()
+    expect(b.id).toBe(1)
+    expect(r.threadCount()).toBe(1)
+    if (let some(t) = r.currentThread()) {
+        expect(t.id).toBe(1)
+    }
+}
+
+test fn unregister_clears_the_handle_and_frees_the_id() {
+    let r = reg()
+    r.registerThread()
+    r.unregisterThread()
+    expect(r.threadCount()).toBe(0)
+    expect(r.currentThread()).toBe(none)
+    // A later registration gets a fresh id, never a reused one.
+    let again = r.registerThread()
+    expect(again.id).toBe(2)
+    expect(r.threadCount()).toBe(1)
+}
+
+test fn unregister_is_a_noop_when_not_registered() {
+    let r = reg()
+    r.unregisterThread()
+    expect(r.threadCount()).toBe(0)
+    expect(r.currentThread()).toBe(none)
+}
+
+test fn all_threads_is_most_recent_first() {
+    let r = reg()
+    let first = r.registerThread()
+    let second = r.registerForeignThread()
+    let third = r.registerForeignThread()
+    expect(r.threadCount()).toBe(3)
+    // insert_thread_locked prepends, so the list reverses registration order.
+    let all = r.allThreads()
+    expect(len(all)).toBe(3)
+    expect(all[0].id).toBe(third.id)
+    expect(all[1].id).toBe(second.id)
+    expect(all[2].id).toBe(first.id)
+    // A foreign registration does not steal this thread's handle.
+    if (let some(t) = r.currentThread()) {
+        expect(t.id).toBe(first.id)
+    }
+}
+
+test fn unregister_removes_only_the_current_node() {
+    let r = reg()
+    r.registerThread()
+    r.registerForeignThread()
+    r.unregisterThread()
+    expect(r.threadCount()).toBe(1)
+    expect(r.allThreads()[0].id).toBe(2)
+}
+
+test fn all_slot_values_skips_zeros_and_walks_innermost_first() {
+    let r = reg()
+    r.registerThread()
+    let outer = frameOn(r, 3)
+    let inner = frameOn(r, 2)
+    r.pushFrame(outer)
+    outer.setSlot(0, 0x100)
+    outer.setSlot(1, 0)
+    outer.setSlot(2, 0x300)
+    r.pushFrame(inner)
+    inner.setSlot(0, 0x200)
+    inner.setSlot(1, 0)
+    // Walk order: innermost frame first, and a null slot contributes nothing.
+    expect(r.allSlotValues()).toBe([0x200, 0x100, 0x300])
+    r.popFrame(inner)
+    expect(r.allSlotValues()).toBe([0x100, 0x300])
+    r.popFrame(outer)
+    expect(len(r.allSlotValues())).toBe(0)
+    outer.destroy()
+    inner.destroy()
+}
+
+test fn all_slot_values_spans_every_registered_thread() {
+    let r = reg()
+    r.registerThread()
+    r.registerForeignThread()
+    let mine = frameOn(r, 1)
+    r.pushFrame(mine)
+    mine.setSlot(0, 0x11)
+    let theirs = r.newFrame(1)
+    // The foreign thread's frame is pushed onto its own node.
+    let node = r.allThreads()[0]
+    node.frames.push(theirs)
+    theirs.setSlot(0, 0x22)
+    // Most recently registered thread is walked first.
+    expect(r.allSlotValues()).toBe([0x22, 0x11])
+    r.popFrame(mine)
+    expect(r.allSlotValues()).toBe([0x22])
+    mine.destroy()
+    theirs.destroy()
+}
+
+test fn empty_list_helpers_produce_empty_lists() {
+    expect(len(emptyFrames())).toBe(0)
+    expect(len(emptyThreads())).toBe(0)
+}

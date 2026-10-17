@@ -1,0 +1,46 @@
+module compiler.diag_test
+
+import { Span, Note, Diagnostic, DiagnosticSink, Severity, emptyDiags, emptyNotes, emptyStrs } from compiler.diag
+
+test fn span_join() {
+    let a = Span(2, 5)
+    let b = Span(0, 3)
+    let j = a.join(b)
+    expect(j.start).toBe(0)
+    expect(j.end).toBe(5)
+}
+
+test fn span_to_and_point() {
+    let a = Span(2, 5)
+    expect(a.to(Span(7, 9)).end).toBe(9)
+    expect(a.point().start).toBe(2)
+    expect(a.point().end).toBe(2)
+}
+
+test fn diagnostic_error_construction() {
+    let d = Diagnostic.error("boom")
+    expect(d.severity == Severity.Error).toBe(true)
+    expect(d.message).toBe("boom")
+    var hasErr = d.severity is Severity
+    expect(hasErr).toBe(true)
+    expect(d.span).not().toExist()
+}
+
+test fn diagnostic_chain() {
+    let d = Diagnostic.errorAt(Span(1, 2), "m").withCode("E0100").suggestion("fix it")
+    expect(d.code).toExist()
+    expect(d.suggestions).toHaveLength(1)
+}
+
+test fn sink_emits_and_counts() {
+    let sink = DiagnosticSink()
+    expect(sink.anyError()).toBe(false)
+    expect(sink.errorCount()).toBe(0)
+    expect(sink.tooManyErrors()).toBe(false)
+    sink.emit(Diagnostic.warnAt(Span(0, 1), "warn"))
+    expect(sink.anyError()).toBe(false)
+    expect(sink.errorCount()).toBe(0)
+    sink.emit(Diagnostic.errorAt(Span(0, 1), "err"))
+    expect(sink.anyError()).toBe(true)
+    expect(sink.errorCount()).toBe(1)
+}

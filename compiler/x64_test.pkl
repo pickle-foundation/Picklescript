@@ -1,0 +1,504 @@
+module compiler.x64_test
+
+import { IrTy, IrConst, IrUnOp, IrBinOp, IrInstr, IrTerm, IrParam, IrExtern, IrBlock, IrFunc, IrModule, Callee, emptyIrTys, emptyIrParams } from compiler.ir
+import { X64Func, X64Out, x64LowerModule, hex2, f64ToBits, x64Dump, emptyRelocs } from compiler.x64
+import { DiagnosticSink } from compiler.diag
+
+fn emptyInstrs() -> List<IrInstr> {
+    var l = [IrInstr.Const(0, IrConst.Int(0))]
+    l.pop()
+    l
+}
+
+fn emptyTags() -> List<string> {
+    var l = [""]
+    l.pop()
+    l
+}
+
+fn emptyBlocks() -> List<IrBlock> {
+    var l = [IrBlock(0, emptyInstrs(), IrTerm.Unreachable)]
+    l.pop()
+    l
+}
+
+fn mkFunc(name: string, symbol: string, ret: IrTy, slots: List<IrTy>, blocks: List<IrBlock>) -> IrFunc {
+    IrFunc(name, symbol, emptyIrParams(), ret, slots, 0, blocks, false, false, emptyTags())
+}
+
+fn mkFuncParams(name: string, symbol: string, params: List<IrParam>, ret: IrTy, slots: List<IrTy>, blocks: List<IrBlock>) -> IrFunc {
+    IrFunc(name, symbol, params, ret, slots, 0, blocks, false, false, emptyTags())
+}
+
+fn mkModuleOne(f: IrFunc) -> IrModule {
+    var fs = [IrFunc("x", "", emptyIrParams(), IrTy.Unit, emptyIrTys(), 0, emptyBlocks(), false, false, emptyTags())]
+    fs.pop()
+    fs.push(f)
+    var es = [IrExtern("x", emptyIrTys(), IrTy.Unit)]
+    es.pop()
+    var bn = {"::seed::": 0}
+    bn.remove("::seed::")
+    var ss = [[0]]
+    ss.pop()
+    IrModule(fs, es, bn, ss, emptyIrGlobals())
+}
+
+fn mkModuleExtern(f: IrFunc, e: IrExtern) -> IrModule {
+    var fs = [IrFunc("x", "", emptyIrParams(), IrTy.Unit, emptyIrTys(), 0, emptyBlocks(), false, false, emptyTags())]
+    fs.pop()
+    fs.push(f)
+    var es = [IrExtern("x", emptyIrTys(), IrTy.Unit)]
+    es.pop()
+    es.push(e)
+    var bn = {"::seed::": 0}
+    bn.remove("::seed::")
+    var ss = [[0]]
+    ss.pop()
+    IrModule(fs, es, bn, ss, emptyIrGlobals())
+}
+
+fn takeF(out: X64Out?) -> X64Func {
+    match (out) {
+        case some(o) -> {
+            if (len(o.funcs) >= 1) {
+                o.funcs[0]
+            } else {
+                expect(false).toBe(true)
+                X64Func("bad", [0], emptyRelocs(), 0, 0)
+            }
+        }
+        case none -> {
+            expect(false).toBe(true)
+            X64Func("bad", [0], emptyRelocs(), 0, 0)
+        }
+    }
+}
+
+fn lowerF(f: IrFunc) -> X64Func {
+    let m = mkModuleOne(f)
+    let d = DiagnosticSink()
+    takeF(x64LowerModule(m, d))
+}
+
+fn lowerFExt(f: IrFunc, e: IrExtern) -> X64Func {
+    let m = mkModuleExtern(f, e)
+    let d = DiagnosticSink()
+    takeF(x64LowerModule(m, d))
+}
+
+fn bytesHex(bs: List<int>) -> string {
+    var acc = ""
+    var i = 0
+    while (i < len(bs)) {
+        acc = acc + hex2(bs[i])
+        i = i + 1
+    }
+    acc
+}
+
+fn assertBytes(xf: X64Func, expected: string) {
+    expect(bytesHex(xf.bytes)).toBe(expected)
+}
+
+fn byteCat(a: List<int>, b: List<int>) -> List<int> {
+    var out = [0]
+    out.pop()
+    var i = 0
+    while (i < len(a)) {
+        out.push(a[i])
+        i = i + 1
+    }
+    i = 0
+    while (i < len(b)) {
+        out.push(b[i])
+        i = i + 1
+    }
+    out
+}
+
+fn containsSeq(bs: List<int>, seq: List<int>) -> bool {
+    if (len(seq) == 0 || len(bs) < len(seq)) {
+        return false
+    }
+    var i = 0
+    while (i <= len(bs) - len(seq)) {
+        var j = 0
+        var ok = true
+        while (j < len(seq)) {
+            if (bs[i + j] != seq[j]) {
+                ok = false
+                break
+            }
+            j = j + 1
+        }
+        if (ok) {
+            return true
+        }
+        i = i + 1
+    }
+    false
+}
+
+fn floatCmpBytes(op: IrBinOp) -> List<int> {
+    let f = mkFunc("f", "pkl_f", IrTy.Bool, [IrTy.Float, IrTy.Float], oneBlockTerm(
+        IrTerm.Return(2),
+        [IrInstr.LoadSlot(0, 0), IrInstr.LoadSlot(1, 1), IrInstr.BinOp(2, op, 0, 1)]))
+    lowerF(f).bytes
+}
+
+// Regression: float Eq/Ne/Lt/Le emitted `setcc` twice with ModRM 0xC0, which
+// is always AL, so the second clobbered the first and the trailing `20 C8` /
+// `08 C8` combined against an undefined CL. `0x20 0xC8` reads like
+// `and al,0x20` but is really `AND AL,CL` - 0x20 is the opcode, not an
+// immediate. The result depended on whatever CL happened to hold: `!=` was
+// always true, `<` and `<=` were always false. That is what stopped the
+// self-hosted compiler from being a fixed point (a NaN-only `a != a` guard made
+// every float constant in generation 2+ a NaN). The second setcc must target CL
+// (ModRM 0xC1); Gt/Ge need only one and were always correct.
+test fn float_cmp_second_setcc_targets_cl() {
+    let comisd = [0x66, 0x0F, 0x2E, 0xC1]
+    // ordered == : sete AL ; setnp CL ; and AL,CL
+    expect(containsSeq(floatCmpBytes(IrBinOp.Eq), byteCat(comisd, [0x0F, 0x94, 0xC0, 0x0F, 0x9B, 0xC1, 0x20, 0xC8]))).toBe(true)
+    // != : setne AL ; setp CL ; or AL,CL  (NaN counts as !=)
+    expect(containsSeq(floatCmpBytes(IrBinOp.Ne), byteCat(comisd, [0x0F, 0x95, 0xC0, 0x0F, 0x9A, 0xC1, 0x08, 0xC8]))).toBe(true)
+    // ordered < : setc AL ; setnp CL ; and AL,CL
+    expect(containsSeq(floatCmpBytes(IrBinOp.Lt), byteCat(comisd, [0x0F, 0x92, 0xC0, 0x0F, 0x9B, 0xC1, 0x20, 0xC8]))).toBe(true)
+    // ordered <= : setbe AL ; setnp CL ; and AL,CL
+    expect(containsSeq(floatCmpBytes(IrBinOp.Le), byteCat(comisd, [0x0F, 0x96, 0xC0, 0x0F, 0x9B, 0xC1, 0x20, 0xC8]))).toBe(true)
+    // Gt/Ge are single setcc: CF=0 already excludes the unordered case.
+    expect(containsSeq(floatCmpBytes(IrBinOp.Gt), byteCat(comisd, [0x0F, 0x97, 0xC0]))).toBe(true)
+    expect(containsSeq(floatCmpBytes(IrBinOp.Ge), byteCat(comisd, [0x0F, 0x93, 0xC0]))).toBe(true)
+}
+
+// Guards the exact defect: no float compare may emit two setcc into the same
+// register. Asserted separately so a future edit cannot reintroduce it while
+// still matching the sequences above by accident.
+test fn float_cmp_never_writes_two_setcc_into_al() {
+    let comisd = [0x66, 0x0F, 0x2E, 0xC1]
+    var ops = [IrBinOp.Eq, IrBinOp.Ne, IrBinOp.Lt, IrBinOp.Le]
+    var i = 0
+    while (i < len(ops)) {
+        let bs = floatCmpBytes(ops[i])
+        expect(containsSeq(bs, byteCat(comisd, [0x0F, 0x94, 0xC0, 0x0F, 0x94, 0xC0]))).toBe(false)
+        expect(containsSeq(bs, byteCat(comisd, [0x0F, 0x95, 0xC0, 0x0F, 0x95, 0xC0]))).toBe(false)
+        expect(containsSeq(bs, byteCat(comisd, [0x0F, 0x92, 0xC0, 0x0F, 0x92, 0xC0]))).toBe(false)
+        expect(containsSeq(bs, byteCat(comisd, [0x0F, 0x96, 0xC0, 0x0F, 0x96, 0xC0]))).toBe(false)
+        expect(containsSeq(bs, byteCat(comisd, [0x0F, 0x9B, 0xC0]))).toBe(false)
+        expect(containsSeq(bs, byteCat(comisd, [0x0F, 0x9A, 0xC0]))).toBe(false)
+        i = i + 1
+    }
+}
+
+fn oneBlockTerm(term: IrTerm, instrs: List<IrInstr>) -> List<IrBlock> {
+    var l = [IrBlock(0, emptyInstrs(), IrTerm.Unreachable)]
+    l.pop()
+    l.push(IrBlock(0, instrs, term))
+    l
+}
+
+test fn f64_to_bits_basics() {
+    expect(f64ToBits(0.0)).toBe(0)
+    expect(f64ToBits(1.0)).toBe(0x3FF0000000000000)
+    expect(f64ToBits(2.0)).toBe(0x4000000000000000)
+    expect(f64ToBits(2.5)).toBe(0x4004000000000000)
+    expect(f64ToBits(1.5)).toBe(0x3FF8000000000000)
+    expect(f64ToBits(-2.5)).toBe(-4610560118520545280)
+}
+
+// Every expected value here is ground truth taken from Rust's native
+// `f64::to_bits()` fed through the same `str::parse::<f64>()` the Pickle
+// checker's literal parser mimics, so this also pins the port to the oracle.
+// The pre-2026-10-03 implementation got three of these cases wrong: it forced
+// the sign bit on overflow (`1.0e400` became `-inf`), let NaN reach the
+// mantissa math (`0.0/0.0` came out as the bits for `1.5`), and flushed the
+// subnormals - including `2.2250738585072014e-308`, the smallest *normal* - to
+// zero.
+test fn f64_to_bits_nonfinite_and_extremes() {
+    // Overflow. An at-or-above-ceiling literal parses to +inf.
+    expect(f64ToBits(1.0e400)).toBe(9218868437227405312)
+    expect(f64ToBits(1.8e308)).toBe(9218868437227405312)
+    expect(f64ToBits(-1.0e400)).toBe(-4503599627370496)
+    expect(f64ToBits(1.0 / 0.0)).toBe(9218868437227405312)
+    expect(f64ToBits(-1.0 / 0.0)).toBe(-4503599627370496)
+    // NaN: canonical quiet NaN, sign taken from the operand.
+    expect(f64ToBits(0.0 / 0.0)).toBe(9221120237041090560)
+    // The exponent-field boundary. 2.2250738585072014e-308 is the smallest
+    // normal double and must keep exponent field 1; the neighbouring literal
+    // is the largest subnormal.
+    expect(f64ToBits(2.2250738585072014e-308)).toBe(4503599627370496)
+    expect(f64ToBits(2.2250738585072011e-308)).toBe(4503599627370495)
+    // Subnormals, whose mantissa field has no implicit leading 1.
+    expect(f64ToBits(1.0e-320)).toBe(2024)
+    expect(f64ToBits(3.0e-320)).toBe(6072)
+    expect(f64ToBits(1.0e-323)).toBe(2)
+    expect(f64ToBits(5e-324)).toBe(1)
+    // Endpoints.
+    expect(f64ToBits(1.7976931348623157e308)).toBe(9218868437227405311)
+    expect(f64ToBits(-0.0)).toBe((0 - 9223372036854775807) - 1)
+}
+
+test fn hex2_digits() {
+    expect(hex2(0)).toBe("00")
+    expect(hex2(0x0A)).toBe("0a")
+    expect(hex2(0x10)).toBe("10")
+    expect(hex2(0x2E)).toBe("2e")
+    expect(hex2(255)).toBe("ff")
+}
+
+test fn int_const_return() {
+    let f = mkFunc("f", "pkl_f", IrTy.Int, emptyIrTys(), oneBlockTerm(
+        IrTerm.Return(0), [IrInstr.Const(0, IrConst.Int(42))]))
+    let xf = lowerF(f)
+    assertBytes(xf, "554889e54881ec2000000048b82a00000000000000488945e8488b45e84889ec5dc3")
+    expect(xf.ncells).toBe(0)
+    expect(xf.totalK).toBe(32)
+    expect(len(xf.relocs)).toBe(0)
+    expect(xf.symbol).toBe("pkl_f")
+}
+
+test fn bool_const_return() {
+    let f = mkFunc("f", "pkl_f", IrTy.Bool, emptyIrTys(), oneBlockTerm(
+        IrTerm.Return(0), [IrInstr.Const(0, IrConst.Bool(true))]))
+    let xf = lowerF(f)
+    assertBytes(xf, "554889e54881ec20000000c645e8018a45e84889ec5dc3")
+    expect(xf.totalK).toBe(32)
+}
+
+test fn unit_return() {
+    let f = mkFunc("f", "pkl_f", IrTy.Unit, emptyIrTys(), oneBlockTerm(
+        IrTerm.Return(none), emptyInstrs()))
+    let xf = lowerF(f)
+    assertBytes(xf, "554889e54881ec200000004889ec5dc3")
+    expect(xf.totalK).toBe(32)
+    expect(xf.ncells).toBe(0)
+}
+
+test fn int_add_return() {
+    let f = mkFunc("f", "pkl_f", IrTy.Int, emptyIrTys(), oneBlockTerm(
+        IrTerm.Return(2),
+        [IrInstr.Const(0, IrConst.Int(5)),
+         IrInstr.Const(1, IrConst.Int(7)),
+         IrInstr.BinOp(2, IrBinOp.Add, 0, 1)]))
+    let xf = lowerF(f)
+    assertBytes(xf, "554889e54881ec3000000048b80500000000000000488945e848b80700000000000000488945e0488b45e8488b4de04801c8488945d8488b45d84889ec5dc3")
+    expect(xf.totalK).toBe(48)
+}
+
+test fn int_div_return() {
+    let f = mkFunc("f", "pkl_f", IrTy.Int, emptyIrTys(), oneBlockTerm(
+        IrTerm.Return(2),
+        [IrInstr.Const(0, IrConst.Int(9)),
+         IrInstr.Const(1, IrConst.Int(4)),
+         IrInstr.BinOp(2, IrBinOp.Div, 0, 1)]))
+    let xf = lowerF(f)
+    assertBytes(xf, "554889e54881ec3000000048b80900000000000000488945e848b80400000000000000488945e0488b45e8488b4de0489948f7f9488945d8488b45d84889ec5dc3")
+}
+
+test fn float_const_return() {
+    let f = mkFunc("f", "pkl_f", IrTy.Float, emptyIrTys(), oneBlockTerm(
+        IrTerm.Return(0), [IrInstr.Const(0, IrConst.Float(2.5))]))
+    let xf = lowerF(f)
+    assertBytes(xf, "554889e54881ec2000000048b8000000000000044066480f6ec0f20f1145e8f20f1045e84889ec5dc3")
+    expect(xf.totalK).toBe(32)
+}
+
+test fn float_cmp_lt_return() {
+    let f = mkFunc("f", "pkl_f", IrTy.Bool, emptyIrTys(), oneBlockTerm(
+        IrTerm.Return(2),
+        [IrInstr.Const(0, IrConst.Float(1.0)),
+         IrInstr.Const(1, IrConst.Float(2.0)),
+         IrInstr.BinOp(2, IrBinOp.Lt, 0, 1)]))
+    let xf = lowerF(f)
+assertBytes(xf, "554889e54881ec3000000048b8000000000000f03f66480f6ec0f20f1145e848b8000000000000004066480f6ec0f20f1145e0f20f1045e8f20f104de0660f2ec10f92c00f9bc120c88845df8a45df4889ec5dc3")
+  }
+
+test fn unop_neg_return() {
+    let f = mkFunc("f", "pkl_f", IrTy.Int, emptyIrTys(), oneBlockTerm(
+        IrTerm.Return(1),
+        [IrInstr.Const(0, IrConst.Int(5)),
+         IrInstr.UnOp(1, IrUnOp.Neg, 0)]))
+    let xf = lowerF(f)
+    assertBytes(xf, "554889e54881ec2000000048b80500000000000000488945e8488b45e848f7d8488945e0488b45e04889ec5dc3")
+    expect(xf.totalK).toBe(32)
+}
+
+/// A 1-byte home directly beneath an aligned 8-byte home must not overlap it.
+/// An access of width W at [rbp-K] consumes offsets [K-W+1, K], so Bool temps
+/// parked at 24 and 25 must force the next 8-byte temp to K >= 33, not to the
+/// 8-aligned 32 (whose footprint [25,32] would clobber the Bool at 25).
+test fn bool_then_int_temps_do_not_overlap() {
+    let f = mkFunc("f", "pkl_f", IrTy.Int, emptyIrTys(), oneBlockTerm(
+        IrTerm.Return(2),
+        [IrInstr.Const(0, IrConst.Bool(true)),
+         IrInstr.Const(1, IrConst.Bool(true)),
+         IrInstr.Const(2, IrConst.Int(7))]))
+    let xf = lowerF(f)
+    expect(xf.totalK).toBe(48)
+    assertBytes(xf, "554889e54881ec30000000c645e801c645e70148b80700000000000000488945d8488b45d84889ec5dc3")
+}
+
+/// `IrUnOp.Not` operates on a `Bool` temp. `tyWidth(Bool)` is 8 bits, so the
+/// load must be 8 bits -- and so must the store. Storing 8 bytes into the 1-byte
+/// slot would overrun the next temp and corrupt an unrelated flag.
+test fn unop_not_bool_is_one_byte() {
+    let f = mkFunc("f", "pkl_f", IrTy.Bool, [IrTy.Bool], oneBlockTerm(
+        IrTerm.Return(1),
+        [IrInstr.LoadSlot(0, 0), IrInstr.UnOp(1, IrUnOp.Not, 0)]))
+    let xf = lowerF(f)
+    // Slot 0 (Bool, 1 byte) is at k = 24; temps 0 and 1 follow at 25 and 26.
+    // Both the load (`8a`, mov r8, r/m8) and the store (`88`, mov r/m8, r8) are
+    // the single-byte forms. A 64-bit store would encode a disp32 qword instead
+    // and overrun the neighbouring temp.
+    expect(xf.totalK).toBe(32)
+    assertBytes(xf, "554889e54881ec200000008a45e88845e78a45e784c00f94c08845e68a45e64889ec5dc3")
+}
+
+test fn unop_not_return() {
+    let f = mkFunc("f", "pkl_f", IrTy.Bool, emptyIrTys(), oneBlockTerm(
+        IrTerm.Return(1),
+        [IrInstr.Const(0, IrConst.Bool(true)),
+         IrInstr.UnOp(1, IrUnOp.Not, 0)]))
+    let xf = lowerF(f)
+    assertBytes(xf, "554889e54881ec20000000c645e8018a45e884c00f94c08845e78a45e74889ec5dc3")
+}
+
+test fn param_seed_and_return() {
+    let f = mkFuncParams("f", "pkl_f", [IrParam("x", IrTy.Int)], IrTy.Int, [IrTy.Int], oneBlockTerm(
+        IrTerm.Return(0), [IrInstr.LoadSlot(0, 0)]))
+    let xf = lowerF(f)
+    assertBytes(xf, "554889e54881ec2000000048894de8488b45e8488945e0488b45e04889ec5dc3")
+}
+
+test fn branch_fixup_patched() {
+    var bs = [IrBlock(0, emptyInstrs(), IrTerm.Unreachable)]
+    bs.pop()
+    bs.push(IrBlock(0, [IrInstr.Const(0, IrConst.Bool(true))], IrTerm.BranchIf(0, 1, 2)))
+    bs.push(IrBlock(1, emptyInstrs(), IrTerm.Return(none)))
+    bs.push(IrBlock(2, [IrInstr.Const(1, IrConst.Int(7))], IrTerm.Return(none)))
+    let f = mkFunc("f", "pkl_f", IrTy.Unit, emptyIrTys(), bs)
+    let xf = lowerF(f)
+    assertBytes(xf, "554889e54881ec20000000c645e8018a45e884c00f8505000000e9050000004889ec5dc348b80700000000000000488945e04889ec5dc3")
+    expect(len(xf.bytes)).toBe(55)
+}
+
+test fn managed_slot_shadow_push_pop() {
+    // A managed slot only needs a shadow frame when the collector can run while
+    // that frame is live, i.e. when the function reaches a may-GC callee. The
+    // call to the registered extern (`abiEngineRegister` seeds the may-GC set)
+    // forces the frame, so this pins the push/register/pop sequence and relocs.
+    let e = IrExtern("abiEngineRegister", [IrTy.Int], IrTy.Unit)
+    let f = mkFunc("f", "pkl_f", IrTy.Str, [IrTy.Str], oneBlockTerm(
+        IrTerm.Return(0),
+        [IrInstr.LoadSlot(0, 0), IrInstr.Const(1, IrConst.Int(0)), IrInstr.Call(2, Callee.Extern(0), [1])]))
+    let xf = lowerFExt(f, e)
+    assertBytes(xf, "554889e54881ec300000004831c0488945f0488945f848b8020000003000005a488945e8488d4de049ba000000000000000041ffd2488b45f0488945f848b80000000000000000488945d8488b4dd849ba000000000000000041ffd2488945d0488d4de049ba000000000000000041ffd2488b45f84889ec5dc3")
+    expect(xf.ncells).toBe(2)
+    expect(xf.totalK).toBe(48)
+    expect(len(xf.relocs)).toBe(3)
+    expect(xf.relocs[0].off).toBe(42)
+    expect(xf.relocs[0].sym).toBe("pickle_shadow_push")
+    expect(xf.relocs[1].off).toBe(81)
+    expect(xf.relocs[1].sym).toBe("abiEngineRegister")
+    expect(xf.relocs[2].off).toBe(102)
+    expect(xf.relocs[2].sym).toBe("pickle_shadow_pop")
+}
+
+/// The perf guard: a frame with managed slots but no may-GC callee must stay
+/// unshadowed. Shadowing every managed frame is what made the self-hosted
+/// compiler ~2.35x slower (`v6`), so this pins the gate in the other direction.
+test fn managed_slot_without_gc_call_has_no_shadow() {
+    let f = mkFunc("f", "pkl_f", IrTy.Str, [IrTy.Str], oneBlockTerm(
+        IrTerm.Return(0), [IrInstr.LoadSlot(0, 0)]))
+    let xf = lowerF(f)
+    assertBytes(xf, "554889e54881ec30000000488b45f0488945f8488b45f84889ec5dc3")
+    expect(xf.ncells).toBe(2)
+    expect(xf.totalK).toBe(48)
+    expect(len(xf.relocs)).toBe(0)
+}
+
+test fn extern_float_mod_call() {
+    let e = IrExtern("pickle_fmod", [IrTy.Float, IrTy.Float], IrTy.Float)
+    let f = mkFunc("f", "pkl_f", IrTy.Float, emptyIrTys(), oneBlockTerm(
+        IrTerm.Return(2),
+        [IrInstr.Const(0, IrConst.Float(5.0)),
+         IrInstr.Const(1, IrConst.Float(2.0)),
+         IrInstr.Call(2, Callee.Extern(0), [0, 1])]))
+    let xf = lowerFExt(f, e)
+    assertBytes(xf, "554889e54881ec3000000048b8000000000000144066480f6ec0f20f1145e848b8000000000000004066480f6ec0f20f1145e0f20f1045e8f20f104de049ba000000000000000041ffd2f20f1145d8f20f1045d84889ec5dc3")
+    expect(len(xf.relocs)).toBe(1)
+    expect(xf.relocs[0].off).toBe(63)
+    expect(xf.relocs[0].sym).toBe("pickle_fmod")
+}
+
+test fn ftoi_saturating() {
+    let f = mkFunc("f", "pkl_f", IrTy.Int, emptyIrTys(), oneBlockTerm(
+        IrTerm.Return(1),
+        [IrInstr.Const(0, IrConst.Float(1.5)),
+         IrInstr.Ftoi(1, 0)]))
+    let xf = lowerF(f)
+    assertBytes(xf, "554889e54881ec2000000048b8000000000000f83f66480f6ec0f20f1145e8f20f1045e8660f2ec07a3148b9000000000000e04366480f6ec9660f2ec1732148b9000000000000e0c366480f6ed1660f2ec27218f2480f2cc0eb1b4831c0eb1648b8ffffffffffffff7feb0a48b80000000000000080488945e0488b45e04889ec5dc3")
+}
+
+/// Regression guard for frame planning. `analyze` must size unmanaged slots and
+/// temps with `tyBytes`, not `tyWidth`; using bits here silently inflates every
+/// frame 8x. Small functions stay under the disp8 limit either way, so nothing
+/// else in this suite would notice. 64 unmanaged Int slots must span 512 bytes
+/// here, not the 4096 the bit widths would give.
+test fn large_frame_sizes_slots_in_bytes() {
+    var slots = emptyIrTys()
+    var i = 0
+    while (i < 64) {
+        slots.push(IrTy.Int)
+        i = i + 1
+    }
+    let f = mkFunc("f", "pkl_f", IrTy.Int, slots, oneBlockTerm(
+        IrTerm.Return(1),
+        [IrInstr.Const(0, IrConst.Int(7)), IrInstr.LoadSlot(1, 63)]))
+    let xf = lowerF(f)
+    // 16-byte shadow header + 8 reserved cell bytes = 24, then 64 * 8 = 512 for
+    // the slots, then two 8-byte temps, rounded up to 16.
+    expect(xf.totalK).toBe(544)
+    // Slot 63 lands at k = 24 + 8*63 = 528 and the two temps at 536/544, so all
+    // three accesses are past the disp8 limit and must use disp32 (0xFFFFFDF0,
+    // 0xFFFFFDE8, 0xFFFFFDE0). Asserting the whole image keeps the large-frame
+    // prologue and encoding path covered.
+    assertBytes(xf, "554889e54881ec2002000048b80700000000000000488985e8fdffff488b85f0fdffff488985e0fdffff488b85e0fdffff4889ec5dc3")
+}
+
+test fn x64_dump_smoke() {
+    let f = mkFunc("f", "pkl_f", IrTy.Int, emptyIrTys(), oneBlockTerm(
+        IrTerm.Return(0), [IrInstr.Const(0, IrConst.Int(42))]))
+    let xf = lowerF(f)
+    expect(len(x64Dump(X64Out([xf]))) > 20).toBe(true)
+}
+
+/// A long enum-tag chain, the shape `Emitter.expr1` uses for its 20-arm
+/// `ExprKind` match. Block 0 tests a tag and branches *forward* past a run of
+/// arm bodies to the join block. If a branch fixup is resolved against the
+/// wrong block start, the chain falls off the end instead of reaching the arm,
+/// and the compiler's own `match` panics at runtime.
+test fn long_forward_branch_chain_reaches_arm() {
+    var blocks = emptyBlocks()
+    var instrs = emptyInstrs()
+    instrs.push(IrInstr.Const(0, IrConst.Int(5)))
+    instrs.push(IrInstr.BinOp(1, IrBinOp.Eq, 0, 0))
+    // Branch to the last block (the "arm"), skipping every filler block.
+    blocks.push(IrBlock(0, instrs, IrTerm.BranchIf(1, 24, 1)))
+    var b = 1
+    while (b < 24) {
+        blocks.push(IrBlock(b, emptyInstrs(), IrTerm.Branch(1)))
+        b = b + 1
+    }
+    let arm = emptyInstrs()
+    arm.push(IrInstr.Const(2, IrConst.Int(1)))
+    blocks.push(IrBlock(24, arm, IrTerm.Return(2)))
+    let f = mkFunc("f", "pkl_f", IrTy.Int, emptyIrTys(), blocks)
+    let xf = lowerF(f)
+    // Prologue, then the tag test in r8 (`mov r8,[rbp-0x18]; cmp r8,rax;
+    // sete al`) and a `jne` that must land on the arm at 0xad -- past all 24
+    // filler blocks. Each filler is a 5-byte `jmp rel32` back to block 1 at
+    // 0x3a, so filler k carries rel = -(5*(k+1)); the last is -0x73. Asserting
+    // the whole image pins every forward fixup: resolving one against the
+    // wrong block start lands elsewhere in this image and fails.
+    assertBytes(xf, "554889e54881ec3000000048b80500000000000000488945e8488b45e8488b4de84839c80f94c08845e78a45e784c00f8578000000e900000000e9fbffffffe9f6ffffffe9f1ffffffe9ecffffffe9e7ffffffe9e2ffffffe9ddffffffe9d8ffffffe9d3ffffffe9ceffffffe9c9ffffffe9c4ffffffe9bfffffffe9baffffffe9b5ffffffe9b0ffffffe9abffffffe9a6ffffffe9a1ffffffe99cffffffe997ffffffe992ffffffe98dffffff48b80100000000000000488945d8488b45d84889ec5dc3")
+}

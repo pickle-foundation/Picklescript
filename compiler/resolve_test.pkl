@@ -1,0 +1,148 @@
+module compiler.resolve_test
+
+import { entryName, entryGenerics, entryKindName, TypeTableEntry, ClassTable, EnumTable, InterfaceTable, genericsOfDecl, hasAttr, anyStr, renderPath, renderList, anyParam, mkBuiltin, sigCompatible, holdsRef, isClassTy, primitive, varsOf, emptyParamInfos, emptyCallableInfos, emptyFieldInfos, emptyPropertyInfos, emptyNamedCtorInfos, emptyVariantInfos, emptyIfaceMemberInfos, emptyMethodSigs, emptyClassTables, emptyPendingFns, emptyConstDecls, emptyItemKindDecls, emptyMapTypes, emptyMapFns, emptyMapAliases, emptyMapSpans } from compiler.resolve
+import { Span } from compiler.diag
+import { GenericParam, Attribute, emptyExprs, emptyAttrs, emptyGenericParams, emptyStrs } from compiler.ast
+import { Ty, tyEq, emptyTys } from compiler.ty
+
+test fn entry_accessors() {
+    let ct = ClassTable("Foo", Span(0, 0), Visibility.Public, ["T", "U"], none, [Ty.Int], emptyFieldInfos(), emptyCallableInfos(), emptyPropertyInfos(), none, emptyNamedCtorInfos(), emptyFieldInfos())
+    let e = TypeTableEntry.Class(ct)
+    expect(entryName(e)).toBe("Foo")
+    expect(entryKindName(e)).toBe("class")
+    expect(len(entryGenerics(e))).toBe(2)
+    expect(entryGenerics(e)[0]).toBe("T")
+    expect(entryGenerics(e)[1]).toBe("U")
+}
+
+test fn enum_entry_accessors() {
+    let et = EnumTable("Color", Span(0, 0), Visibility.Public, ["T"], [Ty.Int], emptyVariantInfos())
+    let e = TypeTableEntry.Enum(et)
+    expect(entryName(e)).toBe("Color")
+    expect(entryKindName(e)).toBe("enum")
+    expect(entryGenerics(e)[0]).toBe("T")
+}
+
+test fn iface_entry_kind() {
+    let it = InterfaceTable("Shape", Span(0, 0), Visibility.Public, emptyStrs(), emptyTys(), emptyIfaceMemberInfos())
+    let e = TypeTableEntry.Interface(it)
+    expect(entryKindName(e)).toBe("interface")
+    expect(entryName(e)).toBe("Shape")
+}
+
+test fn generics_of_decl() {
+    let gs = [GenericParam("T", Span(0, 0)), GenericParam("U", Span(0, 0))]
+    let out = genericsOfDecl(gs)
+    expect(len(out)).toBe(2)
+    expect(out[0]).toBe("T")
+    expect(out[1]).toBe("U")
+    expect(len(genericsOfDecl(emptyGenericParams()))).toBe(0)
+}
+
+test fn has_attr() {
+    let attrs = [Attribute("test", emptyExprs(), Span(0, 0))]
+    expect(hasAttr(attrs, "test")).toBe(true)
+    expect(hasAttr(attrs, "bench")).toBe(false)
+    expect(hasAttr(emptyAttrs(), "test")).toBe(false)
+}
+
+test fn any_str() {
+    expect(anyStr(["a", "b"], "b")).toBe(true)
+    expect(anyStr(["a", "b"], "c")).toBe(false)
+}
+
+test fn render_path() {
+    expect(renderPath(["a"])).toBe("a")
+    expect(renderPath(["a", "b", "c"])).toBe("a.b.c")
+    expect(renderPath(emptyStrs())).toBe("")
+}
+
+test fn render_list() {
+    expect(renderList(emptyStrs())).toBe("none")
+    expect(renderList(["a"])).toBe("a")
+    expect(renderList(["a", "b"])).toBe("a, b")
+}
+
+test fn primitives() {
+    match (primitive("int")) {
+        case some(t) -> expect(tyEq(t, Ty.Int)).toBe(true)
+        case none -> expect(true).toBe(false)
+    }
+    match (primitive("string")) {
+        case some(t) -> expect(tyEq(t, Ty.String)).toBe(true)
+        case none -> expect(true).toBe(false)
+    }
+    match (primitive("void")) {
+        case some(t) -> expect(tyEq(t, Ty.Empty)).toBe(true)
+        case none -> expect(true).toBe(false)
+    }
+    match (primitive("f64")) {
+        case some(t) -> expect(tyEq(t, Ty.Float)).toBe(true)
+        case none -> expect(true).toBe(false)
+    }
+    match (primitive("i64")) {
+        case some(t) -> expect(tyEq(t, Ty.Int)).toBe(true)
+        case none -> expect(true).toBe(false)
+    }
+    match (primitive("deque")) {
+        case some(t) -> expect(true).toBe(false)
+        case none -> expect(true).toBe(true)
+    }
+}
+
+test fn holds_ref() {
+    expect(holdsRef(Ty.Ref(Ty.Int))).toBe(true)
+    expect(holdsRef(Ty.Option(Ty.Ref(Ty.Int)))).toBe(true)
+    expect(holdsRef(Ty.Option(Ty.Int))).toBe(false)
+    expect(holdsRef(Ty.Int)).toBe(false)
+}
+
+test fn is_class_ty() {
+    expect(isClassTy(Ty.Class("Foo", emptyTys()))).toBe(true)
+    expect(isClassTy(Ty.Int)).toBe(false)
+    expect(isClassTy(Ty.Struct("Bar", emptyTys()))).toBe(false)
+}
+
+test fn sig_compatible() {
+    let pa = [anyParam(Span(0, 0), "a")]
+    let pb = [anyParam(Span(0, 0), "b")]
+    expect(sigCompatible(pa, Ty.Int, pb, Ty.Int)).toBe(true)
+    expect(sigCompatible(emptyParamInfos(), Ty.Int, pb, Ty.Int)).toBe(false)
+    expect(sigCompatible(pa, Ty.Int, pa, Ty.String)).toBe(false)
+    expect(sigCompatible(emptyParamInfos(), Ty.String, emptyParamInfos(), Ty.String)).toBe(true)
+}
+
+test fn empty_table_lists() {
+    expect(len(emptyParamInfos())).toBe(0)
+    expect(len(emptyCallableInfos())).toBe(0)
+    expect(len(emptyFieldInfos())).toBe(0)
+    expect(len(emptyPropertyInfos())).toBe(0)
+    expect(len(emptyNamedCtorInfos())).toBe(0)
+    expect(len(emptyVariantInfos())).toBe(0)
+    expect(len(emptyIfaceMemberInfos())).toBe(0)
+    expect(len(emptyMethodSigs())).toBe(0)
+    expect(len(emptyClassTables())).toBe(0)
+    expect(len(emptyPendingFns())).toBe(0)
+    expect(len(emptyConstDecls())).toBe(0)
+    expect(len(emptyItemKindDecls())).toBe(0)
+}
+
+test fn empty_map_factories() {
+    let m = emptyMapTypes()
+    expect(len(m)).toBe(0)
+    let f = emptyMapFns()
+    expect(len(f)).toBe(0)
+    let a = emptyMapAliases()
+    expect(len(a)).toBe(0)
+    let s = emptyMapSpans()
+    expect(len(s)).toBe(0)
+}
+
+test fn builtin_ctor() {
+    let c = mkBuiltin(Span(0, 0), "len", [anyParam(Span(0, 0), "x")], Ty.Int)
+    expect(c.name).toBe("len")
+    expect(tyEq(c.ret, Ty.Int)).toBe(true)
+    expect(len(c.params)).toBe(1)
+    expect(c.params[0].rest).toBe(true)
+    expect(c.params[0].name).toBe("x")
+}

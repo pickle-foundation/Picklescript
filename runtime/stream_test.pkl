@@ -1,0 +1,152 @@
+module runtime.stream_test
+
+import { STREAM_READER, STREAM_WRITER, STREAM_STDOUT, STREAM_STDERR, PStream, Stdio } from runtime.stream
+
+/// In-memory fake for the I/O seam. All state lives on the `Stdio` instance
+/// (no module globals), so `newMemIo` seeds a fresh backing buffer per test.
+
+fn fillStore(io: Stdio, text: string) {
+    var src = bytes(text)
+    var i = 0
+    while (i < len(src)) {
+        io.store.push(src[i] as int)
+        i = i + 1
+    }
+}
+
+fn memRead(s: Stdio, n: int) -> List<byte>? {
+    if (s.cursor >= len(s.store)) {
+        return none
+    }
+    var out = [0x00 as byte]
+    out.pop()
+    var got = 0
+    while (got < n && s.cursor < len(s.store)) {
+        out.push(s.store[s.cursor] as byte)
+        s.cursor = s.cursor + 1
+        got = got + 1
+    }
+    out
+}
+
+fn memWrite(s: Stdio, byts: List<byte>) -> int {
+    var i = 0
+    while (i < len(byts)) {
+        s.store.push(byts[i] as int)
+        i = i + 1
+    }
+    i
+}
+
+fn memFlush(s: Stdio) -> bool {
+    s.flushOk
+}
+
+fn memDrop(s: Stdio) -> bool {
+    s.dropCount = s.dropCount + 1
+    true
+}
+
+fn newMemIo(text: string) -> Stdio {
+    var io = Stdio()
+    io.readUpTo = memRead
+    io.writeBytes = memWrite
+    io.flushIo = memFlush
+    io.dropIo = memDrop
+    fillStore(io, text)
+    io
+}
+
+fn emptyBytes() -> List<byte> {
+    var b = [0x00 as byte]
+    b.pop()
+    b
+}
+
+fn pairBytes(ab: List<int>) -> List<byte> {
+    var b = [0x00 as byte]
+    b.pop()
+    var i = 0
+    while (i < len(ab)) {
+        b.push(ab[i] as byte)
+        i = i + 1
+    }
+    b
+}
+
+fn bytesText(xs: List<int>) -> string {
+    str(pairBytes(xs))
+}
+
+/// Read out of the seam; a failed/EOF read surfaces as a sentinel so a
+/// mismatched expectation fails loudly.
+fn mustRead(s: PStream, n: int) -> string {
+    var c = s.read(n)
+    if (let some(x) = c) {
+        return str(x)
+    }
+    "NO-READ"
+}
+
+test fn reader_rules() {
+    var r = PStream(STREAM_READER, newMemIo("abc"))
+    expect(r.isReadable()).toBe(true)
+    expect(r.isWritable()).toBe(false)
+    expect(mustRead(r, 2)).toBe("ab")
+    expect(mustRead(r, 2)).toBe("c")
+    expect(r.read(2)).toBe(none)
+    expect(r.write(emptyBytes())).toBe(0)
+    expect(r.flush()).toBe(true)
+    expect(r.close()).toBe(true)
+    expect(r.io.dropCount).toBe(1)
+    expect(r.close()).toBe(false)
+    expect(r.read(2)).toBe(none)
+}
+
+test fn writer_rules() {
+    var w = PStream(STREAM_WRITER, newMemIo(""))
+    expect(w.isReadable()).toBe(false)
+    var payload = pairBytes([0x41, 0x42])
+    expect(w.write(payload)).toBe(2)
+    expect(w.flush()).toBe(true)
+    expect(bytesText(w.io.store)).toBe("AB")
+    expect(w.read(2)).toBe(none)
+    expect(w.close()).toBe(true)
+    expect(w.io.dropCount).toBe(1)
+    expect(w.flush()).toBe(false)
+}
+
+test fn stdout_and_stderr_console_writable() {
+    var out = PStream(STREAM_STDOUT, newMemIo(""))
+    var err = PStream(STREAM_STDERR, newMemIo(""))
+    expect(out.isWritable()).toBe(true)
+    expect(err.isWritable()).toBe(true)
+    expect(out.read(3)).toBe(none)
+    expect(out.flush()).toBe(true)
+    expect(err.flush()).toBe(true)
+    expect(out.close()).toBe(true)
+    expect(err.close()).toBe(true)
+}
+
+test fn flush_failure_reports_and_close_still_releases() {
+    var io = newMemIo("")
+    io.flushOk = false
+    var w = PStream(STREAM_WRITER, io)
+    expect(w.flush()).toBe(false)
+    expect(w.close()).toBe(false)
+    expect(io.dropCount).toBe(1)
+}
+
+test fn sweep_closes_unclosed_stream() {
+    var w = PStream(STREAM_WRITER, newMemIo(""))
+    w.onSweep()
+    expect(w.closed).toBe(true)
+    expect(w.io.dropCount).toBe(1)
+    expect(w.read(1)).toBe(none)
+    // A stream swept after explicit close does not double-release.
+    var w2 = PStream(STREAM_WRITER, newMemIo(""))
+    w2.close()
+    w2.io.dropCount = 0
+    w2.onSweep()
+    expect(w2.io.dropCount).toBe(0)
+}

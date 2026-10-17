@@ -1,0 +1,44 @@
+module cli.probeself
+
+import { DiagnosticSink } from compiler.diag
+import { frontend } from compiler.front
+import { emitIr } from compiler.emit
+import { irModuleStr, irxModuleStr } from compiler.ir
+
+fn severityName(s: Severity) -> string {
+    if (s == Severity.Error) {
+        return "Error"
+    }
+    "Warning"
+}
+
+fn main() {
+    for (target in ["pickle/compiler/ast.pkl", "pickle/compiler/check.pkl", "pickle/compiler/emit.pkl", "pickle/compiler/front.pkl", "pickle/compiler/lexer.pkl", "pickle/compiler/parser.pkl", "pickle/compiler/resolve.pkl", "pickle/compiler/token.pkl", "pickle/cli/main.pkl"]) {
+        if (let some(src) = read_file(target)) {
+            let sinks = DiagnosticSink()
+            let loaded = frontend(target, src, sinks)
+            if (let some(l) = loaded) {
+                let m = emitIr(l.program, l.resolved, sinks)
+                if (let some(mm) = m) {
+                    println("OK: " + target + " ir=" + "{len(irModuleStr(mm))}" + " irx=" + "{len(irxModuleStr(mm))}")
+                } else {
+                    println("EMIT FAIL: " + target)
+                }
+            } else {
+                println("FRONT FAIL: " + target)
+            }
+            let ds = sinks.diagnostics
+            var i = 0
+            while (i < len(ds)) {
+                var sp = "0,0"
+                if (let some(s2) = ds[i].span) {
+                    sp = "{s2.start},{s2.end}"
+                }
+                println(severityName(ds[i].severity) + ": " + ds[i].message + " @span(" + sp + ")")
+                i = i + 1
+            }
+        } else {
+            println("NO FILE: " + target)
+        }
+    }
+}

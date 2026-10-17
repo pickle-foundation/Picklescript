@@ -1,0 +1,126 @@
+module runtime.abi_tuple_test
+
+/// Behavioral tests for the ported tuple ABI bodies, mirroring the cases in
+/// `runtime/src/tuple.rs`'s own `mod tests` so the port is checked against the same
+/// expectations the native implementation is.
+
+import { tupleNew, tupleFieldCount, abiTupleNew, abiTupleLen, abiTupleSetField, abiTupleField } from runtime.abi_tuple
+import { abiBoxI64, abiUnboxI64 } from runtime.abi_box
+
+test fn new_zeroes_payload_and_stores_count() {
+    // runtime/src/tuple.rs: new_zeroes_payload_and_stores_count
+    var t = tupleNew(3)
+    expect(abiTupleLen(t)).toBe(3)
+    unsafe {
+        expect(t[1]).toBe(8)
+        expect(t[2]).toBe(56)
+        var i = 0
+        while (i < 3) {
+            expect(abiTupleField(t, i) as int).toBe(0)
+            i = i + 1
+        }
+    }
+    // Out-of-range reads are null, not garbage.
+    unsafe {
+        expect(abiTupleField(t, 5) as int).toBe(0)
+    }
+}
+
+test fn empty_tuple_has_zero_fields() {
+    // runtime/src/tuple.rs: empty_tuple_has_zero_fields. The explicit count is what makes
+    // this unambiguous despite the 32-byte allocator minimum.
+    var t = tupleNew(0)
+    expect(abiTupleLen(t)).toBe(0)
+    unsafe {
+        expect(abiTupleField(t, 0) as int).toBe(0)
+        expect(t[2]).toBe(32)
+    }
+}
+
+test fn new_reinitialises_reused_memory() {
+    // runtime/src/tuple.rs: new_zeroes_reused_dirty_memory. The native body dirties the
+    // payload region with 0xAB before re-initialising; here `alloc` gives zeroed memory,
+    // so the observable half to pin is that every field still reads null after init.
+    var t = tupleNew(2)
+    abiTupleSetField(t, 0, abiBoxI64(99))
+    var fresh = tupleNew(2)
+    expect(abiTupleLen(fresh)).toBe(2)
+    unsafe {
+        expect(abiTupleField(fresh, 0) as int).toBe(0)
+        expect(abiTupleField(fresh, 1) as int).toBe(0)
+    }
+}
+
+test fn set_and_read_fields() {
+    // runtime/src/tuple.rs: set_and_read_fields
+    var t = tupleNew(2)
+    abiTupleSetField(t, 0, abiBoxI64(10))
+    abiTupleSetField(t, 1, abiBoxI64(20))
+    expect(abiUnboxI64(abiTupleField(t, 0))).toBe(10)
+    expect(abiUnboxI64(abiTupleField(t, 1))).toBe(20)
+}
+
+test fn field_count_is_read_from_the_stored_count() {
+    // A tuple's element count lives in word 3, not in the byte size. Overwriting it must
+    // change what `tuple_len` and the bounds check report.
+    var t = tupleNew(4)
+    expect(tupleFieldCount(t)).toBe(4)
+    unsafe {
+        t[3] = 2
+    }
+    expect(abiTupleLen(t)).toBe(2)
+}
+
+test fn overwriting_a_field_replaces_it() {
+    var t = tupleNew(1)
+    abiTupleSetField(t, 0, abiBoxI64(1))
+    abiTupleSetField(t, 0, abiBoxI64(2))
+    expect(abiUnboxI64(abiTupleField(t, 0))).toBe(2)
+    expect(abiTupleLen(t)).toBe(1)
+}
+
+test fn fields_hold_object_pointers_not_copies() {
+    // The slot is a managed reference, so writing the same box into two fields makes both
+    // read the same object. If a body copied the payload instead of storing the address,
+    // the second field would diverge after the first was rewritten.
+    var shared = abiBoxI64(7)
+    var t = tupleNew(2)
+    abiTupleSetField(t, 0, shared)
+    abiTupleSetField(t, 1, shared)
+    expect(abiTupleField(t, 0) as int).toBe(abiTupleField(t, 1) as int)
+    expect(abiUnboxI64(abiTupleField(t, 1))).toBe(7)
+}
+
+test fn out_of_range_reads_return_the_null_pointer() {
+    var t = tupleNew(1)
+    abiTupleSetField(t, 0, abiBoxI64(5))
+    unsafe {
+        expect(abiTupleField(t, 1) as int).toBe(0)
+        expect(abiTupleField(t, 1000) as int).toBe(0)
+    }
+    expect(abiUnboxI64(abiTupleField(t, 0))).toBe(5)
+}
+
+test fn every_field_of_a_wide_tuple_is_independent() {
+    var t = abiTupleNew(6)
+    var i = 0
+    while (i < 6) {
+        abiTupleSetField(t, i, abiBoxI64(i * 100))
+        i = i + 1
+    }
+    expect(abiTupleLen(t)).toBe(6)
+    var j = 0
+    while (j < 6) {
+        expect(abiUnboxI64(abiTupleField(t, j))).toBe(j * 100)
+        j = j + 1
+    }
+}
+
+test fn abi_entry_points_round_trip_a_pair() {
+    var t = abiTupleNew(2)
+    abiTupleSetField(t, 0, abiBoxI64(123))
+    abiTupleSetField(t, 1, abiBoxI64(456))
+    expect(abiTupleLen(t)).toBe(2)
+    expect(abiUnboxI64(abiTupleField(t, 0))).toBe(123)
+    expect(abiUnboxI64(abiTupleField(t, 1))).toBe(456)
+}

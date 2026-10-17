@@ -1,0 +1,128 @@
+module runtime.abi_gc
+
+/// Port of `runtime/src/gc.rs`'s observable ABI: the eight GC symbols -
+/// `pickle_gc_collect`, `pickle_gc_allocations_since_gc`,
+/// `pickle_gc_bytes_since_gc`, `pickle_gc_collection_count`,
+/// `pickle_gc_set_threshold`, `pickle_gc_root_add`, `pickle_manual_adopt`,
+/// `pickle_manual_free`.
+///
+/// THIS IS NOW A THIN SYMBOL LAYER. The mark-and-sweep engine, the
+/// sweepability registry, the allocation-event seam and - new - the automatic
+/// collection trigger all live in `runtime.abi_gcengine`, a leaf module the
+/// register path (`abi_raw`) can import without a cycle. Each body here just
+/// names the engine function it mirrors, so the `#[symbol]` surface is stable
+/// while the machinery has one home.
+///
+/// WHAT THE ENGINE OWNS, AND THE REMAINING DIVERGENCES (unchanged from the old
+/// in-module collector except the trigger):
+///   - **`pickle_gc_collect` is a REAL ported mark-and-sweep (reclamation gate,
+///     phase 2b).** It marks from the port's own root set (static-root cells,
+///     the manual registry, and the current thread's shadow stack), walks the
+///     graph through every registered object's header, and frees the unmarked
+///     registered population - the object block and, for a list/map, its
+///     out-of-line span - back to the OS heap. `liveBytes` = survivors' bytes,
+///     the seam counters zero, and the threshold adapts unless pinned.
+///   - **THE AUTOMATIC TRIGGER IS NOW PORTED.** Native runs a sweep from inside
+///     `Gc::alloc` (`maybe_collect`, gc.rs:474): once `BYTES_SINCE_GC` crosses
+///     the threshold (the `PKL_GC_THRESHOLD` override, else `AUTO_THRESHOLD`),
+///     the allocation that crosses it collects with the fresh object pinned
+///     across its own cycle. The engine's `abiEngineRegister` - the register
+///     moment, adopted by every maker through `abi_raw` - reproduces exactly
+///     that, including the one-time `PKL_NO_AUTO_GC` / `PKL_GC_THRESHOLD`
+///     environment read. This closes the former open divergence.
+///   - **Roots are the static-root cells, the manual registry, and the current
+///     thread's shadow stack.** Native's helper temp-roots and the multi-thread
+///     `shadow.rs` registry (+ its wide lock) are still not ported: a qualified
+///     image collects on its own thread with no in-flight native helper.
+///   - **The walk is exact for every builtin container and conservative for
+///     user classes.** Lists trace by `len`, maps by `cap`, tuples/enums by
+///     their payload fields; boxes and streams are not traced; user classes
+///     walk every payload word and keep only a REGISTERED address as an edge.
+///   - **Finalizers stay native.** A swept object's block (and its list/map
+///     spans) is freed raw; the sweep never runs a user/stream finalizer.
+///   - **`pickle_gc_root_add` registers the cell address the walker traces
+///     every cycle**; the returned handle is discarded by emitted code.
+///   - **`pickle_manual_adopt`/`pickle_manual_free` are registry bookkeeping
+///     with the collector reading the same lists.**
+///
+/// `pickle_gc_collect(force)` accepts and ignores its argument - native v1
+/// always collects.
+
+import { abiEngineAllocCount, abiEngineAllocBytes, abiEngineCollectionCount, abiEngineSetThreshold, abiEngineCollect, abiEngineRootAdd, abiEngineManualAdopt, abiEngineManualFree, abiEngineThresholdNow, abiEngineLiveBytesNow, abiEngineRootCount, abiEngineManualCount } from runtime.abi_gcengine
+
+/// Number of allocations since the last collection - the count, deliberately
+/// distinct from the byte figure. Mirrors `gc.rs::pickle_gc_allocations_since_gc`.
+#[symbol("pickle_gc_allocations_since_gc")]
+fn abiGcAllocationsSinceGc() -> int {
+    return abiEngineAllocCount()
+}
+
+/// Allocations in bytes since the last collection - the quantity the
+/// auto-collect trigger compares. Mirrors `gc.rs::pickle_gc_bytes_since_gc`.
+#[symbol("pickle_gc_bytes_since_gc")]
+fn abiGcBytesSinceGc() -> int {
+    return abiEngineAllocBytes()
+}
+
+/// Completed collection cycles. Mirrors `gc.rs::pickle_gc_collection_count`.
+#[symbol("pickle_gc_collection_count")]
+fn abiGcCollectionCount() -> int {
+    return abiEngineCollectionCount()
+}
+
+/// Pin the auto-collect threshold in object bytes; an explicit set disables the
+/// adaptive post-collect adjustment. Mirrors `gc.rs::pickle_gc_set_threshold`.
+#[symbol("pickle_gc_set_threshold")]
+fn abiGcSetThreshold(bytes: int) {
+    abiEngineSetThreshold(bytes)
+}
+
+/// Collect garbage now. `force` accepted and ignored - native v1 always
+/// collects. Mirrors `gc.rs::pickle_gc_collect`.
+#[symbol("pickle_gc_collect")]
+fn abiGcCollect(force: bool) {
+    abiEngineCollect(force)
+}
+
+/// Register a static root cell the walker traces every cycle. Returns the cell
+/// address (a stable handle shape; emitted callers discard it). Mirrors
+/// `gc.rs::pickle_gc_root_add`.
+#[symbol("pickle_gc_root_add")]
+fn abiGcRootAdd(cell: int) -> int {
+    return abiEngineRootAdd(cell)
+}
+
+/// Adopt `obj` as a programmer-owned allocation; return it for chaining.
+/// Mirrors `gc.rs::pickle_manual_adopt`.
+#[symbol("pickle_manual_adopt")]
+fn abiManualAdopt(obj: *int) -> *int {
+    return abiEngineManualAdopt(obj)
+}
+
+/// Release an object adopted with `abiManualAdopt`. Mirrors
+/// `gc.rs::pickle_manual_free`.
+#[symbol("pickle_manual_free")]
+fn abiManualFree(obj: *int) {
+    abiEngineManualFree(obj)
+}
+
+/// Current mirrored threshold - exported for tests (no language-level readback;
+/// see `abi_gc_test`). Not a `#[symbol]`.
+fn abiGcThresholdNow() -> int {
+    return abiEngineThresholdNow()
+}
+
+/// Last mirrored live figure - refreshed by each collect. Exported for tests.
+fn abiLiveBytesNow() -> int {
+    return abiEngineLiveBytesNow()
+}
+
+/// Number of registered root cells - exported for tests.
+fn abiRootCount() -> int {
+    return abiEngineRootCount()
+}
+
+/// Number of adopted manual objects - exported for tests.
+fn abiManualCount() -> int {
+    return abiEngineManualCount()
+}

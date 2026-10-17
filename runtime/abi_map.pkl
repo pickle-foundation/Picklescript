@@ -1,0 +1,850 @@
+module runtime.abi_map
+
+/// Sovereign map ABI bodies, ported from `runtime/src/map.rs`.
+///
+/// Ported as ONE tranche on purpose. The table is the easy half; the *keys* are the
+/// hard half, and they hash and compare STRUCTURALLY. `Map<List<int>, V>` and
+/// `Map<Map<...>, V>` are legal Pickle, so a port that only handled string and boxed
+/// keys would look correct on the obvious cases and silently return "absent" for
+/// composite ones. Everything here therefore goes through `deepHash`/`deepEq`, which
+/// recurse through lists, maps, enums, tuples and user-class instances.
+///
+/// # Word arithmetic on the full 64-bit word
+///
+/// `int` is signed 64-bit and wraps on overflow (verified: `+`, `*`, `^` all behave as
+/// mod-2^64, which is what `u64::wrapping_*` does). So FNV-1a is expressible directly:
+/// `h = (h ^ x) * FNV_PRIME` with wrapping multiply, exactly `mix` in Rust.
+///
+/// The FNV constants have the high bit set, and Pickle rejects out-of-range integer
+/// literals (`codegen: integer literal out of range for i64`), so they are written in
+/// two's-complement negation form -- the same trick `x64.pkl` uses for `i64::MIN`:
+/// `u64 0xCBF29CE484222325` is `(0 - 0x340D631B7BDDDCDB)`. `CYCLIC_HASH` happens to be
+/// below 2^63, so it is a plain literal. Bit patterns are what matter, so every one of
+/// these reproduces the Rust `u64` value exactly; `abi_map_test.pkl` pins the hashes
+/// against literals taken from a reference implementation rather than against the Rust
+/// map, so the arithmetic is checked independently of the table.
+///
+/// # The sentinel substitution
+///
+/// Rust marks a tombstone with `object::nil_sentinel()` and stores the canonical `none`
+/// key at `object::none_key()`. Both are Rust `static`s, so their *addresses* are
+/// link-time constants a Pickle body cannot produce. This port substitutes small
+/// integers in the key slot:
+///
+///   - `0` empty slot (null - exactly what Rust uses)
+///   - `1` tombstone
+///   - `2` the `none` key
+///
+/// This is observably faithful. `map_keys` already surfaces a stored `none` key back to
+/// callers as null, and the markers never escape the table otherwise. It is safe
+/// because page zero is never mapped, so no live heap object can have address 1 or 2:
+/// `isTombstone`/`isNoneKey` test a forged address 1 or 2 as a marker, but no allocator
+/// ever hands one out.
+///
+/// KNOWN WEAKNESS - the one observable difference from Rust: a program that explicitly
+/// forges `1 as *int` or `2 as *int` as a map key would write what the table reads as a
+/// marker, silently losing that entry. Rust's sentinels are unreachable addresses, so
+/// this cannot happen there. Reaching it needs a deliberate forge of an unmap address;
+/// it is documented rather than defended against because the alternative (exporting the
+/// real sentinel addresses) changes the Rust ABI surface.
+///
+/// KNOWN LIMITATION - like every ported container, map objects and every rehash table
+/// come from `alloc`, which the GC does not track: correct, never reclaimed. `rehash`
+/// therefore leaks the previous table exactly as `abi_list`'s growth leaks its old span.
+///
+/// # Other gaps, inherited from `runtime/src/map.rs`
+///
+/// - `map_set`'s `gc_check_*` argument probes (report_call_site + panic) are omitted:
+///   the compiled paths always pass correctly classed arguments, and Pickle cannot yet
+///   declare an extern to call `pickle_panic_cstr` (see PICKLE_AUDIT.md 18.0).
+/// - `deep_hash`'s `FREE_SENTINEL` branch returns *without* popping `path`, which is
+///   faithful to the original (it makes later sibling hashes in the same `keyHash` see a
+///   spurious ancestor) rather than quietly "fixed".
+/// - `Map<f64, V>` keys compare by `box_bits`, not numeric equality, so `0.0` and `-0.0`
+///   are distinct keys. That is the Rust behaviour, kept as-is.
+
+import { PICKLE_CLASS_MAP, PICKLE_CLASS_STRING, PICKLE_CLASS_LIST, PICKLE_CLASS_ENUM } from runtime.object
+import { PICKLE_CLASS_TUPLE, PICKLE_CLASS_BOX_INT, PICKLE_CLASS_BOX_FLOAT } from runtime.object
+import { PICKLE_CLASS_BOX_BOOL, PICKLE_CLASS_BOX_CHAR } from runtime.object
+import { HEADER, MAP_LEN_OFF, MAP_CAP_OFF, MAP_ENTRIES_OFF, MAP_OBJECT_SIZE } from runtime.layout
+import { LIST_LEN_OFF, LIST_DATA_OFF, ENUM_TAG_OFF, ENUM_FIELDS_OFF, TUPLE_LEN_OFF } from runtime.layout
+import { boxBits } from runtime.abi_box
+import { abiListNew, abiListPush } from runtime.abi_list
+import { abiStrCmp, byteAt } from runtime.abi_string
+// The map object and its entry array both come from `alloc(int, n)`, so the
+// raw-allocation slots must travel with them. See `abi_raw.pkl`.
+// `abiRegisterObject` records the map *object*; the entries array is raw
+// backing, never registered.
+import { abiRawAlloc, abiRegisterObject } from runtime.abi_raw
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// FNV-1a offset basis, `0xCBF29CE484222325`, in two's-complement negation form.
+const FNV_OFFSET: int = 0 - 0x340D631B7BDDDCDB
+/// FNV-1a prime, `0x100000001B3` -- fits in `i64`, plain literal.
+const FNV_PRIME: int = 0x100000001B3
+/// `0x9E3779B97F4A7C15`, the golden-ratio step, in negation form. Also the fixed hash
+/// of a `none`/null key, matching `key_hash`'s early return.
+const GOLDEN: int = 0 - 0x61C8864680B583EB
+/// Hash reported by `deepHash` when it revisits an ancestor. Below 2^63, plain literal.
+const CYCLIC_HASH: int = 0x2F029C2DF8C00001
+/// `map_new`'s floor before rounding to a power of two (`INITIAL_CAP`).
+const INITIAL_CAP: int = 16
+/// `MAX_LOAD`, the occupancy fraction at which the table grows.
+const MAX_LOAD: float = 0.7
+/// `heap::FREE_SENTINEL` (`0xDEAD`), a freed-then-reused key's class. Its blocks are
+/// free-list metadata, so `deepHash` hashes them by identity instead of walking slots.
+const FREE_SENTINEL: int = 0xDEAD
+/// Size above which a reported class size is treated as stale (`1 << 26`).
+const MAX_PLAUSIBLE_SIZE: int = 0x4000000
+
+// Key-slot markers; see the module doc's "sentinel substitution".
+const KEY_EMPTY: int = 0
+const KEY_TOMBSTONE: int = 1
+const KEY_NONE: int = 2
+
+// `deepEq` verdicts, standing in for Rust's `enum Cmp`.
+const CMP_EQUAL: int = 0
+const CMP_DIFF: int = 1
+const CMP_CYCLIC: int = 2
+
+// Word indices: every layout offset above is a BYTE offset, and `*int` indexes words.
+const LEN_WORD: int = MAP_LEN_OFF / 8
+const CAP_WORD: int = MAP_CAP_OFF / 8
+const ENTRIES_WORD: int = MAP_ENTRIES_OFF / 8
+const LIST_LEN_WORD: int = LIST_LEN_OFF / 8
+const LIST_DATA_WORD: int = LIST_DATA_OFF / 8
+const ENUM_TAG_WORD: int = ENUM_TAG_OFF / 8
+const ENUM_FIELDS_WORD: int = ENUM_FIELDS_OFF / 8
+const TUPLE_LEN_WORD: int = TUPLE_LEN_OFF / 8
+/// Word index of payload slot `k`, since `slot(k)` is `HEADER + k*8`.
+const SLOT0_WORD: int = HEADER / 8
+/// `slot(1 + i)` -- the shape enum and tuple payload fields live at.
+const SLOT1_WORD: int = SLOT0_WORD + 1
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+fn isTombstone(k: int) -> bool { return k == KEY_TOMBSTONE }
+fn isNoneKey(k: int) -> bool { return k == KEY_EMPTY || k == KEY_NONE }
+/// Is this key slot a live entry (neither empty nor a tombstone)?
+fn isLiveKey(k: int) -> bool { return k != KEY_EMPTY && k != KEY_TOMBSTONE }
+
+fn mix(h: int, x: int) -> int { return (h ^ x) * FNV_PRIME }
+
+/// Smallest power of two >= `n`, for `n >= 1`. Mirrors `usize::next_power_of_two`
+/// for the range `map_new` can produce (`cap.max(16)`).
+fn nextPow2(n: int) -> int {
+    var p = 1
+    while (p < n) { p = p * 2 }
+    return p
+}
+
+/// Is `addr` on the recursion path already?
+fn pathHas(path: List<int>, addr: int) -> bool {
+    var i = 0
+    while (i < len(path)) {
+        if (path[i] == addr) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+/// Is the ancestor pair `(a, b)` on the equality path already? The path is stored
+/// flat as interleaved `[a, b, a, b, ...]`.
+fn pathHasPair(path: List<int>, a: int, b: int) -> bool {
+    var i = 0
+    while (i + 1 < len(path)) {
+        if (path[i] == a && path[i + 1] == b) { return true }
+        i = i + 2
+    }
+    return false
+}
+
+/// Is `classId` one of the four boxed-scalar classes? `deepHash`/`deepEq` treat them
+/// alike: hash/compare the raw payload word.
+fn isBoxClass(classId: int) -> bool {
+    return classId == PICKLE_CLASS_BOX_INT || classId == PICKLE_CLASS_BOX_FLOAT ||
+           classId == PICKLE_CLASS_BOX_BOOL || classId == PICKLE_CLASS_BOX_CHAR
+}
+
+/// FNV-1a over a string object's inline bytes. Mirrors `fnv1a(string_bytes_ptr(..),
+/// string_bytes_len(..))`, reading the bytes through `byteAt` so the final partial word
+/// is never over-read.
+fn fnv1aStr(s: *int) -> int {
+    unsafe {
+        var h = FNV_OFFSET
+        var n = s[LEN_WORD]
+        var i = 0
+        while (i < n) {
+            h = (h ^ byteAt(s, i)) * FNV_PRIME
+            i = i + 1
+        }
+        return h
+    }
+}
+
+/// Identity hash for a stale/reused or free-list block: `FNV_OFFSET`, xored with the
+/// class id and the address, then multiplied. Lookups then miss instead of walking
+/// arbitrary memory.
+fn identityHash(obj: *int, classId: int) -> int {
+    unsafe {
+        return mix(mix(FNV_OFFSET, classId), obj as int)
+    }
+}
+
+/// `layout::enum_field_count` -- derived from the reported size, not stored.
+fn enumFieldCount(obj: *int) -> int {
+    unsafe {
+        var size = obj[2]
+        if (size <= HEADER + 8) { return 0 }
+        return (size - (HEADER + 8)) / 8
+    }
+}
+
+/// `layout::tuple_field_count` -- the explicit stored count.
+fn tupleFieldCount(obj: *int) -> int {
+    unsafe { return obj[TUPLE_LEN_WORD] }
+}
+
+/// Does `obj` need the deep walk at all? Mirrors `deep_hash`'s dispatch.
+fn isBuiltin(classId: int) -> bool {
+    return classId == PICKLE_CLASS_STRING || classId == PICKLE_CLASS_LIST ||
+           classId == PICKLE_CLASS_MAP || classId == PICKLE_CLASS_ENUM ||
+           classId == PICKLE_CLASS_TUPLE || isBoxClass(classId)
+}
+
+// ---------------------------------------------------------------------------
+// Deep structural hash
+// ---------------------------------------------------------------------------
+
+/// Deep structural hash. `path` is the ancestor chain, so a cycle is *detected* rather
+/// than recursed forever: a revisit reports `(CYCLIC_HASH, true)` instead of descending.
+/// Two equal acyclic structures always produce the same hash.
+///
+/// Returns `(hash, cyclic)`; mirrors `deep_hash`'s `(u64, bool)`.
+fn deepHash(obj: *int, path: List<int>) -> (int, bool) {
+    unsafe {
+        var addr = obj as int
+        if (isNoneKey(addr)) {
+            return (GOLDEN, false)
+        }
+        if (pathHas(path, addr)) {
+            return (CYCLIC_HASH, true)
+        }
+        path.push(addr)
+        var classId = obj[1]
+        // A FREE_SENTINEL block can only be reached through a stale key. Hash by
+        // identity instead of trampling free-list metadata. Faithful to the original,
+        // which returns here without popping `path`.
+        if (classId == FREE_SENTINEL) {
+            return (identityHash(obj, classId), false)
+        }
+
+        var h = FNV_OFFSET
+        var cyclic = false
+
+        if (classId == PICKLE_CLASS_STRING) {
+            h = fnv1aStr(obj)
+        } else if (isBoxClass(classId)) {
+            h = mix(h, classId)
+            h = mix(h, boxBits(obj))
+        } else if (classId == PICKLE_CLASS_LIST) {
+            // Ordered: element order participates in the hash.
+            h = mix(h, classId)
+            var n = obj[LIST_LEN_WORD]
+            var data = obj[LIST_DATA_WORD] as *int
+            var i = 0
+            while (i < n) {
+                let (eh, ec) = deepHash(data[i] as *int, path)
+                h = mix(h, eh)
+                if (ec) { cyclic = true }
+                i = i + 1
+            }
+        } else if (classId == PICKLE_CLASS_MAP) {
+            // Order-insensitive: entries combine by addition, so two maps holding the
+            // same pairs hash alike regardless of insertion order.
+            h = mix(h, classId)
+            var cap = obj[CAP_WORD]
+            var entries = obj[ENTRIES_WORD] as *int
+            var sum = 0
+            var i = 0
+            while (i < cap) {
+                var k = entries[i * 2]
+                if (!isLiveKey(k)) {
+                    i = i + 1
+                    continue
+                }
+                let (kh, kc) = deepHash(k as *int, path)
+                let (vh, vc) = deepHash(entries[i * 2 + 1] as *int, path)
+                if (kc || vc) { cyclic = true }
+                sum = sum + kh
+                sum = sum + vh * GOLDEN
+                i = i + 1
+            }
+            h = mix(h, sum)
+        } else if (classId == PICKLE_CLASS_ENUM) {
+            h = mix(h, classId)
+            h = mix(h, obj[ENUM_TAG_WORD])
+            var n = enumFieldCount(obj)
+            var i = 0
+            while (i < n) {
+                let (eh, ec) = deepHash(obj[SLOT1_WORD + i] as *int, path)
+                h = mix(h, eh)
+                if (ec) { cyclic = true }
+                i = i + 1
+            }
+        } else if (classId == PICKLE_CLASS_TUPLE) {
+            // Ordered: arity and element order participate.
+            h = mix(h, classId)
+            var n = tupleFieldCount(obj)
+            h = mix(h, n)
+            var i = 0
+            while (i < n) {
+                let (eh, ec) = deepHash(obj[SLOT1_WORD + i] as *int, path)
+                h = mix(h, eh)
+                if (ec) { cyclic = true }
+                i = i + 1
+            }
+        } else {
+            // User class/struct/interface instance: class identity + slots.
+            h = mix(h, classId)
+            var size = obj[2]
+            if (size < HEADER || size >= MAX_PLAUSIBLE_SIZE) {
+                // Absurd size: a stale/reused key. Hash by identity so lookups miss.
+                return (identityHash(obj, classId), false)
+            }
+            var slots = (size - HEADER) / 8
+            var i = 0
+            while (i < slots) {
+                let (eh, ec) = deepHash(obj[SLOT0_WORD + i] as *int, path)
+                h = mix(h, eh)
+                if (ec) { cyclic = true }
+                i = i + 1
+            }
+        }
+
+        path.pop()
+        return (h, cyclic)
+    }
+}
+
+/// Hash a map key object. Mirrors `key_hash`.
+///
+/// Strings hash over their bytes and boxed scalars over `(class_id, payload)`, with
+/// `class_id` mixed in everywhere so equal payloads never collide across key types.
+/// Composite keys hash deeply. A key containing a cycle falls back to *root-identity*
+/// hashing -- identity is the one strength-safe semantics for cyclic structures.
+fn keyHash(key: *int) -> int {
+    unsafe {
+        var addr = key as int
+        // A `none` key (null outside, the KEY_NONE marker in the table) is one
+        // distinguished identity whose hash matches the fixed constant `deepHash`
+        // uses for a null slot, so none-as-key and none-nested are interchangeable.
+        if (isNoneKey(addr)) {
+            return GOLDEN
+        }
+        var classId = key[1]
+        if (classId == PICKLE_CLASS_STRING) {
+            return fnv1aStr(key)
+        }
+        if (isBoxClass(classId)) {
+            var h = FNV_OFFSET
+            h = mix(h, classId)
+            h = mix(h, boxBits(key))
+            return h
+        }
+        var path: List<int> = [0]
+        path.pop()
+        let (h, cyclic) = deepHash(key, path)
+        if (cyclic) {
+            return identityHash(key, classId)
+        }
+        return h
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Deep structural equality
+// ---------------------------------------------------------------------------
+
+/// Deep structural equality. `path` holds the ancestor `(a, b)` pairs, so cycles are
+/// detected rather than recursed forever (`CMP_CYCLIC`).
+fn deepEq(a: *int, b: *int, path: List<int>) -> int {
+    unsafe {
+        var aa = a as int
+        var bb = b as int
+        if (aa == bb) { return CMP_EQUAL }
+        // A `none` (null or marker) equals only itself.
+        if (isNoneKey(aa)) {
+            if (isNoneKey(bb)) { return CMP_EQUAL }
+            return CMP_DIFF
+        }
+        if (isNoneKey(bb)) { return CMP_DIFF }
+        if (pathHasPair(path, aa, bb)) { return CMP_CYCLIC }
+        path.push(aa)
+        path.push(bb)
+
+        var r = CMP_EQUAL
+        var classA = a[1]
+        if (classA != b[1]) {
+            r = CMP_DIFF
+        } else if (classA == PICKLE_CLASS_STRING) {
+            if (abiStrCmp(a, b) != 0) { r = CMP_DIFF }
+        } else if (isBoxClass(classA)) {
+            if (boxBits(a) != boxBits(b)) { r = CMP_DIFF }
+        } else if (classA == PICKLE_CLASS_LIST) {
+            var la = a[LIST_LEN_WORD]
+            if (la != b[LIST_LEN_WORD]) {
+                r = CMP_DIFF
+            } else {
+                var da = a[LIST_DATA_WORD] as *int
+                var db = b[LIST_DATA_WORD] as *int
+                var i = 0
+                while (i < la) {
+                    r = deepEq(da[i] as *int, db[i] as *int, path)
+                    if (r != CMP_EQUAL) { break }
+                    i = i + 1
+                }
+            }
+        } else if (classA == PICKLE_CLASS_MAP) {
+            r = deepEqMap(a, b, path)
+        } else if (classA == PICKLE_CLASS_ENUM) {
+            if (a[ENUM_TAG_WORD] != b[ENUM_TAG_WORD]) {
+                r = CMP_DIFF
+            } else {
+                var na = enumFieldCount(a)
+                if (na != enumFieldCount(b)) {
+                    r = CMP_DIFF
+                } else {
+                    var i = 0
+                    while (i < na) {
+                        r = deepEq(a[SLOT1_WORD + i] as *int, b[SLOT1_WORD + i] as *int, path)
+                        if (r != CMP_EQUAL) { break }
+                        i = i + 1
+                    }
+                }
+            }
+        } else if (classA == PICKLE_CLASS_TUPLE) {
+            var na = tupleFieldCount(a)
+            if (na != tupleFieldCount(b)) {
+                r = CMP_DIFF
+            } else {
+                var i = 0
+                while (i < na) {
+                    r = deepEq(a[SLOT1_WORD + i] as *int, b[SLOT1_WORD + i] as *int, path)
+                    if (r != CMP_EQUAL) { break }
+                    i = i + 1
+                }
+            }
+        } else {
+            // User class/struct/interface instance.
+            var na = 0
+            var nb = 0
+            var sa = a[2]
+            var sb = b[2]
+            if (sa > HEADER) { na = (sa - HEADER) / 8 }
+            if (sb > HEADER) { nb = (sb - HEADER) / 8 }
+            if (na != nb) {
+                r = CMP_DIFF
+            } else {
+                var i = 0
+                while (i < na) {
+                    r = deepEq(a[SLOT0_WORD + i] as *int, b[SLOT0_WORD + i] as *int, path)
+                    if (r != CMP_EQUAL) { break }
+                    i = i + 1
+                }
+            }
+        }
+
+        path.pop()
+        path.pop()
+        return r
+    }
+}
+
+/// Order-insensitive map equality: every live entry of `a` must match a *distinct*
+/// live entry of `b`. Mirrors the `PICKLE_CLASS_MAP` arm of `deep_eq`.
+fn deepEqMap(a: *int, b: *int, path: List<int>) -> int {
+    unsafe {
+        var la = a[LEN_WORD]
+        var lb = b[LEN_WORD]
+        if (la != lb) { return CMP_DIFF }
+        var capa = a[CAP_WORD]
+        var ea = a[ENTRIES_WORD] as *int
+        var capb = b[CAP_WORD]
+        var eb = b[ENTRIES_WORD] as *int
+
+        // `used[j]` marks entry `j` of `b` as already matched, so a duplicate in `a`
+        // cannot claim the same `b` entry twice.
+        var used: List<bool> = [false]
+        used.pop()
+        var f = 0
+        while (f < capb) {
+            used.push(false)
+            f = f + 1
+        }
+
+        var r = CMP_EQUAL
+        var i = 0
+        while (i < capa && r == CMP_EQUAL) {
+            var ka = ea[i * 2]
+            var va = ea[i * 2 + 1]
+            if (!isLiveKey(ka)) {
+                i = i + 1
+                continue
+            }
+            var found = false
+            var j = 0
+            while (j < capb) {
+                if (!used[j]) {
+                    var kb = eb[j * 2]
+                    var vb = eb[j * 2 + 1]
+                    if (isLiveKey(kb)) {
+                        let kr = deepEq(ka as *int, kb as *int, path)
+                        if (kr == CMP_EQUAL) {
+                            let vr = deepEq(va as *int, vb as *int, path)
+                            if (vr == CMP_EQUAL) {
+                                used[j] = true
+                                found = true
+                                j = capb
+                            } else if (vr != CMP_DIFF) {
+                                r = vr
+                                j = capb
+                            }
+                        } else if (kr != CMP_DIFF) {
+                            r = kr
+                            j = capb
+                        }
+                    }
+                }
+                j = j + 1
+            }
+            if (!found && r == CMP_EQUAL) { r = CMP_DIFF }
+            i = i + 1
+        }
+        return r
+    }
+}
+
+/// Are `a` and `b` the same key? Mirrors `key_eq`: matching class plus matching
+/// bytes/payload, compared deeply for composites. A cyclic key pair falls back to
+/// root identity (the same strength-safe semantics `keyHash` uses).
+fn keyEq(a: *int, b: *int) -> bool {
+    unsafe {
+        var aa = a as int
+        var bb = b as int
+        if (aa == bb) { return true }
+        // A `none` key equals only itself.
+        if (isNoneKey(aa) || isNoneKey(bb)) { return false }
+        var path: List<int> = [0]
+        path.pop()
+        return deepEq(a, b, path) == CMP_EQUAL
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Open-addressing table
+// ---------------------------------------------------------------------------
+
+/// Allocate a zeroed span of `words` words. Mirrors the
+/// `ptr::write_bytes(fresh, 0, ...)` that `map_new` and `rehash` perform.
+///
+/// This is NOT optional. `alloc` returns UNINITIALISED memory -- measured: a fresh
+/// `alloc(8)` reads back with all eight words non-zero, and `alloc(2048)` came back with
+/// 801 dirty words -- exactly like the native `heap::raw_alloc`, which also skips the
+/// zeroing. Native `map_new` and `rehash` therefore zero the table explicitly, because
+/// for an open-addressing table "this slot is empty" is a load-bearing invariant, not an
+/// aesthetic one: `entriesCount` counted 16 live entries on a brand-new map before this
+/// zeroing was added, so `needs_grow` fired immediately and `find_slot` walked into an
+/// unreadable key. Anything that wants an empty span has to ask for one.
+fn zeroed(words: int) -> *int {
+    unsafe {
+        var p = alloc(int, words)
+        var i = 0
+        while (i < words) {
+            p[i] = 0
+            i = i + 1
+        }
+        return p
+    }
+}
+
+/// Live entries in the table.
+fn entriesCount(entries: *int, cap: int) -> int {
+    unsafe {
+        var n = 0
+        var i = 0
+        while (i < cap) {
+            if (isLiveKey(entries[i * 2])) { n = n + 1 }
+            i = i + 1
+        }
+        return n
+    }
+}
+
+/// Slots that hold anything - a live entry or a tombstone. Growth must key off this,
+/// not the live count: a tombstone still consumes a probe slot, so a table whose live
+/// count is low but whose tombstones fill the array has no empty slot left and
+/// `findSlot` would probe forever. Counting tombstones here forces a rehash (which
+/// compacts them away) before that can happen.
+fn occupiedCount(entries: *int, cap: int) -> int {
+    unsafe {
+        var n = 0
+        var i = 0
+        while (i < cap) {
+            if (entries[i * 2] != KEY_EMPTY) { n = n + 1 }
+            i = i + 1
+        }
+        return n
+    }
+}
+
+/// Does the table need to grow before the next insert? Mirrors `needs_grow`: at
+/// `(occupied + 1) >= cap * MAX_LOAD`, where `occupied` counts live entries AND
+/// tombstones.
+fn needsGrow(entries: *int, cap: int) -> bool {
+    var occupied = occupiedCount(entries, cap)
+    return (occupied as float + 1.0) >= (cap as float * MAX_LOAD)
+}
+
+/// Locate `key` in `entries`. Returns `(slot, found)`: on a miss the slot is either an
+/// empty one or the first tombstone passed, whichever comes first. Mirrors `find_slot`.
+fn findSlot(entries: *int, cap: int, key: *int, h: int) -> (int, bool) {
+    unsafe {
+        var mask = cap - 1
+        var idx = h & mask
+        var firstTomb = -1
+        while (true) {
+            var slot = idx * 2
+            var k = entries[slot]
+            if (k == KEY_EMPTY) {
+                var target = slot
+                if (firstTomb >= 0) { target = firstTomb }
+                return (target, false)
+            }
+            if (isTombstone(k)) {
+                if (firstTomb < 0) { firstTomb = slot }
+            } else if (keyEq(k as *int, key)) {
+                return (slot, true)
+            }
+            idx = (idx + 1) & mask
+        }
+    }
+}
+
+/// Re-probe every live entry into a table of `newCap` slots. Mirrors `rehash`; the old
+/// table is abandoned rather than freed (`alloc` has no free -- see the module doc).
+fn rehash(oldEntries: *int, oldCap: int, newCap: int) -> *int {
+    unsafe {
+        var fresh = zeroed(newCap * 2)
+        var i = 0
+        while (i < oldCap) {
+            var k = oldEntries[i * 2]
+            if (isLiveKey(k)) {
+                var h = keyHash(k as *int)
+                let (slot, _) = findSlot(fresh, newCap, k as *int, h)
+                fresh[slot] = k
+                fresh[slot + 1] = oldEntries[i * 2 + 1]
+            }
+            i = i + 1
+        }
+        return fresh
+    }
+}
+
+/// Create an empty map. Mirrors `map_new`: the requested capacity is floored at
+/// `INITIAL_CAP` and rounded up to a power of two, which `findSlot`'s
+/// `idx & (cap - 1)` masking requires.
+fn mapNew(cap: int) -> *int {
+    unsafe {
+        var c = cap
+        if (c < INITIAL_CAP) { c = INITIAL_CAP }
+        c = nextPow2(c)
+        var obj = alloc(int, MAP_OBJECT_SIZE / 8)
+        obj[0] = 0
+        obj[1] = PICKLE_CLASS_MAP
+        obj[2] = MAP_OBJECT_SIZE
+        obj[LEN_WORD] = 0
+        obj[CAP_WORD] = c
+        obj[ENTRIES_WORD] = zeroed(c * 2) as int
+        abiRegisterObject(obj)
+        return obj
+    }
+}
+
+/// Insert `key -> value`, returning the previous value if any. Mirrors `map_set`.
+///
+/// Only a *null* key is translated to the `none` marker -- there is no other way for a
+/// caller to present one.
+fn mapSet(map: *int, key: *int, value: *int) -> *int {
+    unsafe {
+        var k = key as int
+        if (k == KEY_EMPTY) { k = KEY_NONE }
+        var h = keyHash(k as *int)
+        if (needsGrow(map[ENTRIES_WORD] as *int, map[CAP_WORD])) {
+            var newCap = map[CAP_WORD] * 2
+            map[ENTRIES_WORD] = rehash(map[ENTRIES_WORD] as *int, map[CAP_WORD], newCap) as int
+            map[CAP_WORD] = newCap
+        }
+        var entries = map[ENTRIES_WORD] as *int
+        let (slot, found) = findSlot(entries, map[CAP_WORD], k as *int, h)
+        var old = entries[slot + 1] as *int
+        entries[slot] = k
+        entries[slot + 1] = value as int
+        if (!found) {
+            map[LEN_WORD] = map[LEN_WORD] + 1
+        }
+        return old
+    }
+}
+
+/// Look up `key`; null when absent. Mirrors `map_get`, including its bounded probe:
+/// at most `cap` steps, so a corrupted key chain cannot spin forever.
+fn mapGet(map: *int, key: *int) -> *int {
+    unsafe {
+        var k = key as int
+        if (k == KEY_EMPTY) { k = KEY_NONE }
+        var h = keyHash(k as *int)
+        var cap = map[CAP_WORD]
+        var mask = cap - 1
+        var idx = h & mask
+        var probes = 0
+        var entries = map[ENTRIES_WORD] as *int
+        while (probes < cap) {
+            var slot = idx * 2
+            var sk = entries[slot]
+            if (sk == KEY_EMPTY) { return 0 as *int }
+            if (isLiveKey(sk) && keyEq(sk as *int, k as *int)) {
+                return entries[slot + 1] as *int
+            }
+            idx = (idx + 1) & mask
+            probes = probes + 1
+        }
+        return 0 as *int
+    }
+}
+
+/// Remove `key`, returning the removed value when present else null. Mirrors
+/// `map_remove`: the slot keeps its position and becomes a tombstone, which is what
+/// keeps the probe chains of the entries after it intact.
+fn mapRemove(map: *int, key: *int) -> *int {
+    unsafe {
+        var k = key as int
+        if (k == KEY_EMPTY) { k = KEY_NONE }
+        var h = keyHash(k as *int)
+        var cap = map[CAP_WORD]
+        var mask = cap - 1
+        var idx = h & mask
+        var probes = 0
+        var entries = map[ENTRIES_WORD] as *int
+        while (probes < cap) {
+            var slot = idx * 2
+            var sk = entries[slot]
+            if (sk == KEY_EMPTY) { return 0 as *int }
+            if (isLiveKey(sk) && keyEq(sk as *int, k as *int)) {
+                var v = entries[slot + 1] as *int
+                entries[slot] = KEY_TOMBSTONE
+                entries[slot + 1] = KEY_EMPTY
+                map[LEN_WORD] = map[LEN_WORD] - 1
+                return v
+            }
+            idx = (idx + 1) & mask
+            probes = probes + 1
+        }
+        return 0 as *int
+    }
+}
+
+/// Materialize the live keys (or values) as a fresh `List`. Mirrors `map_snapshot`.
+fn mapSnapshot(map: *int, wantKeys: bool) -> *int {
+    unsafe {
+        var l = abiListNew(0)
+        var cap = map[CAP_WORD]
+        var entries = map[ENTRIES_WORD] as *int
+        var i = 0
+        while (i < cap) {
+            var k = entries[i * 2]
+            if (!isLiveKey(k)) {
+                i = i + 1
+                continue
+            }
+            var val = 0 as *int
+            if (wantKeys) {
+                // A stored `none` key is the marker; surface it as null, the runtime
+                // representation the compiler expects for `T?`.
+                if (k == KEY_NONE) { val = 0 as *int } else { val = k as *int }
+            } else {
+                val = entries[i * 2 + 1] as *int
+            }
+            abiListPush(l, val)
+            i = i + 1
+        }
+        return l
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ABI entry points
+// ---------------------------------------------------------------------------
+
+/// Create an empty map. Mirrors `pickle_map_new(cap)`.
+#[symbol("pickle_map_new")]
+fn abiMapNew(cap: int) -> *int {
+    return mapNew(cap)
+}
+
+/// Insert `key -> value`. Mirrors `pickle_map_set`, which discards the previous value.
+#[symbol("pickle_map_set")]
+fn abiMapSet(map: *int, key: *int, value: *int) {
+    mapSet(map, key, value)
+}
+
+/// Look up `key`, returning `default` when absent instead of null so compiled
+/// `T?`-less call sites get a real object. Mirrors `pickle_map_get_boxed`.
+#[symbol("pickle_map_get_boxed")]
+fn abiMapGetBoxed(map: *int, key: *int, default: *int) -> *int {
+    var got = mapGet(map, key)
+    if ((got as int) == KEY_EMPTY) { return default }
+    return got
+}
+
+/// Look up `key`; null when absent. Mirrors `pickle_map_get`.
+#[symbol("pickle_map_get")]
+fn abiMapGet(map: *int, key: *int) -> *int {
+    return mapGet(map, key)
+}
+
+/// Whether `key` is present. Mirrors `pickle_map_has`.
+#[symbol("pickle_map_has")]
+fn abiMapHas(map: *int, key: *int) -> bool {
+    return (mapGet(map, key) as int) != KEY_EMPTY
+}
+
+/// Remove `key`; the removed value when present, else null -- exactly the `T?`
+/// option representation. Mirrors `pickle_map_remove`.
+#[symbol("pickle_map_remove")]
+fn abiMapRemove(map: *int, key: *int) -> *int {
+    return mapRemove(map, key)
+}
+
+/// Number of live entries. Mirrors `pickle_map_len`.
+#[symbol("pickle_map_len")]
+fn abiMapLen(map: *int) -> int {
+    unsafe { return map[LEN_WORD] }
+}
+
+/// All live keys as a fresh `List`. Mirrors `pickle_map_keys`.
+#[symbol("pickle_map_keys")]
+fn abiMapKeys(map: *int) -> *int {
+    return mapSnapshot(map, true)
+}
+
+/// All live values as a fresh `List`. Mirrors `pickle_map_values`.
+#[symbol("pickle_map_values")]
+fn abiMapValues(map: *int) -> *int {
+    return mapSnapshot(map, false)
+}

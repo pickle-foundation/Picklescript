@@ -1,0 +1,738 @@
+module compiler.pelink
+
+import { CoffObj, CoffSym } from compiler.objread
+import { u16Blob, u32wBlob } from compiler.coff
+import { OrderedMap } from std.collections.orderedmap
+
+class FailBox {
+    var text: string
+
+    constructor() {
+        this.text = ""
+    }
+}
+
+fn hex8(v: int) -> string {
+    var h = "0123456789abcdef"
+    var t = ""
+    var x = v
+    if (x < 0) {
+        x = x + 0x100000000
+    }
+    var n = 0
+    while (n <= 7) {
+        t = chr(h[((x >> (4 * n)) & 15) as int] as int) + t
+        n = n + 1
+    }
+    t
+}
+
+fn algn(n: int, a: int) -> int {
+    if ((n % a) == 0) {
+        return n
+    }
+    ((n / a) + 1) * a
+}
+
+fn pushByte(bs: List<int>, v: int) {
+    bs.push(v & 255)
+}
+
+fn push64(bs: List<int>, v: int) {
+    var i = 0
+    while (i < 8) {
+        bs.push((v >> (8 * i)) & 255)
+        i = i + 1
+    }
+}
+
+fn write64(bs: List<int>, at: int, v: int) {
+    var i = 0
+    while (i < 8) {
+        bs[at + i] = (v >> (8 * i)) & 255
+        i = i + 1
+    }
+}
+
+fn write32(bs: List<int>, at: int, v: int) {
+    var i = 0
+    while (i < 4) {
+        bs[at + i] = (v >> (8 * i)) & 255
+        i = i + 1
+    }
+}
+
+fn read32s(bs: List<int>, at: int) -> int {
+    var v = 0
+    var i = 0
+    while (i < 4) {
+        v = v | (bs[at + i] << (8 * i))
+        i = i + 1
+    }
+    if (v >= 0x80000000) {
+        v = v - 0x100000000
+    }
+    return v
+}
+
+fn zerosInts(n: int) -> List<int> {
+    var l = [0]
+    l.pop()
+    var i = 0
+    while (i < n) {
+        l.push(0)
+        i = i + 1
+    }
+    l
+}
+
+fn startupBytes() -> List<int> {
+    var b = [0]
+    b.pop()
+    let push = fn(xs: List<int>, v: int) -> void {
+        xs.push(v)
+    }
+    push(b, 0x48)
+    push(b, 0x83)
+    push(b, 0xEC)
+    push(b, 0x28)
+    push(b, 0x49)
+    push(b, 0xBA)
+    push64(b, 0)
+    push(b, 0x41)
+    push(b, 0xFF)
+    push(b, 0xD2)
+    push(b, 0x31)
+    push(b, 0xC9)
+    push(b, 0x49)
+    push(b, 0xBA)
+    push64(b, 0)
+    push(b, 0x41)
+    push(b, 0xFF)
+    push(b, 0xD2)
+    push(b, 0x49)
+    push(b, 0xBA)
+    push64(b, 0)
+    push(b, 0x41)
+    push(b, 0xFF)
+    push(b, 0xD2)
+    push(b, 0x31)
+    push(b, 0xC9)
+    push(b, 0x49)
+    push(b, 0xBA)
+    push64(b, 0)
+    push(b, 0x41)
+    push(b, 0xFF)
+    push(b, 0x12)
+    b
+}
+
+fn importIndex(m: OrderedMap<string, int>, nm: string) -> int {
+    if (let some(v) = m.get(nm)) {
+        return v
+    }
+    -1
+}
+
+fn isCrtImp(nm: string) -> bool {
+    if (nm == "memcpy") {
+        return true
+    }
+    if (nm == "memmove") {
+        return true
+    }
+    if (nm == "memset") {
+        return true
+    }
+    if (nm == "memcmp") {
+        return true
+    }
+    false
+}
+
+fn isShellImp(nm: string) -> bool {
+    if (nm == "CommandLineToArgvW") {
+        return true
+    }
+    false
+}
+
+fn secChars(nm: string, isBss: bool) -> int {
+    if (len(nm) >= 5 && sliceRange(nm, 0, 5) == ".text") {
+        return 0x60000020
+    }
+    if (len(nm) >= 6 && sliceRange(nm, 0, 6) == ".rdata") {
+        return 0x40000040
+    }
+    if (isBss) {
+        0xC0000080
+    } else {
+        0xC0000040
+    }
+}
+
+fn pushAscii(bs: List<int>, s: string) {
+    var i = 0
+    while (i < len(s)) {
+        bs.push(s[i] as int)
+        i = i + 1
+    }
+}
+
+fn findSym(ob: CoffObj, nm: string) -> int {
+    var i = 0
+    while (i < len(ob.syms)) {
+        if (ob.syms[i].name == nm) {
+            return i
+        }
+        i = i + 1
+    }
+    -1
+}
+
+fn secHdr(hd: List<int>, off: int, nm: string, virtSz: int, virtAddr: int, sizeRaw: int, ptrRaw: int, chars: int) {
+    var k = 0
+    while (k < 8) {
+        if (k < len(nm)) {
+            hd[off + k] = nm[k] as int
+        } else {
+            hd[off + k] = 0
+        }
+        k = k + 1
+    }
+    u32wBlob(hd, off + 8, virtSz)
+    u32wBlob(hd, off + 12, virtAddr)
+    u32wBlob(hd, off + 16, sizeRaw)
+    u32wBlob(hd, off + 20, ptrRaw)
+    u32wBlob(hd, off + 24, 0)
+    u32wBlob(hd, off + 28, 0)
+    u16Blob(hd, off + 32, 0)
+    u16Blob(hd, off + 34, 0)
+    u32wBlob(hd, off + 36, chars)
+}
+
+fn buildExe(ob: CoffObj, mainName: string, fb: FailBox) -> List<int>? {
+    let imageBase = 0x140000000
+    let textRva = 0x1000
+    if (len(ob.secs) < 1 || ob.secs[0].name != ".text") {
+        fb.text = "merged sections missing .text first"
+        return none
+    }
+    var pre = startupBytes()
+    var preText = algn(len(pre), 16)
+
+    var thunkOff = OrderedMap<string, int>("", 0)
+    var ri0 = 0
+    while (ri0 < len(ob.secs)) {
+        let csT = ob.secs[ri0]
+        if (len(csT.raw) > 0 || csT.isBss) {
+            var rr0 = 0
+            while (rr0 < len(csT.relocs)) {
+                let rl0 = csT.relocs[rr0]
+                if (let some(sy0) = symByIdx(ob, rl0.symIdx)) {
+                    if (sy0.sec == 0 && len(sy0.name) >= 6 && sliceRange(sy0.name, 0, 6) == "__imp_") {
+                        let imp0 = sliceRange(sy0.name, 6, len(sy0.name))
+                        if (isCrtImp(imp0) && !thunkOff.has(sy0.name)) {
+                            thunkOff.set(sy0.name, len(ob.secs[0].raw))
+                            ob.secs[0].raw.push(255)
+                            ob.secs[0].raw.push(37)
+                            ob.secs[0].raw.push(0)
+                            ob.secs[0].raw.push(0)
+                            ob.secs[0].raw.push(0)
+                            ob.secs[0].raw.push(0)
+                        }
+                    }
+                }
+                rr0 = rr0 + 1
+            }
+        }
+        ri0 = ri0 + 1
+    }
+
+    var sectionCount = 1
+    var ri = 0
+    while (ri < len(ob.secs)) {
+        let cs = ob.secs[ri]
+        if (len(cs.raw) > 0 || cs.isBss) {
+            sectionCount = sectionCount + 1
+        }
+        ri = ri + 1
+    }
+
+    var secRva = zerosInts(len(ob.secs))
+    var secOff = zerosInts(len(ob.secs))
+    var secFileSize = zerosInts(len(ob.secs))
+    var cursorRva = textRva
+    var cursorFile = 0
+    ri = 0
+    while (ri < len(ob.secs)) {
+        let cs = ob.secs[ri]
+        if (len(cs.raw) > 0 || cs.isBss) {
+            var content = len(cs.raw)
+            if (ri == 0) {
+                content = preText + content
+            }
+            cursorRva = algn(cursorRva, 0x1000)
+            secRva[ri] = cursorRva
+            if (cs.isBss) {
+                var spanRva = algn(cs.sizeVirt, 0x1000)
+                if (spanRva == 0) {
+                    spanRva = 0x1000
+                }
+                cursorRva = cursorRva + spanRva
+            } else {
+                cursorRva = cursorRva + algn(content, 0x1000)
+                secOff[ri] = cursorFile
+                secFileSize[ri] = algn(content, 0x200)
+                cursorFile = cursorFile + secFileSize[ri]
+            }
+        }
+        ri = ri + 1
+    }
+    if (secRva[0] == 0) {
+        fb.text = "text section empty"
+        return none
+    }
+    let importsRva = cursorRva
+    let importsFileOff = cursorFile
+
+    var imports = [""]
+    imports.pop()
+    imports.push("ExitProcess")
+    let importIndexMap = OrderedMap<string, int>("", 0)
+    importIndexMap.set("ExitProcess", 0)
+    ri = 0
+    while (ri < len(ob.secs)) {
+        let cs = ob.secs[ri]
+        if (len(cs.raw) > 0 || cs.isBss) {
+            var rr = 0
+            while (rr < len(cs.relocs)) {
+                let rl = cs.relocs[rr]
+                if (let some(sy) = symByIdx(ob, rl.symIdx)) {
+                    if (sy.sec == 0) {
+                        let nm = sy.name
+                        if (len(nm) >= 6 && sliceRange(nm, 0, 6) == "__imp_") {
+                            let imp = sliceRange(nm, 6, len(nm))
+                            if (!importIndexMap.has(imp)) {
+                                importIndexMap.set(imp, len(imports))
+                                imports.push(imp)
+                            }
+                        } else {
+                            fb.text = "unresolved extern " + nm
+                            return none
+                        }
+                    }
+                }
+                rr = rr + 1
+            }
+        }
+        ri = ri + 1
+    }
+    let importCount = len(imports)
+
+    var kernNames = [""]
+    kernNames.pop()
+    var crtNames = [""]
+    crtNames.pop()
+    var shellNames = [""]
+    shellNames.pop()
+    var im = 0
+    while (im < importCount) {
+        let n2 = imports[im]
+        if (isCrtImp(n2)) {
+            crtNames.push(n2)
+        } else if (isShellImp(n2)) {
+            shellNames.push(n2)
+        } else {
+            kernNames.push(n2)
+        }
+        im = im + 1
+    }
+    var dlls = [""]
+    dlls.pop()
+    if (len(kernNames) > 0) {
+        dlls.push("KERNEL32.dll")
+    }
+    if (len(shellNames) > 0) {
+        dlls.push("SHELL32.dll")
+    }
+    if (len(crtNames) > 0) {
+        dlls.push("VCRUNTIME140.dll")
+    }
+    let dllCount = len(dlls)
+
+    var idata = [0]
+    idata.pop()
+    var d = 0
+    while (d < 20 * (dllCount + 1)) {
+        idata.push(0)
+        d = d + 1
+    }
+    let hintRva = OrderedMap<string, int>("", 0)
+    let iatSlot = OrderedMap<string, int>("", 0)
+    let dllIatBase = OrderedMap<string, int>("", 0)
+    var di = 0
+    while (di < dllCount) {
+        var grp = [""]
+        grp.pop()
+        if (dlls[di] == "KERNEL32.dll") {
+            var g0 = 0
+            while (g0 < len(kernNames)) {
+                grp.push(kernNames[g0])
+                g0 = g0 + 1
+            }
+        } else if (dlls[di] == "SHELL32.dll") {
+            var gs0 = 0
+            while (gs0 < len(shellNames)) {
+                grp.push(shellNames[gs0])
+                gs0 = gs0 + 1
+            }
+        } else {
+            var g1 = 0
+            while (g1 < len(crtNames)) {
+                grp.push(crtNames[g1])
+                g1 = g1 + 1
+            }
+        }
+        var h2 = 0
+        while (h2 < len(grp)) {
+            let nm = grp[h2]
+            hintRva.set(nm, len(idata))
+            idata.push(0)
+            idata.push(0)
+            pushAscii(idata, nm)
+            idata.push(0)
+            while ((len(idata) % 8) != 0) {
+                idata.push(0)
+            }
+            h2 = h2 + 1
+        }
+        dllIatBase.set(dlls[di], len(idata))
+        h2 = 0
+        while (h2 < len(grp)) {
+            iatSlot.set(grp[h2], len(idata))
+            push64(idata, 0)
+            h2 = h2 + 1
+        }
+        push64(idata, 0)
+        di = di + 1
+    }
+    let dllNameRva = OrderedMap<string, int>("", 0)
+    var dn = 0
+    while (dn < dllCount) {
+        dllNameRva.set(dlls[dn], len(idata))
+        pushAscii(idata, dlls[dn])
+        idata.push(0)
+        dn = dn + 1
+    }
+    let importsSize = len(idata)
+    var pv = 0
+    while (pv < len(kernNames)) {
+        let nm2 = kernNames[pv]
+        if (let some(sl) = iatSlot.get(nm2)) {
+            if (let some(hr) = hintRva.get(nm2)) {
+                write64(idata, sl, importsRva + hr)
+            }
+        }
+        pv = pv + 1
+    }
+    pv = 0
+    while (pv < len(crtNames)) {
+        let nm2 = crtNames[pv]
+        if (let some(sl) = iatSlot.get(nm2)) {
+            if (let some(hr) = hintRva.get(nm2)) {
+                write64(idata, sl, importsRva + hr)
+            }
+        }
+        pv = pv + 1
+    }
+    pv = 0
+    while (pv < len(shellNames)) {
+        let nm2 = shellNames[pv]
+        if (let some(sl) = iatSlot.get(nm2)) {
+            if (let some(hr) = hintRva.get(nm2)) {
+                write64(idata, sl, importsRva + hr)
+            }
+        }
+        pv = pv + 1
+    }
+    var dzi = 0
+    while (dzi < dllCount) {
+        if (let some(ib) = dllIatBase.get(dlls[dzi])) {
+            if (let some(dv) = dllNameRva.get(dlls[dzi])) {
+                u32wBlob(idata, 20 * dzi, importsRva + ib)
+                u32wBlob(idata, 20 * dzi + 12, importsRva + dv)
+                u32wBlob(idata, 20 * dzi + 16, importsRva + ib)
+            }
+        }
+        dzi = dzi + 1
+    }
+    let importsFileSize = algn(importsSize, 0x200)
+
+    var body = [0]
+    body.pop()
+    var b = 0
+    while (b < preText) {
+        if (b < len(pre)) {
+            body.push(pre[b])
+        } else {
+            body.push(0)
+        }
+        b = b + 1
+    }
+    ri = 0
+    while (ri < len(ob.secs)) {
+        let cs = ob.secs[ri]
+        if (!cs.isBss && len(cs.raw) > 0) {
+            while (len(body) < secOff[ri]) {
+                body.push(0)
+            }
+            var bb = 0
+            while (bb < len(cs.raw)) {
+                body.push(cs.raw[bb])
+                bb = bb + 1
+            }
+            while (len(body) < secOff[ri] + secFileSize[ri]) {
+                body.push(0)
+            }
+        }
+        ri = ri + 1
+    }
+    while (len(body) < importsFileOff) {
+        body.push(0)
+    }
+    while (len(body) < importsFileOff + importsFileSize) {
+        body.push(0)
+    }
+    var b2 = 0
+    while (b2 < importsSize) {
+        body[importsFileOff + b2] = idata[b2]
+        b2 = b2 + 1
+    }
+
+    let initIdx = findSym(ob, "pickle_runtime_init")
+    let mainIdx = findSym(ob, mainName)
+    let flushIdx = findSym(ob, "pickle_flush")
+    if (initIdx < 0 || mainIdx < 0 || flushIdx < 0) {
+        fb.text = "missing startup symbol"
+        return none
+    }
+    let initVa = imageBase + secRva[0] + preText + ob.syms[initIdx].value
+    let mainVa = imageBase + secRva[0] + preText + ob.syms[mainIdx].value
+    let flushVa = imageBase + secRva[0] + preText + ob.syms[flushIdx].value
+    write64(body, 6, initVa)
+    write64(body, 21, mainVa)
+    write64(body, 34, flushVa)
+    let ex = importIndex(importIndexMap, "ExitProcess")
+    if (ex < 0) {
+        fb.text = "no ExitProcess import"
+        return none
+    }
+    if (let some(es) = iatSlot.get("ExitProcess")) {
+        write64(body, 49, imageBase + importsRva + es)
+    }
+
+    ri = 0
+    while (ri < len(ob.secs)) {
+        let cs = ob.secs[ri]
+        if (len(cs.raw) > 0 || cs.isBss) {
+            var rr = 0
+            while (rr < len(cs.relocs)) {
+                let rl = cs.relocs[rr]
+                var textPad = 0
+                if (ri == 0) {
+                    textPad = preText
+                }
+                let site = secOff[ri] + textPad + rl.va
+                let siteAbs = imageBase + secRva[ri] + textPad + rl.va
+                var tgt = 0
+                var ok = false
+                if (let some(sy) = symByIdx(ob, rl.symIdx)) {
+                    if (sy.sec >= 1 && sy.sec <= len(ob.secs)) {
+                        if (secRva[sy.sec - 1] != 0) {
+                            var tw = sy.value
+                            if (sy.sec - 1 == 0) {
+                                tw = tw + preText
+                            }
+                            tgt = imageBase + secRva[sy.sec - 1] + tw
+                            ok = true
+                        }
+                    } else if (sy.sec == 0) {
+                        if (len(sy.name) >= 6 && sliceRange(sy.name, 0, 6) == "__imp_") {
+                            let imp = sliceRange(sy.name, 6, len(sy.name))
+                            if (isCrtImp(imp)) {
+                                if (let some(to2) = thunkOff.get(sy.name)) {
+                                    if (let some(sl) = iatSlot.get(imp)) {
+                                        let ta = imageBase + secRva[0] + preText + to2
+                                        write32(body, secOff[0] + preText + to2 + 2, (imageBase + importsRva + sl) - (ta + 6))
+                                        tgt = ta
+                                        ok = true
+                                    }
+                                }
+                            } else {
+                                if (let some(sl) = iatSlot.get(imp)) {
+                                    tgt = imageBase + importsRva + sl
+                                    ok = true
+                                }
+                            }
+                        }
+                    }
+                }
+                if (!ok) {
+                    fb.text = "reloc target unresolved"
+                    return none
+                }
+                if (rl.type == 1) {
+                    write64(body, site, tgt)
+                } else if (rl.type == 4) {
+                    write32(body, site, tgt + read32s(body, site) - (siteAbs + 4))
+                } else if (rl.type == 3) {
+                    u32wBlob(body, site, tgt - imageBase)
+                } else {
+                    fb.text = "unsupported reloc type " + str(rl.type)
+                    return none
+                }
+                rr = rr + 1
+            }
+        }
+        ri = ri + 1
+    }
+
+    let textSz = secFileSize[0]
+    var initDataSize = 0
+    var uninitDataSize = 0
+    ri = 0
+    while (ri < len(ob.secs)) {
+        let cs = ob.secs[ri]
+        if (len(cs.raw) > 0 || cs.isBss) {
+            if (ri != 0 && !cs.isBss) {
+                initDataSize = initDataSize + secFileSize[ri]
+            }
+            if (cs.isBss) {
+                uninitDataSize = uninitDataSize + cs.sizeVirt
+            }
+        }
+        ri = ri + 1
+    }
+    initDataSize = initDataSize + importsFileSize
+    let sizeOfImage = algn(importsRva + algn(importsSize, 0x1000), 0x1000)
+
+    var head = [0]
+    head.pop()
+    var headSz = 0x188 + 40 * sectionCount
+    if (headSz < 0x200) {
+        headSz = 0x200
+    }
+    let headerSize = algn(headSz, 0x200)
+    var h = 0
+    while (h < headerSize) {
+        head.push(0)
+        h = h + 1
+    }
+
+    head[0] = 0x4D
+    head[1] = 0x5A
+    u32wBlob(head, 0x3C, 0x80)
+    head[0x80] = 0x50
+    head[0x81] = 0x45
+    u16Blob(head, 0x84, 0x8664)
+    u16Blob(head, 0x86, sectionCount)
+    u32wBlob(head, 0x88, 0)
+    u32wBlob(head, 0x8C, 0)
+    u32wBlob(head, 0x90, 0)
+    u16Blob(head, 0x94, 0xF0)
+    u16Blob(head, 0x96, 0x0022)
+
+    u16Blob(head, 0x98, 0x20B)
+    head[0x9A] = 14
+    head[0x9B] = 0
+    u32wBlob(head, 0x9C, textSz)
+    u32wBlob(head, 0xA0, initDataSize)
+    u32wBlob(head, 0xA4, uninitDataSize)
+    u32wBlob(head, 0xA8, textRva)
+    u32wBlob(head, 0xAC, textRva)
+    write64(head, 0xB0, imageBase)
+    u32wBlob(head, 0xB8, 0x1000)
+    u32wBlob(head, 0xBC, 0x200)
+    u16Blob(head, 0xC0, 6)
+    u16Blob(head, 0xC2, 0)
+    u16Blob(head, 0xC4, 0)
+    u16Blob(head, 0xC6, 0)
+    u16Blob(head, 0xC8, 6)
+    u16Blob(head, 0xCA, 0)
+    u32wBlob(head, 0xCC, 0)
+    u32wBlob(head, 0xD0, sizeOfImage)
+    u32wBlob(head, 0xD4, headerSize)
+    u32wBlob(head, 0xD8, 0)
+    u16Blob(head, 0xDC, 3)
+    u16Blob(head, 0xDE, 0)
+    // Stack reserve/commit. Pickle's lowering is recursive and its per-function
+    // frames are large (every managed value needs a GC root cell), so the
+    // linker's 1 MiB default runs out while compiling even small programs. The
+    // reserve is address space only and costs nothing until touched. Keep this
+    // in step with STACK_RESERVE/STACK_COMMIT in cli/src/build.rs.
+    write64(head, 0xE0, 0x10000000)
+    write64(head, 0xE8, 0x100000)
+    write64(head, 0xF0, 0x100000)
+    write64(head, 0xF8, 0x1000)
+    u32wBlob(head, 0x100, 0)
+    u32wBlob(head, 0x104, 16)
+    u32wBlob(head, 0x110, importsRva)
+    u32wBlob(head, 0x114, 20 * (dllCount + 1))
+
+    var headerCount = 0
+    var hDst = 0x188
+    ri = 0
+    while (ri < len(ob.secs)) {
+        let cs = ob.secs[ri]
+        if (len(cs.raw) > 0 || cs.isBss) {
+            var hVirtSz = len(cs.raw)
+            if (ri == 0) {
+                hVirtSz = preText + hVirtSz
+            }
+            if (cs.isBss) {
+                hVirtSz = cs.sizeVirt
+            }
+            var hRawSz = secFileSize[ri]
+            var hPtr = 0
+            if (!cs.isBss) {
+                hPtr = secOff[ri] + headerSize
+            }
+            secHdr(head, hDst, cs.name, hVirtSz, secRva[ri], hRawSz, hPtr, secChars(cs.name, cs.isBss))
+            hDst = hDst + 40
+            headerCount = headerCount + 1
+        }
+        ri = ri + 1
+    }
+    secHdr(head, hDst, ".idata", importsSize, importsRva, importsFileSize, importsFileOff + headerSize, 0xC0000040)
+    headerCount = headerCount + 1
+    if (headerCount != sectionCount) {
+        fb.text = "section count mismatch"
+        return none
+    }
+
+    var out = [0]
+    out.pop()
+    var w = 0
+    while (w < len(head)) {
+        out.push(head[w])
+        w = w + 1
+    }
+    w = 0
+    while (w < len(body)) {
+        out.push(body[w])
+        w = w + 1
+    }
+    out
+}
+
+fn symByIdx(ob: CoffObj, rawIdx: int) -> CoffSym? {
+    if (!(rawIdx >= 0) || rawIdx >= len(ob.mapIdx)) {
+        return none
+    }
+    let c = ob.mapIdx[rawIdx]
+    if (!(c >= 0) || c >= len(ob.syms)) {
+        return none
+    }
+    ob.syms[c]
+}

@@ -1,0 +1,43 @@
+module cli.dbgfrontmain
+
+import { DiagnosticSink } from compiler.diag
+import { frontend } from compiler.front
+import { emitIr } from compiler.emit
+import { irModuleStr, irxModuleStr } from compiler.ir
+
+fn severityName(s: Severity) -> string {
+    if (s == Severity.Error) {
+        return "Error"
+    }
+    "Warning"
+}
+
+fn main() {
+    let target = "pickle/cli/main.pkl"
+    if (let some(src) = read_file(target)) {
+        let sinks = DiagnosticSink()
+        if (let some(l) = frontend(target, src, sinks)) {
+            println("FRONT OK: " + target)
+            if (let some(m) = emitIr(l.program, l.resolved, sinks)) {
+                println("EMIT OK ir=" + "{len(irModuleStr(m))}" + " irx=" + "{len(irxModuleStr(m))}")
+            } else {
+                println("EMIT FAIL: " + target)
+            }
+        } else {
+            println("FRONT FAIL: " + target)
+        }
+        let ds = sinks.diagnostics
+        var i = 0
+        while (i < len(ds)) {
+            var sp = "0,0"
+            if (let some(s2) = ds[i].span) {
+                sp = "{s2.start},{s2.end}"
+            }
+            println(severityName(ds[i].severity) + ": " + ds[i].message + " @span(" + sp + ")")
+            i = i + 1
+        }
+        println("DIAGCOUNT=" + str(len(ds)))
+    } else {
+        println("NO FILE: " + target)
+    }
+}

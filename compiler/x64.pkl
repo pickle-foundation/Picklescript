@@ -1,0 +1,1847 @@
+module compiler.x64
+
+import { Diagnostic, DiagnosticSink, Span } from compiler.diag
+import { Callee, IrBlock, IrFunc, IrModule, IrTy, IrConst, IrUnOp, IrBinOp, IrInstr, IrTerm, emptyIrTys, irTyStr } from compiler.ir
+import { sliceRange } from std.text.format
+
+const SHADOW_HEADER_BYTES: int = 16
+const CELL_BYTES: int = 8
+const CALL_SHADOW_BYTES: int = 32
+
+/// The tag the emitter stamps into the high byte of a shadow frame's word 1,
+/// next to the masked `ncells`: `(SHADOW_FRAME_TAG << 56) | (totalK << 32) |
+/// ncells`. The collector reads `totalK` back to conservatively scan the frame's
+/// unmanaged local area, which the cell walk alone cannot see. Keep in step with
+/// `abi_gcengine.pkl`'s copies.
+const SHADOW_FRAME_TAG: int = 90
+const SHADOW_TAG_SHIFT: int = 56
+
+/// The linked module's entry point. Every path out of this function is a place a
+/// throw can escape the program, so each one is where the backend reports it.
+const ENTRY_SYMBOL: string = "pickle_main"
+
+/// ABI: report a throw that escaped the program, and exit 1. A no-op when
+/// nothing escaped, so a program that threw nothing only pays a flag read.
+const EXC_UNCAUGHT: string = "pickle_exc_uncaught"
+
+fn isManaged(t: IrTy) -> bool {
+    match (t) {
+        case IrTy.Str -> true
+        case IrTy.Ptr -> true
+        case IrTy.Int -> false
+        case IrTy.Bool -> false
+        case IrTy.Char -> false
+        case IrTy.Float -> false
+        case IrTy.Unit -> false
+    }
+}
+
+/// The shadow-frame API is the one place the emitter must NOT instrument. Every
+/// other function that owns a managed home gets a shadow frame, but a frame is
+/// built by CALLING `pickle_shadow_push`, so an instrumented `pickle_shadow_push`
+/// would re-enter itself until the stack died - the exact failure `abi_shadow`'s
+/// module doc records. `abiShadowHead` is the reader side of the same protocol:
+/// instrumented, its own prologue would push a frame and it would hand the
+/// collector THAT frame instead of the caller's chain head.
+fn isShadowApiFn(name: string, symbol: string) -> bool {
+    if (symbol == "pickle_shadow_push") {
+        return true
+    }
+    if (symbol == "pickle_shadow_pop") {
+        return true
+    }
+    if (name == "abiShadowHead") {
+        return true
+    }
+    false
+}
+
+fn isFloatTy(t: IrTy) -> bool {
+    match (t) {
+        case IrTy.Float -> true
+        case _ -> false
+    }
+}
+
+fn tyWidth(t: IrTy) -> int {
+    match (t) {
+        case IrTy.Bool -> 8
+        case IrTy.Char -> 32
+        case IrTy.Int -> 64
+        case IrTy.Float -> 64
+        case IrTy.Str -> 64
+        case IrTy.Unit -> 64
+        case IrTy.Ptr -> 64
+    }
+}
+
+fn tyBytes(t: IrTy) -> int {
+    tyWidth(t) / 8
+}
+
+fn isCmp(op: IrBinOp) -> bool {
+    match (op) {
+        case IrBinOp.Eq -> true
+        case IrBinOp.Ne -> true
+        case IrBinOp.Lt -> true
+        case IrBinOp.Le -> true
+        case IrBinOp.Gt -> true
+        case IrBinOp.Ge -> true
+        case _ -> false
+    }
+}
+
+fn alignK(k: int, a: int) -> int {
+    let r = k % a
+    if (r != 0) {
+        k + a - r
+    } else {
+        k
+    }
+}
+
+fn intArgReg(i: int) -> int {
+    match (i) {
+        case 0 -> 1
+        case 1 -> 2
+        case 2 -> 8
+        case 3 -> 9
+        case _ -> 0
+    }
+}
+
+fn funcSymbolOf(m: IrModule, id: int) -> string {
+    let f = m.funcs[id]
+    if (f.symbol != "") {
+        f.symbol
+    } else {
+        f.name
+    }
+}
+
+fn constTy(c: IrConst) -> IrTy {
+    match (c) {
+        case IrConst.Int(_) -> IrTy.Int
+        case IrConst.Float(_) -> IrTy.Float
+        case IrConst.Bool(_) -> IrTy.Bool
+        case IrConst.Char(_) -> IrTy.Char
+        case IrConst.Null -> IrTy.Ptr
+        case IrConst.Str(_) -> IrTy.Str
+        case IrConst.StrAddr(_) -> IrTy.Int
+        case IrConst.FuncAddr(_) -> IrTy.Int
+    }
+}
+
+fn callRet(m: IrModule, callee: Callee) -> IrTy {
+    match (callee) {
+        case Callee.Func(id) -> m.funcs[id].ret
+        case Callee.Extern(id) -> m.externs[id].ret
+    }
+}
+
+/// The PE link stage hands these imports a `jmp [rip+...]` thunk (see
+/// `pelink::isCrtImp`), so a reloc naming `__imp_<name>` already resolves to a
+/// callable address. Every other import resolves to the IAT *slot*, which holds
+/// a pointer and is not code.
+///
+/// Deliberately mirrors `pelink::isCrtImp`/`linklib::isCrtImp`; the lists must
+/// agree or an extern call will jump into data.
+fn isCrtThunkImp(nm: string) -> bool {
+    if (nm == "memcpy") {
+        return true
+    }
+    if (nm == "memmove") {
+        return true
+    }
+    if (nm == "memset") {
+        return true
+    }
+    if (nm == "memcmp") {
+        return true
+    }
+    false
+}
+
+/// True when an extern callee's symbol resolves to an IAT slot rather than to
+/// code, so `emitCall` has to dereference it before jumping.
+fn isImpSlotCall(sym: string) -> bool {
+    if (len(sym) < 6 || sliceRange(sym, 0, 6) != "__imp_") {
+        return false
+    }
+    return !isCrtThunkImp(sliceRange(sym, 6, len(sym)))
+}
+
+class Reloc {
+    var off: int
+    var sym: string
+
+    constructor(off: int, sym: string) {
+        this.off = off
+        this.sym = sym
+    }
+}
+
+class BranchFix {
+    var off: int
+    var target: int
+
+    constructor(off: int, target: int) {
+        this.off = off
+        this.target = target
+    }
+}
+
+class X64Func {
+    var symbol: string
+    var bytes: List<int>
+    var relocs: List<Reloc>
+    var ncells: int
+    var totalK: int
+
+    constructor(symbol: string, bytes: List<int>, relocs: List<Reloc>, ncells: int, totalK: int) {
+        this.symbol = symbol
+        this.bytes = bytes
+        this.relocs = relocs
+        this.ncells = ncells
+        this.totalK = totalK
+    }
+}
+
+class X64Out {
+    var funcs: List<X64Func>
+
+    constructor(funcs: List<X64Func>) {
+        this.funcs = funcs
+    }
+}
+
+fn emptyRelocs() -> List<Reloc> {
+    var l = [Reloc(0, "")]
+    l.pop()
+    l
+}
+
+fn emptyX64Funcs() -> List<X64Func> {
+    var l = [X64Func("x", [0], emptyRelocs(), 0, 0)]
+    l.pop()
+    l
+}
+
+class CB {
+    var bytes: List<int>
+    var relocs: List<Reloc>
+
+    constructor() {
+        this.bytes = [0]
+        this.bytes.pop()
+        this.relocs = emptyRelocs()
+    }
+
+    fn size() -> int {
+        len(this.bytes)
+    }
+
+    fn u8(b: int) {
+        this.bytes.push(b & 0xFF)
+    }
+
+    fn u32le(v: int) {
+        this.u8(v)
+        this.u8(v >> 8)
+        this.u8(v >> 16)
+        this.u8(v >> 24)
+    }
+
+    fn u64le(v: int) {
+        this.u32le(v & 0xFFFFFFFF)
+        this.u32le(v >> 32)
+    }
+
+    fn relocAbs(sym: string) {
+        let off = this.size()
+        this.u64le(0)
+        this.relocs.push(Reloc(off, sym))
+    }
+
+    fn rbpMem(reg: int, k: int) -> List<int> {
+        let d = [0]
+        d.pop()
+        if (k <= 128) {
+            d.push(0x45 | ((reg & 7) << 3))
+            d.push((0 - k) & 0xFF)
+        } else {
+            d.push(0x85 | ((reg & 7) << 3))
+            let neg = (0 - k) & 0xFFFFFFFF
+            d.push(neg & 0xFF)
+            d.push((neg >> 8) & 0xFF)
+            d.push((neg >> 16) & 0xFF)
+            d.push((neg >> 24) & 0xFF)
+        }
+        d
+    }
+
+    fn rex(w: int, ext: int) {
+        var v = 0x40
+        if (w == 64) {
+            v = v | 0x08
+        }
+        if (ext != 0) {
+            v = v | 0x01
+        }
+        this.u8(v)
+    }
+
+    fn ld(reg: int, w: int, k: int) {
+        var ext = 0
+        if (w == 64) {
+            ext = ext | 0x08
+        }
+        if (reg >= 8) {
+            ext = ext | 0x04
+        }
+        if (ext != 0) {
+            this.u8(0x40 | ext)
+        }
+        if (w == 8) {
+            this.u8(0x8A)
+        } else {
+            this.u8(0x8B)
+        }
+        for (b in this.rbpMem(reg, k)) {
+            this.u8(b)
+        }
+    }
+
+    fn st(reg: int, w: int, k: int) {
+        var ext = 0
+        if (w == 64) {
+            ext = ext | 0x08
+        }
+        if (reg >= 8) {
+            ext = ext | 0x04
+        }
+        if (ext != 0) {
+            this.u8(0x40 | ext)
+        }
+if (w == 8) {
+               this.u8(0x88)
+           } else {
+               this.u8(0x89)
+           }
+           for (b in this.rbpMem(reg, k)) {
+               this.u8(b)
+           }
+       }
+
+   /// `mov <dstReg>, [r0]` - load a `w`-bit word at the address in r0.
+   /// Only r0..r7 are addressable here, which is all the callers need. A 64-bit
+   /// access needs REX.W; an 8-bit access into r4..r7 needs a bare REX so the
+   /// encoding picks SPL/BPL/SIL/DIL rather than AH/CH/DH/BH.
+   fn ldMemR0(dstReg: int, w: int) {
+       if (w == 64) {
+           this.u8(0x48)
+       } else if (w == 8 && (dstReg & 7) >= 4) {
+           this.u8(0x40)
+       }
+       this.u8(0x8B)
+       this.u8((dstReg & 7) << 3)
+   }
+
+   /// `mov [r0], <srcReg>` - store a `w`-bit word from srcReg to the address in r0.
+   /// ModRM is `(srcReg << 3) | 0` because r0 is the only base register used.
+   fn stMemR0(srcReg: int, w: int) {
+       if (w == 64) {
+           this.u8(0x48)
+       } else if (w == 8 && (srcReg & 7) >= 4) {
+           this.u8(0x40)
+       }
+       this.u8(0x89)
+       this.u8((srcReg & 7) << 3)
+   }
+
+    fn stImm(reg: int, w: int, k: int, imm: int) {
+        if (w == 8) {
+            this.u8(0xC6)
+            for (b in this.rbpMem(reg, k)) {
+                this.u8(b)
+            }
+            this.u8(imm)
+        } else if (w == 32) {
+            this.u8(0xC7)
+            for (b in this.rbpMem(reg, k)) {
+                this.u8(b)
+            }
+            this.u32le(imm)
+        } else {
+            this.movabsImm(0, imm)
+            this.st(0, 64, k)
+        }
+    }
+
+    fn ssePre(reg: int) {
+        this.u8(0xF2)
+        if (reg >= 4) {
+            this.u8(0x44)
+        }
+    }
+
+    fn ldsd(reg: int, k: int) {
+        this.ssePre(reg)
+        this.u8(0x0F)
+        this.u8(0x10)
+        for (b in this.rbpMem(reg, k)) {
+            this.u8(b)
+        }
+    }
+
+    fn stsd(reg: int, k: int) {
+        this.ssePre(reg)
+        this.u8(0x0F)
+        this.u8(0x11)
+        for (b in this.rbpMem(reg, k)) {
+            this.u8(b)
+        }
+    }
+
+    fn movabsImm(reg: int, imm: int) {
+        var ext = 0x08
+        if (reg >= 8) {
+            ext = ext | 0x01
+        }
+        this.u8(0x40 | ext)
+        this.u8(0xB8 + (reg & 7))
+        this.u64le(imm)
+    }
+
+    fn movabsReloc(reg: int, sym: string) {
+        var ext = 0x08
+        if (reg >= 8) {
+            ext = ext | 0x01
+        }
+        this.u8(0x40 | ext)
+        this.u8(0xB8 + (reg & 7))
+        this.relocAbs(sym)
+    }
+
+    fn leaRbp(reg: int, k: int) {
+        var ext = 0x08
+        if (reg >= 8) {
+            ext = ext | 0x04
+        }
+        this.u8(0x40 | ext)
+        this.u8(0x8D)
+        for (b in this.rbpMem(reg, k)) {
+            this.u8(b)
+        }
+    }
+
+    fn subRsp(k: int) {
+        this.u8(0x48)
+        this.u8(0x81)
+        this.u8(0xEC)
+        this.u32le(k)
+    }
+
+    fn addRsp(k: int) {
+        this.u8(0x48)
+        this.u8(0x81)
+        this.u8(0xC4)
+        this.u32le(k)
+    }
+
+    fn stRsp(reg: int, w: int, disp: int) {
+        if (w == 64) {
+            this.u8(0x48)
+        }
+        if (w == 8) {
+            this.u8(0x88)
+        } else {
+            this.u8(0x89)
+        }
+        this.u8(0x44 | (reg << 3))
+        this.u8(0x24)
+        this.u8(disp)
+    }
+
+    fn stsdRsp(reg: int, disp: int) {
+        this.ssePre(reg)
+        this.u8(0x0F)
+        this.u8(0x11)
+        this.u8(0x44 | ((reg & 7) << 3))
+        this.u8(0x24)
+        this.u8(disp)
+    }
+
+    fn setcc(cc: int) {
+        this.u8(0x0F)
+        this.u8(0x90 + cc)
+        this.u8(0xC0)
+    }
+
+    /// `setcc` into CL. Float compares need two independent results - one from
+    /// the ordering flag (CF/ZF) and one from PF for the unordered case - and
+    /// `setcc` hardcodes ModRM 0xC0, which is always AL. Emitting both into AL
+    /// means the second one clobbers the first; the trailing `AND AL,CL` /
+    /// `OR AL,CL` then combines against an undefined CL, so the result depends
+    /// on whatever CL happened to hold.
+    fn setccCl(cc: int) {
+        this.u8(0x0F)
+        this.u8(0x90 + cc)
+        this.u8(0xC1)
+    }
+}
+
+fn f64ToBits(f: float) -> int {
+    var neg = false
+    var a = f
+    if (a < 0.0) {
+        neg = true
+        a = 0.0 - a
+    }
+    if (a != a) {
+        // NaN compares false against everything, so it slips past both the sign
+        // test and the `== 0.0` test. Rust lowers float constants with native
+        // `to_bits`, so emit the canonical quiet NaN instead of letting it fall
+        // through to the mantissa math below (where `nan as int` is garbage).
+        var nanBits = 0x7FF8000000000000
+        if (neg) {
+            nanBits = nanBits | i64MinBits()
+        }
+        return nanBits
+    }
+    if (a == 0.0) {
+        // `-0.0 < 0.0` is false under IEEE, so `neg` cannot have caught a
+        // negative zero above. `1.0 / a` is the reliable discriminator: it is
+        // `-inf` for `-0.0` and `+inf` for `+0.0`. Rust keeps the sign bit
+        // (`f64::to_bits` of `-0.0` is `i64::MIN`), so this must not flatten
+        // `-0.0` onto `+0.0`.
+        if (neg || (1.0 / a) < 0.0) {
+            return i64MinBits()
+        }
+        return 0
+    }
+    var e = 0
+    // Both normalization loops are bounded. A literal at or above the f64
+    // ceiling parses to +inf, and `inf / 2.0` is still `inf`, so the first
+    // loop would spin forever; symmetrically an underflowing value can reach
+    // 0.0 and then spin forever in the second (`0.0 * 2.0` is still `0.0`).
+    // Clamping `e` turns both into a detectable saturating case below.
+    while (a >= 2.0 && e < 1200) {
+        a = a / 2.0
+        e = e + 1
+    }
+    if (a >= 2.0) {
+        // Saturated upward: the magnitude overflowed to infinity. `a` is
+        // already non-negative here, so the sign bit is taken from `neg` alone -
+        // ORing `i64MinBits()` unconditionally would turn every `+inf`, which
+        // is what an overflowing positive literal such as `1.0e400` parses to,
+        // into `-inf`.
+        var infBits = 0x7FF0000000000000
+        if (neg) {
+            infBits = infBits | i64MinBits()
+        }
+        return infBits
+    }
+    while (a < 1.0 && e > 0 - 1200) {
+        a = a * 2.0
+        e = e - 1
+    }
+    if (a < 1.0 || e < 0 - 1074) {
+        // Saturated downward: the magnitude underflowed past the smallest
+        // subnormal, which really is zero.
+        return 0
+    }
+    var eField = e + 1023
+    var fracI = 0
+    if (eField <= 0) {
+        // Subnormal (e <= -1022): there is no implicit leading 1, so scale the
+        // whole value rather than `a - 1.0`. The mantissa field is
+        // `a * 2^(e + 1074)`, and `e >= -1074` above keeps the loop short.
+        // Note that e == -1022 with a == 1.0 is the smallest *normal*, 2^-1022,
+        // and must keep its exponent field of 1 - it is not zero.
+        var frac = a
+        var k = 0
+        while (k < e + 1074) {
+            frac = frac * 2.0
+            k = k + 1
+        }
+        fracI = frac as int
+        eField = 0
+    } else {
+        fracI = ((a - 1.0) * 4503599627370496.0) as int
+    }
+    var bits = (eField << 52) | fracI
+    if (neg) {
+        bits = bits | i64MinBits()
+    }
+    bits
+}
+
+fn i64MinBits() -> int {
+    (0 - 0x7FFFFFFFFFFFFFFF) - 1
+}
+
+fn negTwo63Bits() -> int {
+    i64MinBits() | 0x43E0000000000000
+}
+
+class FnPlan {
+    var ncells: int
+    var shadowBytes: int
+    var totalK: int
+    var shadowed: bool
+    var slotCell: List<int>
+    var slotK: List<int>
+    var tempCell: Map<int, int>
+    var tempK: Map<int, int>
+    var types: Map<int, IrTy>
+
+    constructor(
+        ncells: int,
+        shadowBytes: int,
+        totalK: int,
+        shadowed: bool,
+        slotCell: List<int>,
+        slotK: List<int>,
+        tempCell: Map<int, int>,
+        tempK: Map<int, int>,
+        types: Map<int, IrTy>
+    ) {
+        this.ncells = ncells
+        this.shadowBytes = shadowBytes
+        this.totalK = totalK
+        this.shadowed = shadowed
+        this.slotCell = slotCell
+        this.slotK = slotK
+        this.tempCell = tempCell
+        this.tempK = tempK
+        this.types = types
+    }
+
+    fn slotHome(s: int) -> int? {
+        if (s < len(this.slotCell) && this.slotCell[s] >= 0) {
+            return this.shadowBytes - SHADOW_HEADER_BYTES - CELL_BYTES * this.slotCell[s]
+        }
+        if (s < len(this.slotK) && this.slotK[s] >= 1) {
+            return this.slotK[s]
+        }
+        none
+    }
+
+    fn tempHome(t: int) -> int? {
+        if (this.tempCell.has(t)) {
+            return this.shadowBytes - SHADOW_HEADER_BYTES - CELL_BYTES * this.tempCell[t]
+        }
+        if (this.tempK.has(t)) {
+            return this.tempK[t]
+        }
+        none
+    }
+}
+
+fn defTy(types: Map<int, IrTy>, v: int) -> IrTy {
+    if (types.has(v)) {
+        types[v]
+    } else {
+        IrTy.Ptr
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Which functions can actually trigger a collection?
+//
+// A shadow frame only exists to keep a function's managed homes visible while a
+// collection can run, and a collection only ever runs under `abiEngineRegister`
+// (the auto-collect trigger; `abiEngineCollect` is reached from there). A
+// function whose body cannot reach that trigger - directly or through the call
+// graph - can never observe a collection, so its homes need no frame at all.
+//
+// Gating the frame on this keeps hot runtime helpers (list get/push, map
+// lookup, string slicing) frame-free: they carry managed `*int` homes now, but
+// none of them can collect. Every frame that genuinely sits on the dynamic
+// chain above a collection is still emitted, because a caller of a collecting
+// function is itself marked collecting (the reachability is transitive).
+//
+// Conservatism: an indirect call (`CallInd`) is treated as collecting, since
+// the target is unknown, and an extern whose symbol names the engine trigger is
+// treated the same way.
+fn computeMayGC(m: IrModule) -> Map<string, bool> {
+    var mgc: Map<string, bool> = {"": false}
+    mgc.remove("")
+    var i = 0
+    while (i < len(m.funcs)) {
+        let f = m.funcs[i]
+        if (f.name == "abiEngineRegister") {
+            mgc[f.name] = true
+        }
+        for (b in f.blocks) {
+            for (ins in b.instrs) {
+                match (ins) {
+                    case IrInstr.Call(d, callee, args) -> {
+                        match (callee) {
+                            case Callee.Func(id) -> {}
+                            case Callee.Extern(id) -> {
+                                // The runtime is linked as extern symbols, so the
+                                // compiler cannot see which of them allocate. Any
+                                // extern call is treated as able to collect.
+                                mgc[f.name] = true
+                            }
+                        }
+                    }
+                    case IrInstr.CallInd(d, fnAddr, params, ret, args) -> {
+                        mgc[f.name] = true
+                    }
+                    case _ -> {}
+                }
+            }
+        }
+        i = i + 1
+    }
+    var changed = true
+    while (changed) {
+        changed = false
+        var a = 0
+        while (a < len(m.funcs)) {
+            let f = m.funcs[a]
+            if (!mgc.has(f.name)) {
+                for (b in f.blocks) {
+                    for (ins in b.instrs) {
+                        match (ins) {
+                            case IrInstr.Call(d, callee, args) -> {
+                                match (callee) {
+                                    case Callee.Func(id) -> {
+                                        if (mgc.has(m.funcs[id].name)) {
+                                            mgc[f.name] = true
+                                            changed = true
+                                        }
+                                    }
+                                    case Callee.Extern(id) -> {}
+                                }
+                            }
+                            case _ -> {}
+                        }
+                    }
+                }
+            }
+            a = a + 1
+        }
+    }
+    mgc
+}
+
+fn analyze(m: IrModule, fun: IrFunc, mayGC: Map<string, bool>) -> FnPlan {
+    var slotCell = [0]
+    slotCell.pop()
+    var slotK = [0]
+    slotK.pop()
+    var i = 0
+    while (i < len(fun.slots)) {
+        slotCell.push(-1)
+        slotK.push(0)
+        i = i + 1
+    }
+    var types = {0: IrTy.Unit}
+    types.remove(0)
+    var allTemps = [0]
+    allTemps.pop()
+    for (b in fun.blocks) {
+        for (ins in b.instrs) {
+            match (ins) {
+                case IrInstr.Const(d, cst) -> {
+                    types[d] = constTy(cst)
+                    allTemps.push(d)
+                }
+                case IrInstr.UnOp(d, op, v) -> {
+                    if (op == IrUnOp.Not) {
+                        types[d] = IrTy.Bool
+                    } else {
+                        types[d] = defTy(types, v)
+                    }
+                    allTemps.push(d)
+                }
+                case IrInstr.BinOp(d, op, a, b) -> {
+                    if (isCmp(op)) {
+                        types[d] = IrTy.Bool
+                    } else {
+                        types[d] = defTy(types, a)
+                    }
+                    allTemps.push(d)
+                }
+                case IrInstr.Copy(d, v) -> {
+                    types[d] = defTy(types, v)
+                    allTemps.push(d)
+                }
+                case IrInstr.Itof(d, v) -> {
+                    types[d] = IrTy.Float
+                    allTemps.push(d)
+                }
+                case IrInstr.Ftoi(d, v) -> {
+                    types[d] = IrTy.Int
+                    allTemps.push(d)
+                }
+                case IrInstr.Chartoi(d, v) -> {
+                    types[d] = IrTy.Int
+                    allTemps.push(d)
+                }
+                case IrInstr.Itochar(d, v) -> {
+                    types[d] = IrTy.Char
+                    allTemps.push(d)
+                }
+                case IrInstr.LoadSlot(d, s) -> {
+                    types[d] = fun.slots[s]
+                    allTemps.push(d)
+                }
+                case IrInstr.StoreSlot(s, v) -> {}
+                case IrInstr.LocalAddr(d, s) -> {
+                    types[d] = IrTy.Int
+                    allTemps.push(d)
+                }
+                case IrInstr.LoadRaw(d, addr, ty) -> {
+                    types[d] = ty
+                    allTemps.push(d)
+                }
+                case IrInstr.StoreRaw(addr, v, ty) -> {}
+                   case IrInstr.GlobalAddr(d, id) -> {
+                       types[d] = IrTy.Int
+                       allTemps.push(d)
+                   }
+                   case IrInstr.LoadGlobal(d, id, ty) -> {
+                       types[d] = ty
+                       allTemps.push(d)
+                   }
+                   case IrInstr.StoreGlobal(id, v, ty) -> {}
+                case IrInstr.Call(d, callee, args) -> {
+                    match (d) {
+                        case some(dd) -> {
+                            types[dd] = callRet(m, callee)
+                            allTemps.push(dd)
+                        }
+                        case none -> {}
+                    }
+                }
+                case IrInstr.CallInd(d, fnAddr, params, ret, args) -> {
+                    match (d) {
+                        case some(dd) -> {
+                            types[dd] = ret
+                            allTemps.push(dd)
+                        }
+                        case none -> {}
+                    }
+                }
+            }
+        }
+    }
+    var ncells = 0
+    var tempCell = {0: 0}
+    tempCell.remove(0)
+    var tempK = {0: 0}
+    tempK.remove(0)
+    i = 0
+    while (i < len(fun.slots)) {
+        if (isManaged(fun.slots[i])) {
+            slotCell[i] = ncells
+            ncells = ncells + 1
+        }
+        i = i + 1
+    }
+    for (t in allTemps) {
+        if (isManaged(types[t])) {
+            tempCell[t] = ncells
+            ncells = ncells + 1
+        }
+    }
+    let shadowBytes = SHADOW_HEADER_BYTES + CELL_BYTES * ncells
+    // The shadow frame occupies K in [0, shadowBytes]: `prev` sits at exactly
+    // shadowBytes, so unmanaged slots/temps must start strictly past it. Starting
+    // at shadowBytes would let an alloc whose K is already a multiple of its
+    // alignment (e.g. tyBytes(Int) == 8) land on `prev`, which pickle_shadow_push
+    // then overwrites.
+    //
+    // A home's displacement K is its *deepest* byte: an access of width W bytes
+    // at [rbp-K] physically consumes offsets [K-W+1, K]. `used` tracks the
+    // deepest K reserved so far, and each new home of width W must satisfy
+    // K >= used + W so [K-W+1, K] clears the previous home instead of
+    // overlapping a small home parked directly beneath an aligned big one.
+    var used = shadowBytes + CELL_BYTES
+    var firstK = true
+    i = 0
+    while (i < len(fun.slots)) {
+        if (!isManaged(fun.slots[i])) {
+            let k = alignK(used + (if (firstK) { 0 } else { tyBytes(fun.slots[i]) }), tyBytes(fun.slots[i]))
+            slotK[i] = k
+            used = k
+            firstK = false
+        }
+        i = i + 1
+    }
+    for (t in allTemps) {
+        if (!isManaged(types[t])) {
+            let k = alignK(used + (if (firstK) { 0 } else { tyBytes(types[t]) }), tyBytes(types[t]))
+            tempK[t] = k
+            used = k
+            firstK = false
+        }
+    }
+    let totalK = alignK(used, 16)
+    let shadowed = ncells > 0 && mayGC.has(fun.name) && !isShadowApiFn(fun.name, fun.symbol)
+    FnPlan(ncells, shadowBytes, totalK, shadowed, slotCell, slotK, tempCell, tempK, types)
+}
+
+class X64Emitter {
+    var m: IrModule
+    var diags: DiagnosticSink
+    var fun: IrFunc
+    var mayGC: Map<string, bool>
+    var plan: FnPlan
+    var failed: bool
+    var cb: CB
+    var fixes: List<BranchFix>
+    var starts: Map<int, int>
+
+    constructor(m: IrModule, fun: IrFunc, diags: DiagnosticSink, mayGC: Map<string, bool>) {
+        this.m = m
+        this.fun = fun
+        this.diags = diags
+        this.failed = false
+        this.mayGC = mayGC
+        this.plan = analyze(m, fun, mayGC)
+        this.cb = CB()
+        this.fixes = [BranchFix(0, 0)]
+        this.fixes.pop()
+        this.starts = {0: 0}
+        this.starts.remove(0)
+    }
+
+    fn fail(msg: string) {
+        this.failed = true
+        this.diags.emit(Diagnostic.errorAt(Span(0, 0), "x64: " + msg))
+    }
+
+fn typeOfT(t: int) -> IrTy {
+           this.plan.types[t]
+       }
+
+   /// Linker symbol behind a global id.
+   fn globalSym(id: int) -> string {
+           this.m.globals[id].symbol
+       }
+
+/// Which global slot types have a lowering. A POD scalar carries its value in
+    /// `.data`; `string` carries a raw object pointer that `pkl_globals_init`
+    /// roots with `pickle_gc_root_add` before any initializer runs. `Ptr` is
+    /// still excluded because nothing emits its root registration yet.
+    fn globalTyOk(ty: IrTy) -> bool {
+ty == IrTy.Int || ty == IrTy.Bool || ty == IrTy.Char || ty == IrTy.Float
+              || ty == IrTy.Str || ty == IrTy.Ptr
+  }
+
+    fn kOfSlot(s: int) -> int {
+        match (this.plan.slotHome(s)) {
+            case some(k) -> k
+            case none -> {
+                this.fail("unplanned slot " + str(s))
+                0
+            }
+        }
+    }
+
+    fn kOfTemp(t: int) -> int {
+        match (this.plan.tempHome(t)) {
+            case some(k) -> k
+            case none -> {
+                this.fail("unplanned temp t" + str(t))
+                0
+            }
+        }
+    }
+
+    fn prologue() {
+        this.cb.u8(0x55)
+        this.cb.u8(0x48)
+        this.cb.u8(0x89)
+        this.cb.u8(0xE5)
+        if (this.plan.totalK > 0) {
+            this.cb.subRsp(this.plan.totalK)
+        }
+        if (this.plan.shadowed) {
+            this.cb.u8(0x48)
+            this.cb.u8(0x31)
+            this.cb.u8(0xC0)
+            var c = 0
+            while (c < this.plan.ncells) {
+                let k = this.plan.shadowBytes - SHADOW_HEADER_BYTES - CELL_BYTES * c
+                this.cb.st(0, 64, k)
+                c = c + 1
+            }
+            let packed = (SHADOW_FRAME_TAG << SHADOW_TAG_SHIFT) | (this.plan.totalK << 32) | this.plan.ncells
+            this.cb.stImm(0, 64, this.plan.shadowBytes - 8, packed)
+        }
+    }
+
+    /// Pushes the shadow frame. Must run AFTER `seedParams`: the frame pointer
+    /// is built with `lea rcx` and `rcx` is also `intArgReg(0)`, so building the
+    /// frame before spilling the incoming args would clobber arg 0.
+    fn pushShadow() {
+        if (this.plan.shadowed) {
+            this.cb.leaRbp(1, this.plan.shadowBytes)
+            this.cb.movabsReloc(10, "pickle_shadow_push")
+            this.cb.u8(0x41)
+            this.cb.u8(0xFF)
+            this.cb.u8(0xD2)
+        }
+    }
+
+    fn popShadow() {
+        if (this.plan.shadowed) {
+            this.cb.leaRbp(1, this.plan.shadowBytes)
+            this.cb.movabsReloc(10, "pickle_shadow_pop")
+            this.cb.u8(0x41)
+            this.cb.u8(0xFF)
+            this.cb.u8(0xD2)
+        }
+    }
+
+    /// Report a throw that escaped the program. A no-op on every path out of a
+    /// function that is not the entry point.
+    ///
+    /// This is deliberately *not* in the IR. The native emitter leaves the same
+    /// job to the host, which calls `take_escaped_exception()` once
+    /// `Program::run` returns; keeping the decision out of the IR is what keeps
+    /// the self-host emitter byte-identical to the native one. A self-host
+    /// module is its own host, so the backend puts the check on the entry
+    /// function's returns instead, and the runtime is what actually consumes the
+    /// flag and renders the payload.
+    ///
+    /// Emitted before the frame is torn down, so the shadow frame is still live
+    /// if reporting ever reaches an allocation, and before the return value is
+    /// loaded into `rax`, which the call would otherwise clobber. Only the
+    /// entry function's `Return` can carry an escape: a throw propagates out of
+    /// an ordinary function as a plain return, and its caller checks the flag.
+    fn emitEscapedCheck() {
+        if (!(this.fun.symbol == ENTRY_SYMBOL)) {
+            return
+        }
+        this.cb.movabsReloc(10, EXC_UNCAUGHT)
+        this.cb.u8(0x41)
+        this.cb.u8(0xFF)
+        this.cb.u8(0xD2)
+    }
+
+    fn seedParams() {
+        var i = 0
+        while (i < len(this.fun.params)) {
+            let t = this.fun.params[i].ty
+            let k = this.kOfSlot(i)
+            if (i < 4) {
+                if (isFloatTy(t)) {
+                    this.cb.stsd(i, k)
+                } else {
+                    this.cb.st(intArgReg(i), tyWidth(t), k)
+                }
+            } else {
+                let disp = 48 + 8 * (i - 4)
+                this.cb.ld(0, 64, 0 - disp)
+                this.cb.st(0, tyWidth(t), k)
+            }
+            i = i + 1
+        }
+    }
+
+    fn emitConst(d: int, c: IrConst) {
+        let k = this.kOfTemp(d)
+        match (c) {
+            case IrConst.Int(v) -> {
+                this.cb.movabsImm(0, v)
+                this.cb.st(0, 64, k)
+            }
+            case IrConst.Float(v) -> {
+                this.cb.movabsImm(0, f64ToBits(v))
+                this.cb.u8(0x66)
+                this.cb.u8(0x48)
+                this.cb.u8(0x0F)
+                this.cb.u8(0x6E)
+                this.cb.u8(0xC0)
+                this.cb.stsd(0, k)
+            }
+            case IrConst.Bool(b) -> {
+                var v = 0
+                if (b) {
+                    v = 1
+                }
+                this.cb.stImm(0, 8, k, v)
+            }
+            case IrConst.Char(v) -> {
+                this.cb.stImm(0, 32, k, v as int)
+            }
+            case IrConst.Null -> {
+                this.cb.movabsImm(0, 0)
+                this.cb.st(0, 64, k)
+            }
+            case IrConst.Str(id) -> {
+                this.cb.movabsReloc(1, "pkl_strdata_" + str(id))
+                this.cb.movabsImm(2, len(this.m.strings[id]))
+                this.cb.movabsReloc(10, "pickle_str_from_bytes")
+                this.cb.u8(0x41)
+                this.cb.u8(0xFF)
+                this.cb.u8(0xD2)
+                this.cb.st(0, 64, k)
+            }
+            case IrConst.StrAddr(id) -> {
+                this.cb.movabsReloc(0, "pkl_strdata_" + str(id))
+                this.cb.st(0, 64, k)
+            }
+            case IrConst.FuncAddr(id) -> {
+                this.cb.movabsReloc(0, funcSymbolOf(this.m, id))
+                this.cb.st(0, 64, k)
+            }
+        }
+    }
+
+    fn emitUnOp(d: int, op: IrUnOp, v: int) {
+        let kd = this.kOfTemp(d)
+        match (op) {
+            case IrUnOp.Neg -> {
+                if (isFloatTy(this.typeOfT(v))) {
+                    this.cb.ldsd(0, this.kOfTemp(v))
+this.cb.movabsImm(0, i64MinBits())
+                    this.cb.u8(0x66)
+                    this.cb.u8(0x48)
+                    this.cb.u8(0x0F)
+                    this.cb.u8(0x6E)
+                    this.cb.u8(0xC8)
+                    this.cb.u8(0x66)
+                    this.cb.u8(0x0F)
+                    this.cb.u8(0x57)
+                    this.cb.u8(0xC1)
+                    this.cb.stsd(0, kd)
+                } else {
+                    let w = tyWidth(this.typeOfT(v))
+                    this.cb.ld(0, w, this.kOfTemp(v))
+                    if (w == 64) {
+                        this.cb.u8(0x48)
+                    }
+                    this.cb.u8(0xF7)
+                    this.cb.u8(0xD8)
+                    this.cb.st(0, w, kd)
+                }
+            }
+            case IrUnOp.Not -> {
+                this.cb.ld(0, 8, this.kOfTemp(v))
+                this.cb.u8(0x84)
+                this.cb.u8(0xC0)
+                this.cb.setcc(0x04)
+                this.cb.st(0, 8, kd)
+            }
+            case IrUnOp.BitNot -> {
+                let w = tyWidth(this.typeOfT(v))
+                this.cb.ld(0, w, this.kOfTemp(v))
+                if (w == 64) {
+                    this.cb.u8(0x48)
+                    this.cb.u8(0xF7)
+                    this.cb.u8(0xD0)
+                } else if (w == 32) {
+                    this.cb.u8(0xF7)
+                    this.cb.u8(0xD0)
+                } else {
+                    this.cb.u8(0xF6)
+                    this.cb.u8(0xD0)
+                }
+                this.cb.st(0, w, kd)
+            }
+        }
+    }
+
+    fn floatCmpSeq(op: IrBinOp) {
+        this.cb.u8(0x66)
+        this.cb.u8(0x0F)
+        this.cb.u8(0x2E)
+        this.cb.u8(0xC1)
+        match (op) {
+            case IrBinOp.Eq -> {
+                this.cb.setcc(0x04)
+                this.cb.setccCl(0x0B)
+                this.cb.u8(0x20)
+                this.cb.u8(0xC8)
+            }
+            case IrBinOp.Ne -> {
+                this.cb.setcc(0x05)
+                this.cb.setccCl(0x0A)
+                this.cb.u8(0x08)
+                this.cb.u8(0xC8)
+            }
+            case IrBinOp.Lt -> {
+                this.cb.setcc(0x02)
+                this.cb.setccCl(0x0B)
+                this.cb.u8(0x20)
+                this.cb.u8(0xC8)
+            }
+            case IrBinOp.Le -> {
+                this.cb.setcc(0x06)
+                this.cb.setccCl(0x0B)
+                this.cb.u8(0x20)
+                this.cb.u8(0xC8)
+            }
+            case IrBinOp.Gt -> {
+                this.cb.setcc(0x07)
+            }
+            case IrBinOp.Ge -> {
+                this.cb.setcc(0x03)
+            }
+            case _ -> {}
+        }
+    }
+
+    fn intSetcc(cc: int) {
+        this.cb.u8(0x0F)
+        this.cb.u8(0x90 + cc)
+        this.cb.u8(0xC0)
+    }
+
+    fn intCmpCc(op: IrBinOp) -> int {
+        match (op) {
+            case IrBinOp.Eq -> 0x04
+            case IrBinOp.Ne -> 0x05
+            case IrBinOp.Lt -> 0x0C
+            case IrBinOp.Le -> 0x0E
+            case IrBinOp.Gt -> 0x0F
+            case IrBinOp.Ge -> 0x0D
+            case _ -> 0x04
+        }
+    }
+
+    fn emitBinOp(d: int, op: IrBinOp, a: int, b: int) {
+        let ta = this.typeOfT(a)
+        let kd = this.kOfTemp(d)
+        if (isFloatTy(ta)) {
+            this.cb.ldsd(0, this.kOfTemp(a))
+            this.cb.ldsd(1, this.kOfTemp(b))
+            if (op == IrBinOp.Mod) {
+                this.cb.movabsReloc(10, "pickle_fmod")
+                this.cb.u8(0x41)
+                this.cb.u8(0xFF)
+                this.cb.u8(0xD2)
+                this.cb.stsd(0, kd)
+            } else if (isCmp(op)) {
+                this.floatCmpSeq(op)
+                this.cb.st(0, 8, kd)
+            } else {
+                match (op) {
+                    case IrBinOp.Add -> {
+                        this.cb.u8(0xF2)
+                        this.cb.u8(0x0F)
+                        this.cb.u8(0x58)
+                        this.cb.u8(0xC1)
+                    }
+                    case IrBinOp.Sub -> {
+                        this.cb.u8(0xF2)
+                        this.cb.u8(0x0F)
+                        this.cb.u8(0x5C)
+                        this.cb.u8(0xC1)
+                    }
+                    case IrBinOp.Mul -> {
+                        this.cb.u8(0xF2)
+                        this.cb.u8(0x0F)
+                        this.cb.u8(0x59)
+                        this.cb.u8(0xC1)
+                    }
+                    case IrBinOp.Div -> {
+                        this.cb.u8(0xF2)
+                        this.cb.u8(0x0F)
+                        this.cb.u8(0x5E)
+                        this.cb.u8(0xC1)
+                    }
+                    case _ -> this.fail("bad float binop")
+                }
+                this.cb.stsd(0, kd)
+            }
+        } else {
+            let w = tyWidth(ta)
+            this.cb.ld(0, w, this.kOfTemp(a))
+            this.cb.ld(1, w, this.kOfTemp(b))
+            if (isCmp(op)) {
+                if (w == 8) {
+                    this.cb.u8(0x38)
+                    this.cb.u8(0xC8)
+                } else if (w == 32) {
+                    this.cb.u8(0x39)
+                    this.cb.u8(0xC8)
+                } else {
+                    this.cb.u8(0x48)
+                    this.cb.u8(0x39)
+                    this.cb.u8(0xC8)
+                }
+                this.intSetcc(this.intCmpCc(op))
+                this.cb.st(0, 8, kd)
+            } else if (op == IrBinOp.Div || op == IrBinOp.Mod) {
+                this.cb.u8(0x48)
+                this.cb.u8(0x99)
+                this.cb.u8(0x48)
+                this.cb.u8(0xF7)
+                this.cb.u8(0xF9)
+                if (op == IrBinOp.Mod) {
+                    this.cb.u8(0x48)
+                    this.cb.u8(0x89)
+                    this.cb.u8(0xD0)
+                }
+                this.cb.st(0, 64, kd)
+            } else if (op == IrBinOp.Shl || op == IrBinOp.Shr) {
+                if (w == 64) {
+                    this.cb.u8(0x48)
+                }
+                this.cb.u8(0xD3)
+                if (op == IrBinOp.Shl) {
+                    this.cb.u8(0xE0)
+                } else {
+                    this.cb.u8(0xF8)
+                }
+                this.cb.st(0, 64, kd)
+            } else {
+                match (op) {
+                    case IrBinOp.Add -> {
+                        if (w == 64) {
+                            this.cb.u8(0x48)
+                        }
+                        this.cb.u8(0x01)
+                        this.cb.u8(0xC8)
+                    }
+                    case IrBinOp.Sub -> {
+                        if (w == 64) {
+                            this.cb.u8(0x48)
+                        }
+                        this.cb.u8(0x29)
+                        this.cb.u8(0xC8)
+                    }
+                    case IrBinOp.Mul -> {
+                        if (w == 64) {
+                            this.cb.u8(0x48)
+                        }
+                        this.cb.u8(0x0F)
+                        this.cb.u8(0xAF)
+                        this.cb.u8(0xC1)
+                    }
+                    case IrBinOp.BitAnd -> {
+                        if (w == 64) {
+                            this.cb.u8(0x48)
+                        }
+                        this.cb.u8(0x21)
+                        this.cb.u8(0xC8)
+                    }
+                    case IrBinOp.BitOr -> {
+                        if (w == 64) {
+                            this.cb.u8(0x48)
+                        }
+                        this.cb.u8(0x09)
+                        this.cb.u8(0xC8)
+                    }
+                    case IrBinOp.BitXor -> {
+                        if (w == 64) {
+                            this.cb.u8(0x48)
+                        }
+                        this.cb.u8(0x31)
+                        this.cb.u8(0xC8)
+                    }
+                    case _ -> this.fail("bad int binop")
+                }
+                this.cb.st(0, w, kd)
+            }
+        }
+    }
+
+    fn emitFtoi(d: int, v: int) {
+        let kd = this.kOfTemp(d)
+        this.cb.ldsd(0, this.kOfTemp(v))
+        this.cb.u8(0x66)
+        this.cb.u8(0x0F)
+        this.cb.u8(0x2E)
+        this.cb.u8(0xC0)
+        var fnan = this.cb.size()
+        this.cb.u8(0x7A)
+        this.cb.u8(0x00)
+        this.cb.movabsImm(1, 0x43E0000000000000)
+        this.cb.u8(0x66)
+        this.cb.u8(0x48)
+        this.cb.u8(0x0F)
+        this.cb.u8(0x6E)
+        this.cb.u8(0xC9)
+        this.cb.u8(0x66)
+        this.cb.u8(0x0F)
+        this.cb.u8(0x2E)
+        this.cb.u8(0xC1)
+        var fbig = this.cb.size()
+        this.cb.u8(0x73)
+        this.cb.u8(0x00)
+        this.cb.movabsImm(1, negTwo63Bits())
+        this.cb.u8(0x66)
+        this.cb.u8(0x48)
+        this.cb.u8(0x0F)
+        this.cb.u8(0x6E)
+        this.cb.u8(0xD1)
+        this.cb.u8(0x66)
+        this.cb.u8(0x0F)
+        this.cb.u8(0x2E)
+        this.cb.u8(0xC2)
+        var fsmall = this.cb.size()
+        this.cb.u8(0x72)
+        this.cb.u8(0x00)
+        this.cb.u8(0xF2)
+        this.cb.u8(0x48)
+        this.cb.u8(0x0F)
+        this.cb.u8(0x2C)
+        this.cb.u8(0xC0)
+        var fdj = this.cb.size()
+        this.cb.u8(0xEB)
+        this.cb.u8(0x00)
+        var offNan = this.cb.size()
+        this.cb.u8(0x48)
+        this.cb.u8(0x31)
+        this.cb.u8(0xC0)
+        var fnj = this.cb.size()
+        this.cb.u8(0xEB)
+        this.cb.u8(0x00)
+        var offBig = this.cb.size()
+        this.cb.movabsImm(0, 0x7FFFFFFFFFFFFFFF)
+        var fbj = this.cb.size()
+        this.cb.u8(0xEB)
+        this.cb.u8(0x00)
+        var offSmall = this.cb.size()
+        this.cb.movabsImm(0, i64MinBits())
+        var offDone = this.cb.size()
+        this.cb.bytes[fnan + 1] = (offNan - (fnan + 2)) & 0xFF
+        this.cb.bytes[fbig + 1] = (offBig - (fbig + 2)) & 0xFF
+        this.cb.bytes[fsmall + 1] = (offSmall - (fsmall + 2)) & 0xFF
+        this.cb.bytes[fdj + 1] = (offDone - (fdj + 2)) & 0xFF
+        this.cb.bytes[fnj + 1] = (offDone - (fnj + 2)) & 0xFF
+        this.cb.bytes[fbj + 1] = (offDone - (fbj + 2)) & 0xFF
+        this.cb.st(0, 64, kd)
+    }
+
+    fn emitMem(op: IrInstr) {
+        match (op) {
+            case IrInstr.LoadSlot(d, s) -> {
+                let w = tyWidth(this.fun.slots[s])
+                let kd = this.kOfTemp(d)
+                this.cb.ld(0, w, this.kOfSlot(s))
+                this.cb.st(0, w, kd)
+            }
+            case IrInstr.StoreSlot(s, v) -> {
+                let w = tyWidth(this.fun.slots[s])
+                let kh = this.kOfSlot(s)
+                this.cb.ld(0, w, this.kOfTemp(v))
+                this.cb.st(0, w, kh)
+            }
+            case IrInstr.LocalAddr(d, s) -> {
+                this.cb.leaRbp(0, this.kOfSlot(s))
+                this.cb.st(0, 64, this.kOfTemp(d))
+            }
+            case IrInstr.LoadRaw(d, addr, ty) -> {
+                this.cb.ld(0, 64, this.kOfTemp(addr))
+                let kd = this.kOfTemp(d)
+                if (isFloatTy(ty)) {
+                    this.cb.u8(0xF2)
+                    this.cb.u8(0x0F)
+                    this.cb.u8(0x10)
+                    this.cb.u8(0x00)
+                    this.cb.stsd(0, kd)
+                } else {
+                    let w = tyWidth(ty)
+                    if (w == 64) {
+                        this.cb.u8(0x48)
+                    }
+                    if (w == 8) {
+                        this.cb.u8(0x8A)
+                    } else {
+                        this.cb.u8(0x8B)
+                    }
+                    this.cb.u8(0x00)
+                    this.cb.st(0, w, kd)
+                }
+            }
+            case IrInstr.StoreRaw(addr, v, ty) -> {
+                this.cb.ld(1, 64, this.kOfTemp(addr))
+                if (isFloatTy(ty)) {
+                    this.cb.ldsd(0, this.kOfTemp(v))
+                    this.cb.u8(0xF2)
+                    this.cb.u8(0x0F)
+                    this.cb.u8(0x11)
+                    this.cb.u8(0x01)
+                } else {
+                    let w = tyWidth(ty)
+                    this.cb.ld(0, w, this.kOfTemp(v))
+                    if (w == 64) {
+                        this.cb.u8(0x48)
+                    }
+                    if (w == 8) {
+                        this.cb.u8(0x88)
+                    } else {
+                        this.cb.u8(0x89)
+                    }
+                    this.cb.u8(0x01)
+                }
+            }
+            case _ -> {}
+        }
+    }
+
+    fn emitCall(sum: string, ptys: List<IrTy>, ret: IrTy, d: int?, args: List<int>) {
+        let n = len(args)
+        var i = 0
+        while (i < n && i < 4) {
+            let t = ptys[i]
+            if (isFloatTy(t)) {
+                this.cb.ldsd(i, this.kOfTemp(args[i]))
+            } else {
+                this.cb.ld(intArgReg(i), tyWidth(t), this.kOfTemp(args[i]))
+            }
+            i = i + 1
+        }
+        var ns = n - 4
+        if (ns < 0) {
+            ns = 0
+        }
+        var R = 0
+        if (ns > 0) {
+            R = CALL_SHADOW_BYTES + 8 * ns + 8 * (ns % 2)
+            this.cb.subRsp(R)
+            i = 4
+            while (i < n) {
+                let j = i - 4
+                let t = ptys[i]
+                let disp = CALL_SHADOW_BYTES + 8 * j
+                if (isFloatTy(t)) {
+                    this.cb.ldsd(4, this.kOfTemp(args[i]))
+                    this.cb.stsdRsp(4, disp)
+                } else {
+                    this.cb.ld(0, tyWidth(t), this.kOfTemp(args[i]))
+                    this.cb.stRsp(0, tyWidth(t), disp)
+                }
+                i = i + 1
+            }
+        }
+        this.cb.movabsReloc(10, sum)
+        if (isImpSlotCall(sum)) {
+            // The reloc above resolved to the IAT slot, which stores the entry
+            // point rather than being one: `mov r10, [r10]` turns the slot
+            // address into the address of the imported function. CRT imports
+            // skip this because their reloc already names a jump thunk.
+            this.cb.u8(0x4D)
+            this.cb.u8(0x8B)
+            this.cb.u8(0x12)
+        }
+        this.cb.u8(0x41)
+        this.cb.u8(0xFF)
+        this.cb.u8(0xD2)
+        if (ns > 0) {
+            this.cb.addRsp(R)
+        }
+        match (d) {
+            case some(dd) -> {
+                if (isFloatTy(ret)) {
+                    this.cb.stsd(0, this.kOfTemp(dd))
+                } else {
+                    this.cb.st(0, tyWidth(ret), this.kOfTemp(dd))
+                }
+            }
+            case none -> {}
+        }
+    }
+
+    fn lowerInstr(ins: IrInstr) {
+        if (this.failed) {
+            return
+        }
+        match (ins) {
+            case IrInstr.Const(d, cst) -> this.emitConst(d, cst)
+            case IrInstr.UnOp(d, op, v) -> this.emitUnOp(d, op, v)
+            case IrInstr.BinOp(d, op, a, b) -> this.emitBinOp(d, op, a, b)
+            case IrInstr.Copy(d, v) -> {
+                let w = tyWidth(this.typeOfT(v))
+                this.cb.ld(0, w, this.kOfTemp(v))
+                this.cb.st(0, w, this.kOfTemp(d))
+            }
+            case IrInstr.Itof(d, v) -> {
+                this.cb.ld(0, 64, this.kOfTemp(v))
+                this.cb.u8(0xF2)
+                this.cb.u8(0x48)
+                this.cb.u8(0x0F)
+                this.cb.u8(0x2A)
+                this.cb.u8(0xC0)
+                this.cb.stsd(0, this.kOfTemp(d))
+            }
+            case IrInstr.Ftoi(d, v) -> this.emitFtoi(d, v)
+            case IrInstr.Chartoi(d, v) -> {
+                this.cb.ld(0, 32, this.kOfTemp(v))
+                this.cb.st(0, 64, this.kOfTemp(d))
+            }
+            case IrInstr.Itochar(d, v) -> {
+                this.cb.ld(0, 64, this.kOfTemp(v))
+                this.cb.u8(0x89)
+                this.cb.u8(0xC0)
+                this.cb.st(0, 32, this.kOfTemp(d))
+            }
+            case IrInstr.LoadSlot(d, s) -> this.emitMem(IrInstr.LoadSlot(d, s))
+            case IrInstr.StoreSlot(s, v) -> this.emitMem(IrInstr.StoreSlot(s, v))
+            case IrInstr.LocalAddr(d, s) -> this.emitMem(IrInstr.LocalAddr(d, s))
+            case IrInstr.LoadRaw(d, addr, ty) -> this.emitMem(IrInstr.LoadRaw(d, addr, ty))
+            case IrInstr.StoreRaw(addr, v, ty) -> this.emitMem(IrInstr.StoreRaw(addr, v, ty))
+                   case IrInstr.GlobalAddr(d, id) -> {
+                       this.cb.movabsReloc(0, this.globalSym(id))
+                       this.cb.st(0, 64, this.kOfTemp(d))
+                   }
+                   case IrInstr.LoadGlobal(d, id, ty) -> {
+                       if (!this.globalTyOk(ty)) {
+                           this.fail("loadglobal of `" + irTyStr(ty) + "` is not lowered yet")
+                           return
+                       }
+                       this.cb.movabsReloc(0, this.globalSym(id))
+                       this.cb.ldMemR0(0, tyWidth(ty))
+                       this.cb.st(0, tyWidth(ty), this.kOfTemp(d))
+                   }
+                   case IrInstr.StoreGlobal(id, v, ty) -> {
+                       if (!this.globalTyOk(ty)) {
+                           this.fail("storeglobal of `" + irTyStr(ty) + "` is not lowered yet")
+                           return
+                       }
+                       this.cb.ld(1, tyWidth(ty), this.kOfTemp(v))
+                       this.cb.movabsReloc(0, this.globalSym(id))
+                       this.cb.stMemR0(1, tyWidth(ty))
+                   }
+            case IrInstr.Call(d, callee, args) -> {
+                var sym = ""
+                var ptys = emptyIrTys()
+                match (callee) {
+                    case Callee.Func(id) -> {
+                        let f = this.m.funcs[id]
+                        sym = funcSymbolOf(this.m, id)
+                        ptys = emptyIrTys()
+                        for (p in f.params) {
+                            ptys.push(p.ty)
+                        }
+                        this.emitCall(sym, ptys, f.ret, d, args)
+                    }
+                    case Callee.Extern(id) -> {
+                        let e = this.m.externs[id]
+                        sym = e.symbol
+                        ptys = e.params
+                        this.emitCall(sym, ptys, e.ret, d, args)
+                    }
+                }
+            }
+            case IrInstr.CallInd(d, fnAddr, params, ret, args) -> {
+                let ptys = params
+                let n = len(args)
+                var i = 0
+                while (i < n && i < 4) {
+                    let t = ptys[i]
+                    if (isFloatTy(t)) {
+                        this.cb.ldsd(i, this.kOfTemp(args[i]))
+                    } else {
+                        this.cb.ld(intArgReg(i), tyWidth(t), this.kOfTemp(args[i]))
+                    }
+                    i = i + 1
+                }
+                var ns = n - 4
+                if (ns < 0) {
+                    ns = 0
+                }
+                var R = 0
+                if (ns > 0) {
+                    R = CALL_SHADOW_BYTES + 8 * ns + 8 * (ns % 2)
+                    this.cb.subRsp(R)
+                    i = 4
+                    while (i < n) {
+                        let j = i - 4
+                        let t = ptys[i]
+                        let disp = CALL_SHADOW_BYTES + 8 * j
+                        if (isFloatTy(t)) {
+                            this.cb.ldsd(4, this.kOfTemp(args[i]))
+                            this.cb.stsdRsp(4, disp)
+                        } else {
+                            this.cb.ld(0, tyWidth(t), this.kOfTemp(args[i]))
+                            this.cb.stRsp(0, tyWidth(t), disp)
+                        }
+                        i = i + 1
+                    }
+                }
+                this.cb.ld(10, 64, this.kOfTemp(fnAddr))
+                this.cb.u8(0x41)
+                this.cb.u8(0xFF)
+                this.cb.u8(0xD2)
+                if (ns > 0) {
+                    this.cb.addRsp(R)
+                }
+                match (d) {
+                    case some(dd) -> {
+                        if (isFloatTy(ret)) {
+                            this.cb.stsd(0, this.kOfTemp(dd))
+                        } else {
+                            this.cb.st(0, tyWidth(ret), this.kOfTemp(dd))
+                        }
+                    }
+                    case none -> {}
+                }
+            }
+        }
+    }
+
+    fn emitJmp(target: int) {
+        this.cb.u8(0xE9)
+        let field = this.cb.size()
+        this.cb.u32le(0)
+        this.fixes.push(BranchFix(field, target))
+    }
+
+    fn emitJcc(cc: int, target: int) {
+        this.cb.u8(0x0F)
+        this.cb.u8(0x80 + cc)
+        let field = this.cb.size()
+        this.cb.u32le(0)
+        this.fixes.push(BranchFix(field, target))
+    }
+
+    fn lowerTerm(t: IrTerm) {
+        match (t) {
+            case IrTerm.Branch(target) -> this.emitJmp(target)
+            case IrTerm.BranchIf(c, tn, el) -> {
+                this.cb.ld(0, 8, this.kOfTemp(c))
+                this.cb.u8(0x84)
+                this.cb.u8(0xC0)
+                this.emitJcc(0x05, tn)
+                this.emitJmp(el)
+            }
+            case IrTerm.Return(v) -> {
+                this.emitEscapedCheck()
+                if (this.plan.shadowed) {
+                    this.popShadow()
+                }
+                match (v) {
+                    case some(ti) -> {
+                        if (!(this.fun.ret == IrTy.Unit)) {
+                            if (isFloatTy(this.fun.ret)) {
+                                this.cb.ldsd(0, this.kOfTemp(ti))
+                            } else {
+                                this.cb.ld(0, tyWidth(this.fun.ret), this.kOfTemp(ti))
+                            }
+                        }
+                    }
+                    case none -> {}
+                }
+                this.cb.u8(0x48)
+                this.cb.u8(0x89)
+                this.cb.u8(0xEC)
+                this.cb.u8(0x5D)
+                this.cb.u8(0xC3)
+            }
+            case IrTerm.Unreachable -> {
+                this.cb.u8(0x0F)
+                this.cb.u8(0x0B)
+            }
+        }
+    }
+
+    fn patchFixes() {
+        for (fx in this.fixes) {
+            match (this.starts.get(fx.target)) {
+                case some(ln) -> {
+                    let p = ln - (fx.off + 4)
+                    this.cb.bytes[fx.off] = p & 0xFF
+                    this.cb.bytes[fx.off + 1] = (p >> 8) & 0xFF
+                    this.cb.bytes[fx.off + 2] = (p >> 16) & 0xFF
+                    this.cb.bytes[fx.off + 3] = (p >> 24) & 0xFF
+                }
+                case none -> this.fail("unknown branch target " + str(fx.target))
+            }
+        }
+    }
+
+    fn emitFunc() -> X64Func? {
+        this.prologue()
+        this.seedParams()
+        this.pushShadow()
+        for (b in this.fun.blocks) {
+            this.starts[b.id] = this.cb.size()
+            for (ins in b.instrs) {
+                this.lowerInstr(ins)
+            }
+            this.lowerTerm(b.term)
+        }
+        if (this.failed) {
+            return none
+        }
+        this.patchFixes()
+        if (this.failed) {
+            return none
+        }
+        X64Func(this.fun.symbol, this.cb.bytes, this.cb.relocs, this.plan.ncells, this.plan.totalK)
+    }
+}
+
+fn x64LowerModule(m: IrModule, diags: DiagnosticSink) -> X64Out? {
+    var funcs = emptyX64Funcs()
+    let mayGC = computeMayGC(m)
+    var i = 0
+    while (i < len(m.funcs)) {
+        let e = X64Emitter(m, m.funcs[i], diags, mayGC)
+        let f = e.emitFunc()
+        var failed = false
+        match (f) {
+            case some(xf) -> funcs.push(xf)
+            case none -> failed = true
+        }
+        if (failed) {
+            return none
+        }
+        i = i + 1
+    }
+    X64Out(funcs)
+}
+
+class HexBuf {
+    var acc: string
+
+    constructor() {
+        this.acc = ""
+    }
+
+    fn put(s: string) {
+        this.acc = this.acc + s
+    }
+
+    fn text() -> string {
+        this.acc
+    }
+}
+
+fn hex2(b: int) -> string {
+    var h = "0123456789abcdef"
+    let hb = bytes(h)
+    let hi = (b >> 4) & 0xF
+    let lo = b & 0xF
+    "{hb[hi] as char}" + "{hb[lo] as char}"
+}
+
+fn x64Dump(out: X64Out) -> string {
+    let w = HexBuf()
+    for (f in out.funcs) {
+        w.put("func " + f.symbol + " ncells=" + str(f.ncells) + " frame=" + str(f.totalK) + "\n")
+        var i = 0
+        while (i < len(f.bytes)) {
+            let o = str(i)
+            var pad = o
+            while (len(pad) < 4) {
+                pad = "0" + pad
+            }
+            w.put(pad + ": ")
+            var j = 0
+            while (j < 8 && i + j < len(f.bytes)) {
+                w.put(hex2(f.bytes[i + j]) + " ")
+                j = j + 1
+            }
+            w.put("\n")
+            i = i + 8
+        }
+        for (r in f.relocs) {
+            w.put("reloc " + str(r.off) + " " + r.sym + "\n")
+        }
+    }
+    w.text()
+}

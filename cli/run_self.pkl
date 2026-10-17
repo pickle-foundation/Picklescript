@@ -1,0 +1,119 @@
+module cli.runself
+
+import { DiagnosticSink } from compiler.diag
+import { frontend } from compiler.front
+import { emitIr } from compiler.emit
+import { irModuleStr, irxModuleStr } from compiler.ir
+
+fn irSources(fileName: string, src: string) -> List<string> {
+    let sinks = DiagnosticSink()
+    var out = emptyStrs()
+    if (let some(loaded) = frontend(fileName, src, sinks)) {
+        if (let some(m) = emitIr(loaded.program, loaded.resolved, sinks)) {
+            out.push(irModuleStr(m))
+            out.push(irxModuleStr(m))
+        } else {
+            out.push("irfail")
+            out.push("irfail")
+        }
+    } else {
+        out.push("irfail")
+        out.push("irfail")
+    }
+    out
+}
+
+fn pathBase(p: string) -> string {
+    let bs = bytes(p)
+    var last = -1
+    var i = 0
+    while (i < len(bs)) {
+        let b = bs[i] as int
+        if (b == 47 || b == 92) {
+            last = i
+        }
+        i = i + 1
+    }
+    if (last == -1) {
+        return p
+    }
+    var out = ""
+    var k = last + 1
+    while (k < len(bs)) {
+        out += "{bs[k] as char}"
+        k = k + 1
+    }
+    out
+}
+
+fn main() {
+    var targets = emptyStrs()
+    let argv = args()
+    if (len(argv) > 0) {
+        for (a in argv) {
+            targets.push(a)
+        }
+    } else if (let some(tf) = read_file("tools/diff/target_self.txt")) {
+        var i = 0
+        var start = 0
+        while (i <= len(tf)) {
+if (i == len(tf) || tf[i] == 10 as int) {
+                    if (i > start) {
+                        var line = ""
+                    var k = start
+                    var tb = bytes(tf)
+                    while (k < i) {
+                        if (tb[k] == 13 as int) {
+                            k = k + 1
+                        } else {
+                            line = line + "{tb[k] as char}"
+                            k = k + 1
+                        }
+                    }
+                    targets.push(line)
+                    }
+                    start = i + 1
+                }
+            i = i + 1
+        }
+    }
+    if (len(targets) == 0) {
+        targets.push("pickle/cli/main.pkl")
+    }
+    for (target in targets) {
+        if (let some(src) = read_file(target)) {
+            var base = pathBase(target)
+            var outIrName = "one_ir.txt"
+            var outIxName = "one_irx.txt"
+            var bs0 = bytes(base)
+            if (len(bs0) > 4 && bs0[len(bs0)-4] == 46 && bs0[len(bs0)-3] == 112 && bs0[len(bs0)-2] == 107 && bs0[len(bs0)-1] == 108) {
+                    var out = ""
+                    var k = 0
+                    while (k < len(bs0) - 4) {
+                        out += "{bs0[k] as char}"
+                        k = k + 1
+                    }
+                    outIrName = out + "_self.ir"
+                    outIxName = out + "_self.irx"
+                }
+            let res = irSources(target, src)
+            // `.ir` oracle is captured with a trailing newline (`println!` in the
+            // Rust CLI); `.irx` with no trailing newline (`print!`).
+            if (len(res) >= 1) {
+                write_file("tools/diff/port/" + outIrName, res[0] + "\n")
+            }
+            if (len(res) >= 2) {
+                write_file("tools/diff/port/" + outIxName, res[1])
+            }
+            println("SELF DONE: " + target)
+        } else {
+            println("NO FILE: " + target)
+        }
+    }
+}
+
+fn emptyStrs() -> List<string> {
+    var l = [""]
+    l.pop()
+    l
+}

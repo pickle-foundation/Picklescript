@@ -1,0 +1,298 @@
+module runtime.abi_console
+
+/// Sovereign console ABI bodies, ported from `runtime/src/console.rs`.
+///
+/// Companion to `runtime.abi_string`: the second group of runtime functions
+/// written IN PICKLE that occupy real C ABI slots via `#[symbol]`.
+///
+/// THE RECURSION RULE - this is the whole design constraint for this file.
+/// `print(x)` lowers per the *static* type of `x`: `print(int)` becomes
+/// `pickle_print_i64`, `print(float)` `pickle_print_f64`, `print(byte)`
+/// `pickle_print_byte`, `print(char)` `pickle_print_char`. Those are all safe to
+/// call from inside an ABI body because none of them routes through
+/// `pickle_print_obj`.
+///
+/// `print` of a `string`, `List`, `Map`, `Enum`, class or struct lowers to
+/// `pickle_print_obj` - the very symbol this file defines. Using it inside a
+/// `print_obj` body re-enters the body and recurses until the stack is
+/// exhausted. So:
+///
+///   - Use `print(int)`, `print(float)`, `print(byte)`, `print(char)` freely.
+///   - Never use `print` on a string/container inside a `print_obj` body.
+///   - Write literal text through `emitCstr`, which goes straight to the
+///     console handle and never touches `print_obj`.
+///
+/// Verified by decoding the IRX extern table for both candidate
+/// `pickle_print_newline` bodies:
+///
+///   - `print(10 as byte)`          -> 3 externs: print_byte, print_obj, print_newline
+///   - `stdout_stream().write(...)` -> 5 externs: adds stdout_stream,
+///                                     str_to_bytes, stream_write
+///
+/// The byte form is both smaller and the one used here, so `pickle_print_obj`
+/// adds no *new* dependency on the runtime to be overridden later - it is
+/// already required by `print`.
+///
+/// Layout authority is `runtime.layout`, mirroring `runtime/src/layout.rs`.
+
+import { PICKLE_CLASS_STRING, PICKLE_CLASS_LIST, PICKLE_CLASS_MAP, PICKLE_CLASS_ENUM, PICKLE_CLASS_TUPLE, PICKLE_CLASS_BOX_INT, PICKLE_CLASS_BOX_FLOAT, PICKLE_CLASS_BOX_BOOL, PICKLE_CLASS_BOX_CHAR } from runtime.object
+import { abiStrFromI64, abiStrFromByte, abiStrFromChar } from runtime.abi_string
+import { fmtF64 } from runtime.abi_float
+import { writeStdout } from runtime.abi_stdio
+import { HEADER, STR_BYTES_OFF } from runtime.layout
+
+/// Renamed from `BYTES_WORD` on purpose: `abi_string` exports a top-level
+/// `BYTES_WORD` too, and a local top-level name that collides with ANY name in an
+/// imported module resolves as undeclared inside a `"{...}"` interpolation
+/// (MEMORIES.md, "interpolation cannot see a shadowing local"). This file has no
+/// interpolation today, so the collision is latent - not worth carrying into a
+/// module that is about to import from `abi_string`.
+const OBJ_BYTES_WORD: int = 4
+
+/// `class_id` is header word 1: `collector.setHeader` writes word 0 = next,
+/// word 1 = `class_id`, word 2 = size.
+const CLASS_ID_WORD: int = 1
+
+/// Payload slot 0, as a word index. Every builtin this symbol dispatches over
+/// keeps its single length/tag/bits field at `HEADER` (`STR_LEN_OFF`,
+/// `LIST_LEN_OFF`, `MAP_LEN_OFF`, `ENUM_TAG_OFF`, `TUPLE_LEN_OFF`,
+/// `BOX_PAYLOAD_OFF` are all `HEADER`), so one index covers all of them.
+const PAYLOAD_WORD: int = HEADER / 8
+
+/// `')'`, the closing byte of every `List(len=..)` / `Map(..)` style form.
+const CLOSE_PAREN: byte = 41 as byte
+
+/// Write `s`'s bytes to stdout, no `pickle_print_obj` involved.
+///
+/// THE ROUTE IS DELIBERATE. `runtime/src/console.rs::write_to_con` -> `write_stdout`
+/// -> on the freestanding build `nostd::console_write`: `GetStdHandle` plus one
+/// `WriteFile`, no buffering and no flush. So this is the *reference* path, not a
+/// shortcut around it - and it is why this file needs no `stdout_stream`, no
+/// `stream_write` and no `stream_flush` to print anything. A string's bytes are
+/// inline and contiguous at `STR_BYTES_OFF` (`byteAt`'s bit packing is
+/// little-endian, so raw memory and `byteAt` read the same bytes), so the payload
+/// pointer plus the length is exactly the `&[u8]` the reference hands to
+/// `WriteFile`. Note it is `STR_BYTES_OFF` (32), not `HEADER` (24): a string
+/// header is `[next, class_id, size, len]`, so the length is at 24 and the bytes
+/// start one word later.
+///
+/// The write itself lives in `runtime.abi_stdio`, the architecture seam for
+/// standard streams - see that file's header for why every console write is
+/// routed through it.
+fn emitCstr(s: string) -> int {
+    unsafe {
+        var p = &s
+        let _ = writeStdout((p as int) + STR_BYTES_OFF, len(s))
+        return 0
+    }
+}
+
+/// Byte `i` of a `string` OBJECT's inline payload.
+fn byteAt(obj: *int, i: int) -> int {
+    unsafe {
+        return (obj[OBJ_BYTES_WORD + (i >> 3)] >> ((i & 7) * 8)) & 255
+    }
+}
+
+/// Write a string object's inline bytes to stdout. Assumes the caller has
+/// already established that `class_id` is `PICKLE_CLASS_STRING`.
+///
+/// Same route as `emitCstr` - one `WriteFile` over the inline payload. Word 3 of
+/// the header is the byte length (`STR_LEN_OFF`), which is the `len` argument.
+fn emitString(obj: *int) -> int {
+    unsafe {
+        var n = obj[3]
+        if (n > 0) {
+            let _ = writeStdout((obj as int) + STR_BYTES_OFF, n)
+        }
+        return 0
+    }
+}
+
+/// Emit a newline. Ported from `console.rs::pickle_print_newline`, which writes
+/// the single byte `b"\n"`.
+///
+/// The byte must come from a raw cell, NOT from `abiStrFromByte` clamped into a
+/// managed string: the previous body (`print(10 as byte)`) lowered to
+/// `pickle_print_byte` -> `abiPrintByte`, which materializes a 1-byte managed
+/// string per call. Native writes the literal byte with zero allocation, and
+/// `println` is hot enough that the extra managed object showed up as +1
+/// allocation / +40 bytes per `println` on the GC counters. `NL_CELL` is a
+/// top-level cell initialized once at runtime init (never re-allocated), and
+/// little-endian memory places `0x0A` at its first byte - the same shape as the
+/// reference's `b"\n"` in rodata.
+var NL_CELL: int = 10
+
+#[symbol("pickle_print_newline")]
+fn abiPrintNewline() -> int {
+    unsafe {
+        let _ = writeStdout(&NL_CELL as int, 1)
+    }
+    return 0
+}
+
+/// Print an `i64` as decimal text. Ported from `console.rs::pickle_print_i64`,
+/// which is `emit_string(strings::int64_to_string(v))` - and `int64_to_string` is
+/// already ported as `pickle_str_from_i64`, so the body reuses it rather than
+/// re-deriving the digits.
+///
+/// Uses `emitString`, never `print(int)`: `print(int)` lowers to
+/// `pickle_print_i64`, which is this very symbol. `emitString` goes straight to
+/// the stream, so there is no re-entry.
+#[symbol("pickle_print_i64")]
+fn abiPrintI64(v: int) -> int {
+    return emitString(abiStrFromI64(v))
+}
+
+/// Print a `u64` as text. The reference is `int64_to_string(v as i64)` - the same
+/// call, with a reinterpret, not an unsigned formatter - so the body is
+/// deliberately identical to `abiPrintI64`.
+#[symbol("pickle_print_u64")]
+fn abiPrintU64(v: int) -> int {
+    return emitString(abiStrFromI64(v))
+}
+
+/// Print `true` / `false`. The reference picks one of two NUL-terminated literals
+/// and hands it to `pickle_print_cstr`, which is a strlen plus a raw byte write;
+/// `emitCstr` writes the same two literals by the same route.
+#[symbol("pickle_print_bool")]
+fn abiPrintBool(v: bool) -> int {
+    if (v) {
+        return emitCstr("true")
+    }
+    return emitCstr("false")
+}
+
+/// Print a single raw byte. The reference is `write_to_con(&[v as u8])` - the
+/// truncation to `u8` is load-bearing, because a `byte` mid-copy inside multi-byte
+/// UTF-8 must survive verbatim. `abiStrFromByte` is the same `v & 255`, and
+/// `str_from_byte` is documented as writing the byte RAW rather than re-encoding,
+/// so this composes without corrupting text.
+///
+/// `print(byte)` would lower back to this symbol, so the body uses `emitString`.
+#[symbol("pickle_print_byte")]
+fn abiPrintByte(v: int) -> int {
+    return emitString(abiStrFromByte(v))
+}
+
+/// Print a `char` as text. The reference is
+/// `char::from_u32(v as u32).unwrap_or('\u{FFFD}')` followed by `encode_utf8` -
+/// exactly `pickle_str_from_char`, including the U+FFFD replacement rule for
+/// surrogates, out-of-range and negative values, so that is what this calls.
+///
+/// `print(char)` would lower back to this symbol.
+#[symbol("pickle_print_char")]
+fn abiPrintChar(v: int) -> int {
+    return emitString(abiStrFromChar(v))
+}
+
+/// Print an `f64` in Rust `Display` form. Ported from
+/// `console.rs::pickle_print_f64`, which is `emit_string(float64_to_string(v))` -
+/// and `float64_to_string` is ported as `runtime.abi_float::fmtF64`, so the body
+/// is the same hand-off `abiPrintI64` makes to `abiStrFromI64`.
+///
+/// `print(float)` lowers to this symbol, so the body goes through `emitString`
+/// rather than `print(v)`.
+#[symbol("pickle_print_f64")]
+fn abiPrintF64(v: float) -> int {
+    return emitString(fmtF64(v))
+}
+
+/// Flush stdout. On the freestanding `nostd` build the Rust original compiles to
+/// an empty body - the `#[cfg]`-guarded `std::io::stdout()` flush is excluded -
+/// because output goes straight to `WriteFile`. An empty body is therefore an
+/// exact port, not an approximation.
+#[symbol("pickle_flush")]
+fn abiFlush() -> int {
+    return 0
+}
+
+/// Class-name text for a non-builtin instance. `className` is the
+/// `gc.class_name` seam and already resolves the reference's two-arm fallback:
+/// the registered name, or the literal `<object>` when the collector holds no
+/// descriptor for the id. So this is a straight hand-off with no null test.
+fn emitClassName(cid: int) -> int {
+    return emitCstr(className(cid))
+}
+
+/// Port of `console.rs::print_obj_raw`: dispatch on `class_id` and write the
+/// same bytes the Rust original writes.
+///
+/// Scalar arms call the scalar printers directly - `print(int)`, `print(float)`,
+/// `print(bool)` and `print(char)` lower to `pickle_print_i64`, `pickle_print_f64`,
+/// `pickle_print_bool` and `pickle_print_char`, none of which route back through
+/// `pickle_print_obj`. That is also what the reference does, and it keeps the
+/// path allocation free. Container arms write a literal through `emitCstr`, then
+/// the number, then the closing byte, mirroring the reference's three separate
+/// `write_to_con` calls rather than concatenating one string.
+///
+/// `print` of a `string` or container is deliberately never used here: that
+/// lowers to `pickle_print_obj` and would recurse until the stack is exhausted.
+///
+/// The reference's leading `obj.is_null()` arm is NOT reproduced. It is dead
+/// code on every current route into this symbol, verified rather than assumed:
+///   - `print`/`println` dispatch on the static type and reject `Ty::Option`
+///     outright (`unsupported `print` argument type`), so the only types that
+///     reach here are non-optional managed refs, which are non-null by
+///     construction.
+///   - the other emitter call site is the `...xs` spread loop, which is
+///     length-guarded and only ever passes elements of a `List`, i.e. non-null.
+/// And Pickle cannot express the test anyway: `*int` is not comparable to
+/// `none` and cannot be assigned `none`, so the arm would be unreachable code
+/// written in a language that has no way to state it. Reproducing the *shape*
+/// would mean adding a pointer-null ABI symbol purely for a dead path.
+#[symbol("pickle_print_obj")]
+fn abiPrintObj(obj: *int) -> int {
+    unsafe {
+        var cid = obj[CLASS_ID_WORD]
+
+        if (cid == PICKLE_CLASS_STRING) {
+            return emitString(obj)
+        }
+        if (cid == PICKLE_CLASS_LIST) {
+            emitCstr("List(len=")
+            print(obj[PAYLOAD_WORD])
+            print(CLOSE_PAREN)
+            return 0
+        }
+        if (cid == PICKLE_CLASS_MAP) {
+            emitCstr("Map(len=")
+            print(obj[PAYLOAD_WORD])
+            print(CLOSE_PAREN)
+            return 0
+        }
+        if (cid == PICKLE_CLASS_ENUM) {
+            emitCstr("Enum(tag=")
+            print(obj[PAYLOAD_WORD])
+            print(CLOSE_PAREN)
+            return 0
+        }
+        if (cid == PICKLE_CLASS_TUPLE) {
+            emitCstr("Tuple(len=")
+            print(obj[PAYLOAD_WORD])
+            print(CLOSE_PAREN)
+            return 0
+        }
+        if (cid == PICKLE_CLASS_BOX_INT) {
+            print(obj[PAYLOAD_WORD])
+            return 0
+        }
+        if (cid == PICKLE_CLASS_BOX_FLOAT) {
+            // The boxed payload is the raw bit pattern, not a numeric value.
+            // `x as float` would be a numeric conversion and is wrong here;
+            // `f64FromBits` is the bit reinterpret the reference gets from
+            // `f64::from_bits(box_bits(obj) as u64)`.
+            print(f64FromBits(obj[PAYLOAD_WORD]))
+            return 0
+        }
+        if (cid == PICKLE_CLASS_BOX_BOOL) {
+            print(obj[PAYLOAD_WORD] != 0)
+            return 0
+        }
+        if (cid == PICKLE_CLASS_BOX_CHAR) {
+            print((obj[PAYLOAD_WORD]) as char)
+            return 0
+        }
+        return emitClassName(cid)
+    }
+}

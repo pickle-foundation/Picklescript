@@ -1,0 +1,69 @@
+module runtime.abi_stdio
+
+/// THE ARCHITECTURE SEAM: every write of a standard stream in the ported
+/// runtime goes through these two functions. Nothing else in `pickle/` may call
+/// `win_get_std_handle` or `win_write_file` on a standard handle.
+///
+/// WHY IT IS ITS OWN MODULE. This file is the only place where "which OS am I
+/// running on" is decided for console output. `runtime.abi_fs` owns the file
+/// system, `runtime.abi_raw` owns the heap, and `runtime.abi_os` owns process
+/// termination - each already isolates one Win32 surface. Console output was the
+/// one remaining surface spread across four files (`abi_console`,
+/// `abi_exception`, `cli/main`, `cli/history`), so a non-Windows port had to
+/// edit all four, two of which sit in the self-hosted CLI. Gathering them here
+/// reduces that edit to one file.
+///
+/// IT DECLARES NO `#[symbol]` SLOTS. A `#[symbol]` fn is activated by an import
+/// (measured, see `abi_exception`'s header), so a module that declares one costs
+/// the importing program an entry in its unresolved set. These are ordinary
+/// functions called by name, so importing `runtime.abi_stdio` activates nothing:
+/// `linkall_all` imports it and its unresolved set is unchanged. That is what
+/// makes it safe for `cli/main` to import - the self-host gap is measured in
+/// whole symbols and this module adds none.
+///
+/// WHAT A LINUX PORT CHANGES. Only the two bodies below, to `write(1, ...)` and
+/// `write(2, ...)`, plus the handle constants (a POSIX build has no handle at
+/// all, so the constants go unused and the bodies take a fixed fd). The callers
+/// keep passing a payload pointer and a byte count, which is already the shape
+/// every libc and Win32 write wants. Nothing above this module knows that
+/// `GetStdHandle` exists.
+///
+/// WHY THE POINTER IS A RAW `int` AND NOT A `*int`. The callers compute the
+/// payload address with `+ STR_BYTES_OFF` themselves, because the string layout
+/// is a *layout* question (`runtime.layout`), not an OS question. Keeping the
+/// offset arithmetic outside means a change to string headers moves only the
+/// layout-dependent lines and leaves this file's contract untouched.
+
+/// `STD_OUTPUT_HANDLE`, spelled the way the SDK does: `(DWORD)-11`.
+const STD_OUTPUT_HANDLE: int = -11
+
+/// `STD_ERROR_HANDLE`, spelled the way the SDK does: `(DWORD)-12`.
+const STD_ERROR_HANDLE: int = -12
+
+/// Write `n` bytes starting at `ptr` to stdout.
+///
+/// One `WriteFile`, no buffering and no flush, mirroring the reference route:
+/// `console.rs::write_to_con` -> `write_stdout` -> freestanding
+/// `nostd::console_write`. Because nothing is buffered, `pickle_flush` is
+/// redundant on this path - which is why `abi_console` can port it as a no-op.
+fn writeStdout(ptr: int, n: int) -> int {
+    unsafe {
+        var h = win_get_std_handle(STD_OUTPUT_HANDLE)
+        let _ = win_write_file(h, ptr, n, 0, 0)
+        return 0
+    }
+}
+
+/// Write `n` bytes starting at `ptr` to stderr.
+///
+/// Same route as `writeStdout` over `STD_ERROR_HANDLE`, mirroring
+/// `nostd::console_error_write`. Callers write stderr through here rather than
+/// through the console module so that an exception report never depends on the
+/// module that `DO NOT IMPORT` rules constrain.
+fn writeStderr(ptr: int, n: int) -> int {
+    unsafe {
+        var h = win_get_std_handle(STD_ERROR_HANDLE)
+        let _ = win_write_file(h, ptr, n, 0, 0)
+        return 0
+    }
+}

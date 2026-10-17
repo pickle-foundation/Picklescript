@@ -1,0 +1,291 @@
+module runtime.fs
+
+/// Port slice 6 of the memory core (decision 2026-09-25): the fs CONTRACT
+/// layer — path normalization, error mapping, and result composition over the
+/// native whole-file syscalls, which themselves stay native (`runtime/src/
+/// fs.rs`: `pickle_read_file`/`write_file`/`file_exists`/`delete`/`mkdir`/
+/// `list_dir`). Errors are values exactly like the native layer: `read` and
+/// `list` failures surface as `none`, `write`/`remove`/`mkdir` report
+/// `false`. This module is pure Pickle and hermetic — the native seam is an
+/// `Fs` interface the production program binds to the real intrinsics and
+/// tests bind to a fake.
+///
+/// Paths are POSIX-style (`/` separator, no drive letters), matching
+/// `stdlib/fs.pkl`. `normalize` collapses empty and `.` segments and resolves
+/// `..` lexically (never above the root for absolute paths; a leading `..`
+/// that cannot resolve is kept, since relative paths can climb).
+
+/// The native-filesystem seam (the only non-pure surface). `read`/`list`
+/// return `none` on failure; `write`/`remove`/`mkdir` return whether they
+/// succeeded.
+interface Fs {
+    fn read(p: string) -> string?
+    fn write(p: string, t: string) -> bool
+    fn exists(p: string) -> bool
+    fn remove(p: string) -> bool
+    fn mkdir(p: string) -> bool
+    fn list(p: string) -> List<string>?
+}
+
+/// Join two path segments with a single `/`.
+fn pathJoin(a: string, b: string) -> string {
+    if (a == "") {
+        return b
+    }
+    if (b == "") {
+        return a
+    }
+    if ((a[len(a) - 1] as int) == 0x2F) {
+        return a + b
+    }
+    a + "/" + b
+}
+
+/// Whether `p` is absolute (starts with `/`).
+fn isAbsolute(p: string) -> bool {
+    len(p) > 0 && (p[0] as int) == 0x2F
+}
+
+/// Copy the string bytes in the half-open range `[lo, hi)` (clamped).
+fn subRange(p: string, lo: int, hi: int) -> string {
+    let bs = bytes(p)
+    var a = lo
+    var b = hi
+    if (a < 0) {
+        a = 0
+    }
+    if (b > len(bs)) {
+        b = len(bs)
+    }
+    if (a >= b) {
+        return ""
+    }
+    var out = bytes("")
+    var i = a
+    while (i < b) {
+        out.push(bs[i])
+        i = i + 1
+    }
+    str(out)
+}
+
+/// Lexically normalize a POSIX path: collapse empty and `.` segments, resolve
+/// `..`. An absolute path never climbs above the root; a relative `..` that
+/// cannot resolve (leading `..`) is preserved. The result has no trailing
+/// slash (root is `/`); an all-empty relative result is `.`.
+fn normalize(p: string) -> string {
+    var stack = [""]
+    stack.remove(0)
+    let leading = isAbsolute(p)
+    var work = bytes(p)
+    work.push(0x2F as byte)
+    var i = 0
+    var seg = bytes("")
+    while (i < len(work)) {
+        if ((work[i] as int) == 0x2F) {
+            let segStr = str(seg)
+            if (segStr == "..") {
+                if (len(stack) > 0) {
+                    stack.remove(len(stack) - 1)
+                } else if (!leading) {
+                    stack.push("..")
+                }
+            } else if (segStr != "." && segStr != "") {
+                stack.push(segStr)
+            }
+            seg = bytes("")
+        } else {
+            seg.push(work[i])
+        }
+        i = i + 1
+    }
+    var out = ""
+    if (leading) {
+        out = "/"
+    }
+    var k = 0
+    while (k < len(stack)) {
+        out = pathJoin(out, stack[k])
+        k = k + 1
+    }
+    if (out == "") {
+        "."
+    } else {
+        out
+    }
+}
+
+/// The final path segment of `p` (trailing slashes ignored); `""` when the
+/// path is empty or all slashes.
+fn baseName(p: string) -> string {
+    let bs = bytes(p)
+    var end = len(bs) - 1
+    while (end >= 0 && (bs[end] as int) == 0x2F) {
+        end = end - 1
+    }
+    if (end < 0) {
+        return ""
+    }
+    var start = end
+    while (start >= 0 && (bs[start] as int) != 0x2F) {
+        start = start - 1
+    }
+    subRange(p, start + 1, end + 1)
+}
+
+/// The directory portion of `p` (trailing slashes ignored), or `""` when it
+/// has no `/`.
+fn dirName(p: string) -> string {
+    let bs = bytes(p)
+    var end = len(bs) - 1
+    while (end >= 0 && (bs[end] as int) == 0x2F) {
+        end = end - 1
+    }
+    var i = end
+    while (i >= 0 && (bs[i] as int) != 0x2F) {
+        i = i - 1
+    }
+    if (i < 0) {
+        return ""
+    }
+    subRange(p, 0, i)
+}
+
+/// Read a whole file; `none` when unreadable. The path is normalized first.
+fn readText(io: Fs, p: string) -> string? {
+    io.read(normalize(p))
+}
+
+/// Overwrite a whole file; `false` when it cannot be written.
+fn writeText(io: Fs, p: string, t: string) -> bool {
+    io.write(normalize(p), t)
+}
+
+/// Whether a path exists (any kind: file or directory).
+fn pathExists(io: Fs, p: string) -> bool {
+    io.exists(normalize(p))
+}
+
+/// Remove a file or empty directory; `false` when it cannot be.
+fn removePath(io: Fs, p: string) -> bool {
+    io.remove(normalize(p))
+}
+
+/// Create a single directory level; `false` when it already exists.
+fn makeDir(io: Fs, p: string) -> bool {
+    io.mkdir(normalize(p))
+}
+
+/// Full child paths in host order; `none` when unreadable/missing.
+fn listChildren(io: Fs, p: string) -> List<string>? {
+    io.list(normalize(p))
+}
+
+/// A normalized POSIX path bound to a filesystem seam.
+class Path {
+    var io: Fs
+    var p: string
+
+    constructor(io: Fs, path: string) {
+        this.io = io
+        this.p = normalize(path)
+    }
+
+    fn text() -> string {
+        this.p
+    }
+
+    fn join(rel: string) -> Path {
+        Path(this.io, pathJoin(this.p, rel))
+    }
+
+    fn name() -> string {
+        baseName(this.p)
+    }
+
+    fn dir() -> string {
+        dirName(this.p)
+    }
+
+    fn exists() -> bool {
+        this.io.exists(this.p)
+    }
+
+    fn read() -> string? {
+        this.io.read(this.p)
+    }
+
+    fn write(t: string) -> bool {
+        this.io.write(this.p, t)
+    }
+}
+
+/// A whole-file wrapper bound to one normalized path.
+class File {
+    var io: Fs
+    var p: string
+
+    constructor(io: Fs, path: string) {
+        this.io = io
+        this.p = normalize(path)
+    }
+
+    fn path() -> string {
+        this.p
+    }
+
+    fn name() -> string {
+        baseName(this.p)
+    }
+
+    fn dir() -> string {
+        dirName(this.p)
+    }
+
+    fn read() -> string? {
+        this.io.read(this.p)
+    }
+
+    fn write(t: string) -> bool {
+        this.io.write(this.p, t)
+    }
+
+    fn exists() -> bool {
+        this.io.exists(this.p)
+    }
+
+    fn remove() -> bool {
+        this.io.remove(this.p)
+    }
+}
+
+/// A directory wrapper bound to one normalized path.
+class Dir {
+    var io: Fs
+    var p: string
+
+    constructor(io: Fs, path: string) {
+        this.io = io
+        this.p = normalize(path)
+    }
+
+    fn path() -> string {
+        this.p
+    }
+
+    fn list() -> List<string>? {
+        this.io.list(this.p)
+    }
+
+    fn exists() -> bool {
+        this.io.exists(this.p)
+    }
+
+    fn create() -> bool {
+        this.io.mkdir(this.p)
+    }
+
+    fn remove() -> bool {
+        this.io.remove(this.p)
+    }
+}

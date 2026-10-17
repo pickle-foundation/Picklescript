@@ -1,0 +1,138 @@
+module runtime.abi_raw
+
+import { abiEngineAllocCount, abiEngineAllocBytes, abiEngineResetCounters, abiEngineRegister, abiEngineUnregister, abiEngineRegisteredCount, abiEngineRegisteredAt, abiEngineRegisteredBytes } from runtime.abi_gcengine
+
+/// Port of `runtime/src/raw.rs`: the two-slot manual-allocation pair behind
+/// `alloc(int, n)` and `free(p)`.
+///
+/// WHY THIS SLOT IS THE VALUABLE ONE. `alloc(int, n)` is not an exotic escape
+/// hatch - it is how every container ABI body gets its memory. `abi_box`,
+/// `abi_class`, `abi_enum`, `abi_list`, `abi_map`, `abi_string` and
+/// `abi_tuple` all reach for it, so as long as these two symbols belong to the
+/// Rust archive, no ported body is actually free of the runtime. Closing them
+/// is what turns a ported module from "portable logic, native allocator" into
+/// a module that needs nothing outside the object.
+///
+/// THE ALLOCATOR IS NOT AN ARBITRARY CHOICE. The reference body is
+/// `alloc::alloc::alloc(Layout::from_size_align(size, 8))`, and Rust's `System`
+/// allocator on Windows lowers that to `HeapAlloc(GetProcessHeap(), 0, size)`
+/// - because the requested alignment, 8, is below the 16-byte threshold above
+/// which `System` starts over-allocating. So these bodies issue *the same
+/// Win32 call on the same heap*, which is what makes the pair safe even if only
+/// one half of it is linked: a pointer handed out here can be released by the
+/// Rust `pickle_raw_free`, and the reverse, without either side knowing the
+/// difference. Choosing `LocalAlloc` or `GlobalAlloc` instead would have
+/// forfeited that for no gain.
+///
+/// Two details of the reference are preserved deliberately:
+///
+///   - `size.max(1)`. The reference clamps before building the `Layout`,
+///     because a zero-sized request is not something a caller can write through
+///     anyway, and a block of one byte is the cheapest way to answer it. The
+///     clamp is kept here so the two implementations agree on what `alloc(p, 0)`
+///     returns.
+///   - no zeroing. `HeapAlloc` with zero flags does not clear memory, and
+///     neither does the Rust `System` allocator. Clearing it here would make
+///     this half *stricter* than the reference, and `memory_test`-style
+///     expectations that a fresh block reads back as zero are written against
+///     the `Heap` free-list model, not against this symbol.
+///
+/// WHAT IS DELIBERATELY NOT PORTED - `raw.rs` also keeps a thread-local `LIVE`
+/// map from pointer to size, and `pickle_raw_free` panics with "raw free of a
+/// pointer that was not allocated (double free?)" when the pointer is not in
+/// it. The registry is not portable as it stands: Pickle's only module-level
+/// mutable storage is the `pickle_static_get` / `pickle_static_set` pair, and
+/// those are themselves still Rust symbols, so a port that waited on them would
+/// simply move the dependency rather than remove it. Nor would the map buy its
+/// cost here - the reference's own header calls it "not a safety mechanism",
+/// and no Pickle-level test reaches the panic. The consequence is recorded
+/// rather than hidden: a double free or a foreign pointer now reaches
+/// `HeapFree`, where the reference produced a clean diagnostic instead. That is
+/// a strictly worse failure mode for buggy programs and no change at all for
+/// correct ones, and it closes the moment `pickle_static_*` is ported.
+///
+/// SIGNATURES. `pickle_raw_alloc(size: i64) -> usize` and
+/// `pickle_raw_free(ptr: usize)` - the latter returns nothing, so the body is
+/// void and the `HeapFree` `BOOL` is discarded at the call site rather than
+/// read back as a 64-bit value whose upper half nobody established.
+///
+/// THE ALLOCATION-EVENT SEAM, THE SWEEPABILITY REGISTRY, AND THEIR GROWTH
+/// HELPERS MOVED to `runtime.abi_gcengine` - the register path must reach the
+/// sweep it triggers, and hosting the registry here would put the reverse edge
+/// of `abi_gc`'s own `abi_raw` import in the graph (a cycle). This module now
+/// keeps only the raw allocator and thin delegating wrappers, so the makers and
+/// tests that import these names from `runtime.abi_raw` are unchanged; the
+/// counters and registry themselves live and are documented in
+/// `abi_gcengine.pkl`.
+
+/// Allocate `size` raw bytes. Mirrors `raw.rs::pickle_raw_alloc`.
+///
+/// The block is not traced by the collector and not reclaimed by anyone but
+/// the caller: `free` must run exactly once, which is the same contract
+/// `alloc(int, n)` has always had in front of these bodies.
+#[symbol("pickle_raw_alloc")]
+fn abiRawAlloc(size: int) -> int {
+    var n = size
+    if (n < 1) {
+        n = 1
+    }
+    var heap = win_get_process_heap()
+    return win_heap_alloc(heap, 0, n)
+}
+
+/// Release a block previously returned by `abiRawAlloc`.
+/// Mirrors `raw.rs::pickle_raw_free`, minus the `LIVE` registry above.
+#[symbol("pickle_raw_free")]
+fn abiRawFree(ptr: int) {
+    var heap = win_get_process_heap()
+    win_heap_free(heap, 0, ptr)
+}
+
+// ---------------------------------------- delegating wrappers (see abi_gcengine)
+// These keep the public names every maker and test already imports from this
+// module. The behaviour - and the automatic-collection trigger that now rides
+// the register moment - lives in `runtime.abi_gcengine`.
+
+/// Number of managed allocations since the last collection - the allocation-
+/// event seam's count, now owned by the engine (`abi_gcengine.pkl`).
+fn abiRawAllocCount() -> int {
+    return abiEngineAllocCount()
+}
+
+/// Managed allocation traffic in bytes since the last collection.
+fn abiRawAllocBytes() -> int {
+    return abiEngineAllocBytes()
+}
+
+/// Zero both seam counters - invoked by the engine's collect.
+fn abiRawResetCounters() {
+    abiEngineResetCounters()
+}
+
+/// Record a managed object as part of the port's live population. Reads the
+/// byte size from header word 2, bumps the seam counters, and runs the
+/// auto-collect trigger (native's `Gc::alloc` moment). Null is ignored.
+fn abiRegisterObject(obj: *int) {
+    abiEngineRegister(obj)
+}
+
+/// Drop an object from the port's live population. Null and an unknown address
+/// are no-ops. The block itself is not freed here.
+fn abiUnregisterObject(obj: *int) {
+    abiEngineUnregister(obj)
+}
+
+/// Number of managed objects currently registered.
+fn abiRegisteredCount() -> int {
+    return abiEngineRegisteredCount()
+}
+
+/// The object address at registry slot `i` - the sweeper's iteration view.
+fn abiRegisteredAt(i: int) -> int {
+    return abiEngineRegisteredAt(i)
+}
+
+/// Total managed-object bytes currently registered.
+fn abiRegisteredBytes() -> int {
+    return abiEngineRegisteredBytes()
+}

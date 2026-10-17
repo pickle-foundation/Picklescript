@@ -1,0 +1,67 @@
+module runtime.map
+
+/// Port of `runtime/src/map.rs`: the portable key policy.
+///
+/// The storage layer stays native: `pickle_map_*` operate on a flat open
+/// bucket array. Buckets hash on the KEY CLASS: string keys by byte content,
+/// numeric boxes by their value, enums by tag+payload, lists/tuples/other by
+/// deep structural content using a recursion-depth guard (cycles degenerate to
+/// identity at the guard). `pickle_map_keys`/`pickle_map_values` snapshot the
+/// live keys/values into fresh lists the caller owns.
+///
+/// What a self-hosted runtime owns is the CONTRACT:
+///   - occupied slots `TableEntry {key,value}` carry BOTH halves;
+///   - indexing a missing key reads the value type's default (the language
+///     `Map` does not observe the `none`/`pickle_map_get` miss — removal and
+///     explicit probing do);
+///   - snapshots never alias the map's internal arrays;
+///   - the resize trigger follows `MAX_LOAD` from `INITIAL_CAP` doubling.
+
+/// Initial bucket capacity of a fresh map.
+const INITIAL_CAP: int = 16
+
+/// Maximum load factor before the bucket array doubles (scaled to tenths).
+const MAX_LOAD: int = 7
+
+/// `MAX_LOAD` as tenths: a map grows once `10 * occupied >= cap * 7`.
+fn overLoadFactor(occupied: int, cap: int) -> bool {
+    occupied * 10 >= cap * 7
+}
+
+/// Key-kind ids used by the lookup policy: kind 0 = string, 1 = boxed scalar
+/// (int/float/bool/char), 2 = enum, 3 = composite (list/tuple/other).
+const KIND_STRING: int = 0
+const KIND_BOX: int = 1
+const KIND_ENUM: int = 2
+const KIND_COMPOSITE: int = 3
+
+/// Two lookup keys are "the same table" only for `(string, string)`,
+/// `(box, box)` with matching box classes, or `(enum, enum)`. A numeric box
+/// never aliases a string bucket and vice versa.
+fn keysCompatible(aKind: int, bKind: int) -> bool {
+    aKind == bKind
+}
+
+/// Keys hashing/equality by byte content: strings.
+fn keyHasBytesContent(kind: int) -> bool {
+    kind == KIND_STRING
+}
+
+/// Composite keys (lists, tuples, other buckets) compare structurally with a
+/// depth guard; at the guard they fall back to identity.
+fn isStructuralKind(kind: int) -> bool {
+    kind == KIND_COMPOSITE
+}
+
+/// `pickle_map_keys` / `pickle_map_values` snapshot semantics: every call
+/// returns a fresh list that shares nothing with the source table.
+fn keysSnapshot(src: List<int>) -> List<int> {
+    var out = [0]
+    out.pop()
+    var i = 0
+    while (i < len(src)) {
+        out.push(src[i])
+        i = i + 1
+    }
+    out
+}

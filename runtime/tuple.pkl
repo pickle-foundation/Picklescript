@@ -1,0 +1,34 @@
+module runtime.tuple
+
+/// Port of `runtime/src/tuple.rs`: portable tuple contract.
+///
+/// The ABI stays native: a tuple is a `{header, len, fields}` object; the
+/// field count lives in the object header so arity never needs a resizable
+/// buffer, and tuple construction compiles directly into
+/// `pickle_tuple_new(len)` + fixed-position `pickle_tuple_set_field`.
+///
+/// What a self-hosted runtime owns is the CONTRACT: field reads outside
+/// `[0, arity)` are `none` (never UB), or panic with the exact message when a
+/// debug build asserts:
+/// `pickle: tuple field index out of bounds`.
+
+/// Panic raised by `pickle_tuple_set_field` (and `pickle_tuple_field_assert`)
+/// on an out-of-bounds field index in build mode.
+const MSG_FIELD_OOB: string = "pickle: tuple field index out of bounds"
+
+/// Mirror of `pickle_tuple_field`: `none` for an index past `arity` or
+/// negative, otherwise the held value.
+fn fieldAt(fields: List<int>, index: int) -> int? {
+    if (index < 0) {
+        return none
+    }
+    if (index >= len(fields)) {
+        return none
+    }
+    fields[index]
+}
+
+/// The bounds predicate behind `pickle_tuple_set_field`'s build-mode assert.
+fn fieldOutOfBounds(index: int, arity: int) -> bool {
+    index < 0 || index >= arity
+}

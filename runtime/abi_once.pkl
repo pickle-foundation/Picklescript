@@ -1,0 +1,229 @@
+module runtime.abi_once
+
+/// Port of the observable once contract of `runtime/src/sync.rs` as real
+/// `#[symbol]` bodies: a handle table plus the three-symbol once family -
+/// new, done, run.
+///
+/// WHAT THIS OWNS. Of `sync.rs`'s once symbols, all three:
+///
+///   once(3) new done run
+///
+/// The 17.1 slice closes the wall `abi_sync.pkl`'s header documented for this
+/// family. That header reserved once because `pickle_once_run` must invoke the
+/// body closure and the only route was `call_closure0`, `pub(crate)`
+/// (`class.rs:255`), with no extern seam and no language mechanism for a `pkl`
+/// module to call an arbitrary extern. That hole is gone: a `#[symbol]` body
+/// may declare a parameter of function type (`fn () -> void`) and call it, so
+/// `abiOnceRun` below drives its body through a plain `CallInd` - no seam, no
+/// native dispatch. The whole family is therefore ported as one coherent
+/// registry, matching the all-or-nothing rule `abi_sync.pkl` documents.
+///
+/// THE HANDLE TABLE, mirrored from `abi_sync.pkl`. One flat word block of
+/// state-block addresses, one entry per handle, handle = index + 1 so 0 stays
+/// the null handle. Entries are leaked for the process lifetime and never
+/// removed. Growth is the same doubling `ensureBlock`/`blockCapGrown`; the two
+/// functions are duplicated (not imported) because importing `abi_sync` would
+/// activate that module's twenty-six `#[symbol]` slots in every image that
+/// imports this one. `KIND_ONCE` takes slot 5 in the shared kind numbering
+/// (`abi_sync` uses 1, 2, 3, 4, 6) so the two registries read identically.
+///
+/// STATE BLOCK. Each once is a raw word block from `alloc`, two words:
+///
+///   once  [0 kind=5, 1 state]
+///
+/// `state` mirrors the freestanding `POnce` state byte (`sync.rs:663`):
+/// 0 = untouched, 1 = a caller is running the initialiser, 2 = done. The
+/// reference's `enter` is a compare-and-set and there is no other thread, so
+/// the 1 state is transient and invisible here; `abiOnceRun` reads it only to
+/// answer "already entered, return false" like `POnce::enter` does for a
+/// non-zero state.
+///
+/// THE FATAL PATH. The wrong-kind and unknown-handle failures reproduce native
+/// `panic::fatal` byte-for-byte on stderr and exit 1 (the same three-write +
+/// `win_exit` seam `abi_expect.pkl` keeps): `fatal: pickle: handle {n} is not
+/// a once\n`. A reachable `fatal` inside a ported module's own test would end
+/// the whole `pickle-cli test` suite, so the unit tests never reach it; it is
+/// verified by the standalone probe (`tools/fatal_parity.ps1`,
+/// `sl_once_kindonce`).
+
+import { abiStrFromI64 } from runtime.abi_string
+import { writeStderr } from runtime.abi_stdio
+import { STR_BYTES_OFF } from runtime.layout
+
+const KIND_ONCE: int = 5
+
+/// The handle registry: a flat word block of state-block addresses.
+var onceBase: int = 0
+var onceCap: int = 0
+var onceCount: int = 0
+const ONCE_INITIAL: int = 8
+
+/// The capacity a block reaches for `idx` items under doubling growth: the
+/// first power-of-2 multiple of `initial` strictly above `idx` (or the input
+/// cap when it already fits). Duplicate of `abi_sync::blockCapGrown`.
+fn blockCapGrown(cap: int, idx: int, initial: int) -> int {
+    if (idx < cap) {
+        return cap
+    }
+    var c = cap
+    if (c == 0) {
+        c = initial
+    }
+    while (idx >= c) {
+        c = c * 2
+    }
+    return c
+}
+
+/// Grow `base`/`cap` so `idx` (a word index) is in range: allocate a fresh
+/// block of the grown capacity, copy the old words, zero the new tail, release
+/// the old block, and return the new base. Duplicate of `abi_sync::ensureBlock`.
+fn ensureBlock(base: int, cap: int, idx: int, initial: int) -> int {
+    var newCap = blockCapGrown(cap, idx, initial)
+    if (newCap == cap) {
+        return base
+    }
+    unsafe {
+        var fresh = alloc(int, newCap)
+        var j = 0
+        while (j < cap) {
+            fresh[j] = (base as *int)[j]
+            j = j + 1
+        }
+        var k = cap
+        while (k < newCap) {
+            fresh[k] = 0
+            k = k + 1
+        }
+        if (base != 0) {
+            free(base as *int)
+        }
+        return fresh as int
+    }
+}
+
+/// Register `state` in the handle table; returns its one-based handle (the
+/// post-push length, `sync.rs::register`).
+fn register(state: int) -> int {
+    var idx = onceCount
+    onceBase = ensureBlock(onceBase, onceCap, idx, ONCE_INITIAL)
+    onceCap = blockCapGrown(onceCap, idx, ONCE_INITIAL)
+    unsafe {
+        (onceBase as *int)[idx] = state
+    }
+    onceCount = onceCount + 1
+    return onceCount
+}
+
+/// The state block for `handle`, or null when the handle names nothing.
+fn entryBlock(handle: int) -> *int {
+    if (handle < 1) {
+        return 0 as *int
+    }
+    if (handle > onceCount) {
+        return 0 as *int
+    }
+    unsafe {
+        return ((onceBase as *int)[handle - 1]) as *int
+    }
+}
+
+/// The state block for `handle` when its kind is `kind`, else null. Mirrors the
+/// native `once_of` dispatch.
+fn ofKind(handle: int, kind: int) -> *int {
+    var b = entryBlock(handle)
+    if (b == 0 as *int) {
+        return b
+    }
+    unsafe {
+        if (b[0] != kind) {
+            return 0 as *int
+        }
+    }
+    return b
+}
+
+/// ---------------------------------------------------------------------------
+/// THE FATAL CHANNEL (stderr spellings of `panic.rs::fatal`, as in `abi_expect`)
+/// ---------------------------------------------------------------------------
+
+fn emitLit(lit: string) -> int {
+    unsafe {
+        var p = &lit
+        let _ = writeStderr((p as int) + STR_BYTES_OFF, len(lit))
+        return 0
+    }
+}
+
+fn emitStr(s: *int) -> int {
+    unsafe {
+        let _ = writeStderr((s as int) + STR_BYTES_OFF, s[3])
+        return 0
+    }
+}
+
+fn fatalExit() -> int {
+    win_exit(1)
+    return 0
+}
+
+/// `fatal: pickle: handle {n} is not {what}\n`, then exit 1.
+fn fatalIsNot(handle: int, what: string) -> int {
+    emitLit("fatal: ")
+    emitLit("pickle: handle ")
+    emitStr(abiStrFromI64(handle))
+    emitLit(" is not ")
+    emitLit(what)
+    emitLit("\n")
+    fatalExit()
+    return 0
+}
+
+/// ---------------------------------------------------------------------------
+/// ONCE
+/// ---------------------------------------------------------------------------
+
+/// A new once, untouched. Returns a one-based handle.
+#[symbol("pickle_once_new")]
+fn abiOnceNew() -> int {
+    unsafe {
+        var b = alloc(int, 2)
+        b[0] = KIND_ONCE
+        b[1] = 0
+        return register(b as int)
+    }
+}
+
+/// Whether the initialiser has already run.
+#[symbol("pickle_once_done")]
+fn abiOnceDone(handle: int) -> bool {
+    var o = ofKind(handle, KIND_ONCE)
+    if (o == 0 as *int) {
+        fatalIsNot(handle, "a once")
+    }
+    unsafe {
+        return o[1] == 2
+    }
+}
+
+/// Run `body` (a zero-argument closure object) exactly once across all tasks.
+/// Returns true for the caller that ran it, false for one that found the
+/// initialiser already run. The 1 state is written first, so a body that fails
+/// leaves the once "running" - the same contract as native `pickle_once_run`
+/// (`sync.rs:869`), which keeps every later `abiOnceRun` false.
+#[symbol("pickle_once_run")]
+fn abiOnceRun(handle: int, body: fn () -> void) -> bool {
+    var o = ofKind(handle, KIND_ONCE)
+    if (o == 0 as *int) {
+        fatalIsNot(handle, "a once")
+    }
+    unsafe {
+        if (o[1] != 0) {
+            return false
+        }
+        o[1] = 1
+        body()
+        o[1] = 2
+        return true
+    }
+}

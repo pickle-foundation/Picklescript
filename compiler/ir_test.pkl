@@ -1,0 +1,642 @@
+module compiler.ir_test
+
+import { IrTy, IrBinOp, IrUnOp, IrConst, Callee, IrInstr, IrTerm, IrBlock, IrParam, IrFunc, IrModule, IrExtern, irTyIsUnit, irTyStr, binOpRepr, unOpRepr, irConstRepr, calleeStr, joinTemps, joinIrTys, callIndStr, callStr, irInstrStr, irTermStr, irBlockStr, irFuncStr, irModuleStr, irxHex2, irxText, irxHexBytesOf, irxHexBytes, irxTemps, irxConstStr, irxInstrStr, irxParseFloat, irxModuleStr, irxFromIrx, emptyIrTys, emptyIrParams, emptyIrInstrs, emptyIrBlocks, emptyStrList, emptyIrStringLists, emptyIrFuncs, emptyIrExterns, emptyIrByName, emptyModule } from compiler.ir
+
+fn someTemp(v: int) -> int? {
+    v
+}
+
+fn noneTemp() -> int? {
+    none
+}
+
+fn floatText(txt: string) -> string {
+    if (let some(v) = irxParseFloat(txt)) {
+        return str(v)
+    }
+    "<none>"
+}
+
+fn fracDigits(txt: string) -> int {
+    let bs = bytes(txt)
+    var i = 0
+    while (i < len(bs)) {
+        if (bs[i] as int == 46) {
+            return len(bs) - i - 1
+        }
+        i = i + 1
+    }
+    0
+}
+
+fn digitCount(txt: string) -> int {
+    let bs = bytes(txt)
+    var n = 0
+    var i = 0
+    while (i < len(bs)) {
+        let c = bs[i] as int
+        if (c >= 48 && c <= 57) {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    n
+}
+
+test fn ir_ty_strings() {
+    expect(irTyStr(IrTy.Bool)).toBe("bool")
+    expect(irTyStr(IrTy.Char)).toBe("char")
+    expect(irTyStr(IrTy.Int)).toBe("int64")
+    expect(irTyStr(IrTy.Float)).toBe("float64")
+    expect(irTyStr(IrTy.Str)).toBe("string")
+    expect(irTyStr(IrTy.Unit)).toBe("unit")
+    expect(irTyStr(IrTy.Ptr)).toBe("ptr")
+    expect(irTyIsUnit(IrTy.Unit)).toBe(true)
+    expect(irTyIsUnit(IrTy.Int)).toBe(false)
+}
+
+test fn binop_reprs() {
+    expect(binOpRepr(IrBinOp.Add)).toBe("add")
+    expect(binOpRepr(IrBinOp.Sub)).toBe("sub")
+    expect(binOpRepr(IrBinOp.Shl)).toBe("shl")
+    expect(binOpRepr(IrBinOp.BitAnd)).toBe("band")
+    expect(binOpRepr(IrBinOp.BitXor)).toBe("bxor")
+    expect(binOpRepr(IrBinOp.Eq)).toBe("eq")
+    expect(binOpRepr(IrBinOp.Ge)).toBe("ge")
+}
+
+test fn unop_reprs() {
+    expect(unOpRepr(IrUnOp.Neg)).toBe("neg")
+    expect(unOpRepr(IrUnOp.Not)).toBe("not")
+    expect(unOpRepr(IrUnOp.BitNot)).toBe("bitnot")
+}
+
+test fn const_reprs() {
+    expect(irConstRepr(IrConst.Int(42))).toBe("42")
+    expect(irConstRepr(IrConst.Int(-7))).toBe("-7")
+    expect(irConstRepr(IrConst.Bool(true))).toBe("true")
+    expect(irConstRepr(IrConst.Bool(false))).toBe("false")
+    expect(irConstRepr(IrConst.Null)).toBe("null")
+    expect(irConstRepr(IrConst.Str(3))).toBe("str#3")
+    expect(irConstRepr(IrConst.StrAddr(9))).toBe("addrof str#9")
+    expect(irConstRepr(IrConst.FuncAddr(1))).toBe("addrof fn#1")
+}
+
+test fn callable_strs() {
+    expect(calleeStr(Callee.Func(2))).toBe("fn#2")
+    expect(calleeStr(Callee.Extern(5))).toBe("extern#5")
+}
+
+test fn temp_joins() {
+    var noTemps = [1]
+    noTemps.pop()
+    expect(joinTemps(noTemps)).toBe("")
+    expect(joinTemps([1, 2, 3])).toBe("t1, t2, t3")
+    expect(joinIrTys([IrTy.Int, IrTy.Float])).toBe("int64, float64")
+}
+
+test fn call_strings() {
+    var noArgs = [1]
+    noArgs.pop()
+    expect(callStr(someTemp(4), Callee.Func(2), [1, 2])).toBe("t4 = call fn#2(t1, t2)")
+    expect(callStr(none, Callee.Extern(5), noArgs)).toBe("call extern#5()")
+    expect(callIndStr(someTemp(1), 7, [IrTy.Int], IrTy.Unit, [2])).toBe("t1 = callind [int64] -> unit (t2) via t7")
+    expect(callIndStr(none, 3, emptyIrTys(), IrTy.Bool, noArgs)).toBe("callind [] -> bool () via t3")
+}
+
+test fn instr_strings() {
+    expect(irInstrStr(IrInstr.Const(0, IrConst.Int(42)))).toBe("t0 = const 42")
+    expect(irInstrStr(IrInstr.UnOp(1, IrUnOp.Neg, 0))).toBe("t1 = neg t0")
+    expect(irInstrStr(IrInstr.BinOp(2, IrBinOp.Add, 0, 1))).toBe("t2 = binop.add t0, t1")
+    expect(irInstrStr(IrInstr.Copy(3, 1))).toBe("t3 = copy t1")
+    expect(irInstrStr(IrInstr.Itof(4, 2))).toBe("t4 = itof t2")
+    expect(irInstrStr(IrInstr.LoadSlot(5, 1))).toBe("t5 = load slot s1")
+    expect(irInstrStr(IrInstr.StoreSlot(2, 6))).toBe("store t6 -> slot s2")
+    expect(irInstrStr(IrInstr.LocalAddr(7, 0))).toBe("t7 = addr slot s0")
+    expect(irInstrStr(IrInstr.LoadRaw(8, 3, IrTy.Str))).toBe("t8 = loadraw.string [t3]")
+    expect(irInstrStr(IrInstr.StoreRaw(4, 9, IrTy.Int))).toBe("storeraw.int64 t9 -> [t4]")
+}
+
+test fn term_strings() {
+    expect(irTermStr(IrTerm.Branch(3))).toBe("branch @3")
+    expect(irTermStr(IrTerm.BranchIf(1, 2, 3))).toBe("branchif t1 @2 @3")
+    expect(irTermStr(IrTerm.Return(someTemp(2)))).toBe("return t2")
+    expect(irTermStr(IrTerm.Return(none))).toBe("return")
+    expect(irTermStr(IrTerm.Unreachable)).toBe("unreachable")
+}
+
+test fn block_string() {
+    let b = IrBlock(0, [IrInstr.Const(0, IrConst.Int(1)), IrInstr.Const(1, IrConst.Int(2))], IrTerm.BranchIf(0, 1, 2))
+    expect(irBlockStr(b)).toBe("@entry:\n    t0 = const 1\n    t1 = const 2\n    branchif t0 @1 @2\n")
+    let b2 = IrBlock(5, emptyIrInstrs(), IrTerm.Return(none))
+    expect(irBlockStr(b2)).toBe("@5:\n    return\n")
+}
+
+test fn func_string() {
+    let f = IrFunc("main", "", [IrParam("x", IrTy.Int)], IrTy.Int, [IrTy.Int], 0, [IrBlock(0, [IrInstr.Const(0, IrConst.Int(1))], IrTerm.Return(someTemp(0)))], true, false, emptyStrList())
+    expect(irFuncStr(f)).toBe("main fn main(x: int64) -> int64\n  @entry:\n    t0 = const 1\n    return t0\n")
+}
+
+test fn module_string() {
+let f = IrFunc("foo", "", emptyIrParams(), IrTy.Unit, emptyIrTys(), 0, [IrBlock(0, emptyIrInstrs(), IrTerm.Unreachable)], false, false, emptyStrList())
+    let m = IrModule([f], emptyIrExterns(), emptyIrByName(), emptyIrStringLists(), emptyIrGlobals())
+    expect(irModuleStr(m)).toBe("fn foo() -> unit\n  @entry:\n    unreachable\n\n")
+}
+
+test fn irx_hex() {
+    expect(irxHex2(0)).toBe("00")
+    expect(irxHex2(255)).toBe("ff")
+    expect(irxHex2(16)).toBe("10")
+    expect(irxHex2(65)).toBe("41")
+    expect(irxText("A")).toBe("41")
+    expect(irxText("hi")).toBe("6869")
+    expect(irxHexBytesOf([104, 105])).toBe("6869")
+    expect(irxHexBytes(bytes("A"))).toBe("41")
+}
+
+test fn irx_temps() {
+    var noTemps = [1]
+    noTemps.pop()
+    expect(irxTemps(noTemps)).toBe("")
+    expect(irxTemps([1, 2])).toBe("1 2")
+}
+
+test fn irx_consts() {
+    expect(irxConstStr(IrConst.Int(7))).toBe("int 7")
+    expect(irxConstStr(IrConst.Bool(false))).toBe("bool false")
+    expect(irxConstStr(IrConst.Null)).toBe("null")
+    expect(irxConstStr(IrConst.StrAddr(2))).toBe("straddr 2")
+    expect(irxConstStr(IrConst.FuncAddr(4))).toBe("fnaddr 4")
+    expect(irxInstrStr(IrInstr.Copy(3, 1))).toBe("copy 3 1")
+    expect(irxInstrStr(IrInstr.BinOp(2, IrBinOp.Add, 0, 1))).toBe("binop 2 add 0 1")
+    expect(irxInstrStr(IrInstr.Call(4, Callee.Func(2), [1, 2]))).toBe("call 4 fn 2 1 2")
+    expect(irxInstrStr(IrInstr.Call(none, Callee.Extern(5), [1]))).toBe("call - extern 5 1")
+}
+
+test fn ir_empty_factories() {
+    expect(len(emptyIrTys())).toBe(0)
+    expect(len(emptyIrParams())).toBe(0)
+    expect(len(emptyIrInstrs())).toBe(0)
+    expect(len(emptyIrBlocks())).toBe(0)
+    expect(len(emptyStrList())).toBe(0)
+    expect(len(emptyIrStringLists())).toBe(0)
+    expect(len(emptyIrFuncs())).toBe(0)
+    expect(len(emptyIrExterns())).toBe(0)
+    let m = emptyModule()
+    expect(len(m.funcs)).toBe(0)
+    expect(len(m.externs)).toBe(0)
+    expect(len(m.strings)).toBe(0)
+}
+
+test fn irx_float_exact() {
+    expect(floatText("0")).toBe("0")
+    expect(floatText("0.0")).toBe("0")
+    expect(floatText("-0")).toBe("-0")
+    expect(floatText("-0.0")).toBe("-0")
+    expect(floatText("-1e-400")).toBe("-0")
+    expect(floatText("-1e-3230")).toBe("-0")
+    expect(floatText("+1.5")).toBe("1.5")
+    expect(floatText(".5")).toBe("0.5")
+    expect(floatText("5.")).toBe("5")
+    expect(floatText("1e0")).toBe("1")
+    expect(floatText("-1")).toBe("-1")
+    expect(floatText("0.1")).toBe("0.1")
+    expect(floatText("0.5")).toBe("0.5")
+    expect(floatText("2.5")).toBe("2.5")
+    expect(floatText("1.25")).toBe("1.25")
+    expect(floatText("3.14159")).toBe("3.14159")
+    expect(floatText("0.30000000000000004")).toBe("0.30000000000000004")
+    expect(floatText("1e20")).toBe("100000000000000000000")
+    expect(floatText("1e-27")).toBe("0.000000000000000000000000001")
+    expect(floatText("1234567890123456789.0123456789e-30")).toBe("0.0000000000012345678901234569")
+    expect(floatText("4503599627370496")).toBe("4503599627370496")
+    expect(floatText("4503599627370495.5")).toBe("4503599627370495.5")
+    expect(floatText("9007199254740993")).toBe("9007199254740992")
+    expect(floatText("123456789012345678901234567890")).toBe("123456789012345680000000000000")
+    expect(floatText("1.0000000000000000000000000000000000001")).toBe("1")
+    expect(floatText("1.00000000000000000000000000000000000001")).toBe("1")
+    expect(floatText("0.9999999999999999999999999999999999")).toBe("1")
+    expect(floatText("9.9999999999999999999999999999999999")).toBe("10")
+}
+
+test fn irx_float_subnormal() {
+    expect(floatText("2.4703282292062327e-324")).toBe("0")
+    expect(floatText("0.1e-323")).toBe("0")
+    expect(floatText("5e-324")).toBe(floatText("4.9406564584124654e-324"))
+    expect(floatText("1e-323")).toBe(floatText("1.0e-323"))
+    expect(fracDigits(floatText("5e-324"))).toBe(324)
+    expect(fracDigits(floatText("1e-323"))).toBe(323)
+    expect(floatText("2.2250738585072014e-308")).toBe(floatText("2.2250738585072013e-308"))
+    expect(fracDigits(floatText("2.2250738585072014e-308"))).toBe(324)
+}
+
+test fn irx_float_overflow() {
+    expect(floatText("1e309")).toBe("inf")
+    expect(floatText("1e400")).toBe("inf")
+    expect(floatText("1.7976931348623159e308")).toBe("inf")
+    expect(floatText("0.0000000000000000000000000000001e400")).toBe("inf")
+    expect(digitCount(floatText("1.7976931348623157e308"))).toBe(309)
+    expect(floatText("inf")).toBe("inf")
+    expect(floatText("INF")).toBe("inf")
+    expect(floatText("infinity")).toBe("inf")
+    expect(floatText("-inf")).toBe("-inf")
+}
+
+test fn irx_float_rejects() {
+    expect(floatText("")).toBe("<none>")
+    expect(floatText(".")).toBe("<none>")
+    expect(floatText("-")).toBe("<none>")
+    expect(floatText("abc")).toBe("<none>")
+    expect(floatText("1.2.3")).toBe("<none>")
+    expect(floatText("1e")).toBe("<none>")
+    expect(floatText("1e+")).toBe("<none>")
+    expect(floatText("0x10")).toBe("<none>")
+    expect(floatText(" 1")).toBe("<none>")
+    expect(floatText("1 ")).toBe("<none>")
+    expect(floatText("1d5")).toBe("<none>")
+    expect(floatText("nanx")).toBe("<none>")
+}
+
+/// A module that exercises every line kind, instruction, and terminator the
+/// IRX format can carry.
+fn irxSample() -> IrModule {
+    var externTys = emptyIrTys()
+    externTys.push(IrTy.Int)
+    externTys.push(IrTy.Ptr)
+    let externs = [IrExtern("puts", emptyIrTys(), IrTy.Unit), IrExtern("read line", externTys, IrTy.Str)]
+    let noBytes = [0]
+    noBytes.pop()
+    let noTemps = [0]
+    noTemps.pop()
+    let strings = [[104, 105], [0, 255, 128, 65], noBytes]
+    let params = [IrParam("a", IrTy.Int), IrParam("b c", IrTy.Str)]
+    let slots = [IrTy.Int, IrTy.Str]
+    let instrs = [
+        IrInstr.Const(0, IrConst.Int(0)),
+        IrInstr.Const(1, IrConst.Int(9223372036854775807)),
+        IrInstr.Const(2, IrConst.Float(0.5)),
+        IrInstr.Const(3, IrConst.Bool(true)),
+        IrInstr.Const(4, IrConst.Char('Z')),
+        IrInstr.Const(5, IrConst.Null),
+        IrInstr.Const(6, IrConst.Str(1)),
+        IrInstr.Const(7, IrConst.StrAddr(0)),
+        IrInstr.Const(8, IrConst.FuncAddr(1)),
+        IrInstr.UnOp(0, IrUnOp.Neg, 0),
+        IrInstr.UnOp(0, IrUnOp.Not, 0),
+        IrInstr.UnOp(0, IrUnOp.BitNot, 0),
+        IrInstr.BinOp(0, IrBinOp.Add, 0, 1),
+        IrInstr.BinOp(0, IrBinOp.Ge, 0, 1),
+        IrInstr.Copy(0, 1),
+        IrInstr.Itof(0, 1),
+        IrInstr.Ftoi(0, 1),
+        IrInstr.Chartoi(0, 1),
+        IrInstr.Itochar(0, 1),
+        IrInstr.LoadSlot(0, 0),
+        IrInstr.StoreSlot(0, 1),
+        IrInstr.LocalAddr(0, 1),
+        IrInstr.LoadRaw(0, 1, IrTy.Char),
+        IrInstr.StoreRaw(0, 1, IrTy.Ptr),
+        IrInstr.Call(0, Callee.Func(1), [1, 2]),
+        IrInstr.Call(none, Callee.Extern(0), [3]),
+        IrInstr.CallInd(0, 9, [IrTy.Int, IrTy.Ptr], IrTy.Int, [4, 5]),
+        IrInstr.CallInd(none, 9, emptyIrTys(), IrTy.Unit, noTemps)
+    ]
+    let blocks = [
+        IrBlock(0, instrs, IrTerm.Return(0)),
+        IrBlock(1, emptyIrInstrs(), IrTerm.Branch(0)),
+        IrBlock(2, [IrInstr.Const(0, IrConst.Bool(false))], IrTerm.BranchIf(0, 1, 0)),
+        IrBlock(3, emptyIrInstrs(), IrTerm.Return(none)),
+        IrBlock(4, emptyIrInstrs(), IrTerm.Unreachable)
+    ]
+    let mainFn = IrFunc("main", "main sym", emptyIrParams(), IrTy.Unit, slots, 0, blocks, true, false, ["tag one", "tag two"])
+    let otherFn = IrFunc("helper", "helper", params, IrTy.Str, emptyIrTys(), 1, blocks, false, true, emptyStrList())
+    var byName = emptyIrByName()
+    byName["main"] = 0
+    byName["helper"] = 1
+    IrModule([mainFn, otherFn], externs, byName, strings, emptyIrGlobals())
+}
+
+/// `irxModuleStr` -> `irxFromIrx` -> `irxModuleStr` must be the identity.
+fn irxRoundTrips(txt: string) -> bool {
+    if (let some(m) = irxFromIrx(txt)) {
+        return irxModuleStr(m) == txt
+    }
+    false
+}
+
+fn irxAccepts(txt: string) -> bool {
+    if (let some(_) = irxFromIrx(txt)) {
+        return true
+    }
+    false
+}
+
+test fn irx_round_trip_sample() {
+    expect(irxRoundTrips(irxModuleStr(irxSample()))).toBe(true)
+}
+
+test fn irx_round_trip_empty() {
+    expect(irxAccepts("")).toBe(true)
+    expect(irxAccepts("\n \t\n")).toBe(true)
+    expect(irxAccepts("irx externs 0\nirx strings 0\nirx funcs 0\n")).toBe(true)
+}
+
+test fn irx_round_trip_whitespace() {
+    let txt = irxModuleStr(irxSample())
+    var spaced = ""
+    var i = 0
+    let bs = bytes(txt)
+    var start = 0
+    while (i < len(bs)) {
+        if (bs[i] as int == 10) {
+            let line = sliceOf(bs, start, i)
+            spaced += "\t" + line + "   "
+            spaced += "\n"
+            start = i + 1
+        }
+        i = i + 1
+    }
+    expect(irxAccepts(spaced)).toBe(true)
+    if (let some(m) = irxFromIrx(txt)) {
+        expect(irxModuleStr(m) == txt).toBe(true)
+    }
+}
+
+fn sliceOf(bs: List<byte>, lo: int, hi: int) -> string {
+    var o = [0 as byte]
+    o.pop()
+    var k = lo
+    while (k < hi) {
+        o.push(bs[k])
+        k = k + 1
+    }
+    str(o)
+}
+
+test fn irx_round_trip_crlf() {
+    let bs = bytes(irxModuleStr(irxSample()))
+    var crlf = [0 as byte]
+    crlf.pop()
+    var i = 0
+    while (i < len(bs)) {
+        let c = bs[i]
+        if (c == 10) {
+            crlf.push(13 as byte)
+        }
+        crlf.push(c)
+        i = i + 1
+    }
+    expect(irxAccepts(str(crlf))).toBe(true)
+}
+
+/// The smallest module the reader accepts, one line at a time.
+const IRX_MIN_HEAD: string = "irx externs 0\nirx strings 0\nirx funcs 1\nfunc 0 6d 6d 1 0 0 unit\nparams 0 \nslots 0 \ntags 0 \nblocks 1\nblock 0\n"
+const IRX_MIN_TAIL: string = "return 0\n"
+
+fn irxMin(body: string) -> string {
+    IRX_MIN_HEAD + body + IRX_MIN_TAIL
+}
+
+fn bytesAt(bs: List<byte>, pat: List<byte>, at: int) -> bool {
+    if (at + len(pat) > len(bs)) { return false }
+    var k = 0
+    while (k < len(pat)) {
+        if (bs[at + k] != pat[k]) { return false }
+        k = k + 1
+    }
+    true
+}
+
+/// `String.replace` is not in the stdlib the IR tests link against.
+fn swap(t: string, pat: string, rep: string) -> string {
+    let bs = bytes(t)
+    let fb = bytes(pat)
+    let tb = bytes(rep)
+    var out = [0 as byte]
+    out.pop()
+    var i = 0
+    while (i < len(bs)) {
+        if (bytesAt(bs, fb, i)) {
+            var k = 0
+            while (k < len(tb)) {
+                out.push(tb[k])
+                k = k + 1
+            }
+            i = i + len(fb)
+        } else {
+            out.push(bs[i])
+            i = i + 1
+        }
+    }
+    str(out)
+}
+
+test fn irx_reader_headers() {
+    expect(irxAccepts("irx externs 0\n")).toBe(true)
+    expect(irxAccepts("irx externs +0\n")).toBe(true)
+    expect(irxAccepts("irx externs 01\n")).toBe(true)
+    expect(irxAccepts("irx externs 0 junk\n")).toBe(false)
+    expect(irxAccepts("irx externs\n")).toBe(false)
+    expect(irxAccepts("irx externs 0 0\n")).toBe(false)
+    expect(irxAccepts("irx bogus 0\n")).toBe(false)
+    expect(irxAccepts("irx externs -1\n")).toBe(false)
+    expect(irxAccepts("irx externs 1.0\n")).toBe(false)
+    expect(irxAccepts("irx externs 99999999999999999999\n")).toBe(false)
+    // `blocks N` is a hint only: Rust never reconciles it with the block list.
+    expect(irxAccepts(swap(irxMin(""), "blocks 1", "blocks 9"))).toBe(true)
+}
+
+test fn irx_reader_externs() {
+    expect(irxAccepts("irx externs 1\nextern 0\n")).toBe(true)
+    expect(irxAccepts("irx externs 1\nextern 0 61\n")).toBe(true)
+    expect(irxAccepts("irx externs 1\nextern 0 zz\n")).toBe(false)
+    expect(irxAccepts("irx externs 1\nextern 0 abc\n")).toBe(false)
+    // A lone 0xC3 is not valid UTF-8.
+    expect(irxAccepts("irx externs 1\nextern 0 c3\n")).toBe(false)
+    expect(irxAccepts("irx externs 1\nextern x 61\n")).toBe(false)
+    expect(irxAccepts("irx externs 1\nesig unit\n")).toBe(false)
+    expect(irxAccepts("irx externs 1\nextern 0 61\nesig nope\n")).toBe(false)
+    expect(irxAccepts("irx externs 1\nextern 0 61\nesig int64 nope\n")).toBe(false)
+    expect(irxAccepts("irx externs 1\nextern 0 61\nesig int64 ptr string\n")).toBe(true)
+}
+
+test fn irx_reader_strings() {
+    expect(irxAccepts("irx strings 1\nstring 0\n")).toBe(true)
+    expect(irxAccepts("irx strings 1\nstring 0 ABcd\n")).toBe(true)
+    expect(irxAccepts("irx strings 1\nstring 0 zz\n")).toBe(false)
+    expect(irxAccepts("irx strings 1\nstring 0 abc\n")).toBe(false)
+    if (let some(m) = irxFromIrx("irx strings 2\nstring 0 00ff\nstring 1\n")) {
+        expect(len(m.strings)).toBe(2)
+        expect(len(m.strings[0])).toBe(2)
+        expect(m.strings[0][1]).toBe(255)
+        expect(len(m.strings[1])).toBe(0)
+    } else {
+        expect(true).toBe(false)
+    }
+}
+
+test fn irx_reader_funcs() {
+    expect(irxAccepts("func 0 6d 6d 1 0 0 unit\n")).toBe(true)
+    // Rust panics on these; the reader rejects them instead.
+    expect(irxAccepts("func 0 6d 6d 1 0 0\n")).toBe(false)
+    expect(irxAccepts("func 0 6d\n")).toBe(false)
+    expect(irxAccepts("func 0 zz 6d 1 0 0 unit\n")).toBe(false)
+    expect(irxAccepts("func 0 c3 6d 1 0 0 unit\n")).toBe(false)
+    expect(irxAccepts("func 0 6d 6d 1 0 x unit\n")).toBe(false)
+    expect(irxAccepts("func 0 6d 6d 1 0 0 nope\n")).toBe(false)
+    // The main/test flags are `== "1"`, so anything else reads as false.
+    expect(irxAccepts("func 0 6d 6d x y 0 unit\n")).toBe(true)
+    if (let some(m) = irxFromIrx("func 0 61 62 1 1 3 string\n")) {
+        expect(len(m.funcs)).toBe(1)
+        expect(m.funcs[0].name).toBe("a")
+        expect(m.funcs[0].symbol).toBe("b")
+        expect(m.funcs[0].isMain).toBe(true)
+        expect(m.funcs[0].isTest).toBe(true)
+        expect(m.funcs[0].entry).toBe(3)
+        expect(irTyStr(m.funcs[0].ret)).toBe("string")
+        expect(m.funcsByName["a"]).toBe(0)
+    } else {
+        expect(true).toBe(false)
+    }
+}
+
+test fn irx_reader_params_slots_tags() {
+    expect(irxAccepts("params 0 \n")).toBe(false)
+    expect(irxAccepts(swap(irxMin(""), "params 0 ", "params 2 "))).toBe(false)
+    // Rust indexes toks[i + 1] here and panics; the reader rejects instead.
+    expect(irxAccepts(swap(irxMin(""), "params 0 ", "params 1 61"))).toBe(false)
+    expect(irxAccepts(swap(irxMin(""), "params 0 ", "params 1 61 nope"))).toBe(false)
+    expect(irxAccepts(swap(irxMin(""), "params 0 ", "params 1 61 int64"))).toBe(true)
+    expect(irxAccepts(swap(irxMin(""), "params 0 ", "params 1 c3 int64"))).toBe(false)
+    expect(irxAccepts(swap(irxMin(""), "slots 0 ", "slots 1 "))).toBe(false)
+    expect(irxAccepts(swap(irxMin(""), "slots 0 ", "slots 1 nope"))).toBe(false)
+    expect(irxAccepts(swap(irxMin(""), "slots 0 ", "slots 2 int64 ptr"))).toBe(true)
+    expect(irxAccepts(swap(irxMin(""), "tags 0 ", "tags 2 61"))).toBe(false)
+    expect(irxAccepts(swap(irxMin(""), "tags 0 ", "tags 1 zz"))).toBe(false)
+    expect(irxAccepts(swap(irxMin(""), "tags 0 ", "tags 1 eda0"))).toBe(false)
+    expect(irxAccepts(swap(irxMin(""), "tags 0 ", "tags 1 c3a9"))).toBe(true)
+}
+
+test fn irx_reader_blocks() {
+    expect(irxAccepts("block 0\n")).toBe(false)
+    expect(irxAccepts(swap(irxMin(""), "block 0", "block x"))).toBe(false)
+    expect(irxAccepts("func 0 6d 6d 1 0 0 unit\nparams 0 \nslots 0 \ntags 0 \nblocks 0\nreturn 0\n")).toBe(false)
+    // An instruction or terminator with no block to attach to is an error.
+    expect(irxAccepts("func 0 6d 6d 1 0 0 unit\nparams 0 \nslots 0 \ntags 0 \nblocks 0\nconst 0 int 1\n")).toBe(false)
+    expect(irxAccepts(irxMin(""))).toBe(true)
+}
+
+test fn irx_reader_consts() {
+    expect(irxAccepts(irxMin("const 0 int 7\n"))).toBe(true)
+    expect(irxAccepts(irxMin("const 0 int -9223372036854775808\n"))).toBe(true)
+    expect(irxAccepts(irxMin("const 0 int 9223372036854775807\n"))).toBe(true)
+    expect(irxAccepts(irxMin("const 0 int 9223372036854775808\n"))).toBe(false)
+    expect(irxAccepts(irxMin("const 0 int -9223372036854775809\n"))).toBe(false)
+    expect(irxAccepts(irxMin("const 0 int x\n"))).toBe(false)
+    // Rust indexes rest[2] here and panics; the reader rejects instead.
+    expect(irxAccepts(irxMin("const 0 int\n"))).toBe(false)
+    expect(irxAccepts(irxMin("const - int 7\n"))).toBe(false)
+    expect(irxAccepts(irxMin("const 0 nope 7\n"))).toBe(false)
+    expect(irxAccepts(irxMin("const 0 null\n"))).toBe(true)
+    expect(irxAccepts(irxMin("const 0 bool true\n"))).toBe(true)
+    expect(irxAccepts(irxMin("const 0 bool yes\n"))).toBe(false)
+    expect(irxAccepts(irxMin("const 0 str 3\n"))).toBe(true)
+    expect(irxAccepts(irxMin("const 0 straddr 3\n"))).toBe(true)
+    expect(irxAccepts(irxMin("const 0 fnaddr 3\n"))).toBe(true)
+    expect(irxAccepts(irxMin("const 0 float -0.0\n"))).toBe(true)
+    expect(irxAccepts(irxMin("const 0 float 5e-324\n"))).toBe(true)
+    expect(irxAccepts(irxMin("const 0 float 1e400\n"))).toBe(true)
+    expect(irxAccepts(irxMin("const 0 float 1e999999\n"))).toBe(true)
+    expect(irxAccepts(irxMin("const 0 float 1e-999999\n"))).toBe(true)
+    expect(irxAccepts(irxMin("const 0 float nope\n"))).toBe(false)
+    expect(irxAccepts(irxMin("const 0 char 128512\n"))).toBe(true)
+    // Deliberate divergence: Rust stores any u32 as a char, even a surrogate or
+    // an out-of-range scalar, which is not a value the rest of the compiler
+    // can use. The reader rejects those instead.
+    expect(irxAccepts(irxMin("const 0 char 55296\n"))).toBe(false)
+    expect(irxAccepts(irxMin("const 0 char 1114112\n"))).toBe(false)
+    expect(irxAccepts(irxMin("const 0 char 4294967296\n"))).toBe(false)
+    expect(irxAccepts(irxMin("const 0 char 0x41\n"))).toBe(false)
+}
+
+test fn irx_reader_instrs() {
+    expect(irxAccepts(irxMin("unop 0 neg 1\n"))).toBe(true)
+    expect(irxAccepts(irxMin("unop 0 negx 1\n"))).toBe(false)
+    expect(irxAccepts(irxMin("unop 0 neg\n"))).toBe(false)
+    expect(irxAccepts(irxMin("binop 0 add 1 2\n"))).toBe(true)
+    expect(irxAccepts(irxMin("binop 0 add 1\n"))).toBe(false)
+    expect(irxAccepts(irxMin("binop 0 addx 1 2\n"))).toBe(false)
+    expect(irxAccepts(irxMin("copy 0 -\n"))).toBe(false)
+    expect(irxAccepts(irxMin("copy 0 1 junk\n"))).toBe(false)
+    expect(irxAccepts(irxMin("addr 0 -\n"))).toBe(false)
+    expect(irxAccepts(irxMin("load 0 0\n"))).toBe(true)
+    expect(irxAccepts(irxMin("load 0 0 nope\n"))).toBe(false)
+    expect(irxAccepts(irxMin("store 0 1\n"))).toBe(true)
+    expect(irxAccepts(irxMin("loadraw 0 int64 1\n"))).toBe(true)
+    expect(irxAccepts(irxMin("loadraw 0 nope 1\n"))).toBe(false)
+    expect(irxAccepts(irxMin("storeraw int64 1 2\n"))).toBe(true)
+    expect(irxAccepts(irxMin("itof 0 1\n"))).toBe(true)
+    expect(irxAccepts(irxMin("ftoi 0 1\n"))).toBe(true)
+    expect(irxAccepts(irxMin("chartoi 0 1\n"))).toBe(true)
+    expect(irxAccepts(irxMin("itochar 0 1\n"))).toBe(true)
+    expect(irxAccepts(irxMin("call 0 fn 1\n"))).toBe(true)
+    expect(irxAccepts(irxMin("call 0 extern 1 2 3\n"))).toBe(true)
+    expect(irxAccepts(irxMin("call - extern 1\n"))).toBe(true)
+    expect(irxAccepts(irxMin("call 0 nope 1\n"))).toBe(false)
+    expect(irxAccepts(irxMin("call 0 extern -\n"))).toBe(false)
+    expect(irxAccepts(irxMin("call 0 extern\n"))).toBe(false)
+    expect(irxAccepts(irxMin("callind - 3 unit 0 0\n"))).toBe(true)
+    expect(irxAccepts(irxMin("callind 0 3 int64 2 int64 ptr 2 4 5\n"))).toBe(true)
+    expect(irxAccepts(irxMin("callind 0 1 int64 0\n"))).toBe(false)
+    // Rust slices past the token vector here and panics; the reader rejects.
+    expect(irxAccepts(irxMin("callind 0 1 int64 9 0\n"))).toBe(false)
+    expect(irxAccepts(irxMin("callind 0 1 int64 0 5 0\n"))).toBe(false)
+    expect(irxAccepts(irxMin("callind 0 1 int64 1 nope 0\n"))).toBe(false)
+    expect(irxAccepts(irxMin("callind 0 1 nope 0 0\n"))).toBe(false)
+    expect(irxAccepts(irxMin("constx 0 int 7\n"))).toBe(false)
+    expect(irxAccepts(irxMin("nope 1\n"))).toBe(false)
+}
+
+test fn irx_reader_terms() {
+    expect(irxAccepts(swap(irxMin(""), "return 0", "return 0 junk"))).toBe(true)
+    expect(irxAccepts(swap(irxMin(""), "return 0", "return -"))).toBe(true)
+    expect(irxAccepts(swap(irxMin(""), "return 0", "return 4294967295"))).toBe(true)
+    expect(irxAccepts(swap(irxMin(""), "return 0", "return 4294967296"))).toBe(false)
+    expect(irxAccepts(swap(irxMin(""), "return 0", "return -1"))).toBe(false)
+    expect(irxAccepts(swap(irxMin(""), "return 0", "return word"))).toBe(false)
+    expect(irxAccepts(swap(irxMin(""), "return 0", "branch 0 junk"))).toBe(true)
+    expect(irxAccepts(swap(irxMin(""), "return 0", "branch x"))).toBe(false)
+    expect(irxAccepts(swap(irxMin(""), "return 0", "branchif 0 1 2"))).toBe(true)
+    expect(irxAccepts(swap(irxMin(""), "return 0", "branchif - 1 2"))).toBe(false)
+    expect(irxAccepts(swap(irxMin(""), "return 0", "unreachable 1 2 3"))).toBe(true)
+}
+
+test fn irx_reader_parses_shape() {
+    let txt = irxModuleStr(irxSample())
+    if (let some(m) = irxFromIrx(txt)) {
+        expect(len(m.externs)).toBe(2)
+        expect(m.externs[1].symbol).toBe("read line")
+        expect(len(m.externs[1].params)).toBe(2)
+        expect(irTyStr(m.externs[1].ret)).toBe("string")
+        expect(len(m.strings)).toBe(3)
+        expect(m.strings[1][2]).toBe(128)
+        expect(len(m.funcs)).toBe(2)
+        expect(m.funcs[0].name).toBe("main")
+        expect(m.funcs[0].symbol).toBe("main sym")
+        expect(m.funcs[0].isMain).toBe(true)
+        expect(len(m.funcs[0].slots)).toBe(2)
+        expect(len(m.funcs[0].tags)).toBe(2)
+        expect(m.funcs[0].tags[1]).toBe("tag two")
+        expect(len(m.funcs[0].blocks)).toBe(5)
+        expect(len(m.funcs[0].blocks[0].instrs)).toBe(28)
+        expect(m.funcsByName["helper"]).toBe(1)
+        let f = m.funcs[1]
+        expect(len(f.params)).toBe(2)
+        expect(f.params[1].name).toBe("b c")
+        expect(irTyStr(f.params[1].ty)).toBe("string")
+        expect(f.isTest).toBe(true)
+        expect(f.entry).toBe(1)
+    } else {
+        expect(true).toBe(false)
+    }
+}

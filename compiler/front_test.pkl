@@ -1,0 +1,242 @@
+module compiler.front_test
+
+import { aliasSuffix, arrayIsClosed, matchingBrace, extractKv, stripTomlComment, stringIndexOf, stringStartsWith, stringEndsWith, stringTrim, stringTrimStart, splitLines, subStr, pathJoin, pathParentP, pathStem, joinPathParts, renderPath, importerDir, copyStrs, singleStr, listHasStr, subListStr, eqStrs, sortStrs, strLt, dedupStrs, emptyWorkspace, emptyMapStrStr, emptyMapStrInt, emptyFileImports, longestPrefixStr, FileImports, parseWorkspaceMembers } from compiler.front
+import { Span } from compiler.diag
+import { emptyStrs } from compiler.ast
+
+fn someInt(v: int) -> int? {
+    v
+}
+
+fn someString(v: string) -> string? {
+    v
+}
+
+fn eqStrings(a: List<string>, b: List<string>) -> bool {
+    if (len(a) != len(b)) {
+        return false
+    }
+    var i = 0
+    while (i < len(a)) {
+        if (a[i] != b[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+fn joinStrsTest(xs: List<string>) -> string {
+    var out = ""
+    var i = 0
+    while (i < len(xs)) {
+        if (i > 0) {
+            out += ","
+        }
+        out += xs[i]
+        i = i + 1
+    }
+    out
+}
+
+test fn alias_suffixes() {
+    expect(aliasSuffix(0)).toBe("A")
+    expect(aliasSuffix(1)).toBe("B")
+    expect(aliasSuffix(25)).toBe("Z")
+    expect(aliasSuffix(26)).toBe("AA")
+    expect(aliasSuffix(27)).toBe("BA")
+    expect(aliasSuffix(51)).toBe("ZA")
+    expect(aliasSuffix(52)).toBe("AB")
+    expect(aliasSuffix(701)).toBe("ZZ")
+}
+
+test fn array_is_closed() {
+    expect(arrayIsClosed("[a, b]")).toBe(true)
+    expect(arrayIsClosed("[a, b")).toBe(false)
+    expect(arrayIsClosed("[]")).toBe(true)
+    expect(arrayIsClosed("[a]")).toBe(true)
+    expect(arrayIsClosed("[a, [b, c]]")).toBe(true)
+    expect(arrayIsClosed("\"[x\"")).toBe(true)
+}
+
+test fn matching_brace() {
+    match (matchingBrace("}")) {
+        case some(i) -> expect(i).toBe(0)
+        case none -> expect(true).toBe(false)
+    }
+    match (matchingBrace("x}")) {
+        case some(i) -> expect(i).toBe(1)
+        case none -> expect(true).toBe(false)
+    }
+    match (matchingBrace("a{{b}}c}}")) {
+        case some(i) -> expect(i).toBe(5)
+        case none -> expect(true).toBe(false)
+    }
+    match (matchingBrace("abc")) {
+        case some(i) -> expect(true).toBe(false)
+        case none -> expect(true).toBe(true)
+    }
+}
+
+test fn extract_kv() {
+    match (extractKv("name = \"foo\" path = \"bar\"", "name")) {
+        case some(v) -> expect(v).toBe("foo")
+        case none -> expect(true).toBe(false)
+    }
+    match (extractKv("name = \"foo\"", "path")) {
+        case some(v) -> expect(true).toBe(false)
+        case none -> expect(true).toBe(true)
+    }
+    match (extractKv("x = \"a\" name = 'q' path = \"b\"", "name")) {
+        case some(v) -> expect(v).toBe("q")
+        case none -> expect(true).toBe(false)
+    }
+    match (extractKv("name = bare", "name")) {
+        case some(v) -> expect(v).toBe("bare")
+        case none -> expect(true).toBe(false)
+    }
+}
+
+test fn strip_toml_comments() {
+    expect(stripTomlComment("# full comment")).toBe("")
+    expect(stripTomlComment("name = \"x\" # trailing")).toBe("name = \"x\" ")
+    expect(stripTomlComment("instr = ab#c")).toBe("instr = ab")
+    expect(stripTomlComment("a = '" + "x#y" + "' #c")).toBe("a = 'x#y' ")
+    expect(stripTomlComment("  # leading spaces")).toBe("  ")
+}
+
+test fn string_index_of() {
+    expect(stringIndexOf("abc", "b")).toBe(1)
+    expect(stringIndexOf("abc", "d")).toBe(-1)
+    expect(stringIndexOf("abc", "c")).toBe(2)
+    expect(stringIndexOf("abc", "")).toBe(0)
+    expect(stringIndexOf("ab", "abc")).toBe(-1)
+    expect(stringIndexOf("aaaa", "aa")).toBe(0)
+}
+
+test fn string_prefix_suffix() {
+    expect(stringStartsWith("hello", "he")).toBe(true)
+    expect(stringStartsWith("hello", "hi")).toBe(false)
+    expect(stringStartsWith("hello", "hello")).toBe(true)
+    expect(stringStartsWith("he", "hello")).toBe(false)
+    expect(stringEndsWith("hello", "lo")).toBe(true)
+    expect(stringEndsWith("hello", "he")).toBe(false)
+    expect(stringEndsWith("hello", "hello")).toBe(true)
+}
+
+test fn string_trims() {
+    expect(stringTrim("  x  ")).toBe("x")
+    expect(stringTrim("x")).toBe("x")
+    expect(stringTrim("  \n\t")).toBe("")
+    expect(stringTrimStart("  x  ")).toBe("x  ")
+    expect(stringTrimStart("x")).toBe("x")
+}
+
+test fn split_lines() {
+    var a = splitLines("a\nb\nc")
+    expect(len(a)).toBe(3)
+    expect(a[0]).toBe("a")
+    expect(a[1]).toBe("b")
+    expect(a[2]).toBe("c")
+    var b = splitLines("a\r\nb")
+    expect(len(b)).toBe(2)
+    expect(b[0]).toBe("a")
+    expect(b[1]).toBe("b")
+    var c = splitLines("")
+    expect(len(c)).toBe(1)
+    expect(c[0]).toBe("")
+}
+
+test fn sub_str() {
+    expect(subStr("hello", 1, 3)).toBe("ell")
+    expect(subStr("hello", 0, 5)).toBe("hello")
+    expect(subStr("hello", 2, 10)).toBe("llo")
+    expect(subStr("", 0, 0)).toBe("")
+}
+
+test fn path_helpers() {
+    expect(pathJoin("a", "b")).toBe("a/b")
+    expect(pathJoin("", "b")).toBe("b")
+    expect(pathJoin("a", "")).toBe("a")
+    expect(pathStem("/a/b/c.pkl")).toBe("c")
+    expect(pathStem("foo.pkl")).toBe("foo")
+    expect(pathStem("dir/foo")).toBe("foo")
+    expect(pathStem("dir/foo.pkl")).toBe("foo")
+    match (pathParentP("/a/b/c")) {
+        case some(p) -> expect(p).toBe("/a/b")
+        case none -> expect(true).toBe(false)
+    }
+    match (pathParentP("c")) {
+        case some(p) -> expect(p).toBe("")
+        case none -> expect(true).toBe(false)
+    }
+    match (pathParentP("")) {
+        case some(p) -> expect(true).toBe(false)
+        case none -> expect(true).toBe(true)
+    }
+    expect(joinPathParts(["a", "b", "c"])).toBe("a/b/c")
+    expect(renderPath(["a", "b", "c"])).toBe("a.b.c")
+    match (importerDir("x/y.pkl")) {
+        case some(d) -> expect(d).toBe("x")
+        case none -> expect(true).toBe(false)
+    }
+    match (importerDir("y.pkl")) {
+        case some(d) -> expect(d).toBe(".")
+        case none -> expect(true).toBe(false)
+    }
+}
+
+test fn str_list_helpers() {
+    var l = copyStrs(["a", "b"])
+    expect(len(l)).toBe(2)
+    expect(l[1]).toBe("b")
+    var s = singleStr("x")
+    expect(len(s)).toBe(1)
+    expect(s[0]).toBe("x")
+    expect(listHasStr(["a", "b"], "b")).toBe(true)
+    expect(listHasStr(["a", "b"], "c")).toBe(false)
+    var sub = subListStr(["a", "b", "c"], 1, 2)
+    expect(len(sub)).toBe(2)
+    expect(sub[0]).toBe("b")
+    expect(sub[1]).toBe("c")
+    expect(eqStrs(["a", "b"], ["a", "b"])).toBe(true)
+    expect(eqStrs(["a", "b"], ["a"])).toBe(false)
+    expect(strLt("a", "b")).toBe(true)
+    expect(strLt("b", "a")).toBe(false)
+    expect(strLt("ab", "abc")).toBe(true)
+}
+
+test fn sort_and_dedup() {
+    var l = ["b", "a", "c"]
+    sortStrs(l)
+    expect(joinStrsTest(l)).toBe("a,b,c")
+    var d = ["a", "a", "b", "b", "b", "c"]
+    dedupStrs(d)
+    expect(joinStrsTest(d)).toBe("a,b,c")
+}
+
+test fn workspace_and_imports() {
+    let w = emptyWorkspace()
+    expect(len(w.crates)).toBe(0)
+    let m = emptyMapStrStr()
+    expect(len(m)).toBe(0)
+    let i = emptyMapStrInt()
+    expect(len(i)).toBe(0)
+    let fi = emptyFileImports()
+    expect(len(fi.modules)).toBe(0)
+}
+
+test fn longest_prefix() {
+    let fi = emptyFileImports()
+    match (longestPrefixStr(["a", "b"], fi)) {
+        case some(k) -> expect(true).toBe(false)
+        case none -> expect(true).toBe(true)
+    }
+}
+
+test fn parse_workspace_members() {
+    let r = parseWorkspaceMembers("name = \"x\"\npath = \"y\"")
+    expect(len(r)).toBe(0)
+    let r2 = parseWorkspaceMembers("")
+    expect(len(r2)).toBe(0)
+}

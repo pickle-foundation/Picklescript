@@ -1,0 +1,362 @@
+module runtime.memory
+
+/// Port slice 3 of the memory core (decision 2026-09-25): the non-moving
+/// heap — free-list triage by size class + coalescing over bump segments.
+/// Mirrors `runtime/src/heap.rs` (`docs/05-memory.md` v1 non-moving
+/// mark-and-sweep).
+///
+/// The model lives in pickle-owned integer address space: every live/free span
+/// has a `Block { addr, size, ... }` record (the real heap's intrusive header
+/// inline in the block). The sweep walks each segment by header size and
+/// returns contiguous dead runs to the free lists, coalesced — exactly the
+/// contract the real heap's sweep satisfies.
+
+/// Minimum object size (header + one aligned slot); also the smallest bin.
+const MIN_OBJECT: int = 32
+
+/// Free-bin count: covers objects up to 2^31; bigger sizes go into the last
+/// bin (`heap.rs::NBINS`).
+const NBINS: int = 28
+
+/// Initial bump-segment capacity in bytes (`heap.rs`: `1 << 20`).
+const INITIAL_CAP: int = 1048576
+
+/// A leftover free span is only worth splitting when it can carry its own
+/// header (24-byte header + one aligned slot).
+const SPLIT_MIN: int = 32
+
+/// Terminal address (no next block / no head).
+const INVALID_ADDR: int = -1
+
+/// Round `n` up to the next multiple of 8 (`heap::align8`).
+fn align8(n: int) -> int {
+    ((n + 7) / 8) * 8
+}
+
+/// Bin index for a block of `size` bytes (`heap.rs::bin_of`): clamp to
+/// `MIN_OBJECT`, then double from `MIN_OBJECT` until size fits, capped at the
+/// last bin.
+fn binOf(size: int) -> int {
+    var s = size
+    if (s < MIN_OBJECT) { s = MIN_OBJECT }
+    var b = 0
+    var pow = MIN_OBJECT
+    while (pow < s && b + 1 < NBINS) {
+        pow = pow << 1
+        b = b + 1
+    }
+    b
+}
+
+/// A modeled heap span. `nextAddr` links the intrusive free list within the
+/// crowded bin head; `isFree` plays the FREE_SENTINEL class id that lets the
+/// sweep skip already-released blocks. `marked` is one sweep cycle's mark.
+///
+/// `words` is the span's RAW 8-byte word content (the real block's bytes), so a
+/// caller can store object headers and payload pointers here and the collector
+/// can walk the REAL layout instead of a modeled edge list. It is sized
+/// `size / 8` and zeroed whenever the span is (re)recorded, so a reused span can
+/// never hand back a stale pointer from its previous occupant.
+class Block {
+    var addr: int
+    var size: int
+    var marked: bool
+    var isFree: bool
+    var nextAddr: int
+    var words: List<int>
+
+    constructor(addr: int, size: int, marked: bool, isFree: bool, nextAddr: int, words: List<int>) {
+        this.addr = addr
+        this.size = size
+        this.marked = marked
+        this.isFree = isFree
+        this.nextAddr = nextAddr
+        this.words = words
+    }
+}
+
+/// `count` zeroed words (seed-and-pop: `[]` is `List<?>`).
+fn zeroWords(count: int) -> List<int> {
+    var xs = [0]
+    xs.pop()
+    var i = 0
+    while (i < count) {
+        xs.push(0)
+        i = i + 1
+    }
+    xs
+}
+
+/// A bump segment: `used` bytes of `addr + used` handed out. Segments grow
+/// head-first in the native heap; here they grow tail-first in a list (walk
+/// order is irrelevant to the sweep).
+class Segment {
+    var addr: int
+    var cap: int
+    var used: int
+
+    constructor(addr: int, cap: int, used: int) {
+        this.addr = addr
+        this.cap = cap
+        this.used = used
+    }
+}
+
+/// The modeled heap: size-class free lists over bump segments.
+class Memory {
+    var blocks: Map<int, Block>
+    var freeHeads: List<int>
+    var segments: List<Segment>
+    var nextBase: int
+
+    constructor() {
+        var dummy = Block(INVALID_ADDR, 0, false, true, INVALID_ADDR, zeroWords(0))
+        this.blocks = {0: dummy}
+        this.blocks.remove(0)
+        this.freeHeads = [INVALID_ADDR]
+        this.freeHeads.remove(0)
+        var k = 0
+        while (k < NBINS) {
+            this.freeHeads.push(INVALID_ADDR)
+            k = k + 1
+        }
+        this.segments = [Segment(0, INITIAL_CAP, 0)]
+        this.nextBase = INITIAL_CAP
+    }
+
+    /// (Re)create the record for span `addr` of `size` bytes. Re-recording
+    /// ZEROES the span's words, which is what makes span reuse safe: a
+    /// previously-freed object's header and payload cannot be read back as a
+    /// live object's.
+    fn record(addr: int, size: int) {
+        this.blocks[addr] = Block(addr, size, false, false, INVALID_ADDR, zeroWords(size / 8))
+    }
+
+    /// Read word `i` of the span at `addr` (0 past the end, mirroring
+    /// `TraceHeap.word`: a malformed object stays inert instead of reading wild).
+    fn word(addr: int, i: int) -> int {
+        if (i < 0) {
+            return 0
+        }
+        var w = this.blocks[addr].words
+        if (i >= len(w)) {
+            return 0
+        }
+        w[i]
+    }
+
+    /// Write word `i` of the span at `addr`. Out-of-range writes are dropped
+    /// rather than growing the span, so a bad offset cannot corrupt the heap.
+    fn setWord(addr: int, i: int, v: int) {
+        if (i < 0) {
+            return
+        }
+        var w = this.blocks[addr].words
+        if (i >= len(w)) {
+            return
+        }
+        w[i] = v
+    }
+
+    /// Words the span at `addr` holds (`size / 8`).
+    fn wordCount(addr: int) -> int {
+        len(this.blocks[addr].words)
+    }
+
+    /// Return span `addr` (size `size`) to its size class, prepending the
+    /// bin's intrusive list (`heap.rs::push_free`; the block header's `next`
+    /// field is a raw pointer there, a record link here).
+    fn pushFree(addr: int, size: int) {
+        this.record(addr, size)
+        this.blocks[addr].isFree = true
+        this.blocks[addr].size = size
+        this.blocks[addr].nextAddr = this.freeHeads[binOf(size)]
+        this.freeHeads[binOf(size)] = addr
+    }
+
+    /// Head address of a free bin (-1 when empty); bins are 0..NBINS-1.
+    fn freeHeadOf(bin: int) -> int {
+        if (bin < 0 || bin >= NBINS) { return INVALID_ADDR }
+        this.freeHeads[bin]
+    }
+
+    /// All block addresses, in the same segment walk order the sweep uses
+    /// (already-free spans included because they carry a header). The
+    /// collector scans these to find dead-but-finalizable objects.
+    fn allBlocks() -> List<int> {
+        var out = [0]
+        out.remove(0)
+        var si = 0
+        while (si < len(this.segments)) {
+            var seg = this.segments[si]
+            var top = seg.addr + seg.used
+            var walk = seg.addr
+            while (walk < top) {
+                out.push(walk)
+                walk = walk + this.blocks[walk].size
+            }
+            si = si + 1
+        }
+        out
+    }
+
+    /// Sum of the sizes of all marked (live) spans. Called before the sweep
+    /// clears marks, mirroring `gc.rs::collect`'s live-bytes accounting.
+    fn liveBytes() -> int {
+        var total = 0
+        var all = this.allBlocks()
+        var i = 0
+        while (i < len(all)) {
+            var a = all[i]
+            if (this.blocks[a].marked) {
+                total = total + this.blocks[a].size
+            }
+            i = i + 1
+        }
+        total
+    }
+
+    fn sizeOfBlock(addr: int) -> int {
+        this.blocks[addr].size
+    }
+
+    fn isBlockMarked(addr: int) -> bool {
+        this.blocks[addr].marked
+    }
+
+    fn isBlockFree(addr: int) -> bool {
+        this.blocks[addr].isFree
+    }
+
+    /// Release one never-coalesced span after its finalizer has run
+    /// (`heap.rs::free_object`): it joins its size class alone and is not
+    /// merged with neighbours.
+    fn freeObject(addr: int) {
+        var size = this.blocks[addr].size
+        this.pushFree(addr, size)
+    }
+
+    /// Reuse a span matching exactly, or large enough to split with a
+    /// header-sized leftover (`heap.rs::alloc_from_free`). Unlinks it from
+    /// the bin, splits the tail, and returns the block address. `-1` when no
+    /// bin holds a usable span.
+    fn allocFromFree(size: int) -> int {
+        var idx = binOf(size)
+        while (idx < NBINS) {
+            var prevAddr = INVALID_ADDR
+            var cur = this.freeHeads[idx]
+            while (cur != INVALID_ADDR) {
+                var block = this.blocks[cur]
+                var full = block.size
+                if (full == size || full >= size + SPLIT_MIN) {
+                    var next = block.nextAddr
+                    if (prevAddr != INVALID_ADDR) {
+                        this.blocks[prevAddr].nextAddr = next
+                    } else {
+                        this.freeHeads[idx] = next
+                    }
+                    if (full > size) {
+                        this.pushFree(cur + size, full - size)
+                        this.blocks[cur].size = size
+                    }
+                    this.blocks[cur].isFree = false
+                    this.blocks[cur].marked = false
+                    return cur
+                }
+                prevAddr = cur
+                cur = block.nextAddr
+            }
+            idx = idx + 1
+        }
+        INVALID_ADDR
+    }
+
+    /// Bump-allocate `size` bytes, growing the segment chain as needed
+    /// (`heap.rs::bump`: double capacity with a sane floor/cap, exact size
+    /// when the request dwarfs the current segment).
+    fn bump(size: int) -> int {
+        var seg = this.segments[len(this.segments) - 1]
+        if (size > seg.cap - seg.used) {
+            var newCap = seg.cap * 2
+            if (newCap < INITIAL_CAP) { newCap = INITIAL_CAP }
+            if (newCap < size) { newCap = size }
+            if (size >= seg.cap * 4) { newCap = size }
+            var fresh = Segment(this.nextBase, newCap, 0)
+            this.segments.push(fresh)
+            this.nextBase = this.nextBase + newCap
+            seg = fresh
+        }
+        var p = seg.addr + seg.used
+        seg.used = seg.used + size
+        p
+    }
+
+    /// Allocate `size` bytes (8-aligned, floored at `MIN_OBJECT`): free-list
+    /// first, bump fallback (`heap.rs::alloc_object`).
+    fn alloc(size: int) -> int {
+        var want = align8(size)
+        if (want < MIN_OBJECT) { want = MIN_OBJECT }
+        var fromFree = this.allocFromFree(want)
+        if (fromFree != INVALID_ADDR) {
+            return fromFree
+        }
+        var addr = this.bump(want)
+        this.record(addr, want)
+        addr
+    }
+
+    /// Mark the span at `addr` (the collector's mark sets this per live
+    /// object; the sweep clears it).
+    fn mark(addr: int) {
+        this.blocks[addr].marked = true
+    }
+
+    /// Flush one contiguous dead run back to the free list; `-1` start means
+    /// nothing to flush. Returns whether a run was released.
+    fn flushRun(deadStart: int, deadLen: int) -> int {
+        if (deadStart != INVALID_ADDR) {
+            this.pushFree(deadStart, deadLen)
+            return 1
+        }
+        0
+    }
+
+    /// Sweep every segment (`heap.rs::sweep`, without raw-block finalizers —
+    /// modeled spans own nothing): clear marks on live spans, coalesce
+    /// contiguous dead spans into merged free runs, and skip already-free
+    /// spans. Returns the number of runs released.
+    fn sweep() -> int {
+        var runs = 0
+        var si = 0
+        while (si < len(this.segments)) {
+            var seg = this.segments[si]
+            var top = seg.addr + seg.used
+            var walk = seg.addr
+            var deadStart = INVALID_ADDR
+            var deadLen = 0
+            while (walk < top) {
+                var block = this.blocks[walk]
+                var size = block.size
+                if (block.isFree) {
+                    runs = runs + this.flushRun(deadStart, deadLen)
+                    deadStart = INVALID_ADDR
+                    deadLen = 0
+                } else if (block.marked) {
+                    block.marked = false
+                    runs = runs + this.flushRun(deadStart, deadLen)
+                    deadStart = INVALID_ADDR
+                    deadLen = 0
+                } else {
+                    if (deadStart == INVALID_ADDR) {
+                        deadStart = walk
+                    }
+                    deadLen = deadLen + size
+                }
+                walk = walk + size
+            }
+            runs = runs + this.flushRun(deadStart, deadLen)
+            si = si + 1
+        }
+        runs
+    }
+}

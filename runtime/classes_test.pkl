@@ -1,0 +1,159 @@
+module runtime.class_test
+
+import { PICKLE_CLASS_USER_BASE } from runtime.object
+import { optNum, NONE_SENTINEL } from runtime.options
+import { classIdOf, slotCountOf, slotGet, slotSet, classIdIs, implementsIface, ifaceMethodAt, CAST_CLASS_MESSAGE, CAST_INTERFACE_MESSAGE } from runtime.classes
+
+fn zeroList(n: int) -> List<int> {
+    var out = [0]
+    out.pop()
+    var i = 0
+    while (i < n) {
+        out.push(0)
+        i = i + 1
+    }
+    out
+}
+
+fn valuesList(values: List<int>) -> List<int> {
+    var out = [0]
+    out.pop()
+    var i = 0
+    while (i < len(values)) {
+        out.push(values[i])
+        i = i + 1
+    }
+    out
+}
+
+/// Parent walk table over ids 0..16: 10 and 11 and 12 form a root chain,
+/// 13 hangs off 10, 1 (List) is the built-in base for 2 and 13's sibling test.
+fn parentTable() -> List<int> {
+    var t = zeroList(17)
+    t[10] = 0
+    t[11] = 10
+    t[12] = 11
+    t[13] = 10
+    t
+}
+
+/// Interface masks per class id: 11 carries iface 1, 13 carries iface 2,
+/// everything else carries none.
+fn ifaceMaskTable() -> List<int> {
+    var m = zeroList(17)
+    m[11] = 1
+    m[13] = 2
+    m
+}
+
+fn clsIface(m: List<int>, cid: int, ifaceId: int) -> bool {
+    if (cid >= len(m)) {
+        return false
+    }
+    m[cid] == ifaceId
+}
+
+/// Method table encoded at [cid*100 + iface*10 + methodIndex]; 0 = miss.
+fn methodTable() -> List<int> {
+    var m = zeroList(14 * 100 + 2 * 10 + 1)
+    m[10 * 100 + 1 * 10 + 0] = 7
+    m[11 * 100 + 1 * 10 + 0] = 9
+    m[11 * 100 + 1 * 10 + 1] = 3
+    m
+}
+
+fn clsMethod(m: List<int>, cid: int, ifaceId: int, methodIndex: int) -> int? {
+    if (cid >= len(m)) {
+        return none
+    }
+    var idx = cid * 100 + ifaceId * 10 + methodIndex
+    if (idx >= len(m)) {
+        return none
+    }
+    if (m[idx] == 0) {
+        return none
+    }
+    m[idx]
+}
+
+test fn raw_class_id_is_clamped_to_user_base() {
+    expect(classIdOf(-5)).toBe(PICKLE_CLASS_USER_BASE)
+    expect(classIdOf(0)).toBe(PICKLE_CLASS_USER_BASE)
+    expect(classIdOf(9)).toBe(PICKLE_CLASS_USER_BASE)
+    expect(classIdOf(10)).toBe(10)
+    expect(classIdOf(55)).toBe(55)
+}
+
+test fn negative_slot_count_is_zero() {
+    expect(slotCountOf(-3)).toBe(0)
+    expect(slotCountOf(0)).toBe(0)
+    expect(slotCountOf(4)).toBe(4)
+}
+
+test fn slot_read_is_none_out_of_bounds() {
+    var f = valuesList([1, 2, 3])
+    expect(optNum(slotGet(f, 0))).toBe(1)
+    expect(optNum(slotGet(f, 2))).toBe(3)
+    expect(optNum(slotGet(f, -1))).toBe(NONE_SENTINEL)
+    expect(optNum(slotGet(f, 3))).toBe(NONE_SENTINEL)
+    expect(optNum(slotGet(f, 100))).toBe(NONE_SENTINEL)
+}
+
+test fn slot_write_out_of_bounds_is_ignored() {
+    var f = valuesList([1, 2, 3])
+    slotSet(f, 1, 9)
+    expect(f[1]).toBe(9)
+    slotSet(f, 5, 99)
+    expect(len(f)).toBe(3)
+    slotSet(f, -1, 99)
+    expect(f[0]).toBe(1)
+}
+
+test fn class_id_is_walk() {
+    var t = parentTable()
+    var parent = (cid: int) => t[cid]
+    expect(classIdIs(10, 10, parent)).toBe(true)
+    expect(classIdIs(11, 10, parent)).toBe(true)
+    expect(classIdIs(12, 10, parent)).toBe(true)
+    expect(classIdIs(13, 10, parent)).toBe(true)
+    expect(classIdIs(11, 13, parent)).toBe(false)
+    expect(classIdIs(13, 1, parent)).toBe(false)
+    expect(classIdIs(10, 0, parent)).toBe(false)
+    expect(classIdIs(10, 1, parent)).toBe(false)
+    expect(classIdIs(13, 13, parent)).toBe(true)
+}
+
+test fn implements_walks_the_parent_chain() {
+    var t = parentTable()
+    var m = ifaceMaskTable()
+    var parent = (cid: int) => t[cid]
+    var iface = (cid: int, ifaceId: int) => clsIface(m, cid, ifaceId)
+    expect(implementsIface(11, 1, iface, parent)).toBe(true)
+    expect(implementsIface(13, 2, iface, parent)).toBe(true)
+    expect(implementsIface(12, 1, iface, parent)).toBe(true)
+    expect(implementsIface(12, 2, iface, parent)).toBe(false)
+    expect(implementsIface(13, 1, iface, parent)).toBe(false)
+    expect(implementsIface(11, 2, iface, parent)).toBe(false)
+    expect(implementsIface(11, 0, iface, parent)).toBe(false)
+}
+
+test fn iface_method_walk_is_nearest_impl_and_miss_is_none() {
+    var t = parentTable()
+    var m = methodTable()
+    var parent = (cid: int) => t[cid]
+    var method = (cid: int, ifaceId: int, mi: int) => clsMethod(m, cid, ifaceId, mi)
+    expect(optNum(ifaceMethodAt(11, 1, 0, method, parent))).toBe(9)
+    expect(optNum(ifaceMethodAt(12, 1, 0, method, parent))).toBe(9)
+    expect(optNum(ifaceMethodAt(13, 1, 0, method, parent))).toBe(7)
+    expect(optNum(ifaceMethodAt(11, 1, 1, method, parent))).toBe(3)
+    expect(optNum(ifaceMethodAt(12, 1, 1, method, parent))).toBe(3)
+    expect(optNum(ifaceMethodAt(13, 1, 1, method, parent))).toBe(NONE_SENTINEL)
+    expect(optNum(ifaceMethodAt(12, 2, 0, method, parent))).toBe(NONE_SENTINEL)
+    expect(optNum(ifaceMethodAt(11, 2, 0, method, parent))).toBe(NONE_SENTINEL)
+    expect(optNum(ifaceMethodAt(11, 0, 0, method, parent))).toBe(NONE_SENTINEL)
+}
+
+test fn cast_messages() {
+    expect(CAST_CLASS_MESSAGE).toBe("pickle: invalid class cast")
+    expect(CAST_INTERFACE_MESSAGE).toBe("pickle: invalid interface cast")
+}

@@ -1,0 +1,80 @@
+module compiler.lexer_test
+
+import { Lexer } from compiler.lexer
+import { Tok } from compiler.token
+import { emptyStrs } from compiler.diag
+
+test fn lexes_keyword_and_ident() {
+    let bs = bytes("fn add(a: int, b: int)\n")
+    let lex = Lexer(bs, 0, 0, none, range(0), 0)
+    let toks = lex.run()
+    expect(len(toks)).toBe(13)
+    var kinds = emptyStrs()
+    for (t in toks) {
+        match (t.token.kind) {
+            case Tok.Fn -> kinds.push("fn")
+            case Tok.Ident -> kinds.push("ident")
+            case Tok.LParen -> kinds.push("(")
+            case Tok.RParen -> kinds.push(")")
+            case Tok.Colon -> kinds.push(":")
+            case Tok.Comma -> kinds.push(",")
+            case Tok.Newline -> kinds.push("nl")
+            case Tok.Eof -> kinds.push("eof")
+            case _ -> kinds.push("?")
+        }
+    }
+    expect(kinds[0]).toBe("fn")
+    expect(kinds[1]).toBe("ident")
+    expect(len(kinds)).toBe(13)
+}
+
+test fn lexes_number_with_suffix() {
+    let bs = bytes("let u8x = 255u8\n")
+    let lex = Lexer(bs, 0, 0, none, range(0), 0)
+    let toks = lex.run()
+    expect(len(toks)).toBe(6)
+    match (toks[0].token.kind) {
+        case Tok.Let -> expect(true).toBe(true)
+        case _ -> expect(false).toBe(true)
+    }
+    var sawNumber = false
+    var sawAssign = false
+    for (t in toks) {
+        match (t.token.kind) {
+            case Tok.Number -> sawNumber = true
+            case Tok.Assign -> sawAssign = true
+            case _ -> {}
+        }
+    }
+    expect(sawNumber).toBe(true)
+    expect(sawAssign).toBe(true)
+}
+
+test fn lexes_string_literal() {
+    let bs = bytes("let s = \"hi\"\n")
+    let lex = Lexer(bs, 0, 0, none, range(0), 0)
+    let toks = lex.run()
+    expect(len(toks)).toBe(6)
+    var sawStr = false
+    for (t in toks) {
+        match (t.token.kind) {
+            case Tok.Str -> sawStr = true
+            case _ -> {}
+        }
+    }
+    expect(sawStr).toBe(true)
+}
+
+test fn lexes_two_char_operator() {
+    let bs = bytes("if a >= b\n")
+    let lex = Lexer(bs, 0, 0, none, range(0), 0)
+    let toks = lex.run()
+    var sawGe = false
+    for (t in toks) {
+        match (t.token.kind) {
+            case Tok.Ge -> sawGe = true
+            case _ -> {}
+        }
+    }
+    expect(sawGe).toBe(true)
+}

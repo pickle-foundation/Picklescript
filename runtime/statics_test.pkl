@@ -1,0 +1,59 @@
+module runtime.statics_test
+
+import { optNum, NONE_SENTINEL } from runtime.options
+import { StaticCells, STATIC_CELL_STRIDE } from runtime.statics
+
+fn freshStore() -> StaticCells {
+    StaticCells()
+}
+
+test fn stride_constant() {
+    expect(STATIC_CELL_STRIDE).toBe(1024)
+}
+
+test fn unset_cell_reads_none() {
+    var s = freshStore()
+    expect(optNum(s.getValue(10, 0))).toBe(NONE_SENTINEL)
+    expect(optNum(s.getValue(0, 0))).toBe(NONE_SENTINEL)
+    expect(optNum(s.getValue(11, 3))).toBe(NONE_SENTINEL)
+    expect(optNum(s.getValue(99, 1))).toBe(NONE_SENTINEL)
+}
+
+test fn set_then_get_roundtrip() {
+    var s = freshStore()
+    s.setValue(10, 0, 42)
+    expect(optNum(s.getValue(10, 0))).toBe(42)
+    s.setValue(10, 1, 8)
+    expect(optNum(s.getValue(10, 0))).toBe(42)
+    expect(optNum(s.getValue(10, 1))).toBe(8)
+}
+
+test fn overwrite_replaces_cell() {
+    var s = freshStore()
+    s.setValue(11, 2, 5)
+    s.setValue(11, 2, 9)
+    expect(optNum(s.getValue(11, 2))).toBe(9)
+}
+
+test fn cells_are_keyed_by_class_and_slot() {
+    var s = freshStore()
+    s.setValue(10, 0, 100)
+    expect(optNum(s.getValue(11, 0))).toBe(NONE_SENTINEL)
+    expect(optNum(s.getValue(10, 1))).toBe(NONE_SENTINEL)
+}
+
+test fn clear_drops_every_cell() {
+    var s = freshStore()
+    s.setValue(10, 0, 1)
+    s.setValue(10, 1999, 2)
+    expect(optNum(s.getValue(10, 1999))).toBe(2)
+    s.clear()
+    expect(optNum(s.getValue(10, 0))).toBe(NONE_SENTINEL)
+    expect(optNum(s.getValue(10, 1999))).toBe(NONE_SENTINEL)
+}
+
+test fn negative_indices_are_no_ops() {
+    var s = freshStore()
+    s.setValue(-1, 0, 5)
+    expect(optNum(s.getValue(-1, 0))).toBe(NONE_SENTINEL)
+}

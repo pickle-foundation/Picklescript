@@ -1,0 +1,66 @@
+module runtime.abi_once_test
+
+import { abiOnceNew, abiOnceDone, abiOnceRun } from runtime.abi_once
+
+/// The unit suite for the once port bodies.
+///
+/// Handle VALUES are process-global and the runtime suite runs tests in an
+/// unspecified order, so assertions only ever say "positive" and "distinct
+/// within this test" - never a fixed number. The register table is append-only
+/// for the process lifetime, so a handle created here can never collide with
+/// one from a later test.
+///
+/// NO TEST REACHES A FATAL PATH. `abiOnceDone`/`abiOnceRun` on a wrong-kind or
+/// unknown handle print `fatal: pickle: handle {n} is not a once` and exit 1
+/// (the expect-slice suite-trap contract): exercising that here would end the
+/// whole `pickle test pickle\runtime` run. It is verified by the standalone
+/// probe (`tools/fatal_parity.ps1`, `sl_once_kindonce`).
+///
+/// The body effect is observed through `recordOnce`, not through a captured
+/// binding: a lambda is captured by value and cannot mutate the enclosing
+/// binding (E0900), so a closure body here only *_calls_* - the recording
+/// happens inside a plain module function.
+var seenOnce: int = 0
+
+fn recordOnce() -> void {
+    seenOnce = seenOnce + 1
+}
+
+test fn handles_are_positive_and_distinct() {
+    var a = abiOnceNew()
+    var b = abiOnceNew()
+    expect(a > 0).toBe(true)
+    expect(b > 0).toBe(true)
+    expect(a == b).toBe(false)
+}
+
+test fn a_fresh_once_is_not_done() {
+    var o = abiOnceNew()
+    expect(abiOnceDone(o)).toBe(false)
+}
+
+test fn run_executes_the_body_exactly_once() {
+    var o = abiOnceNew()
+    seenOnce = 0
+    expect(abiOnceRun(o, fn () { recordOnce() })).toBe(true)
+    expect(seenOnce).toBe(1)
+    expect(abiOnceDone(o)).toBe(true)
+    expect(abiOnceRun(o, fn () { recordOnce() })).toBe(false)
+    expect(seenOnce).toBe(1)
+    expect(abiOnceRun(o, fn () { recordOnce() })).toBe(false)
+    expect(seenOnce).toBe(1)
+}
+
+test fn each_once_runs_independently() {
+    var a = abiOnceNew()
+    var b = abiOnceNew()
+    seenOnce = 0
+    expect(abiOnceRun(a, fn () { recordOnce() })).toBe(true)
+    expect(abiOnceRun(a, fn () { recordOnce() })).toBe(false)
+    expect(seenOnce).toBe(1)
+    expect(abiOnceDone(b)).toBe(false)
+    expect(abiOnceRun(b, fn () { recordOnce() })).toBe(true)
+    expect(seenOnce).toBe(2)
+    expect(abiOnceDone(a)).toBe(true)
+    expect(abiOnceDone(b)).toBe(true)
+}

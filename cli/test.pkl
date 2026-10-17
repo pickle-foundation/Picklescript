@@ -1,0 +1,468 @@
+module cli.tst
+
+import { DiagnosticSink } from compiler.diag
+import { Loader, Rewriter, renderPath } from compiler.front
+import { Resolver } from compiler.resolve
+import { emitIrEx } from compiler.emit
+import { finishLower, newObjs, loadArchive, linkExe } from cli.buildlib
+import { ItemKind, Item } from compiler.ast
+
+/// Build a synthetic single-root pickle module that imports the ported test
+/// runner, defines one `__w{i}` wrapper per original test (each runs the test
+/// body under capture and returns the captured failure message as `string?`),
+/// and a `main()` that reproduces the Rust CLI's `Test` command:
+/// `running <N> test(s) from <path>`, then runs every test/hook and exits with
+/// the nonzero code when any test failed.
+
+fn createStrs() -> List<string> {
+    var l = [""]
+    l.pop()
+    l
+}
+
+fn createInts() -> List<int> {
+    var l = [0]
+    l.pop()
+    l
+}
+
+fn trim(p: string) -> string {
+    var out = ""
+    var sb = bytes(p)
+    var i = 0
+    while (i < len(sb)) {
+        if (sb[i] == 13 as int || sb[i] == 10 as int) {
+            i = i + 1
+        } else {
+            out = out + "{sb[i] as char}"
+            i = i + 1
+        }
+    }
+    out
+}
+
+fn baseName(target: string) -> string {
+    var k = len(target) - 1
+    while (k >= 0) {
+        let b = bytes(target)[k] as int
+        if (b == 47 || b == 92) {
+            break
+        }
+        k = k - 1
+    }
+    var out = ""
+    var j = k + 1
+    while (j < len(target) - 4) {
+        out = out + "{bytes(target)[j] as char}"
+        j = j + 1
+    }
+    out
+}
+
+fn chrCode(n: int) -> string {
+    "{n as char}"
+}
+
+fn quoted(s: string) -> string {
+    var out = chrCode(34)
+    var sb = bytes(s)
+    var i = 0
+    while (i < len(sb)) {
+        let b = sb[i] as int
+        if (b == 92) {
+            out = out + "\\" + "\\"
+        } else {
+            if (b == 34) {
+                out = out + "\\" + chrCode(34)
+            } else {
+                if (b == 123 || b == 125) {
+                    out = out + "\\" + chrCode(b)
+                } else {
+                    if (b == 10) {
+                        out = out + "\\n"
+                    } else {
+                        if (b == 13) {
+                            out = out + "\\r"
+                        } else {
+                            if (b == 9) {
+                                out = out + "\\t"
+                            } else {
+                                if (b == 0) {
+                                    out = out + "\\0"
+                                } else {
+                                    if (b < 128) {
+                                        out = out + chrCode(b)
+                                    } else {
+                                        out = out + str([b as byte])
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    out = out + chrCode(34)
+    out
+}
+
+fn stripPrefixS(s: string, pfx: string) -> string? {
+    if (len(s) < len(pfx)) {
+        return none
+    }
+    var i = 0
+    while (i < len(pfx)) {
+        if (s[i] != pfx[i]) {
+            return none
+        }
+        i = i + 1
+    }
+    var out = ""
+    var j = len(pfx)
+    while (j < len(s)) {
+        let c = s[j] as int
+        if (c < 128) {
+            out = out + "{s[j] as char}"
+        } else {
+            out = out + str([c as byte])
+        }
+        j = j + 1
+    }
+    out
+}
+
+fn isHookName(name: string) -> bool {
+    if (let some(_) = stripPrefixS(name, "__pkl_hook_")) {
+        return true
+    }
+    false
+}
+
+/// Port of `decode_hook` in cli/src/main.rs: the first two characters select
+/// the HOOK_* kind, and the `_`-prefixed remainder is the group path.
+fn hookKindOf(name: string) -> int {
+    var rest = name
+    if (let some(r) = stripPrefixS(name, "__pkl_hook_")) {
+        rest = r
+    }
+    if (len(rest) >= 2) {
+        let a = rest[0]
+        let b = rest[1]
+        if (a == 98 && b == 101) {
+            return 1
+        }
+        if (a == 97 && b == 101) {
+            return 2
+        }
+        if (a == 97 && b == 97) {
+            return 3
+        }
+    }
+    0
+}
+
+fn hookGroupOf(name: string) -> string {
+    var rest = name
+    if (let some(r) = stripPrefixS(name, "__pkl_hook_")) {
+        rest = r
+    }
+    if (len(rest) >= 2) {
+        let a = rest[0]
+        let b = rest[1]
+        if ((a == 98 && (b == 97 || b == 101)) || (a == 97 && (b == 97 || b == 101))) {
+            var tail = ""
+            var j = 2
+            while (j < len(rest)) {
+                tail = tail + "{rest[j] as char}"
+                j = j + 1
+            }
+            rest = tail
+        }
+    }
+    if (let some(g) = stripPrefixS(rest, "_")) {
+        return g
+    }
+    rest
+}
+
+/// The runner helpers are pulled in under aliased names instead of a wildcard
+/// import. A `import * from std.test` in the root would dump every std.test
+/// export (including `emptyStrs`, `emptyTests`, `emptyHooks`, `emptyCallArgs`)
+/// into the same flattened namespace as the test body's own imports and
+/// declarations, which the Rust CLI never does (the Rust runner is native, and
+/// the test file is its own module). Aliased item imports keep the root free of
+/// those bare names while still reaching the runner; `captureBegin`/`captureTake`
+/// resolve as name-level builtins.
+///
+/// `mod` is the module path the original test file declared. It is re-emitted
+/// as the harness root's own module declaration so the root's top-level names
+/// count as module exports. That makes names the test file also exports
+/// (`emptyCallArgs` vs `compiler.ast`, `emptyTests`/`emptyHooks` vs `std.test`)
+/// register as `collided`, so the front end renames both providers and the
+/// flattened program has no duplicate declarations — exactly the Rust CLI's
+/// per-module behavior.
+fn buildHarness(names: List<string>, groups: List<string>, kinds: List<int>, target: string, src: string, mod: string) -> string {
+    var h = ""
+    if (len(mod) > 0) {
+        h = h + "module " + mod + "\n"
+    }
+    h = h + "import {{ emptyTests as __h_emptyTests, emptyHooks as __h_emptyHooks, TestCase as __h_TestCase, Hook as __h_Hook, runTests as __h_runTests }} from std.test\n"
+    var i = 0
+    while (i < len(names)) {
+        h = h + "fn __w" + str(i) + "() -> string? " + chrCode(123) + "\n"
+        h = h + "    captureBegin()\n"
+        h = h + "    __t" + str(i) + "()\n"
+        h = h + "    captureTake()\n"
+        h = h + chrCode(125) + "\n"
+        i = i + 1
+    }
+    h = h + "fn main() " + chrCode(123) + "\n"
+    h = h + "    println(\"running \" + str(" + str(len(names)) + ") + \" test(s) from \" + " + quoted(target) + ")\n"
+    h = h + "    captureBegin()\n"
+    h = h + "    var tests = __h_emptyTests()\n"
+    i = 0
+    while (i < len(names)) {
+        h = h + "    tests.push(__h_TestCase(" + quoted(names[i]) + ", __w" + str(i) + "))\n"
+        i = i + 1
+    }
+    h = h + "    var hooks = __h_emptyHooks()\n"
+    i = 0
+    while (i < len(groups)) {
+        h = h + "    hooks.push(__h_Hook(" + quoted(groups[i]) + ", " + str(kinds[i]) + ", __h" + str(i) + "))\n"
+        i = i + 1
+    }
+    h = h + "    let code = __h_runTests(tests, hooks)\n"
+    h = h + "    exit(code)\n"
+    h = h + chrCode(125) + "\n"
+    h = h + src
+    h
+}
+
+fn startsWithWord(line: string, w: string) -> bool {
+    var li = 0
+    while (li < len(line) && (line[li] == 32 || line[li] == 9 as int)) {
+        li = li + 1
+    }
+    if (len(line) < li + len(w)) {
+        return false
+    }
+    var k = 0
+    while (k < len(w)) {
+        if (line[li + k] != w[k]) {
+            return false
+        }
+        k = k + 1
+    }
+    if (li + len(w) < len(line)) {
+        let c = line[li + len(w)]
+        if (!(c == 32 || c == 9 as int || c == 10 as int || c == 13 as int)) {
+            return false
+        }
+    }
+    true
+}
+
+/// A test file that opens with `module <path>` can't be concatenated under a
+/// root without it; drop the module-declaration line so the harness stays
+/// root-style (the file's items keep their order, so test/hook ordering is
+/// unchanged).
+fn stripModuleLine(src: string) -> string {
+    let sb = bytes(src)
+    var i = 0
+    var start = 0
+    var out = ""
+    while (i <= len(sb)) {
+        if (i == len(sb) || sb[i] == 10 as int) {
+            var line = [1 as byte]
+            line.pop()
+            var k = start
+            while (k < i) {
+                if (sb[k] == 13 as int) {
+                    k = k + 1
+                } else {
+                    line.push(sb[k])
+                    k = k + 1
+                }
+            }
+            let lineStr = str(line)
+            if (!startsWithWord(lineStr, "module")) {
+                out = out + lineStr + "\n"
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    out
+}
+
+/// Pass 1: parse the original test source by itself so we can count and name
+/// the tests/hooks in their true order (the synthesized harness contributes no
+/// test/hook items of its own, so this order matches the merged program's).
+fn genHarness(target: string, src: string, diags: DiagnosticSink) -> string? {
+    let loader = Loader(diags)
+    if (let some(pp) = loader.parseSource(src, 0)) {
+        var names = createStrs()
+        var groups = createStrs()
+        var kinds = createInts()
+        var body = src
+        var mod = ""
+        if (let some(md) = pp.modDecl) {
+            body = stripModuleLine(src)
+            mod = renderPath(md.path)
+        }
+        for (item in pp.items) {
+            match (item.kind) {
+                case ItemKind.Test(f) -> names.push(f.name)
+                case ItemKind.Fn(f) -> {
+                    if (isHookName(f.name)) {
+                        groups.push(hookGroupOf(f.name))
+                        kinds.push(hookKindOf(f.name))
+                    }
+                }
+                case _ -> {}
+            }
+        }
+        // A `*_test.pkl` with no `test` items (e.g. a build-regression fixture
+        // that only imports and lower-checks) mirrors the Rust CLI: nothing is
+        // run, so the harness must be inert. Synthesizing the wrapper `main`
+        // here would collide with the file's own `main`, so emit a stub whose
+        // stdout+exit still match the oracle byte-for-byte.
+        if (len(names) == 0) {
+            return "fn main() " + chrCode(123) + chrCode(125) + "\n"
+        }
+        return buildHarness(names, groups, kinds, target, body, mod)
+    }
+    none
+}
+
+/// Pass 2: apply the same `__t{i}` / `__h{i}` renames in merged item order.
+/// The items are shared objects with the loaded file programs, so rewriting
+/// through the frontend's `Rewriter` sees (and keeps) the renamed names.
+fn renameTests(items: List<Item>) {
+    var ti = 0
+    var hi = 0
+    for (item in items) {
+        match (item.kind) {
+            case ItemKind.Test(f) -> {
+                f.name = "__t" + str(ti)
+                ti = ti + 1
+            }
+            case ItemKind.Fn(f) -> {
+                if (isHookName(f.name)) {
+                    f.name = "__h" + str(hi)
+                    hi = hi + 1
+                }
+            }
+            case _ -> {}
+        }
+    }
+}
+
+fn main() {
+    let argv = args()
+    var target = ""
+    var runtimeLib = ""
+    if (len(argv) > 0) {
+        target = argv[0]
+        if (len(argv) > 1) {
+            runtimeLib = argv[1]
+        }
+    } else if (let some(tf) = read_file("pickle/cli/one_target.txt")) {
+        target = trim(tf)
+    }
+    if (target == "") {
+        println("NO TARGET")
+        return
+    }
+    if (let some(src) = read_file(target)) {
+        let diags = DiagnosticSink()
+        if (let some(h) = genHarness(target, src, diags)) {
+            let loader = Loader(diags)
+            if (let some(loaded) = loader.loadRoot(target, h)) {
+                renameTests(loaded.merged.items)
+                var i = 0
+                while (i < len(loader.files)) {
+                    let rw = Rewriter(loader.files[i].fi, loaded.collided, diags)
+                    rw.rewriteItems(loader.files[i].program.items)
+                    i = i + 1
+                }
+                let resolved = Resolver(diags).resolve(loaded.merged)
+                // Native test lane: lower the transformed harness to COFF, link it
+                // against the pickle runtime archive, and spawn it with inherited
+                // stdio, propagating its exit code. This replaces the old
+                // "emit IRX, execute it under Rust irx-run" path so the whole
+                // ported test stack runs with no Rust compiler in the loop.
+                if (let some(emitted) = emitIrEx(loaded.merged, resolved, diags, 0, "", createStrs())) {
+                    if (let some(program) = finishLower(target, emitted, diags)) {
+                        if (let some(libObjects) = loadArchive(runtimeLib)) {
+                            var objects = newObjs()
+                            objects.push(program.obj)
+                            var objIndex = 0
+                            while (objIndex < len(libObjects)) {
+                                objects.push(libObjects[objIndex])
+                                objIndex = objIndex + 1
+                            }
+                            let exePath = "tools/diff/ptest/" + baseName(target) + "_harness.exe"
+                            if (let some(errorText) = linkExe(objects, exePath, program.overrides)) {
+                                println("TEST LINK FAIL: " + errorText)
+                                printDiags(diags)
+                                exit(1)
+                            }
+                            var childArgv = createStrs()
+                            childArgv.push(exePath)
+                            let outcome = run_cmd(childArgv, none, none, none, none, none, none, true)
+                            if (let some(o) = outcome) {
+                                match (o) {
+                                    case (code, out, err, timed) -> {
+                                        if (let some(c) = code) {
+                                            exit(c)
+                                        }
+                                    }
+                                    case _ -> {}
+                                }
+                            }
+                            exit(1)
+                        }
+                        println("TEST FAIL: cannot read runtime lib " + runtimeLib)
+                        printDiags(diags)
+                        exit(1)
+                    }
+                    println("TEST FAIL: harness did not lower to COFF")
+                    printDiags(diags)
+                    exit(1)
+                }
+                println("IRFAIL")
+                printDiags(diags)
+                exit(1)
+            } else {
+                println("IRFAIL")
+                printDiags(diags)
+                exit(1)
+
+            }
+        } else {
+            println("HARNESS FAIL: " + target)
+            printDiags(diags)
+            exit(1)
+
+        }
+    } else {
+        println("NO FILE: " + target)
+        exit(1)
+    }
+}
+
+fn printDiags(sinks: DiagnosticSink) {
+    let ds = sinks.diagnostics
+    var i = 0
+    while (i < len(ds)) {
+        var sp = "none"
+        if (let some(s0) = ds[i].span) {
+            sp = "(" + str(s0.start) + "," + str(s0.end) + ")"
+        }
+        println("P:diag " + ds[i].message + " span=" + sp)
+        i = i + 1
+    }
+}

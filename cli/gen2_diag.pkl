@@ -1,0 +1,56 @@
+module cli.gen2_diag
+
+import { Diagnostic, DiagnosticSink } from compiler.diag
+import { frontend } from compiler.front
+import { emitIr } from compiler.emit
+
+fn main() {
+    let argv = args()
+    if (len(argv) < 1) {
+        println("NO TARGET")
+        return
+    }
+    let target = argv[0]
+    match (read_file(target)) {
+        case none -> println("NO FILE")
+        case some(src) -> run(target, src)
+    }
+}
+
+fn run(target: string, src: string) {
+    let sinks = DiagnosticSink()
+    match (frontend(target, src, sinks)) {
+        case none -> {
+            println("FRONTEND FAIL")
+            printDiags(sinks)
+        }
+        case some(out) -> match (emitIr(out.program, out.resolved, sinks)) {
+            case none -> {
+                println("EMITIR FAIL")
+                printDiags(sinks)
+            }
+            case some(_) -> {
+                println("EMITIR OK")
+                printDiags(sinks)
+            }
+        }
+    }
+}
+
+fn codeOf(d: Diagnostic) -> string {
+    match (d.code) {
+        case some(c) -> c
+        case none -> ""
+    }
+}
+
+fn printDiags(s: DiagnosticSink) {
+    let ds = s.diagnostics
+    var i = 0
+    while (i < len(ds)) {
+        let d = ds[i]
+        println("DIAG " + codeOf(d) + " " + d.message)
+        i = i + 1
+    }
+    println("DIAGS TOTAL " + str(len(ds)))
+}

@@ -1,0 +1,330 @@
+module runtime.abi_math
+
+/// Sovereign numeric/collection ABI bodies, ported from `runtime/src/math.rs`
+/// (plus the two `contains` helpers added to `runtime/src/{list,strings}.rs`).
+///
+/// These are the runtime functions the compiler lowers the operator forms `**`
+/// and `in` to. Before this file, `emit.rs` bailed on those operators ("this
+/// operator is not lowered yet"), so no program could reach them; the port had
+/// nothing to mirror. With the lowering in place the bodies must exist as real
+/// `#[symbol]` slots, exactly as the native build resolves them.
+///
+/// `pickle_int_pow` is exact by construction: repeated squaring over wrapping
+/// `int` multiplication, which is the same word the native `wrapping_mul` does,
+/// so no rounding or overflow difference is possible.
+///
+/// `pickle_float_pow` targets the runtime's `nostd` build, which has no `libm`,
+/// so `powf` is hand-rolled and the port reproduces it bit-for-bit rather than
+/// calling a platform `pow` that could round differently:
+///   - an integral exponent takes the exact binary-exponentiation path
+///     (`powiExact`), matching `f64::powi` to the last bit;
+///   - a non-integral exponent falls through to `2^(exp * log2(base))`, with
+///     `log2` from a frexp-style range reduction and the `atanh` series, and
+///     `2^` from `2^floor * exp-ish(frac * ln2)`.
+/// `log2f` recovers the exponent and mantissa through `f64Bits` /`f64FromBits`
+/// (`abi_box`), the port's substitute for `to_bits` / `from_bits`, so the
+/// arithmetic is the same arithmetic the native routine performs.
+///
+/// The `in` operator needs two structural-containment helpers. `keyEq` is the
+/// same structural equality map keys use (`pickle_list_contains` mirrors the
+/// native `value_eq`, which is `key_eq`), and `abiStrContains` is a byte-run
+/// scan over the string payload, matching `strings.rs::string_contains`.
+import { pow2, f64Bits, abiF64FromBits } from runtime.abi_box
+import { keyEq } from runtime.abi_map
+import { abiStrLen, byteAt } from runtime.abi_string
+import { LEN_WORD, DATA_WORD } from runtime.abi_list
+
+const LN_2: float = 0.6931471805599453
+const INV_LN_2: float = 1.4426950408889634
+const SQRT_2: float = 1.4142135623730951
+
+/// `2^53`: every finite f64 at least this large is already an integer.
+const TWO_POW_53: float = 9007199254740992.0
+
+/// `base ** exp` for `int` operands. Mirrors `math.rs::pickle_int_pow`: a
+/// negative exponent yields the truncating reciprocal (`±1` for a `±1` base,
+/// else `0`), and the positive path is wrapping repeated squaring.
+#[symbol("pickle_int_pow")]
+fn abiIntPow(base: int, exp: int) -> int {
+    if (exp < 0) {
+        if (base == 1) {
+            return 1
+        }
+        if (base == -1) {
+            if ((exp & 1) == 0) {
+                return 1
+            }
+            return 0 - 1
+        }
+        return 0
+    }
+    var result = 1
+    var b = base
+    var e = exp
+    while (e > 0) {
+        if ((e & 1) == 1) {
+            result = result * b
+        }
+        e = e >> 1
+        if (e > 0) {
+            b = b * b
+        }
+    }
+    return result
+}
+
+/// `floor(x)` for a finite `x` in `-1075..=1024`, using only a truncating cast.
+fn floorF(x: float) -> float {
+    var t = (x as int) as float
+    if (t > x) {
+        return t - 1.0
+    }
+    return t
+}
+
+/// Whether `x` is an exact integer (and not NaN or infinite). Mirrors
+/// `math.rs::is_integral`; the `2^53` shortcut avoids the cast entirely for
+/// magnitudes that cannot have a fractional part.
+fn isIntegral(x: float) -> bool {
+    if (x != x) {
+        return false
+    }
+    var inf = 1.0 / 0.0
+    if (x == inf) {
+        return false
+    }
+    if (x == 0.0 - inf) {
+        return false
+    }
+    if (x >= TWO_POW_53) {
+        return true
+    }
+    if (x <= 0.0 - TWO_POW_53) {
+        return true
+    }
+    return x == ((x as int) as float)
+}
+
+/// Whether the (integral) value `x` is odd. Only meaningful for integers;
+/// magnitudes at or past `2^53` are treated as even, as in `is_odd`.
+fn isOdd(x: float) -> bool {
+    if (x >= TWO_POW_53) {
+        return false
+    }
+    if (x <= 0.0 - TWO_POW_53) {
+        return false
+    }
+    return ((x as int) & 1) != 0
+}
+
+/// `|x|`, spelled with a branch because the port has no `f64::abs`.
+fn absF(x: float) -> float {
+    if (x < 0.0) {
+        return 0.0 - x
+    }
+    return x
+}
+
+/// A quiet NaN, built the same way `abi_box.pkl` builds one (`inf - inf`).
+fn nanF() -> float {
+    return (1.0 / 0.0) - (1.0 / 0.0)
+}
+
+/// `log2(x)` for finite `x > 0`. Mirrors `math.rs::log2_f`: frexp-style range
+/// reduction into `(1/sqrt2, sqrt2]` and the `atanh` series
+/// `ln(m) = 2 * atanh((m-1)/(m+1))`, evaluated by Horner.
+fn log2f(x: float) -> float {
+    var bits = f64Bits(x)
+    var e = ((bits >> 52) & 2047) - 1023
+    if (e == 0 - 1023) {
+        // Subnormal: renormalise by 2^52 and account for the shift.
+        var scaled = x * 4503599627370496.0
+        bits = f64Bits(scaled)
+        e = (((bits >> 52) & 2047) - 1023) - 52
+    }
+    var m = abiF64FromBits((bits & 4503599627370495) | 4607182418800017408)
+    if (m > SQRT_2) {
+        m = m * 0.5
+        e = e + 1
+    }
+    var z = (m - 1.0) / (m + 1.0)
+    var z2 = z * z
+    var acc = 1.0 / 17.0
+    acc = acc * z2 + 1.0 / 15.0
+    acc = acc * z2 + 1.0 / 13.0
+    acc = acc * z2 + 1.0 / 11.0
+    acc = acc * z2 + 1.0 / 9.0
+    acc = acc * z2 + 1.0 / 7.0
+    acc = acc * z2 + 1.0 / 5.0
+    acc = acc * z2 + 1.0 / 3.0
+    acc = acc * z2 + 1.0
+    var ln_m = 2.0 * z * acc
+    return (e as float) + ln_m * INV_LN_2
+}
+
+/// `2^t` for a finite `t`. Mirrors `math.rs::exp2_f`: `2^floor(t)` times a
+/// degree-17 Taylor series of `exp(frac * ln2)` in `frac`.
+fn exp2f(t: float) -> float {
+    if (t > 1024.0) {
+        return 1.0 / 0.0
+    }
+    if (t < 0.0 - 1075.0) {
+        return 0.0
+    }
+    var n = floorF(t)
+    var f = t - n
+    var u = f * LN_2
+    var acc = 1.0 / 355687428096000.0
+    acc = acc * u + 1.0 / 20922789888000.0
+    acc = acc * u + 1.0 / 1307674368000.0
+    acc = acc * u + 1.0 / 87178291200.0
+    acc = acc * u + 1.0 / 6227020800.0
+    acc = acc * u + 1.0 / 479001600.0
+    acc = acc * u + 1.0 / 39916800.0
+    acc = acc * u + 1.0 / 3628800.0
+    acc = acc * u + 1.0 / 362880.0
+    acc = acc * u + 1.0 / 40320.0
+    acc = acc * u + 1.0 / 5040.0
+    acc = acc * u + 1.0 / 720.0
+    acc = acc * u + 1.0 / 120.0
+    acc = acc * u + 1.0 / 24.0
+    acc = acc * u + 1.0 / 6.0
+    acc = acc * u + 1.0 / 2.0
+    acc = acc * u + 1.0
+    acc = acc * u + 1.0
+    return acc * pow2(n as int)
+}
+
+/// `base^n` for `base > 0` and integer `n`, exactly, by repeated squaring.
+/// Mirrors `math.rs::powi_exact`; a negative `n` inverts at the end.
+fn powiExact(base: float, n: int) -> float {
+    if (n == 0) {
+        return 1.0
+    }
+    var neg = n < 0
+    var e = n
+    if (neg) {
+        e = 0 - n
+    }
+    var result = 1.0
+    var b = base
+    while (e > 0) {
+        if ((e & 1) == 1) {
+            result = result * b
+        }
+        e = e >> 1
+        if (e > 0) {
+            b = b * b
+        }
+    }
+    if (neg) {
+        return 1.0 / result
+    }
+    return result
+}
+
+/// `base ** exp` for `float` operands. Mirrors `math.rs::pickle_float_pow`.
+/// Integral exponents take the exact `powiExact` path; only a non-integral
+/// exponent uses `2^(exp * log2(base))`. A negative base is legal only for an
+/// integral (odd) exponent, matching IEEE `pow`.
+#[symbol("pickle_float_pow")]
+fn abiFloatPow(base: float, exp: float) -> float {
+    var nan = nanF()
+    if (base != base) {
+        return nan
+    }
+    if (exp != exp) {
+        return nan
+    }
+    if (exp == 0.0) {
+        return 1.0
+    }
+    if (base == 1.0) {
+        return 1.0
+    }
+    if (exp == 1.0) {
+        return base
+    }
+    var yInt = isIntegral(exp)
+    var odd = isOdd(exp)
+    var neg = false
+    if (base < 0.0 && odd) {
+        neg = true
+    }
+    if (base < 0.0 && !yInt) {
+        return nan
+    }
+    var ax = base
+    if (base < 0.0) {
+        ax = 0.0 - base
+    }
+    if (ax == 0.0) {
+        var r = 0.0
+        if (exp <= 0.0) {
+            r = 1.0 / 0.0
+        }
+        if (neg) {
+            return 0.0 - r
+        }
+        return r
+    }
+    if (yInt && absF(exp) < 9000000000000000000.0) {
+        var r2 = powiExact(ax, exp as int)
+        if (neg) {
+            return 0.0 - r2
+        }
+        return r2
+    }
+    var r3 = exp2f(exp * log2f(ax))
+    if (neg) {
+        return 0.0 - r3
+    }
+    return r3
+}
+
+/// Whether `value` is structurally present in `list`. Mirrors
+/// `list.rs::pickle_list_contains`, which compares each element with
+/// `map::value_eq` (`keyEq` here) - boxed scalars, strings, and nested
+/// containers all compare by value.
+#[symbol("pickle_list_contains")]
+fn abiListContains(list: *int, value: *int) -> bool {
+    unsafe {
+        var n = list[LEN_WORD]
+        var data = list[DATA_WORD] as *int
+        var i = 0
+        while (i < n) {
+            if (keyEq(data[i] as *int, value)) {
+                return true
+            }
+            i = i + 1
+        }
+    }
+    return false
+}
+
+/// Whether the bytes of `needle` occur as a contiguous run in `hay`. An empty
+/// needle is a substring of every string. Mirrors
+/// `strings.rs::string_contains`.
+#[symbol("pickle_str_contains")]
+fn abiStrContains(hay: *int, needle: *int) -> bool {
+    var hn = abiStrLen(hay)
+    var nn = abiStrLen(needle)
+    if (nn == 0) {
+        return true
+    }
+    if (nn > hn) {
+        return false
+    }
+    var i = 0
+    while (i + nn <= hn) {
+        var k = 0
+        while (k < nn && byteAt(hay, i + k) == byteAt(needle, k)) {
+            k = k + 1
+        }
+        if (k == nn) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}

@@ -1,0 +1,467 @@
+module runtime.abi_fs_test
+
+import { abiFileExists, abiDelete, abiMkdir, abiCurrentDir, abiReadFile, abiWriteFile, abiListDir, wideBuf, unitAt, wideUnits } from runtime.abi_fs
+
+/// `CreateFileW` needs these spelled out; see `makeFile`.
+const GENERIC_WRITE: int = 1073741824
+const FILE_SHARE_RWX: int = 7
+const CREATE_ALWAYS: int = 2
+const FILE_ATTRIBUTE_NORMAL: int = 128
+
+/// `INVALID_HANDLE_VALUE`. `CreateFileW` answers it as an all-ones 64-bit
+/// value rather than as an error code, so it cannot be checked the way the
+/// `GetFileAttributesW` sentinel is.
+const INVALID_HANDLE: int = -1
+
+/// `none` seen through the value, the way `fs_test.pkl` asks the same
+/// question.
+fn isNone(x: string?) -> bool {
+    if (let some(v) = x) {
+        return false
+    }
+    true
+}
+
+/// Create an empty file through the raw builtin rather than through
+/// `pickle_write_file`, which is the same primitive `abiDelete` is meant to
+/// replace. Test setup reaching for the system under test would only prove
+/// that the two halves agree with each other.
+fn makeFile(path: string) -> int {
+    unsafe {
+        let w = wideBuf(path)
+        let h = win_create_file_w(w, GENERIC_WRITE, FILE_SHARE_RWX, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0)
+        free(w)
+        return h
+    }
+}
+
+/// `"a" + U+00E9 + ".tt"`, built byte by byte so the source file itself stays
+/// ASCII. Six UTF-8 bytes, five UTF-16 units.
+fn accentedScratch() -> string {
+    let out = bytes("")
+    out.push(97 as byte)
+    out.push(195 as byte)
+    out.push(169 as byte)
+    out.push(46 as byte)
+    out.push(116 as byte)
+    out.push(116 as byte)
+    return str(out)
+}
+
+/// A `string` whose only byte is a stray UTF-8 continuation byte: not valid
+/// UTF-8 under any reading, so `wideUnits` answers -1 and `wideBuf` collapses
+/// it to the empty path. `pickle_str_from_list` copies bytes verbatim, which
+/// is what makes this reachable at all - see the `abi_fs` header.
+fn loneContinuation() -> string {
+    let out = bytes("")
+    out.push(128 as byte)
+    return str(out)
+}
+
+/// U+10348 as UTF-8: `F0 90 8D 88`. Four bytes, above the BMP, so it has to
+/// become two UTF-16 units.
+fn accentedPair() -> string {
+    let out = bytes("")
+    out.push(240 as byte)
+    out.push(144 as byte)
+    out.push(141 as byte)
+    out.push(136 as byte)
+    return str(out)
+}
+
+test fn file_exists_is_false_for_an_absent_path() {
+    let p = "abi_fs_test_no_such_path_9f3"
+    expect(abiFileExists(p)).toBe(false)
+}
+
+test fn file_exists_is_false_for_the_empty_path() {
+    // `fs.rs::path_w` runs `from_utf8(path).unwrap_or("")`, and `""` has no
+    // directory to resolve against, so this misses on every build.
+    let p = ""
+    expect(abiFileExists(p)).toBe(false)
+}
+
+test fn delete_reports_false_when_nothing_is_there() {
+    // Both halves of the fallback run: `DeleteFileW` rejects it as a file that
+    // is not there, `RemoveDirectoryW` rejects it as a directory that is not
+    // there.
+    let p = "abi_fs_test_no_such_path_9f3"
+    expect(abiDelete(p)).toBe(false)
+}
+
+test fn a_file_we_create_exists_then_deletes() {
+    let p = "abi_fs_test_scratch.txt"
+    // Leftovers from an earlier run must not decide this test's outcome.
+    if (abiFileExists(p)) {
+        abiDelete(p)
+    }
+    expect(abiFileExists(p)).toBe(false)
+
+    let h = makeFile(p)
+    expect(h == INVALID_HANDLE).toBe(false)
+    expect(abiFileExists(p)).toBe(true)
+
+    win_close_handle(h)
+    expect(abiDelete(p)).toBe(true)
+    expect(abiFileExists(p)).toBe(false)
+}
+
+test fn mkdir_creates_one_level_then_refuses_to_create_it_again() {
+    let d = "abi_fs_test_scratch_dir"
+    if (abiFileExists(d)) {
+        abiDelete(d)
+    }
+    expect(abiMkdir(d)).toBe(true)
+    expect(abiFileExists(d)).toBe(true)
+    // `std::fs::create_dir` on an existing directory is an error, and
+    // `CreateDirectoryW` reports `ERROR_ALREADY_EXISTS` - both sides `false`.
+    expect(abiMkdir(d)).toBe(false)
+    expect(abiDelete(d)).toBe(true)
+    expect(abiFileExists(d)).toBe(false)
+}
+
+test fn a_non_ascii_path_survives_the_round_trip_to_the_disk() {
+    let p = accentedScratch()
+    if (abiFileExists(p)) {
+        abiDelete(p)
+    }
+    expect(len(p)).toBe(6)
+    expect(wideUnits(p)).toBe(5)
+    expect(abiFileExists(p)).toBe(false)
+
+    let h = makeFile(p)
+    expect(h == INVALID_HANDLE).toBe(false)
+    expect(abiFileExists(p)).toBe(true)
+    win_close_handle(h)
+    expect(abiDelete(p)).toBe(true)
+    expect(abiFileExists(p)).toBe(false)
+}
+
+test fn current_dir_is_a_path_that_really_exists() {
+    // If the conversion lost the path, the sentinel branch would return
+    // `none`; if it returned a path Win32 does not recognise, the round trip
+    // below would not see it.
+    let cwd = abiCurrentDir()
+    expect(isNone(cwd)).toBe(false)
+    if (let some(d) = cwd) {
+        expect(len(d)).toBeGreaterThan(0)
+        expect(abiFileExists(d)).toBe(true)
+    } else {
+        expect("x").toBe("y")
+    }
+}
+
+test fn wide_buf_packs_two_byte_utf8_into_one_unit() {
+    // `a` + `é` + `.tt`: 6 UTF-8 bytes, 5 units, terminator in the 6th slot.
+    let s = accentedScratch()
+    expect(wideUnits(s)).toBe(5)
+    let w = wideBuf(s)
+    expect(unitAt(w, 0)).toBe(97)
+    expect(unitAt(w, 1)).toBe(233)
+    expect(unitAt(w, 2)).toBe(46)
+    expect(unitAt(w, 3)).toBe(116)
+    expect(unitAt(w, 4)).toBe(116)
+    expect(unitAt(w, 5)).toBe(0)
+    unsafe { free(w) }
+}
+
+test fn wide_buf_splits_a_supplementary_code_point_across_a_surrogate_pair() {
+    // U+10348 as UTF-8 is F0 90 8D 88 - 66376, above the BMP, so it takes two
+    // UTF-16 units: D800 + (v >> 10), DC00 + (v & 1023) for v = 840.
+    let s = accentedPair()
+    expect(wideUnits(s)).toBe(2)
+    let w = wideBuf(s)
+    expect(unitAt(w, 0)).toBe(55296)
+    expect(unitAt(w, 1)).toBe(57160)
+    expect(unitAt(w, 2)).toBe(0)
+    unsafe { free(w) }
+}
+
+test fn invalid_utf8_collapses_to_the_empty_path() {
+    // Not "some best-effort decoding": `from_utf8` rejects the byte, the path
+    // becomes `""`, and `""` does not exist. The buffer still has to come back
+    // zeroed, because `putUnit` writes by masked replace over its words.
+    let bad = loneContinuation()
+    expect(wideUnits(bad)).toBe(-1)
+    let w = wideBuf(bad)
+    expect(unitAt(w, 0)).toBe(0)
+    expect(abiFileExists(bad)).toBe(false)
+    unsafe { free(w) }
+}
+
+
+/// Remove `p` when it is there, so a test never inherits the disk state of the
+/// run before it. The four read/write tests below all land in the working
+/// directory the same way `abi_fs_test_scratch.txt` already does.
+fn scratch(p: string) {
+    if (abiFileExists(p)) {
+        abiDelete(p)
+    }
+}
+
+test fn write_then_read_round_trips_text() {
+    let p = "abi_fs_test_rw.txt"
+    scratch(p)
+    expect(abiWriteFile(p, "hello")).toBe(true)
+    expect(abiFileExists(p)).toBe(true)
+    if (let some(s) = abiReadFile(p)) {
+        expect(s).toBe("hello")
+        expect(len(s)).toBe(5)
+    } else {
+        expect("some").toBe("none")
+    }
+    expect(abiDelete(p)).toBe(true)
+    expect(abiFileExists(p)).toBe(false)
+}
+
+test fn writing_zero_bytes_creates_an_empty_file_rather_than_a_missing_one() {
+    let p = "abi_fs_test_rw_empty.txt"
+    scratch(p)
+    expect(abiWriteFile(p, "")).toBe(true)
+    expect(abiFileExists(p)).toBe(true)
+    // An empty file still reads back as `some`: the first `ReadFile` succeeds
+    // and answers 0, and it is that success, not a non-zero count, which is
+    // what `fs.rs` turns into `Some`.
+    expect(isNone(abiReadFile(p))).toBe(false)
+    if (let some(s) = abiReadFile(p)) {
+        expect(len(s)).toBe(0)
+    } else {
+        expect("some").toBe("none")
+    }
+    expect(abiDelete(p)).toBe(true)
+}
+
+test fn read_reports_none_when_the_file_is_not_there() {
+    let p = "abi_fs_test_rw_absent_9f3"
+    scratch(p)
+    // `CreateFileW` with `OPEN_EXISTING` on a path that does not exist fails,
+    // and a failed first `ReadFile` is the only way to reach `none` - so this
+    // pins the branch the empty-file test above deliberately does not take.
+    expect(isNone(abiReadFile(p))).toBe(true)
+    expect(isNone(abiReadFile(""))).toBe(true)
+}
+
+test fn write_reports_false_when_there_is_nowhere_to_put_the_file() {
+    // The parent directory does not exist, so `CreateFileW` has nothing to
+    // create the file in - the same reason `std::fs::write` fails here.
+    expect(abiWriteFile("abi_fs_test_rw_nodir_zz/t.txt", "x")).toBe(false)
+    // An invalid UTF-8 path collapses to `""` before it reaches Win32, and `""`
+    // is not a place a file can be created either.
+    expect(abiWriteFile(loneContinuation(), "x")).toBe(false)
+    expect(abiFileExists("abi_fs_test_rw_nodir_zz")).toBe(false)
+}
+
+test fn a_second_write_replaces_the_first_entirely() {
+    let p = "abi_fs_test_rw_over.txt"
+    scratch(p)
+    expect(abiWriteFile(p, "abcdefgh")).toBe(true)
+    expect(abiWriteFile(p, "xy")).toBe(true)
+    // `CREATE_ALWAYS` truncates rather than appending, so a second write leaves
+    // nothing of the first: an append would read back as eight bytes.
+    if (let some(s) = abiReadFile(p)) {
+        expect(len(s)).toBe(2)
+        expect(s).toBe("xy")
+    } else {
+        expect("some").toBe("none")
+    }
+    expect(abiDelete(p)).toBe(true)
+}
+
+test fn file_bytes_survive_the_round_trip_verbatim() {
+    // Not valid UTF-8, and no reason to be - `ReadFile` hands back what was on
+    // disk and `pickle_str_from_list` copies list bytes into the object
+    // without looking at them, so nothing between the two revalidates.
+    let p = "abi_fs_test_rw_bytes.bin"
+    scratch(p)
+    let payload = bytes("")
+    payload.push(0 as byte)
+    payload.push(255 as byte)
+    payload.push(195 as byte)
+    payload.push(128 as byte)
+    payload.push(7 as byte)
+    expect(abiWriteFile(p, str(payload))).toBe(true)
+    if (let some(s) = abiReadFile(p)) {
+        expect(len(s)).toBe(5)
+        expect(s[0] as int).toBe(0)
+        expect(s[1] as int).toBe(255)
+        expect(s[2] as int).toBe(195)
+        expect(s[3] as int).toBe(128)
+        expect(s[4] as int).toBe(7)
+    } else {
+        expect("some").toBe("none")
+    }
+    expect(abiDelete(p)).toBe(true)
+}
+
+test fn the_language_intrinsics_reach_the_packed_bodies() {
+    // The tests above call the `#[symbol]` bodies directly. This one goes
+    // through `write_file`/`read_file`/`file_exists`/`delete`, which lower to
+    // an extern reference by name - the path a real program takes, and the one
+    // that only resolves when this module is linked in.
+    let p = "abi_fs_test_rw_intrinsic.txt"
+    scratch(p)
+    expect(write_file(p, "intrinsic")).toBe(true)
+    expect(file_exists(p)).toBe(true)
+    if (let some(s) = read_file(p)) {
+        expect(s).toBe("intrinsic")
+    } else {
+        expect("some").toBe("none")
+    }
+    expect(delete(p)).toBe(true)
+    expect(file_exists(p)).toBe(false)
+}
+
+/// `none` seen through a listing. Mirrors `isNone` for `string?` above; the
+/// two cannot be one function because `string?` and `List<string>?` do not
+/// share a type to match on.
+fn listIsNone(xs: List<string>?) -> bool {
+    if (let some(_) = xs) {
+        return false
+    }
+    true
+}
+
+/// The length of a listing, or -1 when the listing is `none` - so a test can
+/// tell "no such directory" from "an empty one" in a single number.
+fn listLen(xs: List<string>?) -> int {
+    if (let some(v) = xs) {
+        return len(v)
+    }
+    -1
+}
+
+/// Whether a listing holds `want`. `a == b` on two strings lowers to
+/// `pickle_str_cmp`, so this compares bytes and not addresses.
+fn has(xs: List<string>?, want: string) -> bool {
+    if (let some(list) = xs) {
+        var i = 0
+        while (i < len(list)) {
+            if (list[i] == want) {
+                return true
+            }
+            i = i + 1
+        }
+        return false
+    }
+    false
+}
+
+/// Empty `d` of whatever an earlier run left in it and recreate it. Cleanup
+/// goes through `abiListDir` deliberately: if the listing is wrong, the test
+/// that owns this directory fails on its own assertions rather than quietly
+/// inheriting the previous run's state.
+fn scratchDir(d: string) -> bool {
+    if (abiFileExists(d)) {
+        if (let some(xs) = abiListDir(d)) {
+            var i = 0
+            while (i < len(xs)) {
+                abiDelete(xs[i])
+                i = i + 1
+            }
+        }
+        abiDelete(d)
+    }
+    abiMkdir(d)
+}
+
+test fn list_dir_reports_none_when_there_is_no_such_directory() {
+    expect(listIsNone(abiListDir("abi_fs_test_ld_absent_9f3"))).toBe(true)
+    expect(listIsNone(abiListDir(""))).toBe(false)
+}
+
+test fn list_dir_reports_none_for_a_file_rather_than_a_directory() {
+    let p = "abi_fs_test_ld_a_file.txt"
+    scratch(p)
+    expect(abiWriteFile(p, "x")).toBe(true)
+    // `FindFirstFileW` is asked for `file\*`, which resolves to nothing - the
+    // same reason `std::fs::read_dir` on a file is an error.
+    expect(listIsNone(abiListDir(p))).toBe(true)
+    expect(abiDelete(p)).toBe(true)
+}
+
+test fn an_empty_directory_lists_as_empty_rather_than_as_missing() {
+    let d = "abi_fs_test_ld_empty"
+    expect(scratchDir(d)).toBe(true)
+    // `FindFirstFileW` answers with `.`, which is dropped - so the directory is
+    // present and the listing is simply short of the entry that started it.
+    expect(listIsNone(abiListDir(d))).toBe(false)
+    expect(listLen(abiListDir(d))).toBe(0)
+    expect(abiDelete(d)).toBe(true)
+}
+
+test fn list_dir_returns_full_child_paths_and_skips_the_dot_entries() {
+    let d = "abi_fs_test_ld"
+    expect(scratchDir(d)).toBe(true)
+    expect(abiWriteFile(d + "\\one.txt", "1")).toBe(true)
+    expect(abiWriteFile(d + "\\two.txt", "2")).toBe(true)
+    expect(abiWriteFile(d + "\\three.txt", "3")).toBe(true)
+
+    let xs = abiListDir(d)
+    expect(listIsNone(xs)).toBe(false)
+    // Three children, not five: `FindFirstFileW` always hands back `.` and
+    // `..`, and `std::fs::read_dir` never shows them, so the skip belongs here.
+    expect(listLen(xs)).toBe(3)
+    expect(has(xs, d + "\\one.txt")).toBe(true)
+    expect(has(xs, d + "\\two.txt")).toBe(true)
+    expect(has(xs, d + "\\three.txt")).toBe(true)
+    expect(has(xs, ".")).toBe(false)
+    expect(has(xs, "..")).toBe(false)
+    // Every entry is a full path under `d`, not a bare file name.
+    expect(has(xs, "one.txt")).toBe(false)
+
+    expect(abiDelete(d + "\\one.txt")).toBe(true)
+    expect(abiDelete(d + "\\two.txt")).toBe(true)
+    expect(abiDelete(d + "\\three.txt")).toBe(true)
+    expect(abiDelete(d)).toBe(true)
+}
+
+test fn a_trailing_separator_is_used_and_not_doubled() {
+    let d = "abi_fs_test_ld_sep"
+    expect(scratchDir(d)).toBe(true)
+    expect(abiWriteFile(d + "\\child.txt", "c")).toBe(true)
+
+    // With no separator the pattern and the children each gain one; with one
+    // already there neither gains another, and the child reads `d\child.txt`
+    // rather than `d\\child.txt`.
+    expect(listLen(abiListDir(d))).toBe(1)
+    expect(has(abiListDir(d), d + "\\child.txt")).toBe(true)
+    expect(listLen(abiListDir(d + "\\"))).toBe(1)
+    expect(has(abiListDir(d + "\\"), d + "\\child.txt")).toBe(true)
+    // The other separator `ends_with_sep` accepts. Win32 normalises `/` in a
+    // search pattern, and the child prefix is whatever the caller passed.
+    expect(listLen(abiListDir(d + "/"))).toBe(1)
+    expect(has(abiListDir(d + "/"), d + "/child.txt")).toBe(true)
+
+    expect(abiDelete(d + "\\child.txt")).toBe(true)
+    expect(abiDelete(d)).toBe(true)
+}
+
+test fn a_non_ascii_directory_name_survives_into_the_child_paths() {
+    let d = accentedScratch()
+    expect(scratchDir(d)).toBe(true)
+    expect(abiWriteFile(d + "\\inner.txt", "i")).toBe(true)
+
+    let xs = abiListDir(d)
+    expect(listIsNone(xs)).toBe(false)
+    expect(listLen(xs)).toBe(1)
+    // Six UTF-8 bytes in the prefix, five UTF-16 units - the same counts the
+    // wide-path tests above pin down for the directory itself.
+    expect(has(xs, d + "\\inner.txt")).toBe(true)
+
+    expect(abiDelete(d + "\\inner.txt")).toBe(true)
+    expect(abiDelete(d)).toBe(true)
+}
+
+test fn the_language_intrinsic_reaches_the_packed_list_dir() {
+    let d = "abi_fs_test_ld_intrinsic"
+    expect(scratchDir(d)).toBe(true)
+    expect(abiWriteFile(d + "\\only.txt", "o")).toBe(true)
+    // The path a real program takes: `list_dir(...)` lowers to an extern
+    // reference by name, which only resolves when this module is linked in.
+    let xs = list_dir(d)
+    expect(listIsNone(xs)).toBe(false)
+    expect(listLen(xs)).toBe(1)
+    expect(has(xs, d + "\\only.txt")).toBe(true)
+    expect(abiDelete(d + "\\only.txt")).toBe(true)
+    expect(abiDelete(d)).toBe(true)
+}

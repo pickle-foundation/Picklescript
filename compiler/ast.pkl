@@ -1,0 +1,707 @@
+module compiler.ast
+
+import { Span } from compiler.diag
+
+class Program {
+    var modDecl: ModuleDecl?
+    var imports: List<ImportDecl>
+    var items: List<Item>
+    /// Set when an integer literal was well formed but too large for i64. The
+    /// lexer can only report that by leaving the value unset, which it also does
+    /// for malformed digits (`0xZZ`), so the fact is carried to codegen instead
+    /// of being diagnosed during parsing: the Rust emitter rejects it in `lit`,
+    /// which means checking still runs and gets to report its own errors first.
+    var intLiteralOverflow: bool
+
+    constructor(modDecl: ModuleDecl?, imports: List<ImportDecl>, items: List<Item>, intLiteralOverflow: bool) {
+        this.modDecl = modDecl
+        this.imports = imports
+        this.items = items
+        this.intLiteralOverflow = intLiteralOverflow
+    }
+}
+
+class ModuleDecl {
+    var path: List<string>
+    var span: Span
+
+    constructor(path: List<string>, span: Span) {
+        this.path = path
+        this.span = span
+    }
+}
+
+enum ImportKind {
+    Module(alias: string?)
+    Items(items: List<ImportItem>)
+    Wildcard
+}
+
+class ImportItem {
+    var path: List<string>
+    var alias: string?
+    var span: Span
+
+    constructor(path: List<string>, alias: string?, span: Span) {
+        this.path = path
+        this.alias = alias
+        this.span = span
+    }
+}
+
+class ImportDecl {
+    var isPublic: bool
+    var source: List<string>
+    var kind: ImportKind
+    var span: Span
+
+    constructor(isPublic: bool, source: List<string>, kind: ImportKind, span: Span) {
+        this.isPublic = isPublic
+        this.source = source
+        this.kind = kind
+        this.span = span
+    }
+}
+
+class Item {
+    var doc: List<string>
+    var attrs: List<Attribute>
+    var span: Span
+    var kind: ItemKind
+
+    constructor(doc: List<string>, attrs: List<Attribute>, span: Span, kind: ItemKind) {
+        this.doc = doc
+        this.attrs = attrs
+        this.span = span
+        this.kind = kind
+    }
+}
+
+class Attribute {
+    var name: string
+    var args: List<Expr>
+    var span: Span
+
+    constructor(name: string, args: List<Expr>, span: Span) {
+        this.name = name
+        this.args = args
+        this.span = span
+    }
+}
+
+enum ItemKind {
+    Fn(f: FnDecl)
+    Class(c: ClassDecl)
+    Struct(s: StructDecl)
+    Enum(e: EnumDecl)
+    Interface(i: InterfaceDecl)
+    Const(c: ConstDecl)
+    Global(g: GlobalDecl)
+    Test(f: FnDecl)
+}
+
+class GlobalDecl {
+   var name: string
+   var visibility: Visibility
+   var ty: TypeExpr?
+   var value: Expr
+   var span: Span
+
+   constructor(name: string, visibility: Visibility, ty: TypeExpr?, value: Expr, span: Span) {
+   this.name = name
+   this.visibility = visibility
+   this.ty = ty
+   this.value = value
+   this.span = span
+   }
+}
+
+enum Visibility {
+    Public
+    Private
+    Protected
+    Default
+}
+
+class GenericParam {
+    var name: string
+    var span: Span
+
+    constructor(name: string, span: Span) {
+        this.name = name
+        this.span = span
+    }
+}
+
+class TypeExpr {
+    var span: Span
+    var kind: TypeExprKind
+
+    constructor(span: Span, kind: TypeExprKind) {
+        this.span = span
+        this.kind = kind
+    }
+}
+
+enum TypeExprKind {
+    Path(path: List<string>)
+    Generic(inner: TypeExpr, args: List<TypeExpr>)
+    Pointer(inner: TypeExpr)
+    Ref(inner: TypeExpr)
+    Option(inner: TypeExpr)
+    Tuple(parts: List<TypeExpr>)
+    Fn(params: List<TypeExpr>, ret: TypeExpr?, isAsync: bool)
+    Infer
+}
+
+class FnDecl {
+    var name: string
+    var span: Span
+    var visibility: Visibility
+    var isAsync: bool
+    var generics: List<GenericParam>
+    var params: List<Param>
+    var returnTy: TypeExpr?
+    var body: FnBody?
+
+    constructor(name: string, span: Span, visibility: Visibility, isAsync: bool, generics: List<GenericParam>, params: List<Param>, returnTy: TypeExpr?, body: FnBody?) {
+        this.name = name
+        this.span = span
+        this.visibility = visibility
+        this.isAsync = isAsync
+        this.generics = generics
+        this.params = params
+        this.returnTy = returnTy
+        this.body = body
+    }
+}
+
+class Param {
+    var name: string
+    var ty: TypeExpr?
+    var default: Expr?
+    var rest: bool
+    var attrs: List<Attribute>
+    var span: Span
+
+    constructor(name: string, ty: TypeExpr?, default: Expr?, rest: bool, attrs: List<Attribute>, span: Span) {
+        this.name = name
+        this.ty = ty
+        this.default = default
+        this.rest = rest
+        this.attrs = attrs
+        this.span = span
+    }
+}
+
+enum FnBody {
+    Block(b: Block)
+    Expr(e: Expr)
+}
+
+class Block {
+    var stmts: List<Stmt>
+    var expr: Expr?
+    var span: Span
+
+    constructor(stmts: List<Stmt>, expr: Expr?, span: Span) {
+        this.stmts = stmts
+        this.expr = expr
+        this.span = span
+    }
+}
+
+enum ForHeader {
+    In(pattern: Pattern, sequence: Expr)
+    Range(init: Stmt, cond: Expr, step: Expr)
+}
+
+enum Stmt {
+    Let(pattern: Pattern, ty: TypeExpr?, init: Expr?, mutable: bool, attrs: List<Attribute>, span: Span)
+    Const(name: string, ty: TypeExpr?, value: Expr, span: Span)
+    Return(value: Expr?, span: Span)
+    Break(span: Span)
+    Continue(span: Span)
+    While(cond: Expr, body: Block, span: Span)
+    For(header: ForHeader, body: Block, span: Span)
+    Try(body: Block, binder: string?, handler: Block?, fin: Block?, span: Span)
+    Throw(value: Expr, span: Span)
+    Expr(e: Expr)
+    Empty(span: Span)
+}
+
+class Expr {
+    var span: Span
+    var kind: ExprKind
+
+    constructor(span: Span, kind: ExprKind) {
+        this.span = span
+        this.kind = kind
+    }
+}
+
+enum ExprKind {
+    Lit(l: Lit)
+    Ident(name: string)
+    This
+    Super
+    Call(callee: Expr, args: List<CallArg>)
+    Member(object: Expr, name: string)
+    Index(object: Expr, index: Expr)
+    Binary(op: BinOp, lhs: Expr, rhs: Expr)
+    Unary(op: UnOp, operand: Expr)
+    Assign(target: Expr, op: AssignOp, value: Expr)
+    Lambda(params: List<Param>, returnTy: TypeExpr?, isAsync: bool, body: FnBody)
+    If(cond: IfCond, then: Block, elseElse: Expr?)
+    Match(scrutinee: Expr, arms: List<MatchArm>)
+    Await(e: Expr)
+    GenericCall(name: string, typeArgs: List<TypeExpr>)
+    Cast(expr: Expr, ty: TypeExpr, kind: CastKind)
+    Unsafe(b: Block)
+    Block(b: Block)
+    Tuple(parts: List<Expr>)
+    Array(parts: List<Expr>)
+    Map(entries: List<MapEntry>)
+    OptAccess(object: Expr, name: string)
+    OptUnwrap(e: Expr)
+    Range(start: Expr, end: Expr, incl: bool)
+}
+
+class MapEntry {
+    var key: Expr
+    var value: Expr
+
+    constructor(key: Expr, value: Expr) {
+        this.key = key
+        this.value = value
+    }
+}
+
+enum IfCond {
+    Cond(e: Expr)
+    Binding(pattern: Pattern, value: Expr)
+}
+
+class MatchArm {
+    var pattern: Pattern
+    var guard: Expr?
+    var body: Expr
+    var span: Span
+
+    constructor(pattern: Pattern, guard: Expr?, body: Expr, span: Span) {
+        this.pattern = pattern
+        this.guard = guard
+        this.body = body
+        this.span = span
+    }
+}
+
+enum CastKind {
+    As
+    TryAs
+    Is
+}
+
+class CallArg {
+    var name: string?
+    var value: Expr
+    var spread: bool
+    var span: Span
+
+    constructor(name: string?, value: Expr, spread: bool, span: Span) {
+        this.name = name
+        this.value = value
+        this.spread = spread
+        this.span = span
+    }
+}
+
+enum Lit {
+    Int(value: int)
+    Float(text: string)
+    Bool(b: bool)
+    Char(c: char)
+    String(parts: List<StrPart>)
+    None
+}
+
+enum StrPart {
+    Text(t: string)
+    Expr(e: Expr)
+}
+
+enum BinOp {
+    Add
+    Sub
+    Mul
+    Div
+    Mod
+    Pow
+    Shl
+    Shr
+    BitAnd
+    BitOr
+    BitXor
+    Lt
+    Le
+    Gt
+    Ge
+    Eq
+    Ne
+    And
+    Or
+    Range
+    RangeIncl
+    NullCoalesce
+    Send
+    Is
+    In
+}
+
+enum AssignOp {
+    Assign
+    Add
+    Sub
+    Mul
+    Div
+    Mod
+    Shl
+    Shr
+    BitAnd
+    BitOr
+    BitXor
+}
+
+enum UnOp {
+    Neg
+    Not
+    BitNot
+    Deref
+    AddrOf
+}
+
+enum Pattern {
+    Wildcard
+    Binding(name: string, ty: TypeExpr?)
+    Literal(l: Lit)
+    Tuple(parts: List<Pattern>)
+    Variant(path: List<string>, payloads: List<Pattern>)
+    Or(parts: List<Pattern>)
+}
+
+class ClassDecl {
+    var name: string
+    var span: Span
+    var visibility: Visibility
+    var generics: List<GenericParam>
+    var extends: TypeExpr?
+    var implements: List<TypeExpr>
+    var members: List<ClassMember>
+
+    constructor(name: string, span: Span, visibility: Visibility, generics: List<GenericParam>, extends: TypeExpr?, implements: List<TypeExpr>, members: List<ClassMember>) {
+        this.name = name
+        this.span = span
+        this.visibility = visibility
+        this.generics = generics
+        this.extends = extends
+        this.implements = implements
+        this.members = members
+    }
+}
+
+class StructDecl {
+    var name: string
+    var span: Span
+    var visibility: Visibility
+    var generics: List<GenericParam>
+    var implements: List<TypeExpr>
+    var members: List<ClassMember>
+
+    constructor(name: string, span: Span, visibility: Visibility, generics: List<GenericParam>, implements: List<TypeExpr>, members: List<ClassMember>) {
+        this.name = name
+        this.span = span
+        this.visibility = visibility
+        this.generics = generics
+        this.implements = implements
+        this.members = members
+    }
+}
+
+class EnumDecl {
+    var name: string
+    var span: Span
+    var visibility: Visibility
+    var generics: List<GenericParam>
+    var variants: List<EnumVariant>
+    var implements: List<TypeExpr>
+
+    constructor(name: string, span: Span, visibility: Visibility, generics: List<GenericParam>, variants: List<EnumVariant>, implements: List<TypeExpr>) {
+        this.name = name
+        this.span = span
+        this.visibility = visibility
+        this.generics = generics
+        this.variants = variants
+        this.implements = implements
+    }
+}
+
+class EnumVariant {
+    var name: string
+    var fields: List<EnumField>
+    var discriminant: int?
+    var span: Span
+
+    constructor(name: string, fields: List<EnumField>, discriminant: int?, span: Span) {
+        this.name = name
+        this.fields = fields
+        this.discriminant = discriminant
+        this.span = span
+    }
+}
+
+class EnumField {
+    var name: string
+    var ty: TypeExpr
+
+    constructor(name: string, ty: TypeExpr) {
+        this.name = name
+        this.ty = ty
+    }
+}
+
+class InterfaceDecl {
+    var name: string
+    var span: Span
+    var visibility: Visibility
+    var generics: List<GenericParam>
+    var extends: List<TypeExpr>
+    var members: List<InterfaceMember>
+
+    constructor(name: string, span: Span, visibility: Visibility, generics: List<GenericParam>, extends: List<TypeExpr>, members: List<InterfaceMember>) {
+        this.name = name
+        this.span = span
+        this.visibility = visibility
+        this.generics = generics
+        this.extends = extends
+        this.members = members
+    }
+}
+
+enum InterfaceMember {
+    Method(m: MethodDecl)
+    Property(name: string, ty: TypeExpr, span: Span)
+    Const(name: string, value: Expr, span: Span)
+}
+
+class ConstDecl {
+    var name: string
+    var visibility: Visibility
+    var ty: TypeExpr?
+    var value: Expr
+    var span: Span
+
+    constructor(name: string, visibility: Visibility, ty: TypeExpr?, value: Expr, span: Span) {
+        this.name = name
+        this.visibility = visibility
+        this.ty = ty
+        this.value = value
+        this.span = span
+    }
+}
+
+enum ClassMember {
+    Field(name: string, ty: TypeExpr?, init: Expr?, visibility: Visibility, isStatic: bool, isConst: bool, attrs: List<Attribute>, span: Span)
+    Method(m: MethodDecl)
+    Constructor(c: ConstructorDecl)
+    Property(p: PropertyDecl)
+    Init(b: Block)
+    Deinit(b: Block)
+    Const(name: string, visibility: Visibility, ty: TypeExpr?, value: Expr, span: Span)
+}
+
+class MethodDecl {
+    var name: string
+    var span: Span
+    var visibility: Visibility
+    var isStatic: bool
+    var isOverride: bool
+    var isAsync: bool
+    var isTest: bool
+    var operator: string?
+    var generics: List<GenericParam>
+    var params: List<Param>
+    var returnTy: TypeExpr?
+    var body: FnBody?
+
+    constructor(name: string, span: Span, visibility: Visibility, isStatic: bool, isOverride: bool, isAsync: bool, isTest: bool, operator: string?, generics: List<GenericParam>, params: List<Param>, returnTy: TypeExpr?, body: FnBody?) {
+        this.name = name
+        this.span = span
+        this.visibility = visibility
+        this.isStatic = isStatic
+        this.isOverride = isOverride
+        this.isAsync = isAsync
+        this.isTest = isTest
+        this.operator = operator
+        this.generics = generics
+        this.params = params
+        this.returnTy = returnTy
+        this.body = body
+    }
+}
+
+class ConstructorDecl {
+    var name: string?
+    var span: Span
+    var visibility: Visibility
+    var params: List<Param>
+    var body: Block
+
+    constructor(name: string?, span: Span, visibility: Visibility, params: List<Param>, body: Block) {
+        this.name = name
+        this.span = span
+        this.visibility = visibility
+        this.params = params
+        this.body = body
+    }
+}
+
+class PropertyDecl {
+    var name: string
+    var span: Span
+    var visibility: Visibility
+    var ty: TypeExpr?
+    var get: PropertyAccessor?
+    var set: PropertyAccessor?
+    var isStatic: bool
+
+    constructor(name: string, span: Span, visibility: Visibility, ty: TypeExpr?, get: PropertyAccessor?, set: PropertyAccessor?, isStatic: bool) {
+        this.name = name
+        this.span = span
+        this.visibility = visibility
+        this.ty = ty
+        this.get = get
+        this.set = set
+        this.isStatic = isStatic
+    }
+}
+
+enum PropertyAccessor {
+    Expr(e: Expr)
+    Block(b: Block)
+}
+
+fn isExpectMethod(name: string) -> bool {
+    name == "toBe" || name == "toEqual" || name == "toBeTruthy" || name == "toBeFalsy" || name == "toBeNull" || name == "toExist" || name == "toHaveLength" || name == "toContain" || name == "toBeGreaterThan" || name == "toBeLessThan"
+}
+
+fn emptyModuleDecls() -> List<ModuleDecl> {
+    var l = [ModuleDecl(["x"], Span(0, 0))]
+    l.pop()
+    l
+}
+
+fn emptyImportDecls() -> List<ImportDecl> {
+    var l = [ImportDecl(false, ["x"], ImportKind.Wildcard, Span(0, 0))]
+    l.pop()
+    l
+}
+
+fn emptyItems() -> List<Item> {
+    var l = [Item(emptyStrs(), emptyAttrs(), Span(0, 0), ItemKind.Const(ConstDecl("x", Visibility.Public, none, Expr(Span(0, 0), ExprKind.Ident("x")), Span(0, 0))))]
+    l.pop()
+    l
+}
+
+fn emptyStrs() -> List<string> {
+    var l = [""]
+    l.pop()
+    l
+}
+
+fn emptyAttrs() -> List<Attribute> {
+    var l = [Attribute("x", emptyExprs(), Span(0, 0))]
+    l.pop()
+    l
+}
+
+fn emptyExprs() -> List<Expr> {
+    var l = [Expr(Span(0, 0), ExprKind.Ident("x"))]
+    l.pop()
+    l
+}
+
+fn emptyImports() -> List<ImportItem> {
+    var l = [ImportItem(["x"], none, Span(0, 0))]
+    l.pop()
+    l
+}
+
+fn emptyParams() -> List<Param> {
+    var l = [Param("x", none, none, false, emptyAttrs(), Span(0, 0))]
+    l.pop()
+    l
+}
+
+fn emptyGenericParams() -> List<GenericParam> {
+    var l = [GenericParam("T", Span(0, 0))]
+    l.pop()
+    l
+}
+
+fn emptyTypeExprs() -> List<TypeExpr> {
+    var l = [TypeExpr(Span(0, 0), TypeExprKind.Infer)]
+    l.pop()
+    l
+}
+
+fn emptyStmts() -> List<Stmt> {
+    var l = [Stmt.Empty(Span(0, 0))]
+    l.pop()
+    l
+}
+
+fn emptyMatchArms() -> List<MatchArm> {
+    var l = [MatchArm(Pattern.Wildcard, none, Expr(Span(0, 0), ExprKind.Ident("x")), Span(0, 0))]
+    l.pop()
+    l
+}
+
+fn emptyCallArgs() -> List<CallArg> {
+    var l = [CallArg(none, Expr(Span(0, 0), ExprKind.Ident("x")), false, Span(0, 0))]
+    l.pop()
+    l
+}
+
+fn emptyStrParts() -> List<StrPart> {
+    var l = [StrPart.Text("")]
+    l.pop()
+    l
+}
+
+fn emptyProcMembers() -> List<ClassMember> {
+    var l = [ClassMember.Init(emptyBlock())]
+    l.pop()
+    l
+}
+
+fn emptyEnumVariants() -> List<EnumVariant> {
+    var l = [EnumVariant("V", emptyEnumFields(), none, Span(0, 0))]
+    l.pop()
+    l
+}
+
+fn emptyEnumFields() -> List<EnumField> {
+    var l = [EnumField("f", TypeExpr(Span(0, 0), TypeExprKind.Infer))]
+    l.pop()
+    l
+}
+
+fn emptyIfaceMembers() -> List<InterfaceMember> {
+    var l = [InterfaceMember.Const("C", Expr(Span(0, 0), ExprKind.Ident("x")), Span(0, 0))]
+    l.pop()
+    l
+}
+
+fn emptyBlock() -> Block {
+    Block(emptyStmts(), none, Span(0, 0))
+}

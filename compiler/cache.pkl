@@ -1,0 +1,267 @@
+module compiler.cache
+
+import { splitLines, subStr } from compiler.front
+import { parseIntLiteral } from compiler.token
+import { toHex } from std.text.format
+
+/// A lowering cache for the self-hosted compiler, keyed on the sources the
+/// lowering consumed.
+///
+/// `irx <file>` re-reads, re-parses, re-resolves, re-checks and re-emits the
+/// whole import graph of `<file>` on every invocation, and for the self-hosted
+/// compiler that graph is the compiler itself -- roughly a megabyte of Pickle
+/// source that only changes when someone edits it. Remembering which files a
+/// lowering read, and hashing their contents, turns a repeat run into a file
+/// read.
+///
+/// The design mirrors the Rust CLI's cache (`cli/src/cache.rs`) deliberately, so
+/// the two are easy to reason about together:
+///
+/// * The file *name* is a digest of the fingerprint and is only a hint. What
+///   makes an entry trustworthy is the full fingerprint stored in its header,
+///   compared on every read. A digest collision therefore costs a recompile,
+///   never a wrong program.
+/// * Inputs are stamped as `path`, byte length and content digest, then sorted
+///   and deduplicated. The loader may read imports in any order, and an
+///   order-sensitive key would miss on every run.
+/// * The payload kind is part of the key, so the `ir` and `irx` renderings of
+///   one program can never collide.
+/// * An entry is `<length>\n<fingerprint>\n\n<payload>`. The length is what
+///   catches an interrupted write, which the runtime cannot make atomic.
+///
+/// There is no environment intrinsic, so the caller supplies the directory and
+/// the switch (`--cache-dir`, `--no-cache`). Nothing here is required for
+/// correctness: every way a read can fail is a miss, and the caller lowers from
+/// source instead.
+const U32: int = 0xFFFFFFFF
+
+fn emptyStrs() -> List<string> {
+    var l = [""]
+    l.pop()
+    l
+}
+
+/// FNV-1a over the string's bytes, truncated to 32 bits.
+///
+/// This names cache files; it never decides correctness. 32 bits keeps every
+/// intermediate inside Pickle's signed 64-bit `int` without the wrapping
+/// arithmetic Pickle does not have.
+fn hashOf(s: string) -> string {
+    var h = 2166136261
+    let bs = bytes(s)
+    var i = 0
+    while (i < len(bs)) {
+        h = (h ^ (bs[i] as int)) & U32
+        h = (h * 16777619) & U32
+        i = i + 1
+    }
+    toHex(h)
+}
+
+/// `path length digest` for one input file, or `none` when it cannot be read.
+///
+/// The length is part of the stamp so that a truncated read misses instead of
+/// hashing a prefix.
+fn stampOf(path: string) -> string? {
+    if (let some(text) = read_file(path)) {
+        return path + " " + "{len(text)} " + hashOf(text)
+    }
+    none
+}
+
+/// Byte-wise string order, which does not depend on how the language happens to
+/// compare strings.
+fn lessBytes(a: string, b: string) -> bool {
+    let x = bytes(a)
+    let y = bytes(b)
+    var n = len(x)
+    if (len(y) < n) {
+        n = len(y)
+    }
+    var i = 0
+    while (i < n) {
+        let xb = x[i] as int
+        let yb = y[i] as int
+        if (xb != yb) {
+            return xb < yb
+        }
+        i = i + 1
+    }
+    len(x) < len(y)
+}
+
+/// Insertion sort: an input is a handful of compiler modules, so anything more
+/// elaborate is not worth the code.
+fn sortStrings(xs: List<string>) {
+    var i = 1
+    while (i < len(xs)) {
+        let v = xs[i]
+        var j = i - 1
+        while (j >= 0 && lessBytes(v, xs[j])) {
+            xs[j + 1] = xs[j]
+            j = j - 1
+        }
+        xs[j + 1] = v
+        i = i + 1
+    }
+}
+
+/// The fingerprint of a lowering: the payload kind, then one stamp per input.
+///
+/// Newline-*separated* rather than newline-terminated, so a fingerprint is
+/// exactly the header block an entry stores ahead of its blank line. `none` when
+/// any input is unreadable: a lowering whose inputs cannot all be read in full
+/// must not reuse one that could.
+fn fingerprint(kind: string, deps: List<string>) -> string? {
+    var stamps = emptyStrs()
+    for (d in deps) {
+        if (let some(s) = stampOf(d)) {
+            stamps.push(s)
+        } else {
+            return none
+        }
+    }
+    sortStrings(stamps)
+    var out = kind
+    var i = 0
+    while (i < len(stamps)) {
+        if (i > 0) {
+            out += "\n"
+        }
+        out += stamps[i]
+        i = i + 1
+    }
+    out
+}
+
+/// Create `dir` and any missing parents. Best effort: a cache that cannot be
+/// written is a slowdown, not a failure.
+fn ensureDir(dir: string) -> bool {
+    if (file_exists(dir)) {
+        return true
+    }
+    let bs = bytes(dir)
+    var i = 1
+    while (i < len(bs)) {
+        if (bs[i] as int == 47 || bs[i] as int == 92) {
+            mkdir(subStr(dir, 0, i))
+        }
+        i = i + 1
+    }
+    mkdir(dir)
+    file_exists(dir)
+}
+
+/// The remembered input list for `entry`, or `none` when there is none.
+///
+/// This is what lets a run decide whether it needs the sources at all: the
+/// fingerprint needs the input list, and the input list is a record of the last
+/// run.
+fn recordedDeps(dir: string, entry: string) -> List<string>? {
+    if (let some(text) = read_file(dir + "/" + hashOf(entry) + ".deps")) {
+        var out = emptyStrs()
+        for (line in splitLines(text)) {
+            if (line != "") {
+                out.push(line)
+            }
+        }
+        if (len(out) == 0) {
+            return none
+        }
+        out
+    } else {
+        none
+    }
+}
+
+/// The offset of the blank line that ends an entry's header, or -1.
+///
+/// Scanned over raw bytes rather than by splitting into lines: an entry holds a
+/// multi-megabyte payload, and this way the payload is cut out byte-exactly
+/// without ever materialising a list of its lines.
+fn headerEnd(text: string) -> int {
+    let bs = bytes(text)
+    var i = 0
+    while (i + 1 < len(bs)) {
+        if (bs[i] as int == 10 && bs[i + 1] as int == 10) {
+            return i
+        }
+        i = i + 1
+    }
+    -1
+}
+
+/// The cached payload for these inputs, or `none`.
+///
+/// Every step that can fail is a miss rather than an error: no entry, a damaged
+/// file, a fingerprint that does not match, or a payload that does not have the
+/// length its header claims. The last of those is what an interrupted write looks
+/// like -- the runtime has no atomic rename -- and it is caught here because a
+/// half-written entry would otherwise be served as a hit.
+fn lookup(dir: string, kind: string, deps: List<string>) -> string? {
+    if (let some(want) = fingerprint(kind, deps)) {
+        if (let some(text) = read_file(dir + "/" + hashOf(want) + ".txt")) {
+            // The file name is a digest of the fingerprint and only a hint; the
+            // header is what makes the entry trustworthy, and no stamp can
+            // contain a blank line, so the split is unambiguous.
+            let end = headerEnd(text)
+            if (end < 0) {
+                return none
+            }
+            let head = subStr(text, 0, end)
+            // The header is a length line then the fingerprint, which is itself
+            // newline-separated, so only the first newline is a boundary.
+            let nl = firstNewline(head)
+            if (nl < 0) {
+                return none
+            }
+            if (subStr(head, nl + 1, len(head) - nl - 1) != want) {
+                return none
+            }
+            if (let some(wantLen) = parseIntLiteral(subStr(head, 0, nl))) {
+                let payload = subStr(text, end + 2, len(text) - end - 2)
+                if (len(bytes(payload)) == wantLen) {
+                    return payload
+                }
+            }
+        }
+    }
+    none
+}
+
+/// The offset of the first newline in `text`, or -1. Only ever called on an
+/// entry's header, which is a few hundred bytes.
+fn firstNewline(text: string) -> int {
+    let bs = bytes(text)
+    var i = 0
+    while (i < len(bs)) {
+        if (bs[i] as int == 10) {
+            return i
+        }
+        i = i + 1
+    }
+    -1
+}
+
+/// Record `entry`'s input list and the payload lowered from it.
+///
+/// The input list is replaced, not merged: a lowering that reached a different
+/// set of files (an import removed) must not leave the old list behind for the
+/// next run to consult. The entry is written first and is content-keyed, so an
+/// interrupted write leaves an orphan file at worst -- never a list pointing at a
+/// missing or stale entry.
+fn store(dir: string, kind: string, entry: string, deps: List<string>, payload: string) {
+    if (!ensureDir(dir)) {
+        return
+    }
+    if (let some(want) = fingerprint(kind, deps)) {
+        let body = str(len(bytes(payload))) + "\n" + want + "\n\n" + payload
+        if (write_file(dir + "/" + hashOf(want) + ".txt", body)) {
+            var list = ""
+            for (d in deps) {
+                list += d + "\n"
+            }
+            write_file(dir + "/" + hashOf(entry) + ".deps", list)
+        }
+    }
+}

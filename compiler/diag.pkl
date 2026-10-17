@@ -1,0 +1,188 @@
+module compiler.diag
+
+class Span {
+    var start: int
+    var end: int
+
+    constructor(start: int, end: int) {
+        this.start = start
+        this.end = end
+    }
+
+    fn join(other: Span) -> Span {
+        var s = this.start
+        if (other.start < s) {
+            s = other.start
+        }
+        var e = this.end
+        if (other.end > e) {
+            e = other.end
+        }
+        Span(s, e)
+    }
+
+    fn to(other: Span) -> Span {
+        this.join(other)
+    }
+
+    fn point() -> Span {
+        Span(this.start, this.start)
+    }
+}
+
+enum Severity {
+    Error
+    Warning
+}
+
+class Note {
+    var span: Span?
+    var message: string
+
+    constructor(span: Span?, message: string) {
+        this.span = span
+        this.message = message
+    }
+}
+
+class Diagnostic {
+    var severity: Severity
+    var message: string
+    var span: Span?
+    var notes: List<Note>
+    var code: string?
+    var suggestions: List<string>
+
+    constructor(severity: Severity, message: string, span: Span?, notes: List<Note>, code: string?, suggestions: List<string>) {
+        this.severity = severity
+        this.message = message
+        this.span = span
+        this.notes = notes
+        this.code = code
+        this.suggestions = suggestions
+    }
+
+    static fn error(message: string) -> Diagnostic {
+        Diagnostic(Severity.Error, message, none, emptyNotes(), none, emptyStrs())
+    }
+
+    static fn errorAt(span: Span, message: string) -> Diagnostic {
+        Diagnostic(Severity.Error, message, span, emptyNotes(), none, emptyStrs())
+    }
+
+    static fn warnAt(span: Span, message: string) -> Diagnostic {
+        Diagnostic(Severity.Warning, message, span, emptyNotes(), none, emptyStrs())
+    }
+
+    fn note(message: string) -> Diagnostic {
+        var ns = this.notes
+        ns.push(Note(none, message))
+        Diagnostic(this.severity, this.message, this.span, ns, this.code, this.suggestions)
+    }
+
+    fn noteAt(span: Span, message: string) -> Diagnostic {
+        var ns = this.notes
+        ns.push(Note(span, message))
+        Diagnostic(this.severity, this.message, this.span, ns, this.code, this.suggestions)
+    }
+
+    fn withCode(code: string) -> Diagnostic {
+        Diagnostic(this.severity, this.message, this.span, this.notes, code, this.suggestions)
+    }
+
+    fn suggestion(suggestion: string) -> Diagnostic {
+        var ss = this.suggestions
+        ss.push(suggestion)
+        Diagnostic(this.severity, this.message, this.span, this.notes, this.code, ss)
+    }
+}
+
+class DiagnosticSink {
+    var diagnostics: List<Diagnostic>
+    var errorsAbort: int
+
+    constructor() {
+        this.diagnostics = emptyDiags()
+        this.errorsAbort = 50
+    }
+
+    fn emit(d: Diagnostic) {
+        this.diagnostics.push(d)
+    }
+
+    fn anyError() -> bool {
+        let ds = this.diagnostics
+        var i = 0
+        while (i < len(ds)) {
+            if (ds[i].severity == Severity.Error) {
+                return true
+            }
+            i = i + 1
+        }
+        false
+    }
+
+    fn errorCount() -> int {
+        let ds = this.diagnostics
+        var n = 0
+        var i = 0
+        while (i < len(ds)) {
+            if (ds[i].severity == Severity.Error) {
+                n = n + 1
+            }
+            i = i + 1
+        }
+        n
+    }
+
+fn tooManyErrors() -> bool {
+        this.errorCount() >= this.errorsAbort
+    }
+
+    /// The errors in this sink as text, one indented block each.
+    ///
+    /// Spans are not resolved here: rendering a caret needs the source text,
+    /// which the sink does not hold. Code and message are what a caller needs to
+    /// act on, and this is what the CLI prints instead of a bare "failed".
+    fn renderAll() -> string {
+        var out = ""
+        let ds = this.diagnostics
+        var i = 0
+        while (i < len(ds)) {
+            if (ds[i].severity == Severity.Error) {
+                if (let some(code) = ds[i].code) {
+                    out += "error[" + code + "] -- "
+                } else {
+                    out += "error -- "
+                }
+                out += ds[i].message + "\n"
+                for (n in ds[i].notes) {
+                    out += "    note: " + n.message + "\n"
+                }
+                for (s in ds[i].suggestions) {
+                    out += "    try: " + s + "\n"
+                }
+            }
+            i = i + 1
+        }
+        out
+    }
+}
+
+fn emptyDiags() -> List<Diagnostic> {
+    var l = [Diagnostic(Severity.Error, "", none, emptyNotes(), none, emptyStrs())]
+    l.pop()
+    l
+}
+
+fn emptyNotes() -> List<Note> {
+    var l = [Note(none, "")]
+    l.pop()
+    l
+}
+
+fn emptyStrs() -> List<string> {
+    var l = [""]
+    l.pop()
+    l
+}

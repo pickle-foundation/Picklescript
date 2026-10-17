@@ -1,0 +1,801 @@
+module runtime.trace_test
+
+import { HEADER, LIST_OBJECT_SIZE, MAP_OBJECT_SIZE, enumObjectSize, tupleObjectSize } from runtime.layout
+import { PICKLE_CLASS_STRING, PICKLE_CLASS_LIST, PICKLE_CLASS_MAP, PICKLE_CLASS_ENUM, PICKLE_CLASS_TUPLE, PICKLE_CLASS_USER_BASE, PICKLE_CLASS_FLAG_FINALIZER } from runtime.object
+import { TraceHeap, TraceDesc, DescriptorTable, RootCell, traceFromRoots, traceOne, enqueue, enumFieldCountOf, NULL_ADDR, NIL_SENTINEL_ADDR, NONE_KEY_ADDR, PICKLE_FLAG_MARKED, SLOTS_PER_MASK_WORD, W_NEXT, W_CLASS_FLAGS, W_SIZE, W_PAYLOAD, W_LIST_LEN, W_LIST_CAP, W_LIST_DATA, W_MAP_CAP, W_MAP_ENTRIES, W_TUPLE_LEN, U32_MASK, emptyInts } from runtime.trace
+import { ShadowRegistry, ShadowFrame } from runtime.shadow
+import { Collector } from runtime.collector
+
+/// A `MapEntry` is two words: key then value.
+const ENTRY_WORDS: int = 2
+
+fn descs() -> DescriptorTable {
+    DescriptorTable()
+}
+
+fn shadow() -> ShadowRegistry {
+    ShadowRegistry()
+}
+
+fn cells(v: int) -> List<RootCell> {
+    var xs = [RootCell(v)]
+    xs
+}
+
+fn noRoots() -> List<int> {
+    emptyInts()
+}
+
+fn newObject(heap: TraceHeap, classId: int, size: int) -> int {
+    var a = heap.allocBlock(size)
+    heap.setClassId(a, classId)
+    heap.setSize(a, size)
+    a
+}
+
+fn newUserObject(heap: TraceHeap, classId: int, slotCount: int) -> int {
+    newObject(heap, classId, HEADER + 8 * slotCount)
+}
+
+/// A list with a real element array, or a null data pointer when `elems` is
+/// empty (the native `list_data` can be null and the walk must tolerate it).
+fn newList(heap: TraceHeap, elems: List<int>) -> int {
+    var a = newObject(heap, PICKLE_CLASS_LIST, LIST_OBJECT_SIZE)
+    var n = len(elems)
+    if (n > 0) {
+        var data = heap.allocWords(n)
+        var i = 0
+        while (i < n) {
+            heap.setWord(data, i, elems[i])
+            i = i + 1
+        }
+        heap.setWord(a, W_LIST_DATA, data)
+        heap.setWord(a, W_LIST_LEN, n)
+        heap.setWord(a, W_LIST_CAP, n)
+    }
+    a
+}
+
+/// A map with a real entry table of `cap` slots, all empty.
+fn newMap(heap: TraceHeap, cap: int) -> int {
+    var a = newObject(heap, PICKLE_CLASS_MAP, MAP_OBJECT_SIZE)
+    if (cap > 0) {
+        var entries = heap.allocWords(ENTRY_WORDS * cap)
+        heap.setWord(a, W_MAP_ENTRIES, entries)
+        heap.setWord(a, W_MAP_CAP, cap)
+        heap.setWord(a, 3, 0)
+    }
+    a
+}
+
+fn setMapEntry(heap: TraceHeap, mapAddr: int, index: int, k: int, v: int) {
+    var entries = heap.word(mapAddr, W_MAP_ENTRIES)
+    heap.setWord(entries, index * ENTRY_WORDS, k)
+    heap.setWord(entries, index * ENTRY_WORDS + 1, v)
+}
+
+/// An enum: payload slot 0 is the unmanaged tag, fields follow.
+fn newEnum(heap: TraceHeap, fieldCount: int, tag: int) -> int {
+    var a = newObject(heap, PICKLE_CLASS_ENUM, enumObjectSize(fieldCount))
+    heap.setPayload(a, 0, tag)
+    a
+}
+
+/// A tuple: payload slot 0 holds the unmanaged element count, fields follow.
+fn newTuple(heap: TraceHeap, fieldCount: int) -> int {
+    newObject(heap, PICKLE_CLASS_TUPLE, tupleObjectSize(fieldCount))
+}
+
+/// The managed-mask words covering `indices`: word `s/32`, bit `s%32`.
+fn maskOf(indices: List<int>) -> List<int> {
+    var words = emptyInts()
+    var i = 0
+    while (i < len(indices)) {
+        var s = indices[i]
+        var w = s / SLOTS_PER_MASK_WORD
+        while (len(words) <= w) {
+            words.push(0)
+        }
+        words[w] = words[w] | (1 << (s % SLOTS_PER_MASK_WORD))
+        i = i + 1
+    }
+    words
+}
+
+fn mark(t: TraceHeap, d: DescriptorTable, sh: ShadowRegistry, root: int) -> int {
+    traceFromRoots(t, d, sh, cells(root), noRoots(), noRoots())
+}
+
+test fn header_packs_class_id_and_flags_in_one_word() {
+    let t = TraceHeap()
+    let a = newObject(t, PICKLE_CLASS_LIST, LIST_OBJECT_SIZE)
+    expect(t.word(a, W_CLASS_FLAGS)).toBe(PICKLE_CLASS_LIST)
+    // flags live in the high half, so setting them must not disturb class_id.
+    t.setFlags(a, PICKLE_CLASS_FLAG_FINALIZER)
+    expect(t.classId(a)).toBe(PICKLE_CLASS_LIST)
+    expect(t.flags(a)).toBe(PICKLE_CLASS_FLAG_FINALIZER)
+    t.setClassId(a, PICKLE_CLASS_MAP)
+    expect(t.flags(a)).toBe(PICKLE_CLASS_FLAG_FINALIZER)
+    expect(t.classId(a)).toBe(PICKLE_CLASS_MAP)
+    t.destroy()
+}
+
+test fn header_carries_size_and_next() {
+    let t = TraceHeap()
+    let a = newObject(t, PICKLE_CLASS_TUPLE, 40)
+    expect(t.size(a)).toBe(40)
+    expect(t.next(a)).toBe(NULL_ADDR)
+    t.setSize(a, 56)
+    expect(t.size(a)).toBe(56)
+    t.setNext(a, 3)
+    expect(t.next(a)).toBe(3)
+    expect(t.size(a)).toBe(56)
+    t.destroy()
+}
+
+test fn mark_bit_is_independent_of_the_finalizable_bit() {
+    // The header flag is PICKLE_FLAG_FINALIZABLE (2), not
+    // PICKLE_CLASS_FLAG_FINALIZER (1) -- the latter is the same bit but lives
+    // in the descriptor's flags, and using it here would collide with the mark
+    // bit and make the test vacuous.
+    let t = TraceHeap()
+    let a = newObject(t, PICKLE_CLASS_LIST, LIST_OBJECT_SIZE)
+    t.setFlags(a, PICKLE_FLAG_FINALIZABLE)
+    expect(t.isMarked(a)).toBe(false)
+    t.setMarked(a)
+    expect(t.isMarked(a)).toBe(true)
+    expect(t.flags(a)).toBe(PICKLE_FLAG_FINALIZABLE | PICKLE_FLAG_MARKED)
+    expect(t.flags(a)).toBe(3)
+    t.clearMarked(a)
+    expect(t.isMarked(a)).toBe(false)
+    expect(t.flags(a)).toBe(PICKLE_FLAG_FINALIZABLE)
+    t.destroy()
+}
+
+test fn reads_past_the_end_of_a_block_are_zero() {
+    // The lesson from shadow_test: a block is exactly the words it was
+    // allocated with, so a field offset past the end must read as 0 rather
+    // than adjacent memory.
+    let t = TraceHeap()
+    let a = newObject(t, PICKLE_CLASS_STRING, HEADER)
+    expect(t.blockWords(a)).toBe(3)
+    // next, class|flags, and size all live inside the three header words.
+    expect(t.word(a, 0)).toBe(0)
+    expect(t.word(a, 1)).toBe(0)
+    expect(t.word(a, 2)).toBe(24)
+    // Word 3 is the first payload slot of a 24-byte object: past the end.
+    expect(t.word(a, 3)).toBe(0)
+    expect(t.word(a, 99)).toBe(0)
+    expect(t.word(a, -1)).toBe(0)
+    expect(t.word(NULL_ADDR, 0)).toBe(0)
+    t.destroy()
+}
+
+test fn clears_all_marks() {
+    let t = TraceHeap()
+    let a = newObject(t, PICKLE_CLASS_STRING, HEADER)
+    let b = newObject(t, PICKLE_CLASS_STRING, HEADER)
+    t.setMarked(a)
+    t.setMarked(b)
+    expect(t.marked()).toBe([a, b])
+    t.clearAllMarks()
+    expect(len(t.marked())).toBe(0)
+    t.destroy()
+}
+
+test fn marks_through_a_builtin_list() {
+    // Mirrors trace.rs::tests::marks_through_builtin_list: a list holding one
+    // element, rooted, marks both.
+    let t = TraceHeap()
+    let d = descs()
+    let sh = shadow()
+    let elem = newObject(t, 9, 48)
+    let list = newList(t, [elem])
+    expect(t.word(list, W_LIST_LEN)).toBe(1)
+    expect(t.word(list, W_LIST_DATA) != NULL_ADDR).toBe(true)
+    expect(t.isMarked(elem)).toBe(false)
+    mark(t, d, sh, list)
+    expect(t.isMarked(list)).toBe(true)
+    expect(t.isMarked(elem)).toBe(true)
+    t.destroy()
+}
+
+test fn list_walk_reaches_every_element() {
+    let t = TraceHeap()
+    let d = descs()
+    let sh = shadow()
+    let a = newObject(t, 11, 24)
+    let b = newObject(t, 12, 24)
+    let c = newObject(t, 13, 24)
+    let list = newList(t, [a, b, c])
+    mark(t, d, sh, list)
+    expect(t.marked()).toBe([a, b, c, list])
+    t.destroy()
+}
+
+test fn list_walk_skips_null_elements() {
+    let t = TraceHeap()
+    let d = descs()
+    let sh = shadow()
+    let a = newObject(t, 11, 24)
+    let list = newList(t, [a, NULL_ADDR, NULL_ADDR])
+    mark(t, d, sh, list)
+    expect(t.marked()).toBe([a, list])
+    t.destroy()
+}
+
+test fn list_with_a_null_data_pointer_traces_nothing() {
+    let t = TraceHeap()
+    let d = descs()
+    let sh = shadow()
+    let list = newObject(t, PICKLE_CLASS_LIST, LIST_OBJECT_SIZE)
+    expect(t.word(list, W_LIST_DATA)).toBe(NULL_ADDR)
+    // The length is deliberately nonzero: a null data pointer must win.
+    t.setWord(list, W_LIST_LEN, 4)
+    mark(t, d, sh, list)
+    expect(t.marked()).toBe([list])
+    t.destroy()
+}
+
+test fn string_has_no_managed_fields() {
+    let t = TraceHeap()
+    let d = descs()
+    let sh = shadow()
+    // A string's bytes are unmanaged, so a nonzero payload must not be traced
+    // even though it looks like a pointer.
+    let s = newObject(t, PICKLE_CLASS_STRING, HEADER + 16)
+    t.setPayload(s, 0, 12345)
+    t.setPayload(s, 1, 12345)
+    mark(t, d, sh, s)
+    expect(t.marked()).toBe([s])
+    t.destroy()
+}
+
+test fn map_walks_keys_and_values() {
+    let t = TraceHeap()
+    let d = descs()
+    let sh = shadow()
+    let k = newObject(t, 20, 24)
+    let v = newObject(t, 21, 24)
+    let m = newMap(t, 4)
+    setMapEntry(t, m, 0, k, v)
+    mark(t, d, sh, m)
+    expect(t.marked()).toBe([k, v, m])
+    t.destroy()
+}
+
+test fn map_scans_the_whole_capacity_not_just_len() {
+    // Open addressing scatters live slots, so a live entry past `len` must
+    // still be found. This is the case that scanning only `len` would strand.
+    let t = TraceHeap()
+    let d = descs()
+    let sh = shadow()
+    let late = newObject(t, 22, 24)
+    let m = newMap(t, 8)
+    t.setWord(m, 3, 1)
+    setMapEntry(t, m, 7, late, NULL_ADDR)
+    expect(t.word(m, 3)).toBe(1)
+    mark(t, d, sh, m)
+    expect(t.isMarked(late)).toBe(true)
+    t.destroy()
+}
+
+test fn map_skips_the_nil_and_none_sentinels() {
+    // Neither sentinel is a real object; dereferencing one would be undefined,
+    // so both must be skipped as keys. `enqueue` rejects them too.
+    let t = TraceHeap()
+    let d = descs()
+    let sh = shadow()
+    let real = newObject(t, 23, 24)
+    let m = newMap(t, 4)
+    setMapEntry(t, m, 0, NIL_SENTINEL_ADDR, NULL_ADDR)
+    setMapEntry(t, m, 1, NONE_KEY_ADDR, NULL_ADDR)
+    setMapEntry(t, m, 2, NULL_ADDR, NULL_ADDR)
+    setMapEntry(t, m, 3, real, NULL_ADDR)
+    mark(t, d, sh, m)
+    expect(t.marked()).toBe([real, m])
+    t.destroy()
+}
+
+test fn map_traces_a_value_even_when_the_key_is_a_sentinel() {
+    // The sentinel guard applies to the key only; a value is always traced.
+    let t = TraceHeap()
+    let d = descs()
+    let sh = shadow()
+    let v = newObject(t, 24, 24)
+    let m = newMap(t, 2)
+    setMapEntry(t, m, 0, NIL_SENTINEL_ADDR, v)
+    mark(t, d, sh, m)
+    expect(t.marked()).toBe([v, m])
+    t.destroy()
+}
+
+test fn enum_skips_the_tag_and_walks_its_fields() {
+    let t = TraceHeap()
+    let d = descs()
+    let sh = shadow()
+    let f0 = newObject(t, 25, 24)
+    let f1 = newObject(t, 26, 24)
+    // A nonzero tag that is NOT an object: payload slot 0 must be skipped.
+    let e = newEnum(t, 2, 999)
+    t.setPayload(e, 1, f0)
+    t.setPayload(e, 2, f1)
+    expect(enumFieldCountOf(t, e)).toBe(2)
+    mark(t, d, sh, e)
+    expect(t.marked()).toBe([f0, f1, e])
+    t.destroy()
+}
+
+test fn enum_with_no_fields_is_inert() {
+    let t = TraceHeap()
+    let d = descs()
+    let sh = shadow()
+    let e = newEnum(t, 0, 1)
+    expect(enumFieldCountOf(t, e)).toBe(0)
+    mark(t, d, sh, e)
+    expect(t.marked()).toBe([e])
+    t.destroy()
+}
+
+test fn tuple_skips_the_count_and_walks_its_fields() {
+    let t = TraceHeap()
+    let d = descs()
+    let sh = shadow()
+    let f0 = newObject(t, 27, 24)
+    let f1 = newObject(t, 28, 24)
+    let tp = newTuple(t, 2)
+    t.setPayload(tp, 0, 2)
+    t.setPayload(tp, 1, f0)
+    t.setPayload(tp, 2, f1)
+    expect(t.word(tp, W_TUPLE_LEN)).toBe(2)
+    mark(t, d, sh, tp)
+    expect(t.marked()).toBe([f0, f1, tp])
+    t.destroy()
+}
+
+test fn user_class_walks_only_its_masked_slots() {
+    let t = TraceHeap()
+    let d = descs()
+    let sh = shadow()
+    let managed = newObject(t, 30, 24)
+    let unmanaged = newObject(t, 31, 24)
+    // Slots 0 and 2 are managed; slot 1 is not. The object is 4 slots wide, so
+    // the unmasked slot is in bounds and a wrong mask would show up as an
+    // extra mark.
+    let o = newUserObject(t, PICKLE_CLASS_USER_BASE, 4)
+    t.setPayload(o, 0, managed)
+    t.setPayload(o, 1, unmanaged)
+    t.setPayload(o, 2, managed)
+    t.setPayload(o, 3, NULL_ADDR)
+    d.register(PICKLE_CLASS_USER_BASE, "Point", 4, maskOf([0, 2]), 0)
+    mark(t, d, sh, o)
+    expect(t.marked()).toBe([managed, o])
+    t.destroy()
+}
+
+test fn an_empty_mask_traces_no_slots() {
+    let t = TraceHeap()
+    let d = descs()
+    let sh = shadow()
+    let o = newUserObject(t, PICKLE_CLASS_USER_BASE, 2)
+    t.setPayload(o, 0, 42)
+    t.setPayload(o, 1, 43)
+    d.register(PICKLE_CLASS_USER_BASE, "Marker", 2, emptyInts(), 0)
+    mark(t, d, sh, o)
+    expect(t.marked()).toBe([o])
+    t.destroy()
+}
+
+test fn mask_word_boundaries_use_32_slots_per_word() {
+    // Slot 32 is word 1 bit 0. If the walk used `w` instead of `w*32` the
+    // boundary would land on the wrong slot and slot 32 would be missed.
+    let t = TraceHeap()
+    let d = descs()
+    let sh = shadow()
+    let s31 = newObject(t, 32, 24)
+    let s32 = newObject(t, 33, 24)
+    let o = newUserObject(t, PICKLE_CLASS_USER_BASE, 33)
+    t.setPayload(o, 31, s31)
+    t.setPayload(o, 32, s32)
+    d.register(PICKLE_CLASS_USER_BASE, "Wide", 33, maskOf([31, 32]), 0)
+    mark(t, d, sh, o)
+    expect(t.marked()).toBe([s31, s32, o])
+    t.destroy()
+}
+
+test fn a_zero_mask_word_is_skipped() {
+    let t = TraceHeap()
+    let d = descs()
+    let sh = shadow()
+    let target = newObject(t, 34, 24)
+    let o = newUserObject(t, PICKLE_CLASS_USER_BASE, 40)
+    t.setPayload(o, 37, target)
+    // Word 0 is all-zero, word 1 marks slot 37. A walk that did not skip the
+    // zero word would still work here, but one that mis-indexed it would not
+    // find slot 37.
+    var mask = emptyInts()
+    mask.push(0)
+    mask.push(1 << 5)
+    d.register(PICKLE_CLASS_USER_BASE, "Sparse", 40, mask, 0)
+    mark(t, d, sh, o)
+    expect(t.marked()).toBe([target, o])
+    t.destroy()
+}
+
+test fn a_mask_bit_past_the_slot_count_is_not_followed() {
+    // The descriptor claims fewer slots than the mask covers. The break on
+    // `idx >= slot_count` is what stops the walk from reading past the
+    // descriptor's view, so the object is deliberately allocated WIDER and the
+    // extra slot holds a live object: if the break were missing, that object
+    // would be marked.
+    let t = TraceHeap()
+    let d = descs()
+    let sh = shadow()
+    let smuggled = newObject(t, 35, 24)
+    // 6 real slots, but the descriptor says 3.
+    let o = newObject(t, PICKLE_CLASS_USER_BASE, HEADER + 8 * 6)
+    t.setPayload(o, 5, smuggled)
+    d.register(PICKLE_CLASS_USER_BASE, "Short", 3, maskOf([5]), 0)
+    mark(t, d, sh, o)
+    expect(t.marked()).toBe([o])
+    expect(t.isMarked(smuggled)).toBe(false)
+    t.destroy()
+}
+
+test fn mask_words_past_the_second_are_fully_walked() {
+    // 86 slots = 3 mask words (86/32 = 2.7). The native tracer had a real bug
+    // here: it walked the managed mask 64 bits at a time but only handled the
+    // FIRST chunk, so every field past 64 stopped being marked and a reachable
+    // field could be freed. `runtime/src/class.rs` now marks all remaining slots
+    // when the mask word is all-ones, pinned by `gc_marks_through_slots_past_the
+    // _mask_width`. The ported walk never had that shape (it iterates
+    // `while (w < d.maskWords)`), so this test exists to KEEP it that way rather
+    // than to fix a live bug: it asserts the tail word is actually traversed and
+    // that the LAST slot is reached.
+    let t = TraceHeap()
+    let d = descs()
+    let sh = shadow()
+    // Last slot (85) is the one a truncated walk would miss.
+    let tail = newObject(t, 40, 24)
+    // A slot in the third word but not last, plus one past the 64 boundary.
+    let third = newObject(t, 41, 24)
+    let pastFirst64 = newObject(t, 42, 24)
+    let o = newUserObject(t, PICKLE_CLASS_USER_BASE, 86)
+    t.setPayload(o, 64, pastFirst64)
+    t.setPayload(o, 70, third)
+    t.setPayload(o, 85, tail)
+    // Full 3-word mask: every one of the 86 slots is a managed pointer.
+    var mask = emptyInts()
+    mask.push(U32_MASK)
+    mask.push(U32_MASK)
+    mask.push((1 << 22) - 1) // 86 - 64 = 22 bits in the last word
+    let desc = d.register(PICKLE_CLASS_USER_BASE, "VeryWide", 86, mask, 0)
+    expect(desc.maskWords).toBe(3)
+    mark(t, d, sh, o)
+    expect(t.isMarked(tail)).toBe(true)
+    expect(t.isMarked(third)).toBe(true)
+    expect(t.isMarked(pastFirst64)).toBe(true)
+    // Only the three live fields + the container. The other 83 masked slots are
+    // NULL and `enqueue` rejects those, so a full-mask descriptor must mark
+    // exactly this many — anything more means the walk ran past the slot count.
+    expect(t.marked()).toHaveLength(4)
+    t.destroy()
+}
+
+test fn an_unregistered_class_traces_no_slots() {
+    let t = TraceHeap()
+    let d = descs()
+    let sh = shadow()
+    let hidden = newObject(t, 36, 24)
+    let o = newUserObject(t, 99, 2)
+    t.setPayload(o, 0, hidden)
+    // No descriptor for class 99: the object is marked as a root but its
+    // fields are not followed.
+    mark(t, d, sh, o)
+    expect(t.marked()).toBe([o])
+    t.destroy()
+}
+
+test fn a_cycle_terminates_and_marks_each_object_once() {
+    let t = TraceHeap()
+    let d = descs()
+    let sh = shadow()
+    let a = newUserObject(t, PICKLE_CLASS_USER_BASE, 1)
+    let b = newUserObject(t, PICKLE_CLASS_USER_BASE + 1, 1)
+    t.setPayload(a, 0, b)
+    t.setPayload(b, 0, a)
+    d.register(PICKLE_CLASS_USER_BASE, "A", 1, maskOf([0]), 0)
+    d.register(PICKLE_CLASS_USER_BASE + 1, "B", 1, maskOf([0]), 0)
+    mark(t, d, sh, a)
+    expect(t.marked()).toBe([a, b])
+    // Mark-on-enqueue means each object is traced exactly once.
+    expect(t.visits).toBe([a, b])
+    t.destroy()
+}
+
+test fn a_shared_child_is_traced_once() {
+    let t = TraceHeap()
+    let d = descs()
+    let sh = shadow()
+    let shared = newUserObject(t, PICKLE_CLASS_USER_BASE + 1, 0)
+    let root = newUserObject(t, PICKLE_CLASS_USER_BASE, 2)
+    t.setPayload(root, 0, shared)
+    t.setPayload(root, 1, shared)
+    d.register(PICKLE_CLASS_USER_BASE, "Root", 2, maskOf([0, 1]), 0)
+    d.register(PICKLE_CLASS_USER_BASE + 1, "Shared", 0, emptyInts(), 0)
+    mark(t, d, sh, root)
+    expect(t.marked()).toBe([shared, root])
+    expect(t.visits).toBe([root, shared])
+    t.destroy()
+}
+
+test fn the_worklist_is_drained_lifo() {
+    // The native loop pops from the end of the worklist, so the last object
+    // enqueued is the first one visited.
+    let t = TraceHeap()
+    let d = descs()
+    let sh = shadow()
+    let a = newUserObject(t, PICKLE_CLASS_USER_BASE + 1, 0)
+    let b = newUserObject(t, PICKLE_CLASS_USER_BASE + 2, 0)
+    let root = newUserObject(t, PICKLE_CLASS_USER_BASE, 2)
+    t.setPayload(root, 0, a)
+    t.setPayload(root, 1, b)
+    d.register(PICKLE_CLASS_USER_BASE, "Root", 2, maskOf([0, 1]), 0)
+    d.register(PICKLE_CLASS_USER_BASE + 1, "A", 0, emptyInts(), 0)
+    d.register(PICKLE_CLASS_USER_BASE + 2, "B", 0, emptyInts(), 0)
+    mark(t, d, sh, root)
+    expect(t.visits).toBe([root, b, a])
+    t.destroy()
+}
+
+test fn enqueue_rejects_null_and_sentinels() {
+    let t = TraceHeap()
+    let a = newObject(t, PICKLE_CLASS_STRING, HEADER)
+    var wl = emptyInts()
+    enqueue(t, wl, NULL_ADDR)
+    enqueue(t, wl, NIL_SENTINEL_ADDR)
+    enqueue(t, wl, NONE_KEY_ADDR)
+    expect(len(wl)).toBe(0)
+    expect(t.isMarked(a)).toBe(false)
+    enqueue(t, wl, a)
+    enqueue(t, wl, a)
+    expect(wl).toBe([a])
+    expect(t.isMarked(a)).toBe(true)
+    t.destroy()
+}
+
+test fn a_root_cell_is_dereferenced_at_trace_time() {
+    // `roots` is a list of CELLS, read as `**cell`, so clearing the cell before
+    // the trace removes the root entirely.
+    let t = TraceHeap()
+    let d = descs()
+    let sh = shadow()
+    let a = newUserObject(t, PICKLE_CLASS_USER_BASE, 1)
+    let b = newUserObject(t, PICKLE_CLASS_USER_BASE + 1, 0)
+    t.setPayload(a, 0, b)
+    d.register(PICKLE_CLASS_USER_BASE, "A", 1, maskOf([0]), 0)
+    d.register(PICKLE_CLASS_USER_BASE + 1, "B", 0, emptyInts(), 0)
+    var roots = cells(a)
+    roots[0].value = NULL_ADDR
+    traceFromRoots(t, d, sh, roots, noRoots(), noRoots())
+    expect(len(t.marked())).toBe(0)
+    // Re-pointing the same cell at the object makes it a root again.
+    roots[0].value = a
+    traceFromRoots(t, d, sh, roots, noRoots(), noRoots())
+    expect(t.marked()).toBe([a, b])
+    t.destroy()
+}
+
+test fn a_null_root_cell_contributes_nothing() {
+    let t = TraceHeap()
+    let d = descs()
+    let sh = shadow()
+    var roots = cells(NULL_ADDR)
+    traceFromRoots(t, d, sh, roots, noRoots(), noRoots())
+    expect(len(t.marked())).toBe(0)
+    t.destroy()
+}
+
+test fn manual_and_temp_roots_are_roots_on_their_own() {
+    // `manual` objects are always roots so they survive until explicitly
+    // freed; temp roots live for exactly one collection.
+    let t = TraceHeap()
+    let d = descs()
+    let sh = shadow()
+    let manual = newUserObject(t, PICKLE_CLASS_USER_BASE, 0)
+    let temp = newUserObject(t, PICKLE_CLASS_USER_BASE + 1, 0)
+    var ms = noRoots()
+    ms.push(manual)
+    var ts = noRoots()
+    ts.push(temp)
+    var roots = cells(NULL_ADDR)
+    expect(traceFromRoots(t, d, sh, roots, ms, ts)).toBe(2)
+    expect(t.marked()).toBe([manual, temp])
+    t.destroy()
+}
+
+test fn shadow_stack_slots_are_roots() {
+    // The last root source: every registered thread's frame slots, walked
+    // innermost frame first. A null slot contributes nothing.
+    let t = TraceHeap()
+    let d = descs()
+    let sh = shadow()
+    let a = newUserObject(t, PICKLE_CLASS_USER_BASE, 0)
+    let b = newUserObject(t, PICKLE_CLASS_USER_BASE + 1, 0)
+    d.register(PICKLE_CLASS_USER_BASE, "A", 0, emptyInts(), 0)
+    d.register(PICKLE_CLASS_USER_BASE + 1, "B", 0, emptyInts(), 0)
+    sh.registerThread()
+    let f = sh.newFrame(2)
+    sh.pushFrame(f)
+    f.setSlot(0, a)
+    f.setSlot(1, NULL_ADDR)
+    expect(traceFromRoots(t, d, sh, cells(NULL_ADDR), noRoots(), noRoots())).toBe(1)
+    expect(t.marked()).toBe([a])
+    // A second slot value is picked up without re-registering the root.
+    t.clearAllMarks()
+    f.setSlot(1, b)
+    traceFromRoots(t, d, sh, cells(NULL_ADDR), noRoots(), noRoots())
+    expect(t.marked()).toBe([a, b])
+    sh.popFrame(f)
+    f.destroy()
+    t.destroy()
+}
+
+test fn shadow_roots_span_every_registered_thread() {
+    let t = TraceHeap()
+    let d = descs()
+    let sh = shadow()
+    let mine = newUserObject(t, PICKLE_CLASS_USER_BASE, 0)
+    let theirs = newUserObject(t, PICKLE_CLASS_USER_BASE + 1, 0)
+    d.register(PICKLE_CLASS_USER_BASE, "A", 0, emptyInts(), 0)
+    d.register(PICKLE_CLASS_USER_BASE + 1, "B", 0, emptyInts(), 0)
+    sh.registerThread()
+    sh.registerForeignThread()
+    let f1 = sh.newFrame(1)
+    sh.pushFrame(f1)
+    f1.setSlot(0, mine)
+    // The foreign thread's frame is pushed onto its own node.
+    let node = sh.allThreads()[0]
+    let f2 = sh.newFrame(1)
+    node.frames.push(f2)
+    f2.setSlot(0, theirs)
+    expect(traceFromRoots(t, d, sh, cells(NULL_ADDR), noRoots(), noRoots())).toBe(2)
+    expect(t.marked()).toBe([mine, theirs])
+    sh.popFrame(f1)
+    f1.destroy()
+    f2.destroy()
+    t.destroy()
+}
+
+test fn root_sources_are_seeded_in_the_native_order() {
+    // cells, then manual, then temp, then shadow slots. With one object per
+    // source the LIFO drain visits them in exactly the reverse order, which is
+    // the observable proof of the seeding order.
+    let t = TraceHeap()
+    let d = descs()
+    let sh = shadow()
+    var a = newUserObject(t, PICKLE_CLASS_USER_BASE, 0)
+    var b = newUserObject(t, PICKLE_CLASS_USER_BASE + 1, 0)
+    var c = newUserObject(t, PICKLE_CLASS_USER_BASE + 2, 0)
+    d.register(PICKLE_CLASS_USER_BASE, "A", 0, emptyInts(), 0)
+    d.register(PICKLE_CLASS_USER_BASE + 1, "B", 0, emptyInts(), 0)
+    d.register(PICKLE_CLASS_USER_BASE + 2, "C", 0, emptyInts(), 0)
+    var ms = noRoots()
+    ms.push(b)
+    var ts = noRoots()
+    ts.push(c)
+    sh.registerThread()
+    let f = sh.newFrame(1)
+    sh.pushFrame(f)
+    f.setSlot(0, a)
+    traceFromRoots(t, d, sh, cells(NULL_ADDR), ms, ts)
+    expect(t.visits).toBe([a, c, b])
+    sh.popFrame(f)
+    f.destroy()
+    t.destroy()
+}
+
+test fn descriptor_reports_its_finalizer() {
+    let d = descs()
+    let plain = d.register(PICKLE_CLASS_USER_BASE, "Plain", 1, maskOf([0]), 0)
+    let fin = d.register(PICKLE_CLASS_USER_BASE + 1, "Fin", 1, maskOf([0]), PICKLE_CLASS_FLAG_FINALIZER)
+    expect(plain.hasFinalizer()).toBe(false)
+    expect(fin.hasFinalizer()).toBe(true)
+    expect(plain.maskWords).toBe(1)
+    if (let some(got) = d.get(PICKLE_CLASS_USER_BASE)) {
+        expect(got.slotCount).toBe(1)
+        expect(got.name).toBe("Plain")
+    }
+    expect(d.get(999)).toBe(none)
+    expect(d.get(-1)).toBe(none)
+}
+
+test fn trace_one_visits_exactly_one_object() {
+    let t = TraceHeap()
+    let d = descs()
+    let wl = emptyInts()
+    let a = newObject(t, PICKLE_CLASS_STRING, HEADER)
+    traceOne(t, d, a, wl)
+    expect(t.visits).toBe([a])
+    expect(len(wl)).toBe(0)
+    t.destroy()
+}
+
+test fn differential_against_the_modeled_collector() {
+    // The whole point of this port: the REAL layout walk and the MODELED edge
+    // walk in collector.pkl must agree about what is reachable. The graph is a
+    // root with two managed slots, one of which cycles back to the root.
+    //
+    //   root(slot0) -> leafA(slot0) -> root
+    //   root(slot1) -> leafB         (no managed fields)
+    let c = Collector()
+    let t = TraceHeap()
+    let d = descs()
+    let sh = shadow()
+
+    let croot = c.alloc(HEADER + 16)
+    let cleafA = c.alloc(HEADER + 8)
+    let cleafB = c.alloc(HEADER + 8)
+    let troot = newUserObject(t, PICKLE_CLASS_USER_BASE, 2)
+    let tleafA = newUserObject(t, PICKLE_CLASS_USER_BASE + 1, 1)
+    let tleafB = newUserObject(t, PICKLE_CLASS_USER_BASE + 2, 1)
+
+    d.register(PICKLE_CLASS_USER_BASE, "Root", 2, maskOf([0, 1]), 0)
+    d.register(PICKLE_CLASS_USER_BASE + 1, "LeafA", 1, maskOf([0]), 0)
+    d.register(PICKLE_CLASS_USER_BASE + 2, "LeafB", 1, emptyInts(), 0)
+
+    t.setPayload(troot, 0, tleafA)
+    t.setPayload(troot, 1, tleafB)
+    t.setPayload(tleafA, 0, troot)
+    t.setPayload(tleafB, 0, NULL_ADDR)
+
+    c.addEdge(croot, cleafA)
+    c.addEdge(croot, cleafB)
+    c.addEdge(cleafA, croot)
+    c.addRoot(croot)
+    c.markFromRoots()
+
+    traceFromRoots(t, d, sh, cells(troot), noRoots(), noRoots())
+
+    // The modeled walker marked exactly the three modeled objects...
+    var modeledMarked = 0
+    var all = c.mem.allBlocks()
+    var i = 0
+    while (i < len(all)) {
+        if (c.marked(all[i])) {
+            modeledMarked = modeledMarked + 1
+        }
+        i = i + 1
+    }
+    expect(modeledMarked).toBe(3)
+    expect(c.marked(croot)).toBe(true)
+    expect(c.marked(cleafA)).toBe(true)
+    expect(c.marked(cleafB)).toBe(true)
+    // ...and the real walk marked exactly the three real objects. Any
+    // disagreement about the mask, the cycle, or the slot arithmetic fails
+    // one of these two assertions.
+    expect(t.marked()).toBe([troot, tleafA, tleafB])
+}
+
+test fn differential_builtin_list_agrees_with_the_modeled_edges() {
+    // Same idea for a builtin: a list whose element array holds two objects.
+    let c = Collector()
+    let t = TraceHeap()
+    let d = descs()
+    let sh = shadow()
+    let celemA = c.alloc(24)
+    let celemB = c.alloc(24)
+    let clist = c.alloc(LIST_OBJECT_SIZE)
+    let telemA = newObject(t, 40, 24)
+    let telemB = newObject(t, 41, 24)
+    let tlist = newList(t, [telemA, telemB])
+    c.addEdge(clist, celemA)
+    c.addEdge(clist, celemB)
+    c.addRoot(clist)
+    c.markFromRoots()
+    traceFromRoots(t, d, sh, cells(tlist), noRoots(), noRoots())
+    expect(c.marked(clist)).toBe(true)
+    expect(c.marked(celemA)).toBe(true)
+    expect(c.marked(celemB)).toBe(true)
+    expect(t.marked()).toBe([telemA, telemB, tlist])
+}

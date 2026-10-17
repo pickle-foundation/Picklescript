@@ -1,0 +1,554 @@
+module runtime.abi_string
+
+import { abiBoxI64, abiUnboxI64 } from runtime.abi_box
+import { abiListNew, abiListLen, abiListGet, abiListPush } from runtime.abi_list
+// String payloads come from `alloc(int, n)`, whose symbol lives in `abi_raw.pkl`.
+//
+// NO REGISTRATION. These bodies deliberately do NOT register their blocks in the
+// sweepability registry (nor, therefore, in the allocation/collection seam the
+// registry feeds). The blocks are raw allocations the collector does not track,
+// which is exactly why the KNOWN LIMITATION note below says they are never
+// reclaimed - putting them in a *sweepability* registry would misstate that and
+// risk the collector freeing a live payload. It would also break parity with the
+// reference: native `pickle_str_*` ops run through `Gc::alloc` without touching
+// the ported registry, so a string built by `str(...)`, `+`, or an `expect`
+// message moves neither the registered count/bytes nor the seam counters, and
+// the ABI suites pin that. Keeping `newStr` out of the registry matches native.
+
+/// Sovereign `string` ABI bodies, ported from `runtime/src/strings.rs`.
+///
+/// These are the first runtime functions written IN PICKLE that occupy real C
+/// ABI slots. `#[symbol]` (added to both compilers) makes the exact export name
+/// writable from Pickle, so emitted code calling `pickle_str_concat` reaches
+/// this module instead of the Rust runtime.
+///
+/// Verified: importing this module and running under both the JIT and the
+/// ported AOT driver produces correct output for concatenation, `i64`
+/// formatting (including negatives and zero), byte length, and string pattern
+/// matching (which lowers to `pickle_str_cmp`).
+///
+/// Layout is the authority in `runtime.layout` and mirrors `runtime/src/layout.rs`:
+/// 24-byte header (`next`, `class_id`/`flags`, `size`), then `len` at word 3
+/// (`STR_LEN_OFF / 8`), then UTF-8 bytes from word 4 (`STR_BYTES_OFF / 8`).
+///
+/// TRAP 1 - `alloc(T, n)` does NOT zero memory, and payload bytes are written
+/// with `|=` for byte-granularity. Every payload word must be zeroed first or
+/// the string carries uninitialized bits past its length. This presents as a
+/// wrong *value* (garbage characters), not a crash, so it is easy to misread as
+/// a logic bug.
+///
+/// TRAP 2 - never call `println` (or anything that concatenates) from inside an
+/// ABI body. `println` lowers to `pickle_str_concat`, so the body re-enters
+/// itself and recurses until the stack is exhausted. Print from the caller.
+///
+/// TRAP 3 - `byteAt` reads a string OBJECT payload; `rawByteAt` reads a bare
+/// address such as a `pkl_strdata_*` literal blob. They differ by 32 bytes and
+/// are easy to confuse. `pickle_str_from_bytes` is the literal-materialisation
+/// path for `IrConst.Str` (x64 lowers a string constant to a
+/// `pickle_str_from_bytes` call), so it must use `rawByteAt`; using `byteAt`
+/// there silently corrupts every string literal in the program.
+///
+/// GAP - Rust treats a null string as empty in `str_len` and `string_concat`,
+/// but Pickle has no null pointer literal and `Option` is not generic over
+/// `*T`, so those defensive branches are not expressible in source yet. These
+/// bodies assume a non-null operand, which is what the compiler emits for a
+/// `string`-typed value. A future null-pointer primitive should restore the
+/// branches verbatim rather than leave the omission.
+///
+/// KNOWN LIMITATION - these strings come from `pickle_raw_alloc`, which the GC
+/// does not track. They are correct and safe, but never reclaimed, so a
+/// long-running program leaks every string it builds. Verified benign: 20k
+/// ported strings plus a forced `gcCollect` completes with the collector still
+/// working and its collection count advancing. Making them collectable needs a
+/// managed allocator that registers with the GC - the next tranche, not a
+/// correctness question for this one.
+
+const HEADER_WORDS: int = 3
+const LEN_WORD: int = 3
+const BYTES_WORD: int = 4
+
+fn wordsFor(n: int) -> int {
+    return HEADER_WORDS + 1 + (n + 7) / 8
+}
+
+/// Allocate a `string` object of `n` bytes. Header words are set; payload words
+/// are zeroed so `byteInto`'s `|=` is well-defined.
+fn newStr(n: int) -> *int {
+    unsafe {
+        var words = wordsFor(n)
+        if (words < HEADER_WORDS + 1) {
+            words = HEADER_WORDS + 1
+        }
+        var p = alloc(int, words)
+        p[0] = 0
+        p[1] = 0
+        p[2] = words * 8
+        p[3] = n
+        var w = BYTES_WORD
+        while (w < words) {
+            p[w] = 0
+            w = w + 1
+        }
+        return p
+    }
+}
+
+/// Allocate a `string` object WITHOUT recording it in the sweepability
+/// registry. This is the layout of a native *static* descriptor name: native
+/// keeps the ten builtin class names as `&'static` bytes on a Rust descriptor
+/// (never `Gc::alloc`), so seeding them must not move the managed-object or
+/// GC counters. Same header/length/payload layout as `newStr`, so `byteInto`,
+/// `byteAt` and `STR_BYTES_OFF` all still apply; the block is never reclaimed.
+fn newStrUnmanaged(n: int) -> *int {
+    unsafe {
+        var words = wordsFor(n)
+        if (words < HEADER_WORDS + 1) {
+            words = HEADER_WORDS + 1
+        }
+        var p = alloc(int, words)
+        p[0] = 0
+        p[1] = 0
+        p[2] = words * 8
+        p[3] = n
+        var w = BYTES_WORD
+        while (w < words) {
+            p[w] = 0
+            w = w + 1
+        }
+        return p
+    }
+}
+
+/// Read byte `i` of a `string` OBJECT's inline payload.
+fn byteAt(s: *int, i: int) -> int {
+    unsafe {
+        return (s[BYTES_WORD + (i >> 3)] >> ((i & 7) * 8)) & 255
+    }
+}
+
+/// Read byte `i` of a RAW byte address - a `pkl_strdata_*` literal blob with no
+/// header and no length word. See TRAP 3 above.
+fn rawByteAt(p: *int, i: int) -> int {
+    unsafe {
+        return (p[i >> 3] >> ((i & 7) * 8)) & 255
+    }
+}
+
+/// OR a byte into position `i`. ONLY valid on a zeroed payload: it cannot clear
+/// bits, so writing 0 over a non-zero byte is a no-op. See `byteOverwrite`.
+fn byteInto(s: *int, i: int, b: int) -> int {
+    unsafe {
+        var w = BYTES_WORD + (i >> 3)
+        s[w] = s[w] | (b << ((i & 7) * 8))
+        return 0
+    }
+}
+
+/// ASSIGN a byte at position `i`, clearing whatever was there.
+///
+/// The mask is built from 255 shifted left by the same sub-word offset, so the
+/// clear covers exactly the addressed byte and leaves its 7 neighbours in the
+/// word alone. This is what `pickle_str_set` needs: it copies the source
+/// payload and then overwrites one byte, which `byteInto` cannot express - ORing
+/// 65 over an existing 63 yields 127, not 65.
+fn byteOverwrite(s: *int, i: int, b: int) -> int {
+    unsafe {
+        var w = BYTES_WORD + (i >> 3)
+        var shift = (i & 7) * 8
+        var mask = (255 << shift) & 0 - 1
+        s[w] = (s[w] & (mask ^ (0 - 1))) | (b << shift)
+        return 0
+    }
+}
+
+/// Length in bytes of a `string`. Mirrors `layout.rs::str_len`, which reads the
+/// `STR_LEN_OFF` word.
+#[symbol("pickle_str_len")]
+fn abiStrLen(s: *int) -> int {
+    unsafe {
+        return s[LEN_WORD]
+    }
+}
+
+/// Copy `n` bytes from a raw byte address into a fresh `string`.
+/// Mirrors `strings.rs::string_from_bytes`.
+#[symbol("pickle_str_from_bytes")]
+fn abiStrFromBytes(ptr: *int, n: int) -> *int {
+    unsafe {
+        if (n < 1) {
+            return newStr(0)
+        }
+        var p = newStr(n)
+        var i = 0
+        while (i < n) {
+            byteInto(p, i, rawByteAt(ptr, i))
+            i = i + 1
+        }
+        return p
+    }
+}
+
+/// Concatenate two `string`s into a fresh third. Mirrors
+/// `strings.rs::string_concat`.
+#[symbol("pickle_str_concat")]
+fn abiStrConcat(a: *int, b: *int) -> *int {
+    unsafe {
+        var la = a[LEN_WORD]
+        var lb = b[LEN_WORD]
+        var p = newStr(la + lb)
+        var i = 0
+        while (i < la) {
+            byteInto(p, i, byteAt(a, i))
+            i = i + 1
+        }
+        var j = 0
+        while (j < lb) {
+            byteInto(p, la + j, byteAt(b, j))
+            j = j + 1
+        }
+        return p
+    }
+}
+
+/// Decimal text for an `i64`. Mirrors `strings.rs::int64_to_string`.
+///
+/// The reference takes the magnitude `unsigned_abs`, so `i64::MIN` is formatted
+/// from `2^63` rather than from a negated `i64` (where `0 - n` would overflow
+/// back to MIN and corrupt the digit loop). Pickle has no `u64`, so the MIN
+/// magnitude is reached through the identity `2^63 = 10 * 922337203685477580 + 8`
+/// - the quotient fits an `i64`, and its decimal digits are produced by the same
+/// div-by-10 loop with `8` appended as the least-significant digit.
+#[symbol("pickle_str_from_i64")]
+fn abiStrFromI64(v: int) -> *int {
+    unsafe {
+        var MIN = 0 - 9223372036854775807 - 1
+        if (v == MIN) {
+            var p = newStr(20)
+            var o = 20
+            byteInto(p, o - 1, 48 + 8)
+            o = o - 1
+            var n = 922337203685477580
+            while (n > 0) {
+                var dig = n % 10
+                o = o - 1
+                byteInto(p, o, 48 + dig)
+                n = n / 10
+            }
+            byteInto(p, 0, 45)
+            return p
+        }
+        var neg = 0
+        var m = v
+        if (m < 0) {
+            neg = 1
+            m = 0 - m
+        }
+        var digits = 1
+        var t = m
+        while (t >= 10) {
+            digits = digits + 1
+            t = t / 10
+        }
+        var total = digits
+        if (neg == 1) {
+            total = digits + 1
+        }
+        var p2 = newStr(total)
+        var o2 = total
+        var d = m
+        var i = 0
+        while (i < digits) {
+            var dig = d % 10
+            o2 = o2 - 1
+            byteInto(p2, o2, 48 + dig)
+            d = d / 10
+            i = i + 1
+        }
+        if (neg == 1) {
+            byteInto(p2, 0, 45)
+        }
+        return p2
+    }
+}
+
+/// Byte at `index` of a string, widened to the compiler's `byte` ABI (`int`).
+///
+/// GAP - out of range. Native `strings.rs::pickle_str_get` panics with
+/// `pickle: string index {index} out of range (len {len})`; that goes through
+/// `panic::pickle_panic_cstr`, which is a PRIVATE native (`pub fn`, no
+/// `#[no_mangle]`), so a ported body cannot call it and Pickle has no panic
+/// syntax. The reachable window is narrower than it looks: the checker only
+/// requires the index to be an `int` (check.rs:3871-3875) and the emitter passes
+/// the value through unclamped, so a *dynamic* index really can go out of range
+/// in user code and native aborts while this returns 0. Restoring the branch
+/// needs a first-class abort primitive, not a cleverer check.
+#[symbol("pickle_str_get")]
+fn abiStrGet(s: *int, index: int) -> int {
+    unsafe {
+        var len = s[LEN_WORD]
+        if (index < 0) {
+            return 0
+        }
+        if (index >= len) {
+            return 0
+        }
+        return byteAt(s, index)
+    }
+}
+
+/// Copy-on-write single-byte replacement. Mirrors `strings.rs::pickle_str_set`:
+/// native allocates a FRESH string, copies the payload, overwrites one byte with
+/// `v as u8` (a truncation, not a checked range), and returns the new object -
+/// the emitter then stores it back into the original target.
+///
+/// Same out-of-range GAP as `abiStrGet`: native panics, this returns `s`
+/// unchanged so the caller keeps a valid string instead of a corrupt one.
+#[symbol("pickle_str_set")]
+fn abiStrSet(s: *int, index: int, v: int) -> *int {
+    unsafe {
+        var len = s[LEN_WORD]
+        if (index < 0) {
+            return s
+        }
+        if (index >= len) {
+            return s
+        }
+        var p = newStr(len)
+        var i = 0
+        while (i < len) {
+            byteInto(p, i, byteAt(s, i))
+            i = i + 1
+        }
+        byteOverwrite(p, index, v & 255)
+        return p
+    }
+}
+
+/// `"true"` / `"false"`. Mirrors `strings.rs::pickle_str_from_bool`, which picks
+/// one of two literal byte blobs and passes it to `string_from_bytes`.
+///
+/// Built byte-by-byte rather than through a literal blob because Pickle has no
+/// source syntax for a raw string-data address: `pkl_strdata_*` is reachable
+/// only via the `IrConst::StrAddr` the emitter synthesises for its own
+/// `pickle_str_from_bytes` call (emit.rs:4992). A `"true"` literal in this
+/// module would therefore be routed back into the body being defined.
+fn abiStrBytes(b0: int, b1: int, b2: int, b3: int, b4: int, n: int) -> *int {
+    unsafe {
+        var p = newStr(n)
+        byteInto(p, 0, b0)
+        if (n > 1) {
+            byteInto(p, 1, b1)
+        }
+        if (n > 2) {
+            byteInto(p, 2, b2)
+        }
+        if (n > 3) {
+            byteInto(p, 3, b3)
+        }
+        if (n > 4) {
+            byteInto(p, 4, b4)
+        }
+        return p
+    }
+}
+
+#[symbol("pickle_str_from_bool")]
+fn abiStrFromBool(v: bool) -> *int {
+    unsafe {
+        if (v) {
+            return abiStrBytes(116, 114, 117, 101, 0, 4)
+        }
+        return abiStrBytes(102, 97, 108, 115, 101, 5)
+    }
+}
+
+/// One-byte string holding `v as u8`. Mirrors `pickle_str_from_byte`, which
+/// writes the byte RAW rather than re-encoding - see the native comment: a
+/// re-encode would corrupt multi-byte text, because a `byte` in the checker is
+/// already the leading byte of a UTF-8 sequence, not a code point.
+#[symbol("pickle_str_from_byte")]
+fn abiStrFromByte(v: int) -> *int {
+    unsafe {
+        var p = newStr(1)
+        byteInto(p, 0, v & 255)
+        return p
+    }
+}
+
+/// Rust `char` (UCS-4 code point) to UTF-8, with the native replacement rule:
+/// `char::from_u32(v).unwrap_or('\u{FFFD}')` turns every invalid code point -
+/// surrogates, anything above U+10FFFF, and (via the i32 ABI) any negative
+/// value - into U+FFFD, which encodes as the three bytes EF BF BD.
+#[symbol("pickle_str_from_char")]
+fn abiStrFromChar(v: int) -> *int {
+    unsafe {
+        var cp = v
+        if (!isScalar(cp)) {
+            cp = REPLACEMENT
+        }
+        var n = utf8Len(cp)
+        var p = newStr(n)
+        if (n == 1) {
+            byteInto(p, 0, cp)
+            return p
+        }
+        // `leadByte` needs the ORIGINAL code point, so keep `start` and let the
+        // continuation loop consume `cp`.
+        var start = cp
+        var i = n
+        while (i > 1) {
+            i = i - 1
+            byteInto(p, i, 128 + (cp & 63))
+            cp = cp / 64
+        }
+        byteInto(p, 0, leadByte(n, start))
+        return p
+    }
+}
+
+/// Rust's `char::from_u32` accepts exactly the Unicode scalar values: 0..=10FFFF
+/// minus the surrogate block D800..=DFFF.
+fn isScalar(cp: int) -> bool {
+    if (cp < 0) {
+        return false
+    }
+    if (cp > 1114111) {
+        return false
+    }
+    if (cp >= 55296) {
+        if (cp <= 57343) {
+            return false
+        }
+    }
+    return true
+}
+
+/// Leading byte of an `n`-byte sequence: `1110xxxx` / `110xxxxx` / `10xxxxxx`
+/// with the low `n-1` bits of the code point folded in. Split out so the shift
+/// and mask stay parenthesised - `&` and `+` precedence in one expression is
+/// exactly the kind of thing that is right by luck.
+fn leadByte(n: int, cp: int) -> int {
+    unsafe {
+        var mask = 0
+        if (n == 2) {
+            mask = 31
+        }
+        if (n == 3) {
+            mask = 15
+        }
+        if (n == 4) {
+            mask = 7
+        }
+        var hi = 0
+        if (n == 2) {
+            hi = 192
+        }
+        if (n == 3) {
+            hi = 224
+        }
+        if (n == 4) {
+            hi = 240
+        }
+        return hi | ((cp >> (6 * (n - 1))) & mask)
+    }
+}
+
+/// U+FFFD REPLACEMENT CHARACTER, native's `unwrap_or('\u{FFFD}')` fallback.
+const REPLACEMENT: int = 65533
+
+/// Byte length of a code point's UTF-8 encoding.
+fn utf8Len(cp: int) -> int {
+    if (cp < 128) {
+        return 1
+    }
+    if (cp < 2048) {
+        return 2
+    }
+    if (cp < 65536) {
+        return 3
+    }
+    return 4
+}
+
+/// Snapshot a string's raw bytes as a fresh `List<byte>`, boxed per byte.
+/// Mirrors `strings.rs::pickle_str_to_bytes`: `list_new(len)` then `len` pushes
+/// of `pickle_box_i64(byte)`.
+///
+/// The native body takes a `gc.temp_lease` to keep the in-flight list rooted
+/// across the per-byte box allocations, which can trigger a nested collection.
+/// The port has no collection at all - `newBox` is raw `alloc` - so there is
+/// nothing to keep alive, and the list stays a plain local.
+#[symbol("pickle_str_to_bytes")]
+fn abiStrToBytes(s: *int) -> *int {
+    unsafe {
+        var len = s[LEN_WORD]
+        var out = abiListNew(len)
+        var i = 0
+        while (i < len) {
+            abiListPush(out, abiBoxI64(byteAt(s, i)))
+            i = i + 1
+        }
+        return out
+    }
+}
+
+/// Build a `string` from a `List<byte>`, the inverse of `abiStrToBytes`.
+/// Mirrors `strings.rs::pickle_str_from_list`, including its `len == 0` early
+/// return of an empty string that never touches the data span.
+///
+/// GAP - the native range guard. Native panics `str(bytes): byte out of
+/// 0..=255` via the private `pickle_panic_cstr`, unreachable from a ported body.
+/// The branch is dead for CHECKED Pickle (a `byte` is 0..=255 by construction,
+/// check.rs:768-770), but this module has no way to prove it, so the value is
+/// truncated to a byte the way `pickle_str_from_byte` does. Silently accepting
+/// a bad element is the wrong default, so this is recorded as a gap rather than
+/// presented as parity.
+#[symbol("pickle_str_from_list")]
+fn abiStrFromList(list: *int) -> *int {
+    unsafe {
+        var len = abiListLen(list)
+        if (len == 0) {
+            return newStr(0)
+        }
+        var p = newStr(len)
+        var i = 0
+        while (i < len) {
+            byteInto(p, i, abiUnboxI64(abiListGet(list, i)) & 255)
+            i = i + 1
+        }
+        return p
+    }
+}
+
+/// Lexicographic byte comparison returning -1 / 0 / 1. Mirrors
+/// `strings.rs::string_cmp`: compare the common prefix, then order by length.
+#[symbol("pickle_str_cmp")]
+fn abiStrCmp(a: *int, b: *int) -> int {
+    unsafe {
+        var la = a[LEN_WORD]
+        var lb = b[LEN_WORD]
+        var n = la
+        if (lb < n) {
+            n = lb
+        }
+        var i = 0
+        while (i < n) {
+            var x = byteAt(a, i)
+            var y = byteAt(b, i)
+            if (x != y) {
+                if (x < y) {
+                    return 0 - 1
+                }
+                return 1
+            }
+            i = i + 1
+        }
+        if (la == lb) {
+            return 0
+        }
+        if (la < lb) {
+            return 0 - 1
+        }
+        return 1
+    }
+}

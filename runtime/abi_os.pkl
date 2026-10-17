@@ -1,0 +1,46 @@
+module runtime.abi_os
+
+/// Port of `runtime/src/os.rs`, the OS-facing half: process termination.
+///
+/// WHY A SEPARATE MODULE. `runtime.os` holds the *model* of the `os.rs`
+/// contract (`exitCodeOf`, `snapshotStrings`): pure Pickle, unit-tested, and
+/// deliberately free of any `#[symbol]` slot so `os_test` keeps exercising the
+/// native bodies. This file owns the one slot that can be filled without the
+/// object model and without the collector - `ExitProcess` is an ordinary Win32
+/// import reached through `win_exit`, the same way `win_thread_id` reaches
+/// `GetCurrentThreadId`.
+///
+/// WHY IT IS NOT IN `abi_exception`. That module's own header records the
+/// measured rule: a `#[symbol]` fn is linked only when Pickle code actually
+/// *calls* it, so defining an entry point is not activation, and swapping one
+/// channel in underneath a native one corrupts output silently rather than
+/// failing. Process exit is not part of the exception channel, so it must not
+/// be promoted alongside it - hence a module of its own, activated on its own.
+///
+/// THE FLUSH HALF OF THE REFERENCE. `os.rs::pickle_exit` flushes and then
+/// terminates. There is nothing to flush here by construction: the ported
+/// console writes with `WriteFile` on every call, and even the native
+/// `console.rs::write_to_con` does `write_all` *then* `flush` for each write,
+/// so no byte is ever left buffered and `pickle_flush` is redundant on that
+/// path - which is why `abi_console` can port it as an exact no-op. Only the
+/// termination half needs to exist for a runtime-free build.
+///
+/// THE CLAMP. `os.rs` clamps to the `i32` range before exiting, and the
+/// freestanding arm then hands the value to `ExitProcess` as a `UINT`. The
+/// clamp is what makes the two agree for negative codes: `std::process::exit`
+/// casts the same clamped `i32`, so `-1` reaches the process status block as
+/// `0xFFFFFFFF` either way. `runtime.os.exitCodeOf` is that clamp, ported and
+/// unit-tested, so the body hands off to it rather than re-deriving the
+/// bounds.
+import { exitCodeOf } from runtime.os
+
+/// ABI: terminate the process with `code`.
+///
+/// Returns nothing rather than being typed `-> !`: the language has no never
+/// type, the single emitter call site (`emit.rs`, the `exit(code)` builtin) is
+/// an `extern_call_void` that discards the result, and the call is
+/// unreachable-after anyway because `ExitProcess` does not return.
+#[symbol("pickle_exit")]
+fn abiExit(code: int) {
+    win_exit(exitCodeOf(code))
+}

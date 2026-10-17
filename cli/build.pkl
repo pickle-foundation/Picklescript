@@ -1,0 +1,59 @@
+module cli.build
+
+import { DiagnosticSink } from compiler.diag
+import { CoffObj } from compiler.objread
+import { newObjs, lowerProgram, loadArchive, linkExe } from cli.buildlib
+
+fn main() {
+    let argv = args()
+    if (len(argv) < 3) {
+        println("BUILD NO ARGS")
+        return
+    }
+    let target = argv[0]
+    let runtimeLib = argv[1]
+    let outputExe = argv[2]
+    if (let some(src) = read_file(target)) {
+        let sinks = DiagnosticSink()
+        if (let some(program) = lowerProgram(target, src, sinks)) {
+            let programObj = program.obj
+            if (let some(libObjects) = loadArchive(runtimeLib)) {
+                var objects = newObjs()
+                objects.push(programObj)
+                var objIndex = 0
+                while (objIndex < len(libObjects)) {
+                    objects.push(libObjects[objIndex])
+                    objIndex = objIndex + 1
+                }
+                if (let some(errorText) = linkExe(objects, outputExe, program.overrides)) {
+                    println("BUILD FAIL: " + errorText)
+                    return
+                }
+                let joined = len(objects)
+                printDiags(sinks)
+                println("BUILD OK objects=" + str(joined) + " exe=" + outputExe)
+                return
+            }
+            println("BUILD FAIL: cannot read runtime lib " + runtimeLib)
+            return
+        }
+        printDiags(sinks)
+        println("BUILD FAIL: source " + target + " did not lower to COFF")
+        return
+    }
+    println("BUILD FAIL: cannot read source " + target)
+}
+
+fn printDiags(diags: DiagnosticSink) {
+    let ds = diags.diagnostics
+    var i = 0
+    while (i < len(ds)) {
+        let d = ds[i]
+        var sp = "none"
+        if (let some(s0) = d.span) {
+            sp = "(" + str(s0.start) + "," + str(s0.end) + ")"
+        }
+        println("DIAG msg=" + d.message + " span=" + sp)
+        i = i + 1
+    }
+}

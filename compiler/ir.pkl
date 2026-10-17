@@ -1,0 +1,2257 @@
+module compiler.ir
+
+enum IrTy {
+    Bool
+    Char
+    Int
+    Float
+    Str
+    Unit
+    Ptr
+}
+
+fn irTyIsUnit(t: IrTy) -> bool {
+    match (t) {
+        case IrTy.Unit -> true
+        case _ -> false
+    }
+}
+
+enum IrUnOp {
+    Neg
+    Not
+    BitNot
+}
+
+enum IrBinOp {
+    Add
+    Sub
+    Mul
+    Div
+    Mod
+    Shl
+    Shr
+    BitAnd
+    BitOr
+    BitXor
+    Eq
+    Ne
+    Lt
+    Le
+    Gt
+    Ge
+}
+
+enum IrConst {
+    Int(v: int)
+    Float(v: float)
+    Bool(b: bool)
+    Char(c: char)
+    Null
+    Str(id: int)
+    StrAddr(id: int)
+    FuncAddr(id: int)
+}
+
+enum Callee {
+    Func(id: int)
+    Extern(id: int)
+}
+
+class IrParam {
+    var name: string
+    var ty: IrTy
+
+    constructor(name: string, ty: IrTy) {
+        this.name = name
+        this.ty = ty
+    }
+}
+
+class IrExtern {
+    var symbol: string
+    var params: List<IrTy>
+    var ret: IrTy
+
+    constructor(symbol: string, params: List<IrTy>, ret: IrTy) {
+        this.symbol = symbol
+        this.params = params
+        this.ret = ret
+    }
+}
+
+enum IrInstr {
+    Const(dst: int, c: IrConst)
+    UnOp(dst: int, op: IrUnOp, v: int)
+    BinOp(dst: int, op: IrBinOp, a: int, b: int)
+    Copy(dst: int, v: int)
+    Itof(dst: int, v: int)
+    Ftoi(dst: int, v: int)
+    Chartoi(dst: int, v: int)
+    Itochar(dst: int, v: int)
+    LoadSlot(dst: int, slot: int)
+    StoreSlot(slot: int, v: int)
+    LocalAddr(dst: int, slot: int)
+    GlobalAddr(dst: int, id: int)
+    LoadGlobal(dst: int, id: int, ty: IrTy)
+    StoreGlobal(id: int, v: int, ty: IrTy)
+    LoadRaw(dst: int, addr: int, ty: IrTy)
+    StoreRaw(addr: int, v: int, ty: IrTy)
+    Call(dst: int?, callee: Callee, args: List<int>)
+    CallInd(dst: int?, fnAddr: int, params: List<IrTy>, ret: IrTy, args: List<int>)
+}
+
+enum IrTerm {
+    Branch(target: int)
+    BranchIf(cond: int, thenV: int, elseV: int)
+    Return(v: int?)
+    Unreachable
+}
+
+class IrBlock {
+    var id: int
+    var instrs: List<IrInstr>
+    var term: IrTerm
+
+    constructor(id: int, instrs: List<IrInstr>, term: IrTerm) {
+        this.id = id
+        this.instrs = instrs
+        this.term = term
+    }
+}
+
+class IrFunc {
+    var name: string
+    var symbol: string
+    var params: List<IrParam>
+    var ret: IrTy
+    var slots: List<IrTy>
+    var entry: int
+    var blocks: List<IrBlock>
+    var isMain: bool
+    var isTest: bool
+    /// `#[tag("...")]` filters, hex-encoded by `irxModuleStr` and whitespace
+    /// delimited on the `tags` line. A tag must therefore be non-empty: an empty
+    /// one serializes to a bare trailing space that the reader tokenizes away, so
+    /// the round trip would fail the tag count. The emitter drops empty tags
+    /// rather than writing one.
+    var tags: List<string>
+
+    constructor(
+        name: string,
+        symbol: string,
+        params: List<IrParam>,
+        ret: IrTy,
+        slots: List<IrTy>,
+        entry: int,
+        blocks: List<IrBlock>,
+        isMain: bool,
+        isTest: bool,
+        tags: List<string>
+    ) {
+        this.name = name
+        this.symbol = symbol
+        this.params = params
+        this.ret = ret
+        this.slots = slots
+        this.entry = entry
+        this.blocks = blocks
+        this.isMain = isMain
+        this.isTest = isTest
+        this.tags = tags
+    }
+}
+
+class IrGlobal {
+    var symbol: string
+    var ty: IrTy
+    var tyExplicit: bool
+    /// `None` means zero-init (emitted into .bss).
+    var init: List<int>?
+
+    constructor(symbol: string, ty: IrTy, tyExplicit: bool, init: List<int>?) {
+        this.symbol = symbol
+        this.ty = ty
+        this.tyExplicit = tyExplicit
+        this.init = init
+    }
+}
+
+fn emptyIrGlobals() -> List<IrGlobal> {
+    var l = [IrGlobal("", IrTy.Unit, false, none)]
+    l.pop()
+    l
+}
+
+class IrModule {
+    var funcs: List<IrFunc>
+    var externs: List<IrExtern>
+    var funcsByName: Map<string, int>
+    var strings: List<List<int>>
+    /// Top-level mutable slots, emitted into `.data`/`.bss`.
+    var globals: List<IrGlobal>
+
+    constructor(funcs: List<IrFunc>, externs: List<IrExtern>, funcsByName: Map<string, int>, strings: List<List<int>>, globals: List<IrGlobal>) {
+        this.funcs = funcs
+        this.externs = externs
+        this.funcsByName = funcsByName
+        this.strings = strings
+        this.globals = globals
+    }
+}
+
+fn emptyIrTys() -> List<IrTy> {
+    var l = [IrTy.Unit]
+    l.pop()
+    l
+}
+
+fn emptyIrParams() -> List<IrParam> {
+    var l = [IrParam("", IrTy.Unit)]
+    l.pop()
+    l
+}
+
+fn emptyIrInstrs() -> List<IrInstr> {
+    var l = [IrInstr.Const(0, IrConst.Int(0))]
+    l.pop()
+    l
+}
+
+fn emptyIrBlocks() -> List<IrBlock> {
+    var l = [IrBlock(0, emptyIrInstrs(), IrTerm.Unreachable)]
+    l.pop()
+    l
+}
+
+fn emptyStrList() -> List<string> {
+    var l = [""]
+    l.pop()
+    l
+}
+
+fn emptyIrStringLists() -> List<List<int>> {
+    var l = [[0]]
+    l.pop()
+    l
+}
+
+fn emptyIrFuncs() -> List<IrFunc> {
+    var l = [IrFunc("x", "", emptyIrParams(), IrTy.Unit, emptyIrTys(), 0, emptyIrBlocks(), false, false, emptyStrList())]
+    l.pop()
+    l
+}
+
+fn emptyIrExterns() -> List<IrExtern> {
+    var l = [IrExtern("x", emptyIrTys(), IrTy.Unit)]
+    l.pop()
+    l
+}
+
+fn emptyIrByName() -> Map<string, int> {
+    let m = {"::seed::": 0}
+    m.remove("::seed::")
+    m
+}
+
+fn emptyModule() -> IrModule {
+    IrModule(emptyIrFuncs(), emptyIrExterns(), emptyIrByName(), emptyIrStringLists(), emptyIrGlobals())
+}
+
+fn irTyStr(t: IrTy) -> string {
+    match (t) {
+        case IrTy.Bool -> "bool"
+        case IrTy.Char -> "char"
+        case IrTy.Int -> "int64"
+        case IrTy.Float -> "float64"
+        case IrTy.Str -> "string"
+        case IrTy.Unit -> "unit"
+        case IrTy.Ptr -> "ptr"
+    }
+}
+
+fn binOpRepr(op: IrBinOp) -> string {
+    match (op) {
+        case IrBinOp.Add -> "add"
+        case IrBinOp.Sub -> "sub"
+        case IrBinOp.Mul -> "mul"
+        case IrBinOp.Div -> "div"
+        case IrBinOp.Mod -> "mod"
+        case IrBinOp.Shl -> "shl"
+        case IrBinOp.Shr -> "shr"
+        case IrBinOp.BitAnd -> "band"
+        case IrBinOp.BitOr -> "bor"
+        case IrBinOp.BitXor -> "bxor"
+        case IrBinOp.Eq -> "eq"
+        case IrBinOp.Ne -> "ne"
+        case IrBinOp.Lt -> "lt"
+        case IrBinOp.Le -> "le"
+        case IrBinOp.Gt -> "gt"
+        case IrBinOp.Ge -> "ge"
+    }
+}
+
+fn unOpRepr(op: IrUnOp) -> string {
+    match (op) {
+        case IrUnOp.Neg -> "neg"
+        case IrUnOp.Not -> "not"
+        case IrUnOp.BitNot -> "bitnot"
+    }
+}
+
+fn irConstRepr(c: IrConst) -> string {
+    match (c) {
+        case IrConst.Int(v) -> str(v)
+        case IrConst.Float(v) -> "{v}f"
+        case IrConst.Bool(b) -> {
+            if (b) {
+                "true"
+            } else {
+                "false"
+            }
+        }
+        case IrConst.Char(c2) -> "'" + "{c2}" + "'"
+        case IrConst.Null -> "null"
+        case IrConst.Str(id) -> "str#" + str(id)
+        case IrConst.StrAddr(id) -> "addrof str#" + str(id)
+        case IrConst.FuncAddr(id) -> "addrof fn#" + str(id)
+    }
+}
+
+fn calleeStr(callee: Callee) -> string {
+    match (callee) {
+        case Callee.Func(id) -> "fn#" + str(id)
+        case Callee.Extern(id) -> "extern#" + str(id)
+    }
+}
+
+fn joinTemps(args: List<int>) -> string {
+    var a = ""
+    var i = 0
+    while (i < len(args)) {
+        if (i > 0) {
+            a += ", "
+        }
+        a += "t" + str(args[i])
+        i += 1
+    }
+    a
+}
+
+fn joinIrTys(params: List<IrTy>) -> string {
+    var s = ""
+    var i = 0
+    while (i < len(params)) {
+        if (i > 0) {
+            s += ", "
+        }
+        s += irTyStr(params[i])
+        i += 1
+    }
+    s
+}
+
+fn callIndStr(dst: int?, fnAddr: int, params: List<IrTy>, ret: IrTy, args: List<int>) -> string {
+    var sig = joinIrTys(params)
+    var a = joinTemps(args)
+    var base = "callind [" + sig + "] -> " + irTyStr(ret) + " (" + a + ") via t" + str(fnAddr)
+    match (dst) {
+        case some(d) -> "t" + str(d) + " = " + base
+        case none -> base
+    }
+}
+
+fn callStr(dst: int?, callee: Callee, args: List<int>) -> string {
+    var a = joinTemps(args)
+    var base = "call " + calleeStr(callee) + "(" + a + ")"
+    match (dst) {
+        case some(d) -> "t" + str(d) + " = " + base
+        case none -> base
+    }
+}
+
+fn irInstrStr(i: IrInstr) -> string {
+    match (i) {
+        case IrInstr.Const(dst, c) -> "t" + str(dst) + " = const " + irConstRepr(c)
+        case IrInstr.UnOp(dst, op, v) -> "t" + str(dst) + " = " + unOpRepr(op) + " t" + str(v)
+        case IrInstr.BinOp(dst, op, a, b) -> {
+            "t" + str(dst) + " = binop." + binOpRepr(op) + " t" + str(a) + ", t" + str(b)
+        }
+        case IrInstr.Copy(dst, v) -> "t" + str(dst) + " = copy t" + str(v)
+        case IrInstr.Itof(dst, v) -> "t" + str(dst) + " = itof t" + str(v)
+        case IrInstr.Ftoi(dst, v) -> "t" + str(dst) + " = ftoi t" + str(v)
+        case IrInstr.Chartoi(dst, v) -> "t" + str(dst) + " = chartoi t" + str(v)
+        case IrInstr.Itochar(dst, v) -> "t" + str(dst) + " = itochar t" + str(v)
+        case IrInstr.LoadSlot(dst, slot) -> "t" + str(dst) + " = load slot s" + str(slot)
+        case IrInstr.StoreSlot(slot, v) -> "store t" + str(v) + " -> slot s" + str(slot)
+        case IrInstr.LocalAddr(dst, slot) -> "t" + str(dst) + " = addr slot s" + str(slot)
+        case IrInstr.LoadRaw(dst, addr, ty) -> {
+            "t" + str(dst) + " = loadraw." + irTyStr(ty) + " [t" + str(addr) + "]"
+        }
+        case IrInstr.StoreRaw(addr, v, ty) -> {
+            "storeraw." + irTyStr(ty) + " t" + str(v) + " -> [t" + str(addr) + "]"
+        }
+        // Global accesses are emitted by `Emitter` but were missing here, so any
+        // module with a top-level `var` that is read crashed `irModuleStr` with
+        // "match is not exhaustive" instead of dumping. Mirrors the `GlobalAddr` /
+        // `LoadGlobal` / `StoreGlobal` arms of `Display for IrInstr` in
+        // `compiler/src/ir.rs`; `irxInstrStr` already handled all three.
+        case IrInstr.GlobalAddr(dst, id) -> {
+            "gaddr t" + str(dst) + " -> global#" + str(id)
+        }
+        case IrInstr.LoadGlobal(dst, id, ty) -> {
+            "loadglobal." + irTyStr(ty) + " global#" + str(id) + " -> t" + str(dst)
+        }
+        case IrInstr.StoreGlobal(id, v, ty) -> {
+            "storeglobal." + irTyStr(ty) + " t" + str(v) + " -> global#" + str(id)
+        }
+        case IrInstr.Call(dst, callee, args) -> callStr(dst, callee, args)
+        case IrInstr.CallInd(dst, fnAddr, params, ret, args) -> callIndStr(dst, fnAddr, params, ret, args)
+    }
+}
+
+fn irTermStr(t: IrTerm) -> string {
+    match (t) {
+        case IrTerm.Branch(target) -> "branch @" + str(target)
+        case IrTerm.BranchIf(cond, thenV, elseV) -> {
+            "branchif t" + str(cond) + " @" + str(thenV) + " @" + str(elseV)
+        }
+        case IrTerm.Return(v) -> {
+            match (v) {
+                case some(t) -> "return t" + str(t)
+                case none -> "return"
+            }
+        }
+        case IrTerm.Unreachable -> "unreachable"
+    }
+}
+
+/// Amortized byte-buffer writer (mirror of Rust's `String::push_str` for the
+/// text serializers). Accumulates raw UTF-8 bytes and flattens once at `text()`.
+class Buf {
+    var parts: List<string>
+    var acc: string
+    var hx: List<byte>
+
+    constructor() {
+        this.parts = [""]
+        this.parts.remove(0)
+        this.acc = ""
+        this.hx = bytes("0123456789abcdef")
+    }
+
+    fn put(s: string) {
+        if (len(this.acc) > 8191) {
+            this.parts.push(this.acc)
+            this.acc = ""
+        }
+        this.acc = this.acc + s
+    }
+
+    /// Two lowercase hex digits for a byte value 0..=255.
+    fn hex(n: int) {
+        if (len(this.acc) > 8191) {
+            this.parts.push(this.acc)
+            this.acc = ""
+        }
+        this.acc = this.acc + "{this.hx[n as int / 16] as char}" + "{this.hx[n as int % 16] as char}"
+    }
+
+    /// Tree-join the collected parts with the pending tail, so appending many
+    /// small parts never re-copies the whole buffer (O(total * log parts)).
+    fn text() -> string {
+        if (len(this.acc) > 0) {
+            this.parts.push(this.acc)
+            this.acc = ""
+        }
+        var n = len(this.parts)
+        while (n > 1) {
+            var i = 0
+            var w = 0
+            while (i < n) {
+                if (i + 1 < n) {
+                    this.parts[w] = this.parts[i] + this.parts[i + 1]
+                } else {
+                    this.parts[w] = this.parts[i]
+                }
+                w += 1
+                i += 2
+            }
+            n = w
+        }
+        if (n == 0) {
+            ""
+        } else {
+            this.parts[0]
+        }
+    }
+}
+
+fn irBlockStr(b: IrBlock) -> string {
+    var w = Buf()
+    var label = "@entry:"
+    if (b.id != 0) {
+        label = "@" + str(b.id) + ":"
+    }
+    w.put(label)
+    w.put("\n")
+    var i = 0
+    while (i < len(b.instrs)) {
+        w.put("    ")
+        w.put(irInstrStr(b.instrs[i]))
+        w.put("\n")
+        i += 1
+    }
+    w.put("    ")
+    w.put(irTermStr(b.term))
+    w.put("\n")
+    w.text()
+}
+
+fn irFuncStr(f: IrFunc) -> string {
+    var kind = ""
+    if (f.isMain) {
+        kind = "main "
+    } else if (f.isTest) {
+        kind = "test "
+    }
+    var ps = ""
+    var i = 0
+    while (i < len(f.params)) {
+        if (i > 0) {
+            ps += ", "
+        }
+        ps += f.params[i].name + ": " + irTyStr(f.params[i].ty)
+        i += 1
+    }
+    var sym = ""
+    if (f.symbol != "") {
+        sym = " @" + f.symbol
+    }
+    var w = Buf()
+    w.put(kind)
+    w.put("fn ")
+    w.put(f.name)
+    w.put("(")
+    w.put(ps)
+    w.put(") -> ")
+    w.put(irTyStr(f.ret))
+    w.put(sym)
+    var b = 0
+    while (b < len(f.blocks)) {
+        w.put("\n  ")
+        w.put(irBlockStr(f.blocks[b]))
+        b += 1
+    }
+    w.text()
+}
+
+fn irModuleStr(m: IrModule) -> string {
+    var w = Buf()
+    var i = 0
+    while (i < len(m.funcs)) {
+        w.put(irFuncStr(m.funcs[i]))
+        w.put("\n")
+        i += 1
+    }
+    w.text()
+}
+
+// ---- IRX round-trippable serialization (mirror of `irx_serialize` in the
+// Rust compiler). Unlike `irModuleStr` this includes the full extern and
+// string tables plus per-func slots/tags/entry, and Rust's `IrModule::from_irx`
+// re-parses it back into the identical module. The text is whitespace
+// token-delimited; all free-form strings (func name/symbol, param name, tag)
+// are hex-encoded so embedded whitespace cannot break line tokenising, and
+// temps/slots/blocks/extern/string/func ids are bare integers.
+
+/// Hex-encode a byte (0..=255) as two lowercase hex digits.
+fn irxHex2(n: int) -> string {
+    var h = "0123456789abcdef"
+    let hb = bytes(h)
+    "{hb[n as int / 16] as char}" + "{hb[n as int % 16] as char}"
+}
+
+/// Hex-encode a string's UTF-8 bytes (mirror of `tok_text`).
+fn irxText(s: string) -> string {
+    var w = Buf()
+    let bs = bytes(s)
+    var i = 0
+    while (i < len(bs)) {
+        w.hex(bs[i] as int)
+        i += 1
+    }
+    w.text()
+}
+
+/// Hex-encode a string's byte list (mirror of `hex(bytes)` for module strings).
+fn irxHexBytesOf(bs: List<int>) -> string {
+    var w = Buf()
+    var i = 0
+    while (i < len(bs)) {
+        w.hex(bs[i])
+        i += 1
+    }
+    w.text()
+}
+
+fn irxHexBytes(bs: List<byte>) -> string {
+    var w = Buf()
+    var i = 0
+    while (i < len(bs)) {
+        w.hex(bs[i] as int)
+        i += 1
+    }
+    w.text()
+}
+
+/// Space-joined bare ids for a temp list.
+fn irxTemps(ts: List<int>) -> string {
+    var w = Buf()
+    var i = 0
+    while (i < len(ts)) {
+        if (i > 0) {
+            w.put(" ")
+        }
+        w.put(str(ts[i]))
+        i += 1
+    }
+    w.text()
+}
+
+fn irxConstStr(c: IrConst) -> string {
+    match (c) {
+        case IrConst.Int(v) -> "int " + str(v)
+        case IrConst.Float(v) -> "float " + str(v)
+        case IrConst.Bool(b) -> {
+            if (b) {
+                "bool true"
+            } else {
+                "bool false"
+            }
+        }
+        case IrConst.Char(v) -> "char " + str(v as int)
+        case IrConst.Null -> "null"
+        case IrConst.Str(id) -> "str " + str(id)
+        case IrConst.StrAddr(id) -> "straddr " + str(id)
+        case IrConst.FuncAddr(id) -> "fnaddr " + str(id)
+    }
+}
+
+fn irxInstrStr(i: IrInstr) -> string {
+    match (i) {
+        case IrInstr.Const(dst, c) -> "const " + str(dst) + " " + irxConstStr(c)
+        case IrInstr.UnOp(dst, op, v) -> "unop " + str(dst) + " " + unOpRepr(op) + " " + str(v)
+        case IrInstr.BinOp(dst, op, a, b) -> {
+            "binop " + str(dst) + " " + binOpRepr(op) + " " + str(a) + " " + str(b)
+        }
+        case IrInstr.Copy(dst, v) -> "copy " + str(dst) + " " + str(v)
+        case IrInstr.Itof(dst, v) -> "itof " + str(dst) + " " + str(v)
+        case IrInstr.Ftoi(dst, v) -> "ftoi " + str(dst) + " " + str(v)
+        case IrInstr.Chartoi(dst, v) -> "chartoi " + str(dst) + " " + str(v)
+        case IrInstr.Itochar(dst, v) -> "itochar " + str(dst) + " " + str(v)
+        case IrInstr.LoadSlot(dst, slot) -> "load " + str(dst) + " " + str(slot)
+        case IrInstr.StoreSlot(slot, v) -> "store " + str(slot) + " " + str(v)
+        case IrInstr.LocalAddr(dst, slot) -> "addr " + str(dst) + " " + str(slot)
+        case IrInstr.LoadRaw(dst, addr, ty) -> {
+            "loadraw " + str(dst) + " " + irTyStr(ty) + " " + str(addr)
+        }
+        case IrInstr.StoreRaw(addr, v, ty) -> {
+            "storeraw " + irTyStr(ty) + " " + str(v) + " " + str(addr)
+        }
+        case IrInstr.GlobalAddr(dst, id) -> {
+            "gaddr " + str(dst) + " " + str(id)
+        }
+        case IrInstr.LoadGlobal(dst, id, ty) -> {
+            "loadglobal " + str(dst) + " " + str(id) + " " + irTyStr(ty)
+        }
+        case IrInstr.StoreGlobal(id, v, ty) -> {
+            "storeglobal " + str(id) + " " + irTyStr(ty) + " " + str(v)
+        }
+        case IrInstr.Call(dst, callee, args) -> {
+            var cal = ""
+            match (callee) {
+                case Callee.Func(id) -> cal = "fn " + str(id)
+                case Callee.Extern(id) -> cal = "extern " + str(id)
+            }
+            var d = "-"
+            match (dst) {
+                case some(dd) -> d = str(dd)
+                case none -> {}
+            }
+            "call " + d + " " + cal + " " + irxTemps(args)
+        }
+        case IrInstr.CallInd(dst, fnAddr, params, ret, args) -> {
+            var d = "-"
+            match (dst) {
+                case some(dd) -> d = str(dd)
+                case none -> {}
+            }
+            var out = "callind " + d + " " + str(fnAddr) + " " + irTyStr(ret) + " " + str(len(params))
+            var i = 0
+            while (i < len(params)) {
+                out += " " + irTyStr(params[i])
+                i += 1
+            }
+            out += " " + str(len(args)) + " " + irxTemps(args)
+            out
+        }
+    }
+}
+
+fn irxTermStr(t: IrTerm) -> string {
+    match (t) {
+        case IrTerm.Branch(target) -> "branch " + str(target)
+        case IrTerm.BranchIf(cond, thenV, elseV) -> {
+            "branchif " + str(cond) + " " + str(thenV) + " " + str(elseV)
+        }
+        case IrTerm.Return(v) -> {
+            match (v) {
+                case some(t) -> "return " + str(t)
+                case none -> "return -"
+            }
+        }
+        case IrTerm.Unreachable -> "unreachable"
+    }
+}
+
+fn irxFuncStr(i: int, f: IrFunc) -> string {
+    var w = Buf()
+    w.put("func ")
+    w.put(str(i))
+    w.put(" ")
+    w.put(irxText(f.name))
+    w.put(" ")
+    w.put(irxText(f.symbol))
+    var isMain = 0
+    if (f.isMain) {
+        isMain = 1
+    }
+    var isTest = 0
+    if (f.isTest) {
+        isTest = 1
+    }
+    w.put(" ")
+    w.put(str(isMain))
+    w.put(" ")
+    w.put(str(isTest))
+    w.put(" ")
+    w.put(str(f.entry))
+    w.put(" ")
+    w.put(irTyStr(f.ret))
+    w.put("\n")
+    // `params <n> hexname ty ...`: the counts are followed by a fixed space
+    // even when empty, matching Rust's `format!("params {} {}\n")`.
+    w.put("params ")
+    w.put(str(len(f.params)))
+    w.put(" ")
+    var p = 0
+    while (p < len(f.params)) {
+        if (p > 0) {
+            w.put(" ")
+        }
+        w.put(irxText(f.params[p].name))
+        w.put(" ")
+        w.put(irTyStr(f.params[p].ty))
+        p += 1
+    }
+    w.put("\n")
+    w.put("slots ")
+    w.put(str(len(f.slots)))
+    w.put(" ")
+    var s = 0
+    while (s < len(f.slots)) {
+        if (s > 0) {
+            w.put(" ")
+        }
+        w.put(irTyStr(f.slots[s]))
+        s += 1
+    }
+    w.put("\n")
+    w.put("tags ")
+    w.put(str(len(f.tags)))
+    w.put(" ")
+    var t = 0
+    while (t < len(f.tags)) {
+        if (t > 0) {
+            w.put(" ")
+        }
+        w.put(irxText(f.tags[t]))
+        t += 1
+    }
+    w.put("\n")
+    w.put("blocks ")
+    w.put(str(len(f.blocks)))
+    w.put("\n")
+    var b = 0
+    while (b < len(f.blocks)) {
+        w.put("block ")
+        w.put(str(f.blocks[b].id))
+        w.put("\n")
+        var k = 0
+        while (k < len(f.blocks[b].instrs)) {
+            w.put(irxInstrStr(f.blocks[b].instrs[k]))
+            w.put("\n")
+            k += 1
+        }
+        w.put(irxTermStr(f.blocks[b].term))
+        w.put("\n")
+        b += 1
+    }
+    w.text()
+}
+
+fn irxModuleStr(m: IrModule) -> string {
+    var w = Buf()
+    w.put("irx externs ")
+    w.put(str(len(m.externs)))
+    w.put("\n")
+    var i = 0
+    while (i < len(m.externs)) {
+        w.put("extern ")
+        w.put(str(i))
+        w.put(" ")
+        w.put(irxText(m.externs[i].symbol))
+        w.put("\n")
+        // `esig <p1> <p2> ... <ret>`: joined param types then ret, with a
+        // fixed space after `esig` even when the param list is empty
+        // (matches Rust's `format!("esig {} {}\n")`).
+        var sigTys = ""
+        var p = 0
+        while (p < len(m.externs[i].params)) {
+            if (p > 0) {
+                sigTys += " "
+            }
+            sigTys += irTyStr(m.externs[i].params[p])
+            p += 1
+        }
+        w.put("esig ")
+        w.put(sigTys)
+        w.put(" ")
+        w.put(irTyStr(m.externs[i].ret))
+        w.put("\n")
+        i += 1
+    }
+    w.put("irx strings ")
+    w.put(str(len(m.strings)))
+    w.put("\n")
+    i = 0
+    while (i < len(m.strings)) {
+        w.put("string ")
+        w.put(str(i))
+        w.put(" ")
+        w.put(irxHexBytesOf(m.strings[i]))
+        w.put("\n")
+        i += 1
+    }
+    w.put("irx globals ")
+    w.put(str(len(m.globals)))
+    w.put("\n")
+    i = 0
+    while (i < len(m.globals)) {
+        w.put("global ")
+        w.put(str(i))
+        w.put(" ")
+        w.put(irxText(m.globals[i].symbol))
+        w.put(" ")
+        // `usize::from(bool)`: the Rust encoder writes 1/0, never true/false.
+        if (m.globals[i].tyExplicit) {
+            w.put("1")
+        } else {
+            w.put("0")
+        }
+        w.put(" ")
+        w.put(irTyStr(m.globals[i].ty))
+        w.put("\n")
+        // `ginit -` means zero-init (.bss); otherwise little-endian bytes.
+        match (m.globals[i].init) {
+            case none -> {
+                w.put("ginit -")
+                w.put("\n")
+            }
+            case some(b) -> {
+                w.put("ginit ")
+                w.put(irxHexBytesOf(b))
+                w.put("\n")
+            }
+        }
+        i += 1
+    }
+    w.put("irx funcs ")
+    w.put(str(len(m.funcs)))
+    w.put("\n")
+    i = 0
+    while (i < len(m.funcs)) {
+        w.put(irxFuncStr(i, m.funcs[i]))
+        i += 1
+    }
+    w.text()
+}
+
+fn emptyF64Limbs() -> List<int> {
+    var xs = [0]
+    var n = len(xs)
+    while (n > 0) {
+        xs.pop()
+        n = n - 1
+    }
+    xs
+}
+
+fn f64Trim(a: List<int>) {
+    while (len(a) > 1 && a[len(a) - 1] == 0) { a.pop() }
+}
+
+fn f64MulSmallAdd(a: List<int>, mul: int, add: int) {
+    var carry = add
+    var i = 0
+    while (i < len(a)) {
+        var t = a[i] * mul + carry
+        a[i] = t & 4294967295
+        carry = t >> 32
+        i = i + 1
+    }
+    while (carry > 0) {
+        a.push(carry & 4294967295)
+        carry = carry >> 32
+    }
+}
+
+fn f64DivSmall(a: List<int>, k: int) -> int {
+    var rem = 0
+    var i = len(a) - 1
+    while (i >= 0) {
+        var cur = rem * 4294967296 + a[i]
+        a[i] = cur / k
+        rem = cur % k
+        i = i - 1
+    }
+    f64Trim(a)
+    rem
+}
+
+fn f64Shl(a: List<int>, n: int) -> List<int> {
+    if (n <= 0) {
+        return a
+    }
+    var out = emptyF64Limbs()
+    var i = 0
+    var limbs = n / 32
+    var bits = n % 32
+    while (i < limbs) {
+        out.push(0)
+        i = i + 1
+    }
+    if (bits == 0) {
+        i = 0
+        while (i < len(a)) {
+            out.push(a[i])
+            i = i + 1
+        }
+        return out
+    }
+    var carry = 0
+    i = 0
+    while (i < len(a)) {
+        var v = a[i]
+        out.push(((v << bits) | carry) & 4294967295)
+        carry = v >> (32 - bits)
+        i = i + 1
+    }
+    if (carry > 0) { out.push(carry & 4294967295) }
+    out
+}
+
+/// Index of the highest set bit, 1-based; 0 when every limb is zero.
+fn f64BitLen(a: List<int>) -> int {
+    if (len(a) == 0) { return 0 }
+    var top = a[len(a) - 1]
+    if (top == 0) { return 0 }
+    var n = 0
+    while (top > 0) {
+        n = n + 1
+        top = top >> 1
+    }
+    (len(a) - 1) * 32 + n
+}
+
+fn f64BitAt(a: List<int>, idx: int) -> bool {
+    if (idx < 0) { return false }
+    var li = idx / 32
+    if (li >= len(a)) { return false }
+    ((a[li] >> (idx % 32)) & 1) == 1
+}
+
+/// True if any bit at index strictly below `idx` is set.
+fn f64AnyBelow(a: List<int>, idx: int) -> bool {
+    if (idx < 0) { return false }
+    var li = idx / 32
+    var i = 0
+    while (i < li && i < len(a)) {
+        if (a[i] != 0) { return true }
+        i = i + 1
+    }
+    if (li < len(a)) {
+        if ((a[li] & ((1 << (idx % 32)) - 1)) != 0) { return true }
+    }
+    false
+}
+
+/// Bits [lo, lo+count) of the big value, right-aligned.
+fn f64Extract(a: List<int>, lo: int, count: int) -> int {
+    var out = 0
+    var i = 0
+    while (i < count) {
+        if (f64BitAt(a, lo + i)) {
+            out = out | (1 << i)
+        }
+        i = i + 1
+    }
+    out
+}
+
+/// Exact `v * 2^k` for binary64 (the steps are all powers of two, so no
+/// rounding is introduced for any `k`).
+fn scalePow2(v: float, k: int) -> float {
+    var n = k
+    if (n < 0) {
+        while (n <= 0 - 32) {
+            v = v / 4294967296.0
+            n = n + 32
+        }
+        while (n < 0) {
+            v = v / 2.0
+            n = n + 1
+        }
+    } else {
+        while (n >= 32) {
+            v = v * 4294967296.0
+            n = n - 32
+        }
+        while (n > 0) {
+            v = v * 2.0
+            n = n - 1
+        }
+    }
+    v
+}
+
+/// Correctly-rounded f64 for the exact value `a * 2^scale`, where `stickyIn`
+/// records that nonzero bits were discarded below `a`'s lowest bit.
+fn f64BigToFloat(a: List<int>, scale: int, stickyIn: bool) -> float {
+    var bl = f64BitLen(a)
+    if (bl == 0) { return 0.0 }
+    var e = scale + bl - 1
+    if (e > 1023) { return 1.0e400 }
+    var drop = bl - 53
+    if (e < 0 - 1022) {
+        // Subnormal: the quantum is 2^-1074, so shift so the result lands on
+        // a multiple of 2^-1074 (scale + drop == -1074).
+        drop = 0 - 1074 - scale
+        if (drop < 0) { drop = 0 }
+    }
+    if (drop <= 0) {
+        // Fewer than 53 significant bits: the value is exact, no rounding.
+        drop = 0
+    }
+    if (drop >= bl) {
+        // The value is entirely below the rounding position, so it rounds to
+        // zero unless it reaches one half of the quantum at 2^(scale+drop).
+        var half = f64BitAt(a, drop - 1)
+        var lowRest = stickyIn || f64AnyBelow(a, drop - 1)
+        if (half && lowRest) { return scalePow2(1.0, scale + drop) }
+        // Below half, or an exact tie: ties-to-even rounds down to zero.
+        return 0.0
+    }
+    var mant = f64Extract(a, drop, bl - drop)
+    var roundBit = false
+    var rest = stickyIn
+    if (drop > 0) {
+        roundBit = f64BitAt(a, drop - 1)
+        rest = stickyIn || f64AnyBelow(a, drop - 1)
+    }
+    if (roundBit && (rest || (mant & 1) == 1)) { mant = mant + 1 }
+    if (mant >= 9007199254740992) {
+        // Rounding overflowed into the next binade: 2^53 * 2^(scale+drop) is
+        // the new value, renormalized as 2^52 * 2^(scale+drop+1).
+        mant = 4503599627370496
+        drop = drop + 1
+    }
+    scalePow2(mant as float, scale + drop)
+}
+
+const F64_MAXSIG: int = 19
+
+/// True if the bytes at `i` equal the ASCII letters of `w`, ignoring case.
+fn f64LowerEq(bs: List<byte>, i: int, w: string) -> bool {
+    let wb = bytes(w)
+    if (i + len(wb) > len(bs)) { return false }
+    var k = 0
+    while (k < len(wb)) {
+        var a = bs[i + k] as int
+        if (a >= 65 && a <= 90) { a = a + 32 }
+        if (a != wb[k] as int) { return false }
+        k = k + 1
+    }
+    true
+}
+
+/// Recognizes `inf`, `infinity`, or `nan` (any case) at `i`; none otherwise.
+fn f64Special(bs: List<byte>, i: int, n: int) -> float? {
+    var rem = n - i
+    if (rem == 3) {
+        if (f64LowerEq(bs, i, "inf")) { return 1.0e400 }
+        if (f64LowerEq(bs, i, "nan")) { return 0.0 / 0.0 }
+    }
+    if (rem == 8) {
+        if (f64LowerEq(bs, i, "infinity")) { return 1.0e400 }
+    }
+    none
+}
+
+/// Correctly-rounded decimal to binary64, matching Rust's
+/// `str::parse::<f64>()`, and also the `inf`/`infinity`/`nan` spellings that
+/// Rust accepts and that `str()` emits for non-finite values.
+///
+/// The mantissa is built in 32-bit limbs from at most `F64_MAXSIG` digits;
+/// every digit past that only refines the sticky bit, so the result depends
+/// on the exact prefix plus one inexactness bit.
+fn irxParseFloat(s: string) -> float? {
+    let bs = bytes(s)
+    var n = len(bs)
+    var i = 0
+    var neg = false
+    if (n > 0) {
+        let c0 = bs[0] as int
+        if (c0 == 43 || c0 == 45) {
+            neg = c0 == 45
+            i = i + 1
+        }
+    }
+    if (let some(sp) = f64Special(bs, i, n)) {
+        if (neg) { return 0.0 - sp }
+        return sp
+    }
+    var m = emptyF64Limbs()
+    var e10 = 0
+    var any = false
+    var sticky = false
+    var sig = 0
+    var started = false
+    while (i < n) {
+        let c = bs[i] as int
+        if (c >= 48 && c <= 57) {
+            any = true
+            if (c != 48) { started = true }
+            if (started || c != 48) {
+                if (sig < F64_MAXSIG) {
+                    f64MulSmallAdd(m, 10, c - 48)
+                    sig = sig + 1
+                } else {
+                    if (c != 48) { sticky = true }
+                    e10 = e10 + 1
+                }
+            }
+            i = i + 1
+        } else { break }
+    }
+    if (i < n && bs[i] as int == 46) {
+        i = i + 1
+        while (i < n) {
+            let c = bs[i] as int
+            if (c >= 48 && c <= 57) {
+                any = true
+                if (started || c != 48) {
+                    if (sig < F64_MAXSIG) {
+                        f64MulSmallAdd(m, 10, c - 48)
+                        sig = sig + 1
+                        e10 = e10 - 1
+                    } else {
+                        // Past F64_MAXSIG the digit only refines the sticky bit;
+                        // it must not shift the scale or the value collapses.
+                        if (c != 48) { sticky = true }
+                    }
+                    if (c != 48) { started = true }
+                } else {
+                    // A leading fractional zero shifts the scale without
+                    // contributing a significant digit.
+                    e10 = e10 - 1
+                }
+                i = i + 1
+            } else { break }
+        }
+    }
+    if (!any) { return none }
+    if (i < n && (bs[i] as int == 101 || bs[i] as int == 69)) {
+        i = i + 1
+        var eneg = false
+        if (i < n && (bs[i] as int == 43 || bs[i] as int == 45)) {
+            eneg = bs[i] as int == 45
+            i = i + 1
+        }
+        var ev = 0
+        var ed = false
+        while (i < n) {
+            let c = bs[i] as int
+            if (c >= 48 && c <= 57) {
+                ed = true
+                // Saturate: anything past +-100000 is already +-inf or zero.
+                if (ev < 100000) { ev = ev * 10 + (c - 48) }
+                i = i + 1
+            } else { break }
+        }
+        if (!ed) { return none }
+        if (eneg) { e10 = e10 - ev } else { e10 = e10 + ev }
+    }
+    if (i != n) { return none }
+    if (len(m) == 0) {
+        if (neg) { return 0.0 * (0.0 - 1.0) }
+        return 0.0
+    }
+    // The exact path below scales a big integer by 10^e10, so a wild exponent
+    // would cost O(e10^2) limb work. `m` holds at most F64_MAXSIG digits, so
+    // e10 >= 400 is past f64::MAX and e10 <= -400 is under half of 2^-1074:
+    // both settle the value without touching the big integer.
+    if (e10 >= 400) {
+        if (neg) { return 0.0 - 1.0e400 }
+        return 1.0e400
+    }
+    if (400 + e10 <= 0) {
+        if (neg) { return 0.0 * (0.0 - 1.0) }
+        return 0.0
+    }
+    var r = 0.0
+    if (e10 >= 0) {
+        var k = 0
+        while (k < e10) {
+            f64MulSmallAdd(m, 5, 0)
+            k = k + 1
+        }
+        r = f64BigToFloat(m, e10, sticky)
+    } else {
+        // m / 5^q / 2^q: shift up for guard bits, divide by 5 q times, and
+        // record whether any division truncated a nonzero remainder.
+        var q = 0 - e10
+        var sh = 3 * q + 80
+        var acc = f64Shl(m, sh)
+        var k2 = 0
+        while (k2 < q) {
+            var rem = f64DivSmall(acc, 5)
+            if (rem != 0) { sticky = true }
+            k2 = k2 + 1
+        }
+        r = f64BigToFloat(acc, e10 - sh, sticky)
+    }
+    if (neg) {
+        // `0.0 - 0.0` is `+0.0`, so a negative zero needs a real sign flip.
+        if (r == 0.0) { return 0.0 * (0.0 - 1.0) }
+        return 0.0 - r
+    }
+    r
+}
+
+// ---- IRX text parsing (mirror of `IrModule::from_irx` and the `parse_irx_*`
+// helpers in the Rust compiler). This reads back exactly what `irxModuleStr`
+// writes. Every shape the Rust reader rejects with an error is rejected here
+// as well (by yielding `none`), and so are the few short-token shapes on which
+// the Rust reader indexes past the end of its own token vector instead of
+// reporting an error.
+
+fn irxEmptyBytes() -> List<byte> {
+    var out = [1 as byte]
+    out.pop()
+    out
+}
+
+fn irxEmptyIntList() -> List<int> {
+    var out = [0]
+    out.pop()
+    out
+}
+
+/// Value of one hex digit, or -1 when `c` is not a hex digit.
+fn irxHexDigit(c: int) -> int {
+    if (c >= 48 && c <= 57) { return c - 48 }
+    if (c >= 97 && c <= 102) { return c - 87 }
+    if (c >= 65 && c <= 70) { return c - 55 }
+    0 - 1
+}
+
+/// Bytes for an even-length hex token; none for an odd length or a bad digit.
+fn irxUnhex(s: string) -> List<byte>? {
+    let bs = bytes(s)
+    if (len(bs) % 2 != 0) { return none }
+    var out = irxEmptyBytes()
+    var i = 0
+    while (i < len(bs)) {
+        let hi = irxHexDigit(bs[i] as int)
+        let lo = irxHexDigit(bs[i + 1] as int)
+        if (hi < 0 || lo < 0) { return none }
+        out.push((hi * 16 + lo) as byte)
+        i = i + 2
+    }
+    out
+}
+
+/// True when `bs` is well-formed UTF-8, i.e. what `String::from_utf8` takes.
+fn irxUtf8Ok(bs: List<byte>) -> bool {
+    var i = 0
+    while (i < len(bs)) {
+        let b0 = bs[i] as int
+        var n = 0
+        if (b0 < 0x80) {
+            n = 0
+        } else if ((b0 & 0xE0) == 0xC0) {
+            // 0xC0/0xC1 can only ever start an overlong two-byte form.
+            if (b0 < 0xC2) { return false }
+            n = 1
+        } else if ((b0 & 0xF0) == 0xE0) {
+            n = 2
+        } else if ((b0 & 0xF8) == 0xF0) {
+            if (0xF4 < b0) { return false }
+            n = 3
+        } else {
+            return false
+        }
+        if (i + n >= len(bs)) { return false }
+        var k = 1
+        while (k <= n) {
+            if (((bs[i + k] as int) & 0xC0) != 0x80) { return false }
+            k = k + 1
+        }
+        if (n == 2) {
+            let cp = ((b0 & 0x0F) << 12) | (((bs[i + 1] as int) & 0x3F) << 6) | ((bs[i + 2] as int) & 0x3F)
+            if (cp < 0x800) { return false }
+            if (cp >= 0xD800 && cp <= 0xDFFF) { return false }
+        }
+        if (n == 3) {
+            let cp = ((b0 & 0x07) << 18) | (((bs[i + 1] as int) & 0x3F) << 12) | (((bs[i + 2] as int) & 0x3F) << 6) | ((bs[i + 3] as int) & 0x3F)
+            if (cp < 0x10000 || 0x10FFFF < cp) { return false }
+        }
+        i = i + n + 1
+    }
+    true
+}
+
+/// A hex token that must also decode to valid UTF-8 text.
+fn irxUnhexText(s: string) -> string? {
+    if (let some(bs) = irxUnhex(s)) {
+        if (irxUtf8Ok(bs)) {
+            return str(bs)
+        }
+    }
+    none
+}
+
+/// Rust's `uN::from_str`: an optional '+', at least one digit, no overflow.
+fn irxUint(s: string, max: int) -> int? {
+    let bs = bytes(s)
+    var i = 0
+    if (len(bs) > 0 && bs[0] as int == 43) { i = 1 }
+    if (i >= len(bs)) { return none }
+    var v = 0
+    while (i < len(bs)) {
+        let c = bs[i] as int
+        if (c < 48 || 57 < c) { return none }
+        let d = c - 48
+        if (v > (max - d) / 10) { return none }
+        v = v * 10 + d
+        i = i + 1
+    }
+    v
+}
+
+fn irxU32(s: string) -> int? {
+    irxUint(s, 4294967295)
+}
+
+/// `usize::from_str`, narrowed to the non-negative `int` range.
+fn irxCount(s: string) -> int? {
+    irxUint(s, 9223372036854775807)
+}
+
+fn irxCountOk(s: string) -> bool {
+    if (let some(_) = irxCount(s)) {
+        return true
+    }
+    false
+}
+
+/// Rust's `i64::from_str`. A negative literal is accumulated as a negative
+/// value so that -9223372036854775808 stays representable.
+fn irxI64(s: string) -> int? {
+    let bs = bytes(s)
+    var i = 0
+    var neg = false
+    if (len(bs) > 0 && (bs[0] as int == 43 || bs[0] as int == 45)) {
+        neg = bs[0] as int == 45
+        i = 1
+    }
+    if (i >= len(bs)) { return none }
+    if (neg) {
+        let minv = 0 - 9223372036854775807 - 1
+        var v = 0
+        while (i < len(bs)) {
+            let c = bs[i] as int
+            if (c < 48 || 57 < c) { return none }
+            let d = c - 48
+            if (v < (minv + d) / 10) { return none }
+            v = v * 10 - d
+            i = i + 1
+        }
+        return v
+    }
+    var u = 0
+    while (i < len(bs)) {
+        let c = bs[i] as int
+        if (c < 48 || 57 < c) { return none }
+        let d = c - 48
+        if (u > (9223372036854775807 - d) / 10) { return none }
+        u = u * 10 + d
+        i = i + 1
+    }
+    u
+}
+
+/// Width in bytes of the whitespace at `i`, or 0. Covers Rust's
+/// `char::is_whitespace` ASCII set plus U+00A0 and U+0085.
+fn irxSpaceWidth(bs: List<byte>, i: int) -> int {
+    let c = bs[i] as int
+    if (c == 32 || c == 9 || c == 10 || c == 11 || c == 12 || c == 13) { return 1 }
+    if (c == 194 && i + 1 < len(bs)) {
+        let c1 = bs[i + 1] as int
+        if (c1 == 160 || c1 == 133) { return 2 }
+    }
+    0
+}
+
+/// `line.split_whitespace()`.
+fn irxTokens(line: string) -> List<string> {
+    let bs = bytes(line)
+    var out = emptyStrList()
+    var i = 0
+    while (i < len(bs)) {
+        let w = irxSpaceWidth(bs, i)
+        if (w > 0) {
+            i = i + w
+        } else {
+            var start = i
+            var stop = i
+            while (stop < len(bs) && irxSpaceWidth(bs, stop) == 0) { stop = stop + 1 }
+            var tok = irxEmptyBytes()
+            var k = start
+            while (k < stop) {
+                tok.push(bs[k])
+                k = k + 1
+            }
+            out.push(str(tok))
+            i = stop
+        }
+    }
+    out
+}
+
+fn irxSliceBytes(bs: List<byte>, lo: int, hi: int) -> string {
+    var out = irxEmptyBytes()
+    var k = lo
+    while (k < hi) {
+        out.push(bs[k])
+        k = k + 1
+    }
+    str(out)
+}
+
+/// `text.lines()`: split on '\n', dropping one trailing '\r' per line.
+fn irxLines(text: string) -> List<string> {
+    let bs = bytes(text)
+    var out = emptyStrList()
+    var start = 0
+    var i = 0
+    while (i < len(bs)) {
+        if (bs[i] as int == 10) {
+            var end = i
+            if (end > start && bs[end - 1] as int == 13) { end = end - 1 }
+            out.push(irxSliceBytes(bs, start, end))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if (start < len(bs)) {
+        var end = len(bs)
+        if (end > start && bs[end - 1] as int == 13) { end = end - 1 }
+        out.push(irxSliceBytes(bs, start, end))
+    }
+    out
+}
+
+fn irxParseTy(s: string) -> IrTy? {
+    if (s == "bool") { return IrTy.Bool }
+    if (s == "char") { return IrTy.Char }
+    if (s == "int64") { return IrTy.Int }
+    if (s == "float64") { return IrTy.Float }
+    if (s == "string") { return IrTy.Str }
+    if (s == "unit") { return IrTy.Unit }
+    if (s == "ptr") { return IrTy.Ptr }
+    none
+}
+
+fn irxParseUnOp(s: string) -> IrUnOp? {
+    if (s == "neg") { return IrUnOp.Neg }
+    if (s == "not") { return IrUnOp.Not }
+    if (s == "bitnot") { return IrUnOp.BitNot }
+    none
+}
+
+fn irxParseBinOp(s: string) -> IrBinOp? {
+    if (s == "add") { return IrBinOp.Add }
+    if (s == "sub") { return IrBinOp.Sub }
+    if (s == "mul") { return IrBinOp.Mul }
+    if (s == "div") { return IrBinOp.Div }
+    if (s == "mod") { return IrBinOp.Mod }
+    if (s == "shl") { return IrBinOp.Shl }
+    if (s == "shr") { return IrBinOp.Shr }
+    if (s == "band") { return IrBinOp.BitAnd }
+    if (s == "bor") { return IrBinOp.BitOr }
+    if (s == "bxor") { return IrBinOp.BitXor }
+    if (s == "eq") { return IrBinOp.Eq }
+    if (s == "ne") { return IrBinOp.Ne }
+    if (s == "lt") { return IrBinOp.Lt }
+    if (s == "le") { return IrBinOp.Le }
+    if (s == "gt") { return IrBinOp.Gt }
+    if (s == "ge") { return IrBinOp.Ge }
+    none
+}
+
+/// A temp or slot id: `u32::from_str`, minus the `-` placeholder that only
+/// `call`/`callind` dst and `return` accept.
+fn irxParseId(s: string) -> int? {
+    if (s == "-") { return none }
+    irxU32(s)
+}
+
+fn irxParseCallee(kind: string, id: string) -> Callee? {
+    if (kind == "fn") {
+        if (let some(x) = irxCount(id)) {
+            return Callee.Func(x)
+        }
+        return none
+    }
+    if (kind == "extern") {
+        if (let some(x) = irxCount(id)) {
+            return Callee.Extern(x)
+        }
+        return none
+    }
+    none
+}
+
+/// `toks[lo..hi)` parsed as temp ids.
+fn irxParseTemps(toks: List<string>, lo: int, hi: int) -> List<int>? {
+    if (lo < 0 || len(toks) < hi || hi < lo) { return none }
+    var out = irxEmptyIntList()
+    var i = lo
+    while (i < hi) {
+        if (let some(x) = irxParseId(toks[i])) {
+            out.push(x)
+        } else {
+            return none
+        }
+        i = i + 1
+    }
+    out
+}
+
+/// `const <dst> <kind> [val]`. Every kind but `null` needs its value token:
+/// the Rust reader reads `rest[2]` unconditionally for those kinds, so a
+/// missing value is rejected here instead of reading past the token list.
+fn irxParseConst(toks: List<string>) -> IrConst? {
+    let kind = toks[2]
+    if (kind == "null") { return IrConst.Null }
+    if (len(toks) < 4) { return none }
+    let v = toks[3]
+    if (kind == "int") {
+        if (let some(x) = irxI64(v)) {
+            return IrConst.Int(x)
+        }
+        return none
+    }
+    if (kind == "float") {
+        if (let some(x) = irxParseFloat(v)) {
+            return IrConst.Float(x)
+        }
+        return none
+    }
+    if (kind == "bool") {
+        if (v == "true") { return IrConst.Bool(true) }
+        if (v == "false") { return IrConst.Bool(false) }
+        return none
+    }
+    if (kind == "char") {
+        if (let some(x) = irxU32(v)) {
+            // A Pickle `char` is a Unicode scalar value, so the Rust reader's
+            // wider `u32` slot is narrowed here.
+            if (x > 0x10FFFF) { return none }
+            if (x >= 0xD800 && x <= 0xDFFF) { return none }
+            return IrConst.Char(x as char)
+        }
+        return none
+    }
+    if (kind == "str") {
+        if (let some(x) = irxCount(v)) {
+            return IrConst.Str(x)
+        }
+        return none
+    }
+    if (kind == "straddr") {
+        if (let some(x) = irxCount(v)) {
+            return IrConst.StrAddr(x)
+        }
+        return none
+    }
+    if (kind == "fnaddr") {
+        if (let some(x) = irxCount(v)) {
+            return IrConst.FuncAddr(x)
+        }
+        return none
+    }
+    none
+}
+
+fn irxIsInstrHead(s: string) -> bool {
+    s == "const" || s == "unop" || s == "binop" || s == "copy" || s == "itof" || s == "ftoi" || s == "chartoi" || s == "itochar" || s == "load" || s == "store" || s == "addr" || s == "loadraw" || s == "storeraw" || s == "call" || s == "callind" || s == "gaddr" || s == "loadglobal" || s == "storeglobal"
+}
+
+fn irxIsTermHead(s: string) -> bool {
+    s == "branch" || s == "branchif" || s == "return" || s == "unreachable"
+}
+
+fn irxParseInstr(toks: List<string>) -> IrInstr? {
+    let head = toks[0]
+    let n = len(toks)
+    if (head == "const") {
+        if (n < 3) { return none }
+        if (let some(d) = irxParseId(toks[1])) {
+            if (let some(c) = irxParseConst(toks)) {
+                return IrInstr.Const(d, c)
+            }
+        }
+        return none
+    }
+    if (head == "unop") {
+        if (n != 4) { return none }
+        if (let some(d) = irxParseId(toks[1])) {
+            if (let some(op) = irxParseUnOp(toks[2])) {
+                if (let some(v) = irxParseId(toks[3])) {
+                    return IrInstr.UnOp(d, op, v)
+                }
+            }
+        }
+        return none
+    }
+    if (head == "binop") {
+        if (n != 5) { return none }
+        if (let some(d) = irxParseId(toks[1])) {
+            if (let some(op) = irxParseBinOp(toks[2])) {
+                if (let some(a) = irxParseId(toks[3])) {
+                    if (let some(b) = irxParseId(toks[4])) {
+                        return IrInstr.BinOp(d, op, a, b)
+                    }
+                }
+            }
+        }
+        return none
+    }
+    if (head == "copy" || head == "itof" || head == "ftoi" || head == "chartoi" || head == "itochar") {
+        if (n != 3) { return none }
+        if (let some(d) = irxParseId(toks[1])) {
+            if (let some(v) = irxParseId(toks[2])) {
+                if (head == "copy") { return IrInstr.Copy(d, v) }
+                if (head == "itof") { return IrInstr.Itof(d, v) }
+                if (head == "ftoi") { return IrInstr.Ftoi(d, v) }
+                if (head == "chartoi") { return IrInstr.Chartoi(d, v) }
+                return IrInstr.Itochar(d, v)
+            }
+        }
+        return none
+    }
+    if (head == "load" || head == "addr") {
+        if (n != 3) { return none }
+        if (let some(d) = irxParseId(toks[1])) {
+            if (let some(s) = irxParseId(toks[2])) {
+                if (head == "load") { return IrInstr.LoadSlot(d, s) }
+                return IrInstr.LocalAddr(d, s)
+            }
+        }
+        return none
+    }
+    if (head == "store") {
+        if (n != 3) { return none }
+        if (let some(s) = irxParseId(toks[1])) {
+            if (let some(v) = irxParseId(toks[2])) {
+                return IrInstr.StoreSlot(s, v)
+            }
+        }
+        return none
+    }
+    if (head == "loadraw") {
+        if (n != 4) { return none }
+        if (let some(d) = irxParseId(toks[1])) {
+            if (let some(t) = irxParseTy(toks[2])) {
+                if (let some(a) = irxParseId(toks[3])) {
+                    return IrInstr.LoadRaw(d, a, t)
+                }
+            }
+        }
+        return none
+    }
+    if (head == "storeraw") {
+        if (n != 4) { return none }
+        if (let some(t) = irxParseTy(toks[1])) {
+            if (let some(v) = irxParseId(toks[2])) {
+                if (let some(a) = irxParseId(toks[3])) {
+                    return IrInstr.StoreRaw(a, v, t)
+                }
+            }
+        }
+        return none
+    }
+    if (head == "gaddr") {
+        if (n != 3) { return none }
+        if (let some(d) = irxParseId(toks[1])) {
+            if (let some(g) = irxParseId(toks[2])) {
+                return IrInstr.GlobalAddr(d, g)
+            }
+        }
+        return none
+    }
+    if (head == "loadglobal") {
+        if (n != 4) { return none }
+        if (let some(d) = irxParseId(toks[1])) {
+            if (let some(g) = irxParseId(toks[2])) {
+                if (let some(t) = irxParseTy(toks[3])) {
+                    return IrInstr.LoadGlobal(d, g, t)
+                }
+            }
+        }
+        return none
+    }
+    if (head == "storeglobal") {
+        if (n != 4) { return none }
+        if (let some(g) = irxParseId(toks[1])) {
+            if (let some(t) = irxParseTy(toks[2])) {
+                if (let some(v) = irxParseId(toks[3])) {
+                    return IrInstr.StoreGlobal(g, v, t)
+                }
+            }
+        }
+        return none
+    }
+    if (head == "call") {
+        // `call <dst|-> <fn|extern> <id> <arg>...`
+        if (n < 4) { return none }
+        if (let some(c) = irxParseCallee(toks[2], toks[3])) {
+            if (let some(args) = irxParseTemps(toks, 4, n)) {
+                if (toks[1] == "-") {
+                    return IrInstr.Call(none, c, args)
+                }
+                if (let some(d) = irxParseId(toks[1])) {
+                    return IrInstr.Call(d, c, args)
+                }
+            }
+        }
+        return none
+    }
+    if (head == "callind") {
+        // `callind <dst|-> <fn_addr> <ret> <nparams> <pty>* <nargs> <arg>*`
+        if (n < 6) { return none }
+        var dst = 0 - 1
+        if (toks[1] != "-") {
+            if (let some(d) = irxParseId(toks[1])) {
+                dst = d
+            } else {
+                return none
+            }
+        }
+        if (let some(a) = irxParseId(toks[2])) {
+            if (let some(rt) = irxParseTy(toks[3])) {
+                if (let some(np) = irxCount(toks[4])) {
+                    if (n - 6 < np) { return none }
+                    var ps = emptyIrTys()
+                    var i = 5
+                    while (i < 5 + np) {
+                        match (irxParseTy(toks[i])) {
+                            case some(t) -> ps.push(t)
+                            case none -> { return none }
+                        }
+                        i = i + 1
+                    }
+                    if (let some(na) = irxCount(toks[i])) {
+                        if (n - i - 1 < na) { return none }
+                        if (let some(args) = irxParseTemps(toks, i + 1, i + 1 + na)) {
+                            if (dst < 0) {
+                                return IrInstr.CallInd(none, a, ps, rt, args)
+                            }
+                            return IrInstr.CallInd(dst, a, ps, rt, args)
+                        }
+                    }
+                }
+            }
+        }
+        return none
+    }
+    none
+}
+
+fn irxParseTerm(toks: List<string>) -> IrTerm? {
+    let head = toks[0]
+    let n = len(toks)
+    if (head == "branch") {
+        if (n < 2) { return none }
+        if (let some(x) = irxU32(toks[1])) {
+            return IrTerm.Branch(x)
+        }
+        return none
+    }
+    if (head == "branchif") {
+        if (n < 4) { return none }
+        if (let some(c) = irxU32(toks[1])) {
+            if (let some(t) = irxU32(toks[2])) {
+                if (let some(e) = irxU32(toks[3])) {
+                    return IrTerm.BranchIf(c, t, e)
+                }
+            }
+        }
+        return none
+    }
+    if (head == "return") {
+        if (n < 2) { return IrTerm.Return(none) }
+        if (toks[1] == "-") { return IrTerm.Return(none) }
+        if (let some(x) = irxU32(toks[1])) {
+            return IrTerm.Return(x)
+        }
+        return none
+    }
+    if (head == "unreachable") {
+        return IrTerm.Unreachable
+    }
+    none
+}
+
+class IrxReader {
+    var m: IrModule
+    var cur: int
+    var ok: bool
+
+    constructor() {
+        this.m = emptyModule()
+        this.cur = 0 - 1
+        this.ok = true
+    }
+
+    /// True once a `func` header has been seen; records the failure otherwise.
+    fn inFunc() -> bool {
+        if (this.cur < 0) {
+            this.ok = false
+            return false
+        }
+        true
+    }
+
+    /// Index of the block an instruction or terminator is appended to.
+    fn lastBlock() -> int {
+        if (!this.inFunc()) { return 0 - 1 }
+        let f = this.m.funcs[this.cur]
+        if (len(f.blocks) == 0) {
+            this.ok = false
+            return 0 - 1
+        }
+        len(f.blocks) - 1
+    }
+
+    fn headerLine(toks: List<string>) {
+        if (len(toks) != 3) {
+            this.ok = false
+            return
+        }
+        let what = toks[1]
+        if (what != "externs" && what != "strings" && what != "funcs" && what != "globals") {
+            this.ok = false
+            return
+        }
+        if (!irxCountOk(toks[2])) { this.ok = false }
+    }
+
+    fn externLine(toks: List<string>) {
+        if (len(toks) < 2) {
+            this.ok = false
+            return
+        }
+        if (!irxCountOk(toks[1])) {
+            this.ok = false
+            return
+        }
+        // A missing symbol token is an empty symbol, as in the Rust reader.
+        var sym = ""
+        if (len(toks) > 2) {
+            if (let some(s) = irxUnhexText(toks[2])) {
+                sym = s
+            } else {
+                this.ok = false
+                return
+            }
+        }
+        this.m.externs.push(IrExtern(sym, emptyIrTys(), IrTy.Unit))
+    }
+
+    fn esigLine(toks: List<string>) {
+        if (len(this.m.externs) == 0) {
+            this.ok = false
+            return
+        }
+        var ret = IrTy.Unit
+        match (irxParseTy(toks[len(toks) - 1])) {
+            case some(t) -> ret = t
+            case none -> {
+                this.ok = false
+                return
+            }
+        }
+        var ps = emptyIrTys()
+        var i = 1
+        while (i < len(toks) - 1) {
+            match (irxParseTy(toks[i])) {
+                case some(t) -> ps.push(t)
+                case none -> {
+                    this.ok = false
+                    return
+                }
+            }
+            i = i + 1
+        }
+        let e = this.m.externs[len(this.m.externs) - 1]
+        e.params = ps
+        e.ret = ret
+    }
+
+    fn stringLine(toks: List<string>) {
+        if (len(toks) < 2) {
+            this.ok = false
+            return
+        }
+        if (!irxCountOk(toks[1])) {
+            this.ok = false
+            return
+        }
+        var raw = irxEmptyBytes()
+        if (len(toks) > 2) {
+            if (let some(b) = irxUnhex(toks[2])) {
+                raw = b
+            } else {
+                this.ok = false
+                return
+            }
+        }
+        var lst = irxEmptyIntList()
+        var i = 0
+        while (i < len(raw)) {
+            lst.push(raw[i] as int)
+            i = i + 1
+        }
+        this.m.strings.push(lst)
+    }
+
+    fn funcLine(toks: List<string>) {
+        if (len(toks) < 8) {
+            this.ok = false
+            return
+        }
+        if (!irxCountOk(toks[1])) {
+            this.ok = false
+            return
+        }
+        var name = ""
+        if (let some(s) = irxUnhexText(toks[2])) {
+            name = s
+        } else {
+            this.ok = false
+            return
+        }
+        var sym = ""
+        if (let some(s) = irxUnhexText(toks[3])) {
+            sym = s
+        } else {
+            this.ok = false
+            return
+        }
+        var entry = 0
+        if (let some(e) = irxU32(toks[6])) {
+            entry = e
+        } else {
+            this.ok = false
+            return
+        }
+        var ret = IrTy.Unit
+        if (let some(t) = irxParseTy(toks[7])) {
+            ret = t
+        } else {
+            this.ok = false
+            return
+        }
+        this.m.funcs.push(IrFunc(name, sym, emptyIrParams(), ret, emptyIrTys(), entry, emptyIrBlocks(), toks[4] == "1", toks[5] == "1", emptyStrList()))
+        this.cur = len(this.m.funcs) - 1
+        this.m.funcsByName[name] = this.cur
+    }
+
+    fn paramsLine(toks: List<string>) {
+        if (!this.inFunc()) { return }
+        if (len(toks) < 2) {
+            this.ok = false
+            return
+        }
+        var n = 0
+        if (let some(c) = irxCount(toks[1])) {
+            n = c
+        } else {
+            this.ok = false
+            return
+        }
+        var ps = emptyIrParams()
+        var i = 2
+        while (i < len(toks)) {
+            var nm = ""
+            if (let some(s) = irxUnhexText(toks[i])) {
+                nm = s
+            } else {
+                this.ok = false
+                return
+            }
+            if (i + 1 >= len(toks)) {
+                this.ok = false
+                return
+            }
+            var t = IrTy.Unit
+            if (let some(x) = irxParseTy(toks[i + 1])) {
+                t = x
+            } else {
+                this.ok = false
+                return
+            }
+            ps.push(IrParam(nm, t))
+            i = i + 2
+        }
+        if (len(ps) != n) {
+            this.ok = false
+            return
+        }
+        this.m.funcs[this.cur].params = ps
+    }
+
+    fn slotsLine(toks: List<string>) {
+        if (!this.inFunc()) { return }
+        if (len(toks) < 2) {
+            this.ok = false
+            return
+        }
+        var n = 0
+        if (let some(c) = irxCount(toks[1])) {
+            n = c
+        } else {
+            this.ok = false
+            return
+        }
+        var ss = emptyIrTys()
+        var i = 2
+        while (i < len(toks)) {
+            if (let some(t) = irxParseTy(toks[i])) {
+                ss.push(t)
+            } else {
+                this.ok = false
+                return
+            }
+            i = i + 1
+        }
+        if (len(ss) != n) {
+            this.ok = false
+            return
+        }
+        this.m.funcs[this.cur].slots = ss
+    }
+
+    fn tagsLine(toks: List<string>) {
+        if (!this.inFunc()) { return }
+        if (len(toks) < 2) {
+            this.ok = false
+            return
+        }
+        var n = 0
+        if (let some(c) = irxCount(toks[1])) {
+            n = c
+        } else {
+            this.ok = false
+            return
+        }
+        var ts = emptyStrList()
+        var i = 2
+        while (i < len(toks)) {
+            if (let some(s) = irxUnhexText(toks[i])) {
+                ts.push(s)
+            } else {
+                this.ok = false
+                return
+            }
+            i = i + 1
+        }
+        if (len(ts) != n) {
+            this.ok = false
+            return
+        }
+        this.m.funcs[this.cur].tags = ts
+    }
+
+    fn blocksLine(toks: List<string>) {
+        if (!this.inFunc()) { return }
+        if (len(toks) < 2) {
+            this.ok = false
+            return
+        }
+        if (!irxCountOk(toks[1])) {
+            this.ok = false
+            return
+        }
+        this.m.funcs[this.cur].blocks = emptyIrBlocks()
+    }
+
+    fn blockLine(toks: List<string>) {
+        if (!this.inFunc()) { return }
+        if (len(toks) < 2) {
+            this.ok = false
+            return
+        }
+        var id = 0
+        if (let some(x) = irxU32(toks[1])) {
+            id = x
+        } else {
+            this.ok = false
+            return
+        }
+        this.m.funcs[this.cur].blocks.push(IrBlock(id, emptyIrInstrs(), IrTerm.Unreachable))
+    }
+
+    fn instrLine(toks: List<string>) {
+        if (let some(x) = irxParseInstr(toks)) {
+            let b = this.lastBlock()
+            if (b < 0) { return }
+            this.m.funcs[this.cur].blocks[b].instrs.push(x)
+            return
+        }
+        this.ok = false
+    }
+
+    fn globalLine(toks: List<string>) {
+      // `global <i> <hexsymbol> <typedeclared> <ty>`
+      if (len(toks) != 5) {
+      this.ok = false
+      return
+      }
+      if (!irxCountOk(toks[1])) {
+      this.ok = false
+      return
+      }
+      if (let some(sym) = irxUnhexText(toks[2])) {
+      var explicit = false
+      // Anything other than "1" reads as false, matching the Rust reader's
+      // `== "1"` test; "0" is the only value the encoder ever writes.
+      if (toks[3] == "1") {
+      explicit = true
+      }
+      if (let some(t) = irxParseTy(toks[4])) {
+      this.m.globals.push(IrGlobal(sym, t, explicit, none))
+      return
+      }
+      }
+      this.ok = false
+   }
+
+   fn ginitLine(toks: List<string>) {
+      // Strict on token count: silently ignoring trailing bytes would apply a
+      // truncated initializer and hand the global the wrong value.
+      if (len(toks) != 2) {
+      this.ok = false
+      return
+      }
+      if (len(this.m.globals) == 0) {
+      this.ok = false
+      return
+      }
+      if (toks[1] == "-") {
+      this.m.globals[len(this.m.globals) - 1].init = none
+      return
+      }
+      if (let some(b) = irxUnhex(toks[1])) {
+      var lst = irxEmptyIntList()
+      var i = 0
+      while (i < len(b)) {
+      lst.push(b[i] as int)
+      i = i + 1
+      }
+      this.m.globals[len(this.m.globals) - 1].init = lst
+      return
+      }
+      this.ok = false
+   }
+
+   fn termLine(toks: List<string>) {
+        if (let some(x) = irxParseTerm(toks)) {
+            let b = this.lastBlock()
+            if (b < 0) { return }
+            this.m.funcs[this.cur].blocks[b].term = x
+            return
+        }
+        this.ok = false
+    }
+
+    fn line(toks: List<string>) {
+        match (toks[0]) {
+            case "irx" -> this.headerLine(toks)
+            case "extern" -> this.externLine(toks)
+            case "esig" -> this.esigLine(toks)
+            case "string" -> this.stringLine(toks)
+            case "global" -> this.globalLine(toks)
+            case "ginit" -> this.ginitLine(toks)
+            case "func" -> this.funcLine(toks)
+            case "params" -> this.paramsLine(toks)
+            case "slots" -> this.slotsLine(toks)
+            case "tags" -> this.tagsLine(toks)
+            case "blocks" -> this.blocksLine(toks)
+            case "block" -> this.blockLine(toks)
+            case _ -> {
+                if (irxIsInstrHead(toks[0])) {
+                    this.instrLine(toks)
+                } else {
+                    if (irxIsTermHead(toks[0])) {
+                        this.termLine(toks)
+                    } else {
+                        this.ok = false
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Parse IRX text (as written by `irxModuleStr`) back into a module, or none
+/// when the text is malformed. `funcsByName` is rebuilt in index order.
+fn irxFromIrx(text: string) -> IrModule? {
+    let r = IrxReader()
+    let lines = irxLines(text)
+    var i = 0
+    while (i < len(lines) && r.ok) {
+        let toks = irxTokens(lines[i])
+        i = i + 1
+        if (len(toks) > 0) {
+            r.line(toks)
+        }
+    }
+    if (!r.ok) { return none }
+    r.m
+}

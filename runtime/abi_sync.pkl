@@ -1,0 +1,680 @@
+module runtime.abi_sync
+
+/// Port of the observable single-thread data contract of `runtime/src/sync.rs`
+/// as real `#[symbol]` bodies: a handle table plus the five non-closure
+/// primitive families - mutex, cond, semaphore, atomic, and channel.
+///
+/// WHAT THIS OWNS. Of `sync.rs`'s thirteen ABI symbols, these twenty-six:
+///
+///   mutex(4)  new lock trylock unlock
+///   cond(4)   new signal broadcast wait
+///   sem(4)    new acquire try_acquire release
+///   atomic(5) new load store add cas
+///   channel(9) new cap len send try_send recv try_recv close closed
+///
+/// WHAT STAYS NATIVE - and why this is a hard rule, not a convenience. The
+/// `#[symbol]` override is activated per imported module, so a handle's
+/// registry must be chosen whole. A ported `*_new` registers in the port's
+/// handle table; the matching `*_op` bodies must therefore also be ported, or
+/// the native op would index the native `OBJECTS` table for a port-created
+/// handle and answer "not a <what>". So each family below is ported as a
+/// complete set. The two families this header originally reserved - once and
+/// thread - are no longer exceptions: the 17.1 slice closed the `call_closure0`
+/// wall (a `#[symbol]` body can declare a function-type parameter and call
+/// it), and `runtime/abi_once.pkl` plus `runtime/abi_threads.pkl` now own all
+/// eleven of their symbols. Every family in this file stays a complete set.
+///
+/// THE HANDLE TABLE. One flat word block of state-block addresses, one entry
+/// per handle, handle = index + 1 so 0 stays the null handle (`sync.rs:579`).
+/// Entries are leaked for the process lifetime and never removed, matching the
+/// native "a handle can outlive the value it names" contract. Growth is the
+/// same doubling `ensureBlock`/`blockCapGrown` that `abi_gc.pkl` defines for
+/// the root registry; the two functions are duplicated here rather than
+/// imported because importing `runtime.abi_gc` would activate that module's
+/// eight `#[symbol]` slots in every image that imports this one.
+///
+/// STATE BLOCKS. Each primitive is a raw word block from `alloc` (unmanaged,
+/// invisible to the collector, never reclaimed - exactly the raw-arena
+/// contract the box and list port bodies already rely on). Word 0 is the kind,
+/// the rest are that kind's fields, all raw `i64`:
+///
+///   mutex    [0 kind=1, 1 permits=1, 2 held]
+///   cond     [0 kind=2, 1 permits=0, 2 parked]
+///   sem      [0 kind=3, 1 permits,    2 parked]
+///   atomic   [0 kind=4, 1 value]
+///   channel  [0 kind=6, 1 cap, 2 head, 3 count, 4 closed, 5 buf]
+///
+/// A channel's `buf` word is the address of a separate `cap`-word block holding
+/// the ring (values are raw scalars, boxed only by `pickle_channel_try_recv`'s
+/// `abiBoxI64` hand-off, the same shape the native `recv` returns unboxed).
+///
+/// THE SINGLE-THREAD DIVERGENCE. The port runs under the same "no peer" answer
+/// as the freestanding build: `take` spins in place instead of parking, and a
+/// `parked` register exists only so `broadcast` reads it truthfully - it can
+/// never be non-zero while one thread runs, so broadcast hands out zero permits
+/// (a `give_all(0)`, matching native's `give_all(parked())` for that case).
+/// There is no contention to exclude; `mutex`/`sem` exclude through their
+/// permit counts, which is the one-thread behaviour shared with the native
+/// build. A program that waits for a permit nobody will hand over spins
+/// forever, visibly, exactly as the freestanding slice does - so the blocking
+/// paths are absent from every probe and unit test below.
+///
+/// THE FATAL PATH. Wrong-kind and channel-protocol failures reproduce native
+/// `panic::fatal` byte-for-byte on stderr and exit 1 (the same three-write +
+/// `win_exit` seam `abi_expect.pkl` keeps): `fatal: pickle: handle {n} is not
+/// {what}\n`, `fatal: pickle: send on closed channel\n`, `fatal: pickle:
+/// receive on a closed, empty channel\n`, and `fatal: pickle: channel capacity
+/// must be at least 1, got {cap}\n` with `{cap}` formatted by `abiStrFromI64`.
+/// Programs importing this module never exercise these in-process (see the
+/// expect-slice note: a reachable `fatal` inside a ported module's own test
+/// would end the whole `pickle-cli test` suite); they are verified by the
+/// standalone probes.
+
+import { abiBoxI64 } from runtime.abi_box
+import { abiStrFromI64 } from runtime.abi_string
+import { writeStderr } from runtime.abi_stdio
+import { STR_BYTES_OFF } from runtime.layout
+
+const KIND_MUTEX: int = 1
+const KIND_COND: int = 2
+const KIND_SEM: int = 3
+const KIND_ATOMIC: int = 4
+const KIND_CHANNEL: int = 6
+
+/// The handle registry: a flat word block of state-block addresses.
+var syncBase: int = 0
+var syncCap: int = 0
+var syncCount: int = 0
+const SYNC_INITIAL: int = 16
+
+/// The capacity a block reaches for `idx` items under doubling growth: the
+/// first power-of-2 multiple of `initial` strictly above `idx` (or the input
+/// cap when it already fits). Duplicate of `abi_gc::blockCapGrown` - importing
+/// it would activate `abi_gc`'s symbols in every importing image.
+fn blockCapGrown(cap: int, idx: int, initial: int) -> int {
+    if (idx < cap) {
+        return cap
+    }
+    var c = cap
+    if (c == 0) {
+        c = initial
+    }
+    while (idx >= c) {
+        c = c * 2
+    }
+    return c
+}
+
+/// Grow `base`/`cap` so `idx` (a word index) is in range: allocate a fresh
+/// block of the grown capacity, copy the old words, zero the new tail, release
+/// the old block, and return the new base. Duplicate of `abi_gc::ensureBlock`.
+fn ensureBlock(base: int, cap: int, idx: int, initial: int) -> int {
+    var newCap = blockCapGrown(cap, idx, initial)
+    if (newCap == cap) {
+        return base
+    }
+    unsafe {
+        var fresh = alloc(int, newCap)
+        var j = 0
+        while (j < cap) {
+            fresh[j] = (base as *int)[j]
+            j = j + 1
+        }
+        var k = cap
+        while (k < newCap) {
+            fresh[k] = 0
+            k = k + 1
+        }
+        if (base != 0) {
+            free(base as *int)
+        }
+        return fresh as int
+    }
+}
+
+/// Register `state` in the handle table; returns its one-based handle (the
+/// post-push length, `sync.rs::register`).
+fn register(state: int) -> int {
+    var idx = syncCount
+    syncBase = ensureBlock(syncBase, syncCap, idx, SYNC_INITIAL)
+    syncCap = blockCapGrown(syncCap, idx, SYNC_INITIAL)
+    unsafe {
+        (syncBase as *int)[idx] = state
+    }
+    syncCount = syncCount + 1
+    return syncCount
+}
+
+/// The state block for `handle`, or null when the handle names nothing.
+fn entryBlock(handle: int) -> *int {
+    if (handle < 1) {
+        return 0 as *int
+    }
+    if (handle > syncCount) {
+        return 0 as *int
+    }
+    unsafe {
+        return ((syncBase as *int)[handle - 1]) as *int
+    }
+}
+
+/// The state block for `handle` when its kind is `kind`, else null. Mirrors
+/// the native `*_of` dispatch (the two fall to the same `not_a` fatal).
+fn ofKind(handle: int, kind: int) -> *int {
+    var b = entryBlock(handle)
+    if (b == 0 as *int) {
+        return b
+    }
+    unsafe {
+        if (b[0] != kind) {
+            return 0 as *int
+        }
+    }
+    return b
+}
+
+/// ---------------------------------------------------------------------------
+/// THE FATAL CHANNEL (stderr spellings of `panic.rs::fatal`, as in `abi_expect`)
+/// ---------------------------------------------------------------------------
+
+fn emitLit(lit: string) -> int {
+    unsafe {
+        var p = &lit
+        let _ = writeStderr((p as int) + STR_BYTES_OFF, len(lit))
+        return 0
+    }
+}
+
+fn emitStr(s: *int) -> int {
+    unsafe {
+        let _ = writeStderr((s as int) + STR_BYTES_OFF, s[3])
+        return 0
+    }
+}
+
+fn fatalExit() -> int {
+    win_exit(1)
+    return 0
+}
+
+/// `fatal: pickle: handle {n} is not {what}\n`, then exit 1.
+fn fatalIsNot(handle: int, what: string) -> int {
+    emitLit("fatal: ")
+    emitLit("pickle: handle ")
+    emitStr(abiStrFromI64(handle))
+    emitLit(" is not ")
+    emitLit(what)
+    emitLit("\n")
+    fatalExit()
+    return 0
+}
+
+/// A fixed-message channel fatal without a handle.
+fn fatalLit(msg: string) -> int {
+    emitLit("fatal: ")
+    emitLit(msg)
+    emitLit("\n")
+    fatalExit()
+    return 0
+}
+
+/// `fatal: pickle: channel capacity must be at least 1, got {cap}\n`.
+fn fatalCap(cap: int) -> int {
+    emitLit("fatal: ")
+    emitLit("pickle: channel capacity must be at least 1, got ")
+    emitStr(abiStrFromI64(cap))
+    emitLit("\n")
+    fatalExit()
+    return 0
+}
+
+/// ---------------------------------------------------------------------------
+/// PERMIT PRIMITIVE (the single-thread spin build of `PSemaphore`)
+/// ---------------------------------------------------------------------------
+
+/// `b[1] < n` - the permit predicate the spin loops re-test.
+fn permitLt(b: *int, n: int) -> bool {
+    unsafe {
+        return b[1] < n
+    }
+}
+
+/// Wait for `b[1]` to hold at least `n` permits, then subtract `n`. The spin
+/// re-reads the permit word each iteration, the same predicate re-test the
+/// freestanding `take` loop performs; with no peer the loop is the visible
+/// hang the nostd contract documents.
+fn takePermits(b: *int, n: int) -> int {
+    unsafe {
+        while (permitLt(b, n)) {
+            let _ = b[1]
+        }
+        b[1] = b[1] - n
+        return 0
+    }
+}
+
+/// Subtract `n` permits if they are free right now. Never blocks.
+fn tryTakePermits(b: *int, n: int) -> bool {
+    unsafe {
+        if (b[1] < n) {
+            return false
+        }
+        b[1] = b[1] - n
+        return true
+    }
+}
+
+/// Add `n` permits. No peer is waiting, so there is no wake (the nostd body's
+/// notification is a no-op).
+fn givePermits(b: *int, n: int) -> int {
+    unsafe {
+        b[1] = b[1] + n
+        return 0
+    }
+}
+
+/// ---------------------------------------------------------------------------
+/// MUTEX
+/// ---------------------------------------------------------------------------
+
+#[symbol("pickle_mutex_new")]
+fn abiMutexNew() -> int {
+    unsafe {
+        var b = alloc(int, 3)
+        b[0] = KIND_MUTEX
+        b[1] = 1
+        b[2] = 0
+        return register(b as int)
+    }
+}
+
+#[symbol("pickle_mutex_lock")]
+fn abiMutexLock(handle: int) -> int {
+    var m = ofKind(handle, KIND_MUTEX)
+    if (m == 0 as *int) {
+        fatalIsNot(handle, "a mutex")
+    }
+    takePermits(m, 1)
+    unsafe { m[2] = 1 }
+    return 0
+}
+
+#[symbol("pickle_mutex_trylock")]
+fn abiMutexTryLock(handle: int) -> bool {
+    var m = ofKind(handle, KIND_MUTEX)
+    if (m == 0 as *int) {
+        fatalIsNot(handle, "a mutex")
+    }
+    unsafe {
+        if (m[2] != 0) {
+            return false
+        }
+    }
+    if (!tryTakePermits(m, 1)) {
+        return false
+    }
+    unsafe { m[2] = 1 }
+    return true
+}
+
+#[symbol("pickle_mutex_unlock")]
+fn abiMutexUnlock(handle: int) -> int {
+    var m = ofKind(handle, KIND_MUTEX)
+    if (m == 0 as *int) {
+        fatalIsNot(handle, "a mutex")
+    }
+    unsafe {
+        if (m[2] == 0) {
+            return 0
+        }
+        m[2] = 0
+    }
+    givePermits(m, 1)
+    return 0
+}
+
+/// ---------------------------------------------------------------------------
+/// COND
+/// ---------------------------------------------------------------------------
+
+#[symbol("pickle_cond_new")]
+fn abiCondNew() -> int {
+    unsafe {
+        var b = alloc(int, 3)
+        b[0] = KIND_COND
+        b[1] = 0
+        b[2] = 0
+        return register(b as int)
+    }
+}
+
+#[symbol("pickle_cond_signal")]
+fn abiCondSignal(handle: int) -> int {
+    var c = ofKind(handle, KIND_COND)
+    if (c == 0 as *int) {
+        fatalIsNot(handle, "a cond")
+    }
+    givePermits(c, 1)
+    return 0
+}
+
+#[symbol("pickle_cond_broadcast")]
+fn abiCondBroadcast(handle: int) -> int {
+    var c = ofKind(handle, KIND_COND)
+    if (c == 0 as *int) {
+        fatalIsNot(handle, "a cond")
+    }
+    unsafe {
+        givePermits(c, c[2])
+        return 0
+    }
+}
+
+/// Release `mutex`, wait on `cond`, retake `mutex`. A null mutex waits without one.
+#[symbol("pickle_cond_wait")]
+fn abiCondWait(cond: int, mutex: int) -> int {
+    var c = ofKind(cond, KIND_COND)
+    if (c == 0 as *int) {
+        fatalIsNot(cond, "a cond")
+    }
+    var m = ofKind(mutex, KIND_MUTEX)
+    if (m == 0 as *int) {
+        takePermits(c, 1)
+        return 0
+    }
+    abiMutexUnlock(mutex)
+    takePermits(c, 1)
+    abiMutexLock(mutex)
+    return 0
+}
+
+/// ---------------------------------------------------------------------------
+/// SEM
+/// ---------------------------------------------------------------------------
+
+#[symbol("pickle_sem_new")]
+fn abiSemNew(permits: int) -> int {
+    unsafe {
+        var p = permits
+        if (p < 0) {
+            p = 0
+        }
+        var b = alloc(int, 3)
+        b[0] = KIND_SEM
+        b[1] = p
+        b[2] = 0
+        return register(b as int)
+    }
+}
+
+#[symbol("pickle_sem_acquire")]
+fn abiSemAcquire(handle: int, n: int) -> int {
+    var s = ofKind(handle, KIND_SEM)
+    if (s == 0 as *int) {
+        fatalIsNot(handle, "a semaphore")
+    }
+    var count = n
+    if (count < 1) {
+        count = 1
+    }
+    takePermits(s, count)
+    return 0
+}
+
+#[symbol("pickle_sem_try_acquire")]
+fn abiSemTryAcquire(handle: int, n: int) -> bool {
+    var s = ofKind(handle, KIND_SEM)
+    if (s == 0 as *int) {
+        fatalIsNot(handle, "a semaphore")
+    }
+    var count = n
+    if (count < 1) {
+        count = 1
+    }
+    return tryTakePermits(s, count)
+}
+
+#[symbol("pickle_sem_release")]
+fn abiSemRelease(handle: int, n: int) -> int {
+    var s = ofKind(handle, KIND_SEM)
+    if (s == 0 as *int) {
+        fatalIsNot(handle, "a semaphore")
+    }
+    var count = n
+    if (count < 1) {
+        count = 1
+    }
+    givePermits(s, count)
+    return 0
+}
+
+/// ---------------------------------------------------------------------------
+/// ATOMIC
+/// ---------------------------------------------------------------------------
+
+#[symbol("pickle_atomic_new")]
+fn abiAtomicNew(value: int) -> int {
+    unsafe {
+        var b = alloc(int, 2)
+        b[0] = KIND_ATOMIC
+        b[1] = value
+        return register(b as int)
+    }
+}
+
+#[symbol("pickle_atomic_load")]
+fn abiAtomicLoad(handle: int) -> int {
+    var a = ofKind(handle, KIND_ATOMIC)
+    if (a == 0 as *int) {
+        fatalIsNot(handle, "an atomic")
+    }
+    unsafe {
+        return a[1]
+    }
+}
+
+#[symbol("pickle_atomic_store")]
+fn abiAtomicStore(handle: int, value: int) -> int {
+    var a = ofKind(handle, KIND_ATOMIC)
+    if (a == 0 as *int) {
+        fatalIsNot(handle, "an atomic")
+    }
+    unsafe { a[1] = value }
+    return 0
+}
+
+/// `fetch_add`: returns the value from before the addition.
+#[symbol("pickle_atomic_add")]
+fn abiAtomicAdd(handle: int, delta: int) -> int {
+    var a = ofKind(handle, KIND_ATOMIC)
+    if (a == 0 as *int) {
+        fatalIsNot(handle, "an atomic")
+    }
+    unsafe {
+        var old = a[1]
+        a[1] = old + delta
+        return old
+    }
+}
+
+#[symbol("pickle_atomic_cas")]
+fn abiAtomicCas(handle: int, expected: int, value: int) -> bool {
+    var a = ofKind(handle, KIND_ATOMIC)
+    if (a == 0 as *int) {
+        fatalIsNot(handle, "an atomic")
+    }
+    unsafe {
+        if (a[1] != expected) {
+            return false
+        }
+        a[1] = value
+        return true
+    }
+}
+
+/// ---------------------------------------------------------------------------
+/// CHANNEL
+/// ---------------------------------------------------------------------------
+
+/// `!closed && count == cap` - a send is blocked until a slot frees or the
+/// channel closes.
+fn channelFull(ch: *int) -> bool {
+    unsafe {
+        return ch[4] == 0 && ch[3] == ch[1]
+    }
+}
+
+/// `!closed && count == 0` - a receive is blocked until a value arrives or the
+/// channel closes.
+fn channelEmpty(ch: *int) -> bool {
+    unsafe {
+        return ch[4] == 0 && ch[3] == 0
+    }
+}
+
+#[symbol("pickle_channel_new")]
+fn abiChannelNew(cap: int) -> int {
+    if (cap < 1) {
+        fatalCap(cap)
+    }
+    unsafe {
+        var buf = alloc(int, cap)
+        var i = 0
+        while (i < cap) {
+            buf[i] = 0
+            i = i + 1
+        }
+        var b = alloc(int, 6)
+        b[0] = KIND_CHANNEL
+        b[1] = cap
+        b[2] = 0
+        b[3] = 0
+        b[4] = 0
+        b[5] = buf as int
+        return register(b as int)
+    }
+}
+
+#[symbol("pickle_channel_cap")]
+fn abiChannelCap(handle: int) -> int {
+    var ch = ofKind(handle, KIND_CHANNEL)
+    if (ch == 0 as *int) {
+        fatalIsNot(handle, "a channel")
+    }
+    unsafe {
+        return ch[1]
+    }
+}
+
+#[symbol("pickle_channel_len")]
+fn abiChannelLen(handle: int) -> int {
+    var ch = ofKind(handle, KIND_CHANNEL)
+    if (ch == 0 as *int) {
+        fatalIsNot(handle, "a channel")
+    }
+    unsafe {
+        return ch[3]
+    }
+}
+
+#[symbol("pickle_channel_send")]
+fn abiChannelSend(handle: int, value: int) -> int {
+    var ch = ofKind(handle, KIND_CHANNEL)
+    if (ch == 0 as *int) {
+        fatalIsNot(handle, "a channel")
+    }
+    unsafe {
+        while (channelFull(ch)) {
+            let _ = ch[3]
+        }
+        if (ch[4] != 0) {
+            fatalLit("pickle: send on closed channel")
+        }
+        var i = (ch[2] + ch[3]) % ch[1]
+        (ch[5] as *int)[i] = value
+        ch[3] = ch[3] + 1
+        return 0
+    }
+}
+
+#[symbol("pickle_channel_try_send")]
+fn abiChannelTrySend(handle: int, value: int) -> bool {
+    var ch = ofKind(handle, KIND_CHANNEL)
+    if (ch == 0 as *int) {
+        fatalIsNot(handle, "a channel")
+    }
+    unsafe {
+        if (ch[4] != 0) {
+            fatalLit("pickle: send on closed channel")
+        }
+        if (ch[3] == ch[1]) {
+            return false
+        }
+        var i = (ch[2] + ch[3]) % ch[1]
+        (ch[5] as *int)[i] = value
+        ch[3] = ch[3] + 1
+        return true
+    }
+}
+
+#[symbol("pickle_channel_recv")]
+fn abiChannelRecv(handle: int) -> int {
+    var ch = ofKind(handle, KIND_CHANNEL)
+    if (ch == 0 as *int) {
+        fatalIsNot(handle, "a channel")
+    }
+    unsafe {
+        while (channelEmpty(ch)) {
+            let _ = ch[3]
+        }
+        if (ch[3] == 0) {
+            fatalLit("pickle: receive on a closed, empty channel")
+        }
+        var i = ch[2]
+        var v = (ch[5] as *int)[i]
+        ch[2] = (ch[2] + 1) % ch[1]
+        ch[3] = ch[3] - 1
+        return v
+    }
+}
+
+/// A value if one is buffered, boxed through the ported `pickle_box_i64`;
+/// null when empty, whether or not the channel is closed.
+#[symbol("pickle_channel_try_recv")]
+fn abiChannelTryRecv(handle: int) -> *int {
+    var ch = ofKind(handle, KIND_CHANNEL)
+    if (ch == 0 as *int) {
+        fatalIsNot(handle, "a channel")
+    }
+    unsafe {
+        if (ch[3] == 0) {
+            return 0 as *int
+        }
+        var i = ch[2]
+        var v = (ch[5] as *int)[i]
+        ch[2] = (ch[2] + 1) % ch[1]
+        ch[3] = ch[3] - 1
+        return abiBoxI64(v)
+    }
+}
+
+#[symbol("pickle_channel_close")]
+fn abiChannelClose(handle: int) -> int {
+    var ch = ofKind(handle, KIND_CHANNEL)
+    if (ch == 0 as *int) {
+        fatalIsNot(handle, "a channel")
+    }
+    unsafe { ch[4] = 1 }
+    return 0
+}
+
+#[symbol("pickle_channel_closed")]
+fn abiChannelClosed(handle: int) -> bool {
+    var ch = ofKind(handle, KIND_CHANNEL)
+    if (ch == 0 as *int) {
+        fatalIsNot(handle, "a channel")
+    }
+    unsafe {
+        return ch[4] != 0
+    }
+}

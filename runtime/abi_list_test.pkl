@@ -1,0 +1,292 @@
+module runtime.abi_list_test
+
+/// Behavioral tests for the ported list ABI bodies. These call the Pickle
+/// implementations directly (not the `#[symbol]` slots) so the suite pins the logic
+/// itself; `tests/pickle/abi_box_main.pkl` covers the C ABI wiring separately.
+
+import { listNew, requireCapacity, abiListNew, abiListLen, abiListGet, abiListSet, abiListPush, abiListPop, abiListRemove, abiListInsert, abiListSort, abiRange } from runtime.abi_list
+import { abiBoxI64, abiUnboxI64 } from runtime.abi_box
+import { abiStrCmp } from runtime.abi_string
+
+/// Read element `i` of `l` back as its boxed int payload.
+fn at(l: *int, i: int) -> int {
+    return abiUnboxI64(abiListGet(l, i))
+}
+
+test fn new_list_is_empty_with_the_native_initial_capacity() {
+    var l = listNew(0)
+    expect(abiListLen(l)).toBe(0)
+    unsafe {
+        // cap is floored at INITIAL_CAP = 8, matching list.rs::list_new(0).
+        expect(l[4]).toBe(8)
+        expect(l[1]).toBe(1)
+        expect(l[2]).toBe(48)
+    }
+}
+
+test fn new_list_honors_a_larger_requested_capacity() {
+    var l = listNew(64)
+    expect(abiListLen(l)).toBe(0)
+    unsafe {
+        expect(l[4]).toBe(64)
+    }
+}
+
+test fn push_and_get_round_trip_in_order() {
+    var l = listNew(0)
+    abiListPush(l, abiBoxI64(10))
+    abiListPush(l, abiBoxI64(20))
+    abiListPush(l, abiBoxI64(30))
+    expect(abiListLen(l)).toBe(3)
+    expect(at(l, 0)).toBe(10)
+    expect(at(l, 1)).toBe(20)
+    expect(at(l, 2)).toBe(30)
+}
+
+test fn push_grows_past_the_initial_capacity_and_preserves_elements() {
+    // 20 pushes force two growth steps (8 -> 16 -> 32) with real copies, which is
+    // the path that has to keep word 5 pointing at the live span.
+    var l = listNew(0)
+    var i = 0
+    while (i < 20) {
+        abiListPush(l, abiBoxI64(i * 3))
+        i = i + 1
+    }
+    expect(abiListLen(l)).toBe(20)
+    unsafe {
+        expect(l[4]).toBe(32)
+    }
+    var j = 0
+    while (j < 20) {
+        expect(at(l, j)).toBe(j * 3)
+        j = j + 1
+    }
+}
+
+test fn get_out_of_bounds_returns_the_null_pointer() {
+    // list.rs::list_get returns core::ptr::null_mut() rather than trapping, and the
+    // null pointer is word 0, so the ported body must return exactly that.
+    var l = listNew(0)
+    abiListPush(l, abiBoxI64(1))
+    var oob = abiListGet(l, 1)
+    unsafe {
+        expect(oob as int).toBe(0)
+    }
+    var past = abiListGet(l, 9999)
+    unsafe {
+        expect(past as int).toBe(0)
+    }
+}
+
+test fn get_on_an_empty_list_returns_null() {
+    var l = listNew(0)
+    unsafe {
+        expect(abiListGet(l, 0) as int).toBe(0)
+    }
+}
+
+test fn set_overwrites_in_place_and_keeps_the_length() {
+    var l = listNew(0)
+    abiListPush(l, abiBoxI64(1))
+    abiListPush(l, abiBoxI64(2))
+    abiListSet(l, 0, abiBoxI64(99))
+    expect(abiListLen(l)).toBe(2)
+    expect(at(l, 0)).toBe(99)
+    expect(at(l, 1)).toBe(2)
+}
+
+test fn pop_returns_the_last_element_and_shrinks() {
+    var l = listNew(0)
+    abiListPush(l, abiBoxI64(7))
+    abiListPush(l, abiBoxI64(8))
+    expect(abiUnboxI64(abiListPop(l))).toBe(8)
+    expect(abiListLen(l)).toBe(1)
+    expect(abiUnboxI64(abiListPop(l))).toBe(7)
+    expect(abiListLen(l)).toBe(0)
+}
+
+test fn pop_on_an_empty_list_returns_the_null_pointer() {
+    var l = listNew(0)
+    unsafe {
+        expect(abiListPop(l) as int).toBe(0)
+    }
+}
+
+test fn remove_shifts_the_tail_left_and_returns_the_element() {
+    var l = listNew(0)
+    abiListPush(l, abiBoxI64(1))
+    abiListPush(l, abiBoxI64(2))
+    abiListPush(l, abiBoxI64(3))
+    abiListPush(l, abiBoxI64(4))
+    expect(abiUnboxI64(abiListRemove(l, 1))).toBe(2)
+    expect(abiListLen(l)).toBe(3)
+    expect(at(l, 0)).toBe(1)
+    expect(at(l, 1)).toBe(3)
+    expect(at(l, 2)).toBe(4)
+}
+
+test fn remove_the_last_element_leaves_the_prefix_intact() {
+    var l = listNew(0)
+    abiListPush(l, abiBoxI64(1))
+    abiListPush(l, abiBoxI64(2))
+    abiListPush(l, abiBoxI64(3))
+    expect(abiUnboxI64(abiListRemove(l, 2))).toBe(3)
+    expect(abiListLen(l)).toBe(2)
+    expect(at(l, 0)).toBe(1)
+    expect(at(l, 1)).toBe(2)
+}
+
+test fn insert_shifts_the_tail_right_and_grows() {
+    var l = listNew(0)
+    abiListPush(l, abiBoxI64(1))
+    abiListPush(l, abiBoxI64(3))
+    abiListInsert(l, 1, abiBoxI64(2))
+    expect(abiListLen(l)).toBe(3)
+    expect(at(l, 0)).toBe(1)
+    expect(at(l, 1)).toBe(2)
+    expect(at(l, 2)).toBe(3)
+}
+
+test fn insert_at_the_end_appends_and_insert_at_zero_prepends() {
+    var l = listNew(0)
+    abiListPush(l, abiBoxI64(2))
+    abiListInsert(l, 1, abiBoxI64(3))
+    abiListInsert(l, 0, abiBoxI64(1))
+    expect(abiListLen(l)).toBe(3)
+    expect(at(l, 0)).toBe(1)
+    expect(at(l, 1)).toBe(2)
+    expect(at(l, 2)).toBe(3)
+}
+
+test fn insert_past_the_end_grows_the_span_first() {
+    // list.rs::list_insert calls require_capacity(n + 1) before shifting, so an
+    // insert into a full list must not scribble past the live span.
+    var l = listNew(0)
+    var i = 0
+    while (i < 8) {
+        abiListPush(l, abiBoxI64(i))
+        i = i + 1
+    }
+    abiListInsert(l, 0, abiBoxI64(100))
+    expect(abiListLen(l)).toBe(9)
+    expect(at(l, 0)).toBe(100)
+    var j = 1
+    while (j < 9) {
+        expect(at(l, j)).toBe(j - 1)
+        j = j + 1
+    }
+}
+
+test fn require_capacity_is_a_no_op_when_capacity_already_suffices() {
+    var l = listNew(32)
+    requireCapacity(l, 4)
+    unsafe {
+        expect(l[4]).toBe(32)
+    }
+    expect(abiListLen(l)).toBe(0)
+}
+
+test fn sort_int_kind_orders_by_boxed_payload() {
+    var l = listNew(0)
+    abiListPush(l, abiBoxI64(5))
+    abiListPush(l, abiBoxI64(-3))
+    abiListPush(l, abiBoxI64(0))
+    abiListPush(l, abiBoxI64(9))
+    abiListSort(l, 0)
+    expect(at(l, 0)).toBe(-3)
+    expect(at(l, 1)).toBe(0)
+    expect(at(l, 2)).toBe(5)
+    expect(at(l, 3)).toBe(9)
+}
+
+test fn sort_is_stable_for_equal_keys() {
+    // insertion sort compares with a strict `<`, so equal keys must keep input order.
+    var l = listNew(0)
+    abiListPush(l, abiBoxI64(2))
+    abiListPush(l, abiBoxI64(1))
+    abiListPush(l, abiBoxI64(2))
+    abiListPush(l, abiBoxI64(1))
+    abiListSort(l, 0)
+    expect(at(l, 0)).toBe(1)
+    expect(at(l, 1)).toBe(1)
+    expect(at(l, 2)).toBe(2)
+    expect(at(l, 3)).toBe(2)
+}
+
+test fn sort_handles_empty_and_single_element_lists() {
+    var empty = listNew(0)
+    abiListSort(empty, 0)
+    expect(abiListLen(empty)).toBe(0)
+    var one = listNew(0)
+    abiListPush(one, abiBoxI64(42))
+    abiListSort(one, 0)
+    expect(at(one, 0)).toBe(42)
+}
+
+test fn sort_spans_a_growth_boundary() {
+    var l = listNew(0)
+    var i = 0
+    while (i < 12) {
+        // A pseudo-random-looking but deterministic permutation.
+        abiListPush(l, abiBoxI64((i * 7) % 12))
+        i = i + 1
+    }
+    abiListSort(l, 0)
+    var k = 0
+    while (k < 12) {
+        expect(at(l, k)).toBe(k)
+        k = k + 1
+    }
+}
+
+test fn range_builds_an_ascending_sequence() {
+    var l = abiRange(0, 5, 1)
+    expect(abiListLen(l)).toBe(5)
+    var i = 0
+    while (i < 5) {
+        expect(at(l, i)).toBe(i)
+        i = i + 1
+    }
+}
+
+test fn range_honors_a_step_greater_than_one() {
+    var l = abiRange(2, 11, 3)
+    expect(abiListLen(l)).toBe(3)
+    expect(at(l, 0)).toBe(2)
+    expect(at(l, 1)).toBe(5)
+    expect(at(l, 2)).toBe(8)
+}
+
+test fn range_with_a_negative_step_descends_to_the_exclusive_end() {
+    var l = abiRange(5, 0, -2)
+    expect(abiListLen(l)).toBe(3)
+    expect(at(l, 0)).toBe(5)
+    expect(at(l, 1)).toBe(3)
+    expect(at(l, 2)).toBe(1)
+}
+
+test fn range_with_a_zero_step_is_empty() {
+    var l = abiRange(0, 10, 0)
+    expect(abiListLen(l)).toBe(0)
+}
+
+test fn range_with_an_empty_interval_is_empty_in_both_directions() {
+    expect(abiListLen(abiRange(5, 5, 1))).toBe(0)
+    expect(abiListLen(abiRange(0, 0, -1))).toBe(0)
+}
+
+test fn range_grows_across_many_elements() {
+    var l = abiRange(0, 50, 1)
+    expect(abiListLen(l)).toBe(50)
+    expect(at(l, 49)).toBe(49)
+    unsafe {
+        expect(l[4]).toBe(64)
+    }
+}
+
+test fn abi_entry_point_builds_a_usable_list() {
+    var l = abiListNew(0)
+    abiListPush(l, abiBoxI64(1234))
+    expect(abiListLen(l)).toBe(1)
+    expect(at(l, 0)).toBe(1234)
+}

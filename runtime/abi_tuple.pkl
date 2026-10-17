@@ -1,0 +1,112 @@
+module runtime.abi_tuple
+
+/// Sovereign tuple ABI bodies, ported from `runtime/src/tuple.rs`.
+///
+/// Companion to `runtime.abi_list` and `runtime.abi_box`. A tuple is the simplest
+/// managed aggregate in the runtime: a header, an explicit element count, then the
+/// payload fields, so there is no table, no hashing and no growth to reproduce.
+///
+/// Layout is `runtime.layout`, mirroring `runtime/src/layout.rs`:
+///   - 24-byte header at words 0/1/2 (`next`, `class_id`/`flags`, `size`)
+///   - the element count (`usize`) at word 3, `TUPLE_LEN_OFF`
+///   - the payload fields from word 4, `TUPLE_FIELDS_OFF`
+///   - `tuple_object_size(n)` = 32 + n*8 bytes, so `4 + n` words in all
+///
+/// The count is stored explicitly rather than derived from the size because the
+/// allocator's 32-byte minimum makes a size-derived count ambiguous for an empty
+/// tuple. That is the Rust comment verbatim, and it is why `abiTupleNew(0)` must report
+/// `len == 0` rather than falling out of the byte size.
+///
+/// Fields are managed references - boxed scalars or object pointers, exactly like list
+/// elements - so each store goes through the explicit `as int` cast that the
+/// `*T <-> int` raw-address cast makes legal (see PICKLE_AUDIT.md 17.1).
+///
+/// KNOWN LIMITATION - like the other ported aggregates, tuples come from `alloc`, which
+/// the GC does not track: correct, never reclaimed.
+///
+/// GAP - `tuple_set_field` asserts `index < len` and panics with
+/// "pickle: tuple field index out of bounds". Callers pass *constant* indices into a
+/// freshly constructed tuple of matching width, so a program cannot reach it, and the
+/// check is left out rather than turned into a silently ignored store. Porting it needs
+/// a callable panic primitive (Pickle source cannot declare an extern - see 18.0).
+
+import { PICKLE_CLASS_TUPLE } from runtime.object
+import { TUPLE_LEN_OFF, TUPLE_FIELDS_OFF, HEADER } from runtime.layout
+// The tuple payload comes from `alloc(int, n)`, so the raw-allocation slots
+// must travel with it. See `abi_raw.pkl`.
+import { abiRawAlloc, abiRegisterObject } from runtime.abi_raw
+
+/// Word index of the element count. `TUPLE_LEN_OFF` is a byte offset (24), so it has to
+/// be divided by the 8-byte word size to become a `*int` index.
+const LEN_WORD: int = TUPLE_LEN_OFF / 8
+/// Word index of payload field 0. `TUPLE_FIELDS_OFF` is a byte offset (32).
+const FIELDS_WORD: int = TUPLE_FIELDS_OFF / 8
+/// Bytes of header plus the count slot; every field adds 8.
+const TUPLE_BASE_BYTES: int = HEADER + 8
+
+/// The element count stored in a tuple object. Mirrors `layout::tuple_field_count`,
+/// which reads the explicit count rather than deriving it from the size.
+fn tupleFieldCount(obj: *int) -> int {
+    unsafe {
+        return obj[LEN_WORD]
+    }
+}
+
+/// Create a tuple object holding `fieldCount` null payload fields.
+/// Mirrors `tuple.rs::tuple_new` -> `tuple_init`: write the count, then zero every
+/// payload field so an uninitialised slot is never traced. `alloc` already returns zeroed
+/// memory, but the body writes the fields explicitly so it does not depend on that.
+fn tupleNew(fieldCount: int) -> *int {
+    unsafe {
+        var words = FIELDS_WORD + fieldCount
+        var obj = alloc(int, words)
+        obj[0] = 0
+        obj[1] = PICKLE_CLASS_TUPLE
+        obj[2] = TUPLE_BASE_BYTES + fieldCount * 8
+        obj[LEN_WORD] = fieldCount
+        var i = 0
+        while (i < fieldCount) {
+            obj[FIELDS_WORD + i] = 0
+            i = i + 1
+        }
+        abiRegisterObject(obj)
+        return obj
+    }
+}
+
+/// Create a tuple object with `field_count` null payload fields.
+/// Mirrors `pickle_tuple_new`.
+#[symbol("pickle_tuple_new")]
+fn abiTupleNew(fieldCount: int) -> *int {
+    return tupleNew(fieldCount)
+}
+
+/// The element count. Mirrors `pickle_tuple_len`.
+#[symbol("pickle_tuple_len")]
+fn abiTupleLen(obj: *int) -> int {
+    return tupleFieldCount(obj)
+}
+
+/// Write a payload field. Mirrors `pickle_tuple_set_field`; its bounds assert is the
+/// documented GAP above, since callers pass constant indices into a matching tuple.
+#[symbol("pickle_tuple_set_field")]
+fn abiTupleSetField(obj: *int, index: int, value: *int) {
+    unsafe {
+        if (index >= tupleFieldCount(obj)) {
+            return
+        }
+        obj[FIELDS_WORD + index] = value as int
+    }
+}
+
+/// A payload field; null when the index is out of bounds.
+/// Mirrors `pickle_tuple_field`, whose out-of-range result is the null pointer.
+#[symbol("pickle_tuple_field")]
+fn abiTupleField(obj: *int, index: int) -> *int {
+    unsafe {
+        if (index >= tupleFieldCount(obj)) {
+            return 0 as *int
+        }
+        return obj[FIELDS_WORD + index] as *int
+    }
+}

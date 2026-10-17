@@ -1,0 +1,424 @@
+module runtime.collector_test
+
+import { Collector } from runtime.collector
+
+test fn marks_reachable_graph() {
+    var c = Collector()
+    var a = c.alloc(64)
+    var b = c.alloc(64)
+    var kid = c.alloc(64)
+    c.addRoot(a)
+    c.addEdge(a, kid)
+    c.markFromRoots()
+    expect(c.marked(a)).toBe(true)
+    expect(c.marked(kid)).toBe(true)
+    expect(c.marked(b)).toBe(false)
+}
+
+test fn collect_keeps_reachable_and_frees_the_rest() {
+    var c = Collector()
+    var a = c.alloc(64)
+    var b = c.alloc(64)
+    var kid = c.alloc(64)
+    c.addRoot(a)
+    c.addEdge(a, kid)
+    var runs = c.collect()
+    expect(runs).toBe(1)
+    expect(c.liveBytes).toBe(128)
+    expect(c.freeHeadOf(1)).toBe(b)
+    expect(c.marked(a)).toBe(false)
+    expect(c.marked(kid)).toBe(false)
+}
+
+test fn manual_objects_survive_until_released() {
+    var c = Collector()
+    var a = c.alloc(64)
+    c.addRoot(a)
+    var m = c.alloc(64)
+    c.adoptManual(m)
+    c.collect()
+    expect(c.freeHeadOf(1)).toBe(-1)
+    c.releaseManual(m)
+    var runs = c.collect()
+    expect(runs).toBe(1)
+    expect(c.freeHeadOf(1)).toBe(m)
+}
+
+test fn finalizer_runs_once_for_a_dead_object() {
+    var c = Collector()
+    var a = c.alloc(32)
+    c.addRoot(a)
+    var dead = c.alloc(32)
+    c.setFinalizable(dead)
+    var runs = c.collect()
+    expect(runs).toBe(0)
+    var f = c.finalized()
+    expect(len(f)).toBe(1)
+    expect(f[0]).toBe(dead)
+    expect(c.freeHeadOf(0)).toBe(dead)
+    c.collect()
+    expect(len(c.finalized())).toBe(1)
+}
+
+test fn rooted_finalizable_object_is_not_finalized() {
+    var c = Collector()
+    var a = c.alloc(32)
+    c.addRoot(a)
+    c.setFinalizable(a)
+    c.collect()
+    expect(len(c.finalized())).toBe(0)
+    expect(c.liveBytes).toBe(32)
+    expect(c.freeHeadOf(0)).toBe(-1)
+}
+
+test fn deferred_block_is_reused_by_a_later_alloc() {
+    var c = Collector()
+    var dead = c.alloc(32)
+    c.setFinalizable(dead)
+    c.collect()
+    expect(c.freeHeadOf(0)).toBe(dead)
+    var reused = c.alloc(32)
+    expect(reused).toBe(dead)
+    c.setFinalizable(reused)
+    c.collect()
+    expect(len(c.finalized())).toBe(2)
+}
+
+test fn dropping_the_root_reclaims_the_object() {
+    var c = Collector()
+    var a = c.alloc(64)
+    c.addRoot(a)
+    c.collect()
+    c.dropRoot(a)
+    c.collect()
+    expect(c.liveBytes).toBe(0)
+    expect(c.freeHeadOf(1)).toBe(a)
+}
+
+test fn temp_roots_live_for_exactly_one_cycle() {
+    var c = Collector()
+    var a = c.alloc(64)
+    c.addTempRoot(a)
+    c.collect()
+    expect(c.liveBytes).toBe(64)
+    expect(c.freeHeadOf(1)).toBe(-1)
+    c.collect()
+    expect(c.liveBytes).toBe(0)
+    expect(c.freeHeadOf(1)).toBe(a)
+}
+
+test fn a_chain_of_edges_keeps_all_links_alive() {
+    var c = Collector()
+    var n1 = c.alloc(64)
+    var n2 = c.alloc(64)
+    var n3 = c.alloc(64)
+    var n4 = c.alloc(64)
+    c.addRoot(n1)
+    c.addEdge(n1, n2)
+    c.addEdge(n2, n3)
+    c.collect()
+    expect(c.liveBytes).toBe(192)
+    expect(c.freeHeadOf(1)).toBe(n4)
+}
+
+test fn collect_counts_collection_cycles() {
+    var c = Collector()
+    expect(c.collections).toBe(0)
+    c.collect()
+    c.collect()
+    expect(c.collections).toBe(2)
+}
+
+test fn contiguous_dead_spans_merge_into_one_run() {
+    var c = Collector()
+    c.alloc(64)
+    c.alloc(64)
+    c.alloc(64)
+    var a = c.alloc(32)
+    c.addRoot(a)
+    var runs = c.collect()
+    expect(runs).toBe(1)
+    expect(c.freeHeadOf(3)).toBe(0)
+}
+
+// ---- real-layout path: the mark walk reads the object's own words ----
+
+test fn a_real_object_is_traced_through_its_own_layout() {
+    // No addEdge anywhere: the field pointer lives in the heap span, so this can
+    // only pass if the collector reads the real header and the managed mask.
+    var c = Collector()
+    var parent = c.newUserObject(2)
+    var kid = c.newUserObject(1)
+    c.setField(parent, 0, kid)
+    c.addRoot(parent)
+    c.markFromRoots()
+    expect(c.marked(parent)).toBe(true)
+    expect(c.marked(kid)).toBe(true)
+}
+
+test fn a_real_object_with_no_root_is_not_marked() {
+    var c = Collector()
+    var parent = c.newUserObject(1)
+    var kid = c.newUserObject(1)
+    c.setField(parent, 0, kid)
+    c.markFromRoots()
+    expect(c.marked(parent)).toBe(false)
+    expect(c.marked(kid)).toBe(false)
+}
+
+test fn a_real_field_left_null_does_not_mark_anything() {
+    var c = Collector()
+    var parent = c.newUserObject(3)
+    c.addRoot(parent)
+    c.markFromRoots()
+    expect(c.marked(parent)).toBe(true)
+    expect(len(c.allMarked())).toBe(1)
+}
+
+test fn a_real_chain_keeps_every_link_alive_through_collect() {
+    var c = Collector()
+    var a = c.newUserObject(1)
+    var b = c.newUserObject(1)
+    var d = c.newUserObject(1)
+    var dead = c.newUserObject(1)
+    c.setField(a, 0, b)
+    c.setField(b, 0, d)
+    c.addRoot(a)
+    c.collect()
+    expect(c.liveBytes).toBe(3 * (24 + 8))
+    expect(c.isReachable(d)).toBe(true)
+    expect(c.isReachable(dead)).toBe(false)
+}
+
+test fn a_cyclic_real_graph_terminates_and_keeps_both_live() {
+    var c = Collector()
+    var a = c.newUserObject(1)
+    var b = c.newUserObject(1)
+    c.setField(a, 0, b)
+    c.setField(b, 0, a)
+    c.addRoot(a)
+    c.markFromRoots()
+    expect(len(c.allMarked())).toBe(2)
+}
+
+test fn a_real_object_beyond_64_slots_marks_its_last_field() {
+    // The wide-mask case, on the collector's own heap: 86 fields means a 3-word
+    // managed mask, and the live pointer sits in the LAST field. A walk that
+    // handled only the first chunk would free it.
+    var c = Collector()
+    var parent = c.newUserObject(86)
+    var tail = c.newUserObject(1)
+    c.setField(parent, 85, tail)
+    c.addRoot(parent)
+    c.markFromRoots()
+    expect(c.marked(tail)).toBe(true)
+}
+
+test fn a_reused_span_does_not_serve_a_stale_pointer() {
+    // A freed real object keeps its old field pointer in the span's words. When
+    // that span is handed back out, `Memory.record` must have zeroed it, or the
+    // new occupant would inherit a live-looking reference to freed memory.
+    var c = Collector()
+    var first = c.newUserObject(1)
+    var target = c.newUserObject(1)
+    c.setField(first, 0, target)
+    c.addRoot(first)
+    c.dropRoot(first)
+    c.collect()
+    // `first` is free now; allocate the same size to reclaim the span.
+    var second = c.alloc(32)
+    expect(second).toBe(first)
+    expect(c.field(second, 0)).toBe(0)
+}
+
+test fn a_real_and_a_modeled_object_can_be_mixed_in_one_graph() {
+    // `addEdge` still works for any object, real or not — it is an additional
+    // edge source, not the only one. A raw span has no class header, so the
+    // modeled walk is how it gets traversed.
+    var c = Collector()
+    var real = c.newUserObject(1)
+    var leaf = c.newUserObject(1)
+    var modeled = c.alloc(64)
+    var modeledKid = c.alloc(64)
+    c.setField(real, 0, leaf)
+    c.addEdge(modeled, modeledKid)
+    c.addRoot(real)
+    c.addEdge(real, modeled)
+    c.markFromRoots()
+    expect(c.marked(leaf)).toBe(true)
+    expect(c.marked(modeled)).toBe(true)
+    expect(c.marked(modeledKid)).toBe(true)
+}
+
+// ---- builtin containers: real payload views, no addEdge ----
+
+test fn a_list_traces_its_elements_from_its_own_header() {
+    var c = Collector()
+    var a = c.newUserObject(1)
+    var b = c.newUserObject(1)
+    var d = c.newUserObject(1)
+    var dead = c.newUserObject(1)
+    var xs = c.newList(3, 4)
+    c.listPush(xs, a)
+    c.listPush(xs, b)
+    c.listPush(xs, d)
+    c.setField(a, 0, xs)
+    c.addRoot(a)
+    c.markFromRoots()
+    expect(c.marked(xs)).toBe(true)
+    expect(c.marked(b)).toBe(true)
+    expect(c.marked(d)).toBe(true)
+    expect(c.marked(dead)).toBe(false)
+}
+
+test fn a_list_only_traces_up_to_its_length() {
+    // Elements past `len` live in the array but are not part of the list, so
+    // they must stay unmarked.
+    var c = Collector()
+    var xs = c.newList(1, 4)
+    var inRange = c.newUserObject(1)
+    var beyond = c.newUserObject(1)
+    var data = c.mem.word(xs, 5)
+    c.mem.setWord(data, 0, inRange)
+    c.mem.setWord(data, 1, beyond)
+    c.addRoot(xs)
+    c.markFromRoots()
+    expect(c.marked(inRange)).toBe(true)
+    expect(c.marked(beyond)).toBe(false)
+}
+
+test fn a_list_push_grows_the_element_array_by_doubling() {
+    var c = Collector()
+    var xs = c.newList(0, 0)
+    var i = 0
+    while (i < 9) {
+        c.listPush(xs, c.newUserObject(1))
+        i = i + 1
+    }
+    // Word 3 = len, word 4 = cap, word 5 = data.
+    expect(c.mem.word(xs, 3)).toBe(9)
+    expect(c.mem.word(xs, 4)).toBe(16)
+    expect(c.listGet(xs, 0)).toBeTruthy()
+    expect(c.listGet(xs, 9)).toBe(0)
+}
+
+test fn a_list_get_is_bounds_checked() {
+    var c = Collector()
+    var xs = c.newList(0, 4)
+    c.listPush(xs, c.newUserObject(1))
+    expect(c.listGet(xs, 0)).toBeTruthy()
+    expect(c.listGet(xs, 1)).toBe(0)
+    expect(c.listGet(xs, -1)).toBe(0)
+}
+
+test fn a_list_of_strings_does_not_trace_its_byte_span() {
+    var c = Collector()
+    var xs = c.newList(1, 1)
+    var s = c.newString(4)
+    c.listPush(xs, s)
+    c.addRoot(xs)
+    c.markFromRoots()
+    // The string is live...
+    expect(c.marked(s)).toBe(true)
+    // ...and reading its length word marked nothing else.
+    expect(len(c.allMarked())).toBe(2)
+}
+
+test fn a_map_traces_keys_and_values_across_its_whole_table() {
+    var c = Collector()
+    var m = c.newMap(4)
+    var k1 = c.newUserObject(1)
+    var v1 = c.newUserObject(1)
+    var k2 = c.newUserObject(1)
+    var v2 = c.newUserObject(1)
+    var k3 = c.newUserObject(1)
+    var v3 = c.newUserObject(1)
+    c.mapPut(m, 0, k1, v1)
+    c.mapPut(m, 2, k2, v2)
+    c.mapPut(m, 3, k3, v3)
+    c.addRoot(m)
+    c.markFromRoots()
+    expect(c.marked(k1)).toBe(true)
+    expect(c.marked(v1)).toBe(true)
+    expect(c.marked(k2)).toBe(true)
+    expect(c.marked(v2)).toBe(true)
+    expect(c.marked(k3)).toBe(true)
+    expect(c.marked(v3)).toBe(true)
+}
+
+test fn a_map_skips_its_empty_slot_and_both_sentinels() {
+    // Slot 1 is left empty, slot 0 holds the NIL sentinel. Neither is a real
+    // object: dereferencing one would be undefined.
+    var c = Collector()
+    var m = c.newMap(4)
+    var real = c.newUserObject(1)
+    c.mapPut(m, 0, -1, real)
+    c.addRoot(m)
+    c.markFromRoots()
+    expect(c.marked(real)).toBe(true)
+    expect(len(c.allMarked())).toBe(2)
+}
+
+test fn a_tuple_traces_every_field() {
+    var c = Collector()
+    var a = c.newUserObject(1)
+    var b = c.newUserObject(1)
+    var t = c.newTuple(2)
+    c.tupleSet(t, 0, a)
+    c.tupleSet(t, 1, b)
+    c.addRoot(t)
+    c.markFromRoots()
+    expect(c.marked(a)).toBe(true)
+    expect(c.marked(b)).toBe(true)
+}
+
+test fn an_enum_does_not_trace_its_tag_but_traces_its_fields() {
+    // Payload slot 0 is the unmanaged tag. Chasing it would dereference a small
+    // integer as if it were an object pointer.
+    var c = Collector()
+    var payload = c.newUserObject(1)
+    var en = c.newEnum(1, 7)
+    c.enumSet(en, 0, payload)
+    c.addRoot(en)
+    c.markFromRoots()
+    expect(c.marked(payload)).toBe(true)
+    expect(len(c.allMarked())).toBe(2)
+}
+
+test fn a_stream_does_not_trace_its_raw_inner_pointer() {
+    var c = Collector()
+    var s = c.newStream(12345)
+    c.addRoot(s)
+    c.markFromRoots()
+    expect(len(c.allMarked())).toBe(1)
+}
+
+test fn a_builtin_cycle_terminates() {
+    // list -> user -> list. Mark-on-push is what makes the walk terminate.
+    var c = Collector()
+    var xs = c.newList(1, 1)
+    var holder = c.newUserObject(1)
+    c.listPush(xs, holder)
+    c.setField(holder, 0, xs)
+    c.addRoot(xs)
+    c.markFromRoots()
+    expect(len(c.allMarked())).toBe(2)
+}
+
+test fn a_whole_builtin_graph_survives_collect_without_any_addedge() {
+    var c = Collector()
+    var xs = c.newList(2, 2)
+    var m = c.newMap(2)
+    var t = c.newTuple(2)
+    var leaf = c.newUserObject(1)
+    c.mapPut(m, 0, leaf, xs)
+    c.tupleSet(t, 0, m)
+    c.tupleSet(t, 1, leaf)
+    c.listPush(xs, t)
+    c.listPush(xs, leaf)
+    c.addRoot(xs)
+    c.collect()
+    // xs + 2 elements + map + tuple + leaf
+    expect(len(c.allMarked())).toBe(0)
+    expect(c.liveBytes).toBeGreaterThan(0)
+}

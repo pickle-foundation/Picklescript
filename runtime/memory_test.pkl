@@ -1,0 +1,180 @@
+module runtime.memory_test
+
+import { Memory, MIN_OBJECT, NBINS, INITIAL_CAP, SPLIT_MIN, INVALID_ADDR, align8, binOf } from runtime.memory
+
+test fn bin_mapping() {
+    expect(binOf(32)).toBe(0)
+    expect(binOf(33)).toBe(1)
+    expect(binOf(64)).toBe(1)
+    expect(binOf(4096)).toBe(7)
+    expect(binOf(2097152)).toBe(16)
+    expect(binOf(8589934592)).toBe(NBINS - 1)
+}
+
+test fn align8_rounds_up() {
+    expect(align8(32)).toBe(32)
+    expect(align8(33)).toBe(40)
+    expect(align8(48)).toBe(48)
+    expect(align8(0)).toBe(0)
+}
+
+test fn constants() {
+    expect(MIN_OBJECT).toBe(32)
+    expect(SPLIT_MIN).toBe(32)
+    expect(INITIAL_CAP).toBe(1048576)
+    expect(NBINS).toBe(28)
+}
+
+test fn first_alloc_bumps_from_zero() {
+    var m = Memory()
+    expect(m.alloc(48)).toBe(0)
+    expect(m.freeHeadOf(0)).toBe(INVALID_ADDR)
+}
+
+test fn alloc_floors_and_aligns_the_request() {
+    var m = Memory()
+    expect(m.alloc(4)).toBe(0)
+    expect(m.alloc(33)).toBe(32)
+}
+
+test fn bump_allocations_are_contiguous() {
+    var m = Memory()
+    expect(m.alloc(48)).toBe(0)
+    expect(m.alloc(48)).toBe(48)
+    expect(m.alloc(32)).toBe(96)
+}
+
+test fn bump_grows_a_fresh_segment() {
+    var m = Memory()
+    var big = m.alloc(2097152)
+    expect(big).toBe(INITIAL_CAP)
+    expect(m.alloc(48)).toBe(INITIAL_CAP + 2097152)
+}
+
+test fn free_reuse_returns_the_swept_block() {
+    var m = Memory()
+    var a = m.alloc(64)
+    var b = m.alloc(64)
+    m.mark(a)
+    expect(m.sweep()).toBe(1)
+    expect(m.alloc(64)).toBe(b)
+    expect(m.alloc(64)).toBe(128)
+}
+
+test fn sweep_coalesces_contiguous_dead_objects() {
+    var m = Memory()
+    m.alloc(32)
+    m.alloc(32)
+    expect(m.sweep()).toBe(1)
+    expect(m.freeHeadOf(1)).toBe(0)
+    expect(m.alloc(32)).toBe(0)
+    expect(m.alloc(32)).toBe(32)
+}
+
+test fn sweep_keeps_marked_objects_between_dead_runs() {
+    var m = Memory()
+    m.alloc(32)
+    m.mark(m.alloc(32))
+    m.alloc(32)
+    expect(m.sweep()).toBe(2)
+    expect(m.alloc(32)).toBe(64)
+    expect(m.alloc(32)).toBe(0)
+}
+
+test fn sweep_skips_already_free_spans() {
+    var m = Memory()
+    var a = m.alloc(64)
+    var b = m.alloc(64)
+    m.mark(a)
+    expect(m.sweep()).toBe(1)
+    expect(m.sweep()).toBe(1)
+    expect(m.alloc(64)).toBe(a)
+    expect(m.alloc(64)).toBe(b)
+}
+
+test fn triage_skips_unsplittable_span_and_uses_exact_fit() {
+    var m = Memory()
+    var a = m.alloc(64)
+    var b = m.alloc(64)
+    m.mark(a)
+    m.sweep()
+    expect(m.alloc(48)).toBe(128)
+    expect(m.alloc(64)).toBe(b)
+}
+
+test fn triage_splits_a_large_span_with_header_sized_leftover() {
+    var m = Memory()
+    var a = m.alloc(128)
+    m.alloc(128)
+    m.mark(a)
+    m.sweep()
+    expect(m.alloc(48)).toBe(128)
+    expect(m.alloc(32)).toBe(176)
+    expect(m.alloc(48)).toBe(208)
+}
+
+// ---- raw span words: the collector's real-layout path ----
+
+test fn span_words_start_zeroed_and_read_back() {
+    var m = Memory()
+    var a = m.alloc(64)
+    expect(m.wordCount(a)).toBe(8)
+    expect(m.word(a, 0)).toBe(0)
+    m.setWord(a, 0, 0x11223344)
+    expect(m.word(a, 0)).toBe(0x11223344)
+}
+
+test fn reading_past_the_end_of_a_span_returns_zero() {
+    // Mirrors `TraceHeap.word`: a malformed object must stay inert rather than
+    // read a neighbouring span's words.
+    var m = Memory()
+    var a = m.alloc(32)
+    expect(m.wordCount(a)).toBe(4)
+    expect(m.word(a, 4)).toBe(0)
+    expect(m.word(a, 999)).toBe(0)
+}
+
+test fn out_of_range_word_writes_are_dropped() {
+    // A bad offset must not corrupt the heap or grow the span.
+    var m = Memory()
+    var a = m.alloc(32)
+    m.setWord(a, 99, 7)
+    expect(m.word(a, 99)).toBe(0)
+    expect(m.wordCount(a)).toBe(4)
+}
+
+test fn negative_word_indices_are_ignored() {
+    var m = Memory()
+    var a = m.alloc(32)
+    m.setWord(a, -1, 7)
+    expect(m.word(a, -1)).toBe(0)
+}
+
+test fn a_recycled_span_is_zeroed_before_reuse() {
+    // The critical safety property: a freed span's words must not survive into
+    // the next occupant, or the new object inherits a live-looking pointer.
+    var m = Memory()
+    var a = m.alloc(64)
+    m.setWord(a, 0, 0xDEAD)
+    m.setWord(a, 3, 0xBEEF)
+    m.pushFree(a, 64)
+    var again = m.alloc(64)
+    expect(again).toBe(a)
+    expect(m.word(a, 0)).toBe(0)
+    expect(m.word(a, 3)).toBe(0)
+}
+
+test fn a_split_tail_is_zeroed_too() {
+    // Splitting hands out a tail span; it must start clean, not carry the
+    // parent's bytes.
+    var m = Memory()
+    var big = m.alloc(128)
+    m.setWord(big, 0, 0x1234)
+    m.setWord(big, 12, 0x5678)
+    m.pushFree(big, 128)
+    var head = m.alloc(64)
+    expect(head).toBe(big)
+    var tail = m.alloc(32)
+    expect(m.word(tail, 0)).toBe(0)
+    expect(m.word(tail, 5)).toBe(0)
+}

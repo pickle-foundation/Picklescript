@@ -1,0 +1,125 @@
+module runtime.exception_test
+
+/// Port of the `#[cfg(test)] mod tests` in `runtime/src/exception.rs`.
+
+import { ExceptionState, NO_PAYLOAD, publish, isPending, take } from runtime.exception
+import { clear, takeEscaped, reset, describe, intToString } from runtime.exception
+
+test fn publish_then_take_round_trips() {
+    let st = ExceptionState()
+    publish(st, 1)
+    expect(isPending(st)).toBe(true)
+    expect(take(st)).toBe(1)
+    expect(isPending(st)).toBe(false)
+    expect(take(st)).toBe(NO_PAYLOAD)
+}
+
+test fn take_clears_the_flag() {
+    let st = ExceptionState()
+    publish(st, 7)
+    let _ = take(st)
+    expect(isPending(st)).toBe(false)
+    expect(take(st)).toBe(NO_PAYLOAD)
+}
+
+test fn a_payload_is_readable_until_it_is_taken() {
+    // The native runtime roots the in-flight payload through the collector's
+    // temp roots, because every frame that referenced it has returned. Here the
+    // state object holds it, so the equivalent property is that the payload
+    // survives until `take` rather than being cleared by publishing.
+    let st = ExceptionState()
+    publish(st, 42)
+    expect(st.payload).toBe(42)
+    let _ = take(st)
+    expect(st.payload).toBe(NO_PAYLOAD)
+}
+
+test fn clear_reports_whether_a_throw_was_in_flight() {
+    let st = ExceptionState()
+    expect(clear(st)).toBe(false)
+    publish(st, 5)
+    expect(clear(st)).toBe(true)
+    expect(isPending(st)).toBe(false)
+    expect(take(st)).toBe(NO_PAYLOAD)
+}
+
+test fn an_absent_payload_is_still_a_throw() {
+    let st = ExceptionState()
+    publish(st, NO_PAYLOAD)
+    expect(isPending(st)).toBe(true)
+    expect(take(st)).toBe(NO_PAYLOAD)
+    expect(isPending(st)).toBe(false)
+}
+
+test fn publishing_twice_keeps_the_last_payload() {
+    // Matches the native ABI: the newer exception is the one that reaches the
+    // handler, and the superseded payload stops being reachable.
+    let st = ExceptionState()
+    publish(st, 1)
+    publish(st, 2)
+    expect(take(st)).toBe(2)
+    expect(isPending(st)).toBe(false)
+}
+
+test fn escaped_throw_is_reported_once() {
+    let st = ExceptionState()
+    expect(takeEscaped(st)).toBe(NO_PAYLOAD)
+    publish(st, 9)
+    expect(takeEscaped(st)).toBe(9)
+    expect(takeEscaped(st)).toBe(NO_PAYLOAD)
+}
+
+test fn reset_forgets_an_in_flight_throw() {
+    let st = ExceptionState()
+    publish(st, 3)
+    reset(st)
+    expect(isPending(st)).toBe(false)
+    expect(st.payload).toBe(NO_PAYLOAD)
+}
+
+test fn a_fresh_state_starts_clean() {
+    let st = ExceptionState()
+    expect(isPending(st)).toBe(false)
+    expect(take(st)).toBe(NO_PAYLOAD)
+}
+
+test fn clear_leaves_an_unrelated_state_alone() {
+    // `clear` must only touch the state it is handed; two concurrent throws in
+    // one runtime are separate owners.
+    let a = ExceptionState()
+    let b = ExceptionState()
+    publish(a, 11)
+    expect(clear(b)).toBe(false)
+    expect(isPending(a)).toBe(true)
+    expect(take(a)).toBe(11)
+}
+
+test fn describe_renders_a_payload() {
+    expect(describe(123)).toBe("uncaught exception 123")
+}
+
+test fn describe_renders_a_negative_payload() {
+    expect(describe(-45)).toBe("uncaught exception -45")
+}
+
+test fn describe_handles_an_absent_payload() {
+    expect(describe(NO_PAYLOAD)).toBe("uncaught exception")
+}
+
+test fn int_to_string_renders_zero() {
+    expect(intToString(0)).toBe("0")
+}
+
+test fn int_to_string_renders_single_digits() {
+    expect(intToString(7)).toBe("7")
+}
+
+test fn int_to_string_renders_every_digit() {
+    expect(intToString(102)).toBe("102")
+    expect(intToString(987654321)).toBe("987654321")
+}
+
+test fn int_to_string_renders_negatives() {
+    expect(intToString(-1)).toBe("-1")
+    expect(intToString(-2048)).toBe("-2048")
+}

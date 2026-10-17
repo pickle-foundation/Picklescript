@@ -1,0 +1,190 @@
+module runtime.gc_test
+
+import { GcStats, GC_DEFAULT_THRESHOLD, shouldAutoCollect, ModeledGc, NativeGc, collectNow, HeapWatch } from runtime.gc
+
+/// A spy that records the calls `collectNow` dispatches, so the seam is proven
+/// to route to the injected implementation rather than to a fixed one.
+class SpyGc implements Gc {
+    var calls: int
+    var lastForce: bool
+
+    constructor() {
+        this.calls = 0
+        this.lastForce = false
+    }
+
+    fn collect(force: bool) {
+        this.calls = this.calls + 1
+        this.lastForce = force
+    }
+}
+
+fn freshStats() -> GcStats {
+    GcStats()
+}
+
+test fn default_threshold_is_8mib() {
+    expect(GC_DEFAULT_THRESHOLD).toBe(8388608)
+    expect(GC_DEFAULT_THRESHOLD).toBe(8 * 1024 * 1024)
+}
+
+test fn fresh_stats_are_zeroed_with_default_threshold() {
+    var s = freshStats()
+    expect(s.collections).toBe(0)
+    expect(s.allocationsSinceGc).toBe(0)
+    expect(s.autoCollectThreshold).toBe(8388608)
+}
+
+test fn allocations_and_collections_track() {
+    var s = freshStats()
+    s.allocation()
+    s.allocation()
+    s.allocation()
+    expect(s.allocationsSinceGc).toBe(3)
+    expect(s.collections).toBe(0)
+    s.collect()
+    expect(s.collections).toBe(1)
+    expect(s.allocationsSinceGc).toBe(0)
+    s.allocation()
+    expect(s.allocationsSinceGc).toBe(1)
+    expect(s.collections).toBe(1)
+}
+
+test fn threshold_updates_and_reset_restores_default() {
+    var s = freshStats()
+    s.setThreshold(4096)
+    expect(s.autoCollectThreshold).toBe(4096)
+    s.collect()
+    s.allocation()
+    s.reset()
+    expect(s.autoCollectThreshold).toBe(8388608)
+    expect(s.collections).toBe(0)
+    expect(s.allocationsSinceGc).toBe(0)
+}
+
+test fn auto_collect_fires_at_and_above_threshold() {
+    expect(shouldAutoCollect(8388607, 8388608)).toBe(false)
+    expect(shouldAutoCollect(8388608, 8388608)).toBe(true)
+    expect(shouldAutoCollect(8388609, 8388608)).toBe(true)
+    expect(shouldAutoCollect(0, 1024)).toBe(false)
+    expect(shouldAutoCollect(1023, 1024)).toBe(false)
+    expect(shouldAutoCollect(1024, 1024)).toBe(true)
+    expect(shouldAutoCollect(5000, 1000)).toBe(true)
+}
+
+test fn modeled_seam_records_against_the_observable_contract() {
+    var gc = ModeledGc()
+    collectNow(gc, true)
+    collectNow(gc, false)
+    expect(gc.stats.collections).toBe(2)
+    expect(gc.stats.allocationsSinceGc).toBe(0)
+    expect(gc.forced).toBe(1)
+}
+
+test fn collect_now_dispatches_to_the_injected_implementation() {
+    var spy = SpyGc()
+    collectNow(spy, true)
+    expect(spy.calls).toBe(1)
+    expect(spy.lastForce).toBe(true)
+    collectNow(spy, false)
+    expect(spy.calls).toBe(2)
+    expect(spy.lastForce).toBe(false)
+}
+
+test fn native_seam_drives_the_live_collector_and_survives_the_call() {
+    // A real collection runs here, with the live heap in play: the object
+    // graph below is live at the collection and must still be walkable after.
+    var gc = NativeGc()
+    var keep = [1, 2, 3]
+    collectNow(gc, true)
+    expect(gc.collections).toBe(1)
+    expect(len(keep)).toBe(3)
+    expect(keep[2]).toBe(3)
+    collectNow(gc, false)
+    expect(gc.collections).toBe(2)
+    expect(keep[0]).toBe(1)
+}
+test fn heap_watch_reads_real_bytes_from_the_live_collector() {
+    // HeapWatch observes the LIVE collector, not a mirror: the bytes it reports
+    // come from `pickle_gc_bytes_since_gc` via `gcBytesSinceGc`.
+    var w = HeapWatch()
+    gcCollect(true)
+    let fresh = w.bytesSinceGc()
+    expect(fresh).toBeLessThan(w.threshold)
+    // Real allocations must move the byte counter. `fresh` must be captured
+    // BEFORE allocating, since the allocation itself would change it.
+    let keeper = [0]
+    var i = 0
+    while (i < 64) {
+        keeper.push(i)
+        i = i + 1
+    }
+    expect(w.bytesSinceGc()).toBeGreaterThan(fresh)
+}
+
+test fn heap_watch_threshold_is_honoured_by_the_live_trigger() {
+    var w = HeapWatch()
+    w.setThreshold(4096)
+    expect(w.threshold).toBe(4096)
+    // Immediately after a full collection nothing is due, and collectIfDue is
+    // a no-op rather than a spurious collection.
+    gcCollect(true)
+    expect(w.isDue()).toBe(false)
+    expect(w.collectIfDue()).toBe(false)
+    // The byte counter counts MANAGED object allocations (strings/classes/
+    // lists); a v1 list keeps its elements in a raw slab that is NOT counted.
+    // A crossing must therefore allocate managed objects, not ints.
+    let before = w.bytesSinceGc()
+    let keeper = ["seed"]
+    var i = 0
+    while (i < 300) {
+        keeper.push("x" + str(i))
+        i = i + 1
+    }
+    expect(w.bytesSinceGc()).toBeGreaterThan(before)
+    expect(w.bytesSinceGc()).toBeLessThan(64 * 1024)
+    // The crossing keeper survived whatever the live collector did.
+    expect(len(keeper)).toBe(301)
+    expect(keeper[300]).toBe("x299")
+    // Whether the trigger auto-fired DURING the crossing depends on the host
+    // environment (auto-gc is pinned off under the battery), but a manual
+    // full collection always resets the byte counter back under the threshold.
+    gcCollect(true)
+    expect(w.bytesSinceGc()).toBeLessThan(4096)
+    expect(w.isDue()).toBe(false)
+    expect(w.collectIfDue()).toBe(false)
+}
+
+test fn heap_watch_reports_collection_count_and_resets() {
+    var w = HeapWatch()
+    let before = w.collectionCount()
+    gcCollect(true)
+    expect(w.collectionCount()).toBeGreaterThan(before)
+    w.setThreshold(GC_DEFAULT_THRESHOLD * 2)
+    expect(w.threshold).toBe(GC_DEFAULT_THRESHOLD * 2)
+    w.reset()
+    expect(w.threshold).toBe(GC_DEFAULT_THRESHOLD)
+    expect(w.collections).toBe(0)
+}
+
+test fn allocations_since_gc_is_a_count_not_the_byte_total() {
+    // Guards the distinction that made the first cut of this seam wrong:
+    // `maybe_collect` compares BYTES_SINCE_GC, so the allocation COUNT must
+    // never be used as the trigger quantity.
+    var w = HeapWatch()
+    gcCollect(true)
+    let bytes0 = w.bytesSinceGc()
+    let allocs0 = w.allocationsSinceGc()
+    let keeper = [0]
+    var i = 0
+    while (i < 32) {
+        keeper.push(i)
+        i = i + 1
+    }
+    let bytes1 = w.bytesSinceGc()
+    let allocs1 = w.allocationsSinceGc()
+    expect(allocs1 - allocs0).toBeGreaterThan(0)
+    // 32 ints are far more bytes than allocations; equating them is the bug.
+    expect(bytes1 - bytes0).toBeGreaterThan(allocs1 - allocs0)
+}
+

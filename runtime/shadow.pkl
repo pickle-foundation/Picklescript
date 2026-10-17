@@ -1,0 +1,333 @@
+module runtime.shadow
+
+/// Port of `runtime/src/shadow.rs`: the shadow-stack protocol.
+/// Compiled functions own a fixed-size slot frame; the prologue pushes it,
+/// spills every live managed pointer into its slot around each safepoint, and
+/// the epilogue pops it. The collector treats every registered thread's frame
+/// slots as roots (`runtime.trace` walks them).
+///
+/// The frames are REAL memory: a frame is one `alloc(int, n)` block held as a
+/// `*int` and read/written through `unsafe`, the same raw-composition risk
+/// check `arena.pkl::RawChunk` clears for the bump allocator. That makes the
+/// layout load-bearing rather than asserted: if the 16-byte header or the
+/// `16 + 8*i` slot stride were wrong, the raw-composition tests fail instead of
+/// the port agreeing with itself.
+///
+/// Two things stay modeled. The THREAD REGISTRY: a native intrusive list of
+/// `GcThread` nodes chained by `next`, plus a thread-local handle — the port
+/// keeps a `List<GcThread>` in prepend order and an optional `current` handle,
+/// which preserves every observable the tracer depends on (LIFO frame stack,
+/// ids from 1 with 0 meaning "unregistered", the all-threads walk). And the
+/// `prev` link between frames, which is a `*mut ShadowFrame` natively: Pickle
+/// has no pointer-to-integer cast, so a frame carries a modeled integer `id`
+/// and `prev` holds that id (0 for none). The same int-addressed modeling
+/// convention `collector.pkl` uses for heap addresses.
+///
+/// The native `REGISTRY` mutex serializes mutation against the collector's
+/// walk. There is nothing to port in a single-threaded model, so what is
+/// preserved is the *scope* discipline instead: every registry and frame
+/// mutation goes through this module's methods, which is exactly the surface
+/// the lock protects.
+
+/// Header: `prev` (8) + `slot_count` (4) + `_pad` (4) = 16 bytes.
+const FRAME_HEADER_BYTES: int = 16
+
+/// The header in 8-byte words: slot 0 is `prev`, slot 1 packs
+/// `slot_count`/`_pad`, and the managed slots follow inline.
+const FRAME_HEADER_SLOTS: int = 2
+const FRAME_PREV_SLOT: int = 0
+const FRAME_COUNT_SLOT: int = 1
+const FRAME_FIRST_SLOT: int = 2
+
+/// Byte offset of slot `index`: the native `ShadowFrame::slots_ptr().add(index)`.
+fn frameSlotOffset(index: int) -> int {
+    FRAME_HEADER_BYTES + 8 * index
+}
+
+/// Bytes a frame with `slotCount` slots occupies.
+fn frameBytes(slotCount: int) -> int {
+    FRAME_HEADER_BYTES + 8 * slotCount
+}
+
+/// One shadow frame over a real allocation, addressed by a modeled id.
+/// `id` is what the `prev` header word records; `p` is the real backing block.
+class ShadowFrame {
+    var id: int
+    var p: *int
+    var slotCount: int
+
+    constructor(id: int, p: *int, slotCount: int) {
+        this.id = id
+        this.p = p
+        this.slotCount = slotCount
+    }
+
+    /// Allocate a real, fully zeroed frame (the native prologue gets its frame
+    /// as zeroed stack memory; `debug_check_zeroed` relies on that). Ids are
+    /// handed out from 1 so that 0 can mean "no enclosing frame".
+    static fn create(id: int, slotCount: int) -> ShadowFrame {
+        unsafe {
+            var p = alloc(int, FRAME_HEADER_SLOTS + slotCount)
+            var f = ShadowFrame(id, p, slotCount)
+            f.clear()
+            f
+        }
+    }
+
+    fn destroy() {
+        unsafe { free(this.p) }
+    }
+
+    /// Zero the header and every slot, then store the slot count.
+    fn clear() {
+        unsafe {
+            var i = 0
+            while (i < FRAME_HEADER_SLOTS + this.slotCount) {
+                this.p[i] = 0
+                i = i + 1
+            }
+        }
+        this.setStoredCount(this.slotCount)
+    }
+
+    /// Enclosing frame id, 0 for none.
+    fn prev() -> int {
+        unsafe { this.p[FRAME_PREV_SLOT] }
+    }
+
+    fn setPrev(v: int) {
+        unsafe { this.p[FRAME_PREV_SLOT] = v }
+    }
+
+    /// The slot count as stored in the header word, separate from the field so
+    /// a test can prove the header really carries it.
+    fn storedCount() -> int {
+        unsafe { this.p[FRAME_COUNT_SLOT] }
+    }
+
+    fn setStoredCount(n: int) {
+        unsafe { this.p[FRAME_COUNT_SLOT] = n }
+    }
+
+    /// Read slot `index`. The native `ShadowFrame::slot` asserts
+    /// `index < slot_count`; a port has no panic, so callers are trusted here
+    /// and the bounds are covered by the layout tests instead.
+    fn slot(index: int) -> int {
+        unsafe { this.p[FRAME_FIRST_SLOT + index] }
+    }
+
+    /// Set slot `index` to a managed address.
+    fn setSlot(index: int, v: int) {
+        unsafe { this.p[FRAME_FIRST_SLOT + index] = v }
+    }
+
+    /// Indices of slots that are not zero, in order. This is
+    /// `debug_check_zeroed` / `assert_ptr_empty` expressed as a value: the
+    /// native version asserts and aborts, which a test cannot observe, so the
+    /// port reports the dirty offsets and lets the test decide.
+    fn dirtySlots() -> List<int> {
+        var out = [0]
+        out.remove(0)
+        var i = 0
+        while (i < this.slotCount) {
+            if (this.slot(i) != 0) {
+                out.push(i)
+            }
+            i = i + 1
+        }
+        out
+    }
+
+    /// The slot values in order (a collector's view of one frame).
+    fn slotValues() -> List<int> {
+        var out = [0]
+        out.remove(0)
+        var i = 0
+        while (i < this.slotCount) {
+            out.push(this.slot(i))
+            i = i + 1
+        }
+        out
+    }
+}
+
+/// Per-OS-thread GC state. `id` is what `pickle_gc_register_thread` returns.
+class GcThread {
+    var id: int
+    var frames: List<ShadowFrame>
+
+    constructor(id: int) {
+        this.id = id
+        this.frames = emptyFrames()
+    }
+}
+
+/// An empty `List<ShadowFrame>`. The language types `[]` as `List<?>`, and
+/// neither an annotation nor an `as` cast narrows it, so seed-and-pop is the
+/// established idiom (see `object.pkl`'s `List<ClassDesc>`).
+fn emptyFrames() -> List<ShadowFrame> {
+    unsafe {
+        var seed = ShadowFrame(1, alloc(int, 1), 0)
+        var xs = [seed]
+        xs.pop()
+        free(seed.p)
+        xs
+    }
+}
+
+/// An empty `List<GcThread>` (same idiom as `emptyFrames`).
+fn emptyThreads() -> List<GcThread> {
+    var xs = [GcThread(0)]
+    xs.pop()
+    xs
+}
+
+/// The process-wide thread registry: `THREAD_HEAD` plus the thread-local
+/// handle and the id counter, in one instance (no module globals, the same
+/// discipline as `object.pkl::ClassRegistry`).
+class ShadowRegistry {
+    var threads: List<GcThread>
+    var current: GcThread?
+    var nextId: int
+    var nextFrameId: int
+
+    constructor() {
+        this.threads = emptyThreads()
+        this.current = none
+        // `THREAD_COUNT` starts at 1 so that 0 can mean "no thread".
+        this.nextId = 1
+        this.nextFrameId = 1
+    }
+
+    /// This thread's node, or none when unregistered (`current_thread`).
+    fn currentThread() -> GcThread? {
+        this.current
+    }
+
+    /// Every registered node, most recently registered first
+    /// (`insert_thread_locked` prepends, so the list reverses registration
+    /// order — the order the collector's walk sees).
+    fn allThreads() -> List<GcThread> {
+        this.threads
+    }
+
+    /// Registered node count.
+    fn threadCount() -> int {
+        len(this.threads)
+    }
+
+    /// Register this thread, or return the existing node
+    /// (`register_thread` / `ensure_registered_locked`). Ids are handed out
+    /// from 1 upward.
+    fn registerThread() -> GcThread {
+        if (let some(t) = this.current) {
+            return t
+        }
+        var node = GcThread(this.nextId)
+        this.nextId = this.nextId + 1
+        this.threads.insert(0, node)
+        this.current = node
+        node
+    }
+
+    /// Register a node for ANOTHER OS thread: inserted into the registry but
+    /// deliberately not made `current`, because `register_thread` on a foreign
+    /// thread would leave this thread's thread-local handle alone. The native
+    /// build gets this by spawning a thread; a single-threaded port needs the
+    /// entry point spelled out to test the all-threads walk.
+    fn registerForeignThread() -> GcThread {
+        var node = GcThread(this.nextId)
+        this.nextId = this.nextId + 1
+        this.threads.insert(0, node)
+        node
+    }
+
+    /// Remove the current node from the registry and clear the handle
+    /// (`unregister_thread`). The native version also frees the node; the port
+    /// drops the reference, which is the observable part.
+    fn unregisterThread() {
+        if (let some(t) = this.current) {
+            var i = 0
+            while (i < len(this.threads)) {
+                if (this.threads[i].id == t.id) {
+                    this.threads.remove(i)
+                    break
+                }
+                i = i + 1
+            }
+            this.current = none
+        }
+    }
+
+    /// Allocate a frame with a fresh id from the registry's counter.
+    fn newFrame(slotCount: int) -> ShadowFrame {
+        var f = ShadowFrame.create(this.nextFrameId, slotCount)
+        this.nextFrameId = this.nextFrameId + 1
+        f
+    }
+
+    /// Push `frame` onto this thread's frame stack (`push_frame`): the new
+    /// frame records the old top as its `prev`, then becomes the top.
+    fn pushFrame(frame: ShadowFrame) {
+        if (let some(t) = this.current) {
+            if (len(t.frames) > 0) {
+                frame.setPrev(t.frames[len(t.frames) - 1].id)
+            }
+            t.frames.push(frame)
+        }
+    }
+
+    /// Pop `frame`, which must be the current top (`pop_frame`). The native
+    /// version asserts the ordering; the port returns whether the pop was in
+    /// order so a test can observe it, and leaves the stack untouched when it
+    /// was not.
+    fn popFrame(frame: ShadowFrame) -> bool {
+        if (let some(t) = this.current) {
+            if (len(t.frames) == 0) {
+                return false
+            }
+            if (t.frames[len(t.frames) - 1].id != frame.id) {
+                return false
+            }
+            t.frames.pop()
+            frame.setPrev(0)
+            return true
+        }
+        false
+    }
+
+    /// Frame-stack depth of the current thread.
+    fn frameDepth() -> int {
+        if (let some(t) = this.currentThread()) {
+            return len(t.frames)
+        }
+        0
+    }
+
+    /// Every non-null slot value across every frame of every registered thread,
+    /// in walk order: thread by thread, and within a thread from the innermost
+    /// frame outward. This is the root set `trace_from_roots` collects from the
+    /// shadow stacks.
+    fn allSlotValues() -> List<int> {
+        var out = [0]
+        out.remove(0)
+        var i = 0
+        while (i < len(this.threads)) {
+            var fr = this.threads[i].frames
+            var j = len(fr) - 1
+            while (j >= 0) {
+                var vals = fr[j].slotValues()
+                var k = 0
+                while (k < len(vals)) {
+                    if (vals[k] != 0) {
+                        out.push(vals[k])
+                    }
+                    k = k + 1
+                }
+                j = j - 1
+            }
+            i = i + 1
+        }
+        out
+    }
+}

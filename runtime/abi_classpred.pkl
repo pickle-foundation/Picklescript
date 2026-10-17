@@ -1,0 +1,339 @@
+module runtime.abi_classpred
+
+/// Port of the interface half of `runtime/src/class.rs` plus the bucket store
+/// in `runtime/src/gc.rs`, as real `#[symbol]` bodies: the class-predicate
+/// slice alongside `abi_class_extra`.
+///
+/// WHAT THIS OWNS. `pickle_class_add_interface`,
+/// `pickle_class_add_iface_method`, `pickle_class_implements`,
+/// `pickle_iface_method`, `pickle_class_is`, `pickle_class_cast`, and
+/// `pickle_iface_cast` share ONE store, indexed by `(class id, interface id)`:
+/// a flat `alloc(int, n)` word block of `[cid, iid, midx, fp]` records, where
+/// `midx == BUCKET_MIDX` marks a bucket-only row (native's
+/// `(iface_id, empty methods)` entry) and a non-negative `midx` is a method
+/// row carrying its fn pointer. Scalar top-level vars are image data, the same
+/// discipline as `abi_statics`, because the compiler injects the registration
+/// calls at the TOP of `main`'s entry block - before any managed initializer
+/// runs.
+///
+/// WHY A FLAT ARENA. Native keeps a `BTreeMap<class_id, Vec<(iface_id,
+/// Vec<(midx, fp)>)>>`; the port keeps the same contract - bucket presence for
+/// `is`, nearest-chain lookup for dispatch - in one growable arena scanned
+/// linearly. Divergence: lookups are O(records) instead of O(log n)/O(1);
+/// the arena stays small (one row per registered `(cid, iid)` pair and per
+/// method) so the walk costs less than the map hashing it replaces. Growth
+/// mirrors `abi_class_extra::ensureNameCap`: double until it fits, zero the
+/// new tail so untouched rows read `[0, 0, 0, 0]`.
+///
+/// THE PARENT CHAIN lives in `abi_class_extra` (stride-3 registry, see there);
+/// this module only reads it through `classParentOf`, so a class registered
+/// with a parent is walkable by `is`/`as`/dispatch without this module ever
+/// seeing the name registry. The walk bodies themselves are the tested
+/// mirrors in `runtime.classes` (`classIdIs`, `implementsIface`,
+/// `ifaceMethodAt`), wired with per-call lambdas - the same pairing
+/// `classes_test` exercises directly.
+///
+/// THE HEADER READ. Instance predicates read word 1 of the object header for
+/// the class id, unmasked - the same read `abi_console`, `abi_map`, and
+/// `abi_expect` already perform. The port never packs flags into word 1 (only
+/// the modelled test heap in `trace.pkl` splits them), so the raw word IS the
+/// class id, exactly what native reads as `(*obj).class_id: u32`.
+///
+/// THE FATAL PATHS. The two casts fold native's
+/// `pickle_panic_cstr(...)`-into-`fatal` route into `fatalMsg` with the
+/// literals exported by `runtime.classes` (`CAST_CLASS_MESSAGE`,
+/// `CAST_INTERFACE_MESSAGE`): `fatal: ` + message + newline, one stderr write
+/// each, exit 1. Like every body here they allocate nothing and keep no
+/// managed cells, so the module never coexists with the collector.
+///
+/// DOCUMENTED DIVERGENCE. `pickle_class_add_iface_method` with `iid == 0`:
+/// native's `class_ensure_iface` early-outs and the subsequent
+/// `.find(...).unwrap()` panics - unreachable through the emitter, which only
+/// emits registered interfaces (ids start at 1). The port no-ops instead:
+/// reproducing an unwrap panic would mean a panic path no typed program can
+/// reach, and the no-op loses nothing a reachable program observes.
+
+import { classParentOf } from runtime.abi_class_extra
+import { fatalMsg } from runtime.abi_panic
+import { classIdIs, implementsIface, ifaceMethodAt, CAST_CLASS_MESSAGE, CAST_INTERFACE_MESSAGE } from runtime.classes
+
+/// Word 1 of an object header carries the class id (never packed with flags
+/// in the ported heap - see header).
+const CLASS_ID_WORD: int = 1
+
+/// Word stride of one interface record: `[cid, iid, midx, fp]`.
+const IFACE_STRIDE: int = 4
+
+/// `midx` value marking a bucket-only row (native's interface entry with an
+/// empty method table). Method rows hold a non-negative index, so the
+/// sentinel can never collide with one.
+const BUCKET_MIDX: int = -1
+
+/// First capacity in words (16 records before the first growth).
+const INITIAL_IFACE_WORDS: int = 64
+
+/// The record block, word-addressed. Image data (see header): readable at
+/// process entry, valid at every point the injected registrations run.
+var ifaceBase: int = 0
+/// Capacity of `ifaceBase`, in words. Lockstep with the base: `base == 0`
+/// exactly while `cap == 0`.
+var ifaceCap: int = 0
+/// Words in use - always a multiple of `IFACE_STRIDE`.
+var ifaceWords: int = 0
+
+/// Grow the record block so `ifaceWords + IFACE_STRIDE` words are in range:
+/// double until they fit, allocate fresh (unzeroed, like every `alloc`), copy
+/// the old words, zero the new tail, then release the old block. Safe to free:
+/// no external code can hold a pointer into the old block.
+fn ensureIfaceCap() {
+    if (ifaceWords + IFACE_STRIDE <= ifaceCap) {
+        return
+    }
+    unsafe {
+        var cap = ifaceCap
+        if (cap == 0) {
+            cap = INITIAL_IFACE_WORDS
+        }
+        while (ifaceWords + IFACE_STRIDE > cap) {
+            cap = cap * 2
+        }
+        var fresh = alloc(int, cap)
+        var j = 0
+        while (j < ifaceWords) {
+            fresh[j] = (ifaceBase as *int)[j]
+            j = j + 1
+        }
+        var k = ifaceWords
+        while (k < cap) {
+            fresh[k] = 0
+            k = k + 1
+        }
+        if (ifaceBase != 0) {
+            free(ifaceBase as *int)
+        }
+        ifaceBase = fresh as int
+        ifaceCap = cap
+    }
+}
+
+/// Append one record. Callers have already checked for an existing row with
+/// the same key - registration is idempotent exactly like native's
+/// `any`/`all` guards.
+fn ifacePush(cid: int, iid: int, midx: int, fp: int) {
+    ensureIfaceCap()
+    unsafe {
+        var r = ifaceBase as *int
+        var w = ifaceWords
+        r[w] = cid
+        r[w + 1] = iid
+        r[w + 2] = midx
+        r[w + 3] = fp
+    }
+    ifaceWords = ifaceWords + IFACE_STRIDE
+}
+
+/// Word offset of the first record keyed `(cid, iid)`, or -1 when the class
+/// has no row for that interface. One scan answers native's bucket lookup:
+/// a bucket row or any method row for the pair proves the interface is
+/// present (the public API always writes a bucket row first, so the two
+/// coincide).
+fn bucketRowIndex(cid: int, iid: int) -> int {
+    unsafe {
+        var r = ifaceBase as *int
+        var w = 0
+        while (w < ifaceWords) {
+            if (r[w] == cid && r[w + 1] == iid) {
+                return w
+            }
+            w = w + IFACE_STRIDE
+        }
+    }
+    return -1
+}
+
+/// Word offset of the exact method record `(cid, iid, midx)`, or -1.
+fn methodRowIndex(cid: int, iid: int, midx: int) -> int {
+    unsafe {
+        var r = ifaceBase as *int
+        var w = 0
+        while (w < ifaceWords) {
+            if (r[w] == cid && r[w + 1] == iid && r[w + 2] == midx) {
+                return w
+            }
+            w = w + IFACE_STRIDE
+        }
+    }
+    return -1
+}
+
+/// Interface-bucket presence for the walk lambdas: `(cid, iid)` has any row.
+/// The `iid <= 0` arm mirrors native `class_iface_has`'s zero guard; a
+/// negative cid simply never matches a stored row.
+fn bucketHas(cid: int, iid: int) -> bool {
+    if (iid <= 0) {
+        return false
+    }
+    return bucketRowIndex(cid, iid) >= 0
+}
+
+/// Method fn pointer for the `ifaceMethodAt` walk lambda: `none` on a miss
+/// (native `class_iface_method`'s `Option<usize>`), else the stored pointer.
+/// A stored fp is a live code address - never 0 - so `some(0)` cannot masquerade
+/// as a miss.
+fn methodAt(cid: int, iid: int, midx: int) -> int? {
+    if (iid <= 0 || midx < 0) {
+        return none
+    }
+    var w = methodRowIndex(cid, iid, midx)
+    if (w < 0) {
+        return none
+    }
+    var fp = 0
+    unsafe {
+        fp = (ifaceBase as *int)[w + 3]
+    }
+    fp
+}
+
+/// ABI: `x is T` across the parent chain. Negative targets and null objects
+/// are false without touching the header (native's `pickle_class_is` guard
+/// then `class_is` null arm); otherwise the tested `classIdIs` mirror walks
+/// `obj`'s class id up the `classParentOf` chain, parent 0 terminating.
+#[symbol("pickle_class_is")]
+fn abiClassIs(obj: *int, cid: int) -> bool {
+    if (cid < 0) {
+        return false
+    }
+    var parent = (c: int) => classParentOf(c)
+    unsafe {
+        if (obj == 0 as *int) {
+            return false
+        }
+        return classIdIs(obj[CLASS_ID_WORD], cid, parent)
+    }
+}
+
+/// ABI: `x as T`. Returns `obj` when it is an instance of `cid` or a
+/// descendant, else the fatal class-cast message (native's
+/// `class_id >= 0 && class_is` success arm, `pickle_panic_cstr` failure arm).
+/// The `return` after `fatalMsg` is unreachable - `win_exit` never returns -
+/// but the body must still satisfy the pointer return type, the same shape
+/// `abiPanicNoMatch` uses for its int.
+#[symbol("pickle_class_cast")]
+fn abiClassCast(obj: *int, cid: int) -> *int {
+    if (cid >= 0) {
+        var parent = (c: int) => classParentOf(c)
+        unsafe {
+            if (obj != 0 as *int && classIdIs(obj[CLASS_ID_WORD], cid, parent)) {
+                return obj
+            }
+        }
+    }
+    fatalMsg(CAST_CLASS_MESSAGE)
+    return 0 as *int
+}
+
+/// ABI: `x is I` across the parent chain. Negative interfaces are false
+/// (native's `pickle_class_implements` guard); null objects and interface 0
+/// are false inside `class_implements`'s own arm - the `implementsIface`
+/// mirror repeats the `<= 0` guard, so both routes stay false.
+#[symbol("pickle_class_implements")]
+fn abiClassImplements(obj: *int, iid: int) -> bool {
+    if (iid < 0) {
+        return false
+    }
+    var parent = (c: int) => classParentOf(c)
+    var has = (c: int, i: int) => bucketHas(c, i)
+    unsafe {
+        if (obj == 0 as *int) {
+            return false
+        }
+        return implementsIface(obj[CLASS_ID_WORD], iid, has, parent)
+    }
+}
+
+/// ABI: implementation fn pointer of interface `iid` method `midx` for `obj`'s
+/// class - the nearest entry walking the parent chain, or 0 when nothing in
+/// the chain implements it. Negative guards first (native's
+/// `pickle_iface_method`), then null / interface 0 (native's `iface_method`
+/// arm); `ifaceMethodAt` does the nearest-first walk and `none` folds to the
+/// 0 the emitter's dispatch fallback branches on.
+#[symbol("pickle_iface_method")]
+fn abiIfaceMethod(obj: *int, iid: int, midx: int) -> int {
+    if (iid < 0 || midx < 0) {
+        return 0
+    }
+    var parent = (c: int) => classParentOf(c)
+    var method = (c: int, i: int, m: int) => methodAt(c, i, m)
+    unsafe {
+        if (obj == 0 as *int || iid == 0) {
+            return 0
+        }
+        var fp = ifaceMethodAt(obj[CLASS_ID_WORD], iid, midx, method, parent)
+        if (let some(v) = fp) {
+            return v
+        }
+        return 0
+    }
+}
+
+/// ABI: `x as I`. Returns `obj` when its class (or an ancestor) implements
+/// `iid`, else the fatal interface-cast message (native's
+/// `iid >= 0 && class_implements` success arm). Null objects fail the
+/// walk and take the fatal arm, exactly as native does.
+#[symbol("pickle_iface_cast")]
+fn abiIfaceCast(obj: *int, iid: int) -> *int {
+    if (iid >= 0) {
+        var parent = (c: int) => classParentOf(c)
+        var has = (c: int, i: int) => bucketHas(c, i)
+        unsafe {
+            if (obj != 0 as *int && implementsIface(obj[CLASS_ID_WORD], iid, has, parent)) {
+                return obj
+            }
+        }
+    }
+    fatalMsg(CAST_INTERFACE_MESSAGE)
+    return 0 as *int
+}
+
+/// ABI: record that `cid` implements interface `iid`, so `is`/`as` and
+/// dispatch see it - an interface with no methods still needs its bucket.
+/// Negative ids return before any write; `iid == 0` early-outs where native's
+/// `class_ensure_iface` does; an existing `(cid, iid)` row is a no-op, so
+/// duplicate registration (native's `!bucket.iter().any` guard) never
+/// duplicates a record. Void convention: no return type, like
+/// `abiStaticSet`.
+#[symbol("pickle_class_add_interface")]
+fn abiClassAddInterface(cid: int, iid: int) {
+    if (cid < 0 || iid < 0) {
+        return
+    }
+    if (iid == 0) {
+        return
+    }
+    if (bucketRowIndex(cid, iid) >= 0) {
+        return
+    }
+    ifacePush(cid, iid, BUCKET_MIDX, 0)
+}
+
+/// ABI: record `cid`'s implementation of interface `iid` method `midx`.
+/// Negative ids return first (native's extern guards); `iid == 0` no-ops per
+/// the documented divergence in the header. Otherwise native's order: ensure
+/// the bucket exists, then push the method row only if `(cid, iid, midx)` is
+/// not recorded yet (its `all(...)` dedup guard).
+#[symbol("pickle_class_add_iface_method")]
+fn abiClassAddIfaceMethod(cid: int, iid: int, midx: int, fp: int) {
+    if (cid < 0 || iid < 0 || midx < 0) {
+        return
+    }
+    if (iid == 0) {
+        return
+    }
+    if (bucketRowIndex(cid, iid) < 0) {
+        ifacePush(cid, iid, BUCKET_MIDX, 0)
+    }
+    if (methodRowIndex(cid, iid, midx) < 0) {
+        ifacePush(cid, iid, midx, fp)
+    }
+}

@@ -1,0 +1,88 @@
+module cli.gen2
+
+import { DiagnosticSink } from compiler.diag
+import { frontend } from compiler.front
+import { emitIr } from compiler.emit
+import { irModuleStr, irxModuleStr } from compiler.ir
+
+fn irSources(fileName: string, src: string) -> List<string> {
+    let sinks = DiagnosticSink()
+    var out = emptyStrs()
+    if (let some(loaded) = frontend(fileName, src, sinks)) {
+        if (let some(m) = emitIr(loaded.program, loaded.resolved, sinks)) {
+            out.push(irModuleStr(m))
+            out.push(irxModuleStr(m))
+        } else {
+            out.push("irfail")
+            out.push("irfail")
+        }
+    } else {
+        out.push("irfail")
+        out.push("irfail")
+    }
+    out
+}
+
+fn trim(p: string) -> string {
+    var out = ""
+    var sb = bytes(p)
+    var i = 0
+    while (i < len(sb)) {
+        if (sb[i] == 13 as int || sb[i] == 10 as int) {
+            i = i + 1
+        } else {
+            out = out + "{sb[i] as char}"
+            i = i + 1
+        }
+    }
+    out
+}
+
+fn baseName(target: string) -> string {
+    var k = len(target) - 1
+    while (k >= 0) {
+        let b = bytes(target)[k] as int
+        if (b == 47 || b == 92) {
+            break
+        }
+        k = k - 1
+    }
+    var out = ""
+    var j = k + 1
+    while (j < len(target) - 4) {
+        out = out + "{bytes(target)[j] as char}"
+        j = j + 1
+    }
+    out
+}
+
+fn main() {
+    let argv = args()
+    var target = ""
+    var viaArgv = false
+    if (len(argv) > 0) {
+        target = argv[0]
+        viaArgv = true
+    } else if (let some(tf) = read_file("pickle/cli/one_target.txt")) {
+        target = trim(tf)
+    }
+    if (target == "") {
+        println("NO TARGET")
+        return
+    }
+    if (let some(src) = read_file(target)) {
+        let res = irSources(target, src)
+        let base = baseName(target)
+        write_file("tools/diff/gen2/" + base + "_gen2.ir", res[0] + "\n")
+        write_file("tools/diff/gen2/" + base + "_gen2.irx", res[1])
+        println("GEN2 DONE: " + target + (if (viaArgv) { " (argv)" } else { "" }))
+    } else {
+        println("NO FILE: " + target)
+    }
+}
+
+fn emptyStrs() -> List<string> {
+    var l = [""]
+    l.pop()
+    l
+}

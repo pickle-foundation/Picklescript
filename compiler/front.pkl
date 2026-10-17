@@ -1,0 +1,2043 @@
+module compiler.front
+
+import * from compiler.ast
+import { Span, Diagnostic, DiagnosticSink } from compiler.diag
+import { Lexer } from compiler.lexer
+import { decodeCp, cpLen } from compiler.token
+import { parse } from compiler.parser
+import { Resolver, ResolvedProgram } from compiler.resolve
+import { checkProgram } from compiler.check
+
+class FrontOutput {
+    var program: Program
+    var resolved: ResolvedProgram
+    /// Every file the loader read, in load order.
+    ///
+    /// A lowering cache keys its entry on these: the result depends on all of
+    /// them, and the entry file's own text is only known once the frontend has
+    /// read it.
+    var paths: List<string>
+
+    constructor(program: Program, resolved: ResolvedProgram, paths: List<string>) {
+        this.program = program
+        this.resolved = resolved
+        this.paths = paths
+    }
+}
+
+class LoadedModules {
+    var merged: Program
+    var collided: List<string>
+
+    constructor(merged: Program, collided: List<string>) {
+        this.merged = merged
+        this.collided = collided
+    }
+}
+
+class ModuleFile {
+    var filePath: string
+    var modulePath: List<string>
+    var exports: List<string>
+    var isPackage: bool
+    var pubNs: List<PubNs>
+    var pubItems: List<PubItem>
+    var imports: List<ImportDecl>
+    var program: Program
+    var fi: FileImports
+
+    constructor(filePath: string, modulePath: List<string>, exports: List<string>, isPackage: bool, pubNs: List<PubNs>, pubItems: List<PubItem>, imports: List<ImportDecl>, program: Program, fi: FileImports) {
+        this.filePath = filePath
+        this.modulePath = modulePath
+        this.exports = exports
+        this.isPackage = isPackage
+        this.pubNs = pubNs
+        this.pubItems = pubItems
+        this.imports = imports
+        this.program = program
+        this.fi = fi
+    }
+}
+
+class FileImports {
+    var modules: Map<string, ModuleBinding>
+    var aliases: Map<string, List<string>>
+    var renames: Map<string, RenameTarget>
+    var bindings: Map<string, List<string>>
+    var ownModule: string?
+
+    constructor(modules: Map<string, ModuleBinding>, aliases: Map<string, List<string>>, renames: Map<string, RenameTarget>, bindings: Map<string, List<string>>, ownModule: string?) {
+        this.modules = modules
+        this.aliases = aliases
+        this.renames = renames
+        this.bindings = bindings
+        this.ownModule = ownModule
+    }
+}
+
+class ModuleBinding {
+    var exports: List<string>
+    var provider: List<string>?
+
+    constructor(exports: List<string>, provider: List<string>?) {
+        this.exports = exports
+        this.provider = provider
+    }
+}
+
+class PubNs {
+    var name: string
+    var provider: List<string>
+    var exports: List<string>
+
+    constructor(name: string, provider: List<string>, exports: List<string>) {
+        this.name = name
+        this.provider = provider
+        this.exports = exports
+    }
+}
+
+class PubItem {
+    var name: string
+    var idx: int
+
+    constructor(name: string, idx: int) {
+        this.name = name
+        this.idx = idx
+    }
+}
+
+class RenameTarget {
+    var name: string
+    var provider: List<string>
+
+    constructor(name: string, provider: List<string>) {
+        this.name = name
+        this.provider = provider
+    }
+}
+
+class ImportedAs {
+    var path: List<string>
+    var span: Span
+
+    constructor(path: List<string>, span: Span) {
+        this.path = path
+        this.span = span
+    }
+}
+
+class Workspace {
+    var crates: Map<string, string>
+
+    constructor(crates: Map<string, string>) {
+        this.crates = crates
+    }
+
+    fn crateDir(name: string) -> string? {
+        this.crates.get(name)
+    }
+}
+
+enum ModuleLoc {
+    File(path: string)
+    Package(path: string)
+}
+
+enum ItemTarget {
+    ModuleFile(idx: int, local: string)
+    Symbol(idx: int, name: string, local: string)
+}
+
+class Loader {
+    var diags: DiagnosticSink
+    var loaded: Map<string, int>
+    var files: List<ModuleFile>
+    var workspace: Workspace
+
+    constructor(diags: DiagnosticSink) {
+        this.diags = diags
+        this.loaded = emptyMapStrInt()
+        this.files = emptyModuleFiles()
+        this.workspace = emptyWorkspace()
+    }
+
+    fn parseSource(src: string, base: int) -> Program? {
+        let lx = Lexer(bytes(src), 0, 0, none, range(0), base)
+        let toks = lx.run()
+        parse(toks, this.diags)
+    }
+
+    fn loadRoot(fileName: string, source: string) -> LoadedModules? {
+        if (let some(pp) = this.parseSource(source, 0)) {
+            var declared: List<string>? = none
+            if (let some(md) = pp.modDecl) {
+                declared = md.path
+            }
+            var modulePath = emptyStrs()
+            if (let some(d) = declared) {
+                modulePath = copyStrs(d)
+            }
+            var exports = emptyStrs()
+            for (item in pp.items) {
+                exports.push(topLevelName(item))
+            }
+            this.workspace = discoverWorkspace(fileName)
+            this.files.push(ModuleFile(fileName, modulePath, exports, false, emptyPubNs(), emptyPubItems(), pp.imports, pp, emptyFileImports()))
+            this.loaded[fileName] = 0
+            this.processImports(0)
+
+            var itemCounts = emptyMapStrInt()
+            for (f in this.files) {
+                if (len(f.modulePath) == 0 || f.isPackage) {
+                    continue
+                }
+                for (n in f.exports) {
+                    var cnt = 0
+                    if (let some(c) = itemCounts.get(n)) {
+                        cnt = c
+                    }
+                    itemCounts[n] = cnt + 1
+                }
+            }
+            var collided = emptyStrs()
+            for (k in itemCounts.keys()) {
+                if (itemCounts[k] > 1) {
+                    collided.push(k)
+                }
+            }
+
+            var items = emptyItems()
+            for (f in this.files) {
+                for (it in f.program.items) {
+                    items.push(it)
+                }
+            }
+            let merged = Program(pp.modDecl, emptyImportDecls(), items, pp.intLiteralOverflow)
+            return LoadedModules(merged, collided)
+        }
+        none
+    }
+
+    fn processImports(idx: int) {
+        let imports = this.files[idx].imports
+        let importer = this.files[idx].filePath
+        var fi = emptyFileImports()
+        var boundAliases = emptyStrs()
+        var boundSymbols = emptyStrs()
+        for (imp in imports) {
+            match (imp.kind) {
+                case ImportKind.Module(al) -> {
+                    let target = this.ensureModule(importer, imp.source, imp.span)
+                    var exports = emptyStrs()
+                    if (let some(t) = target) {
+                        exports = copyStrs(this.files[t].exports)
+                    }
+                    var aliasName = ""
+                    if (let some(a) = al) {
+                        aliasName = a
+                    } else if (len(imp.source) > 0) {
+                        aliasName = imp.source[len(imp.source) - 1]
+                    }
+                    if (listHasStr(boundAliases, aliasName) || fi.aliases.has(aliasName)) {
+                        this.diags.emit(Diagnostic.errorAt(imp.span, "duplicate import alias `" + aliasName + "`").withCode("E0202"))
+                    }
+                    boundAliases.push(aliasName)
+                    if (imp.isPublic) {
+                        if (let some(t) = target) {
+                            let texports = copyStrs(this.files[t].exports)
+                            let tpath = copyStrs(this.files[t].modulePath)
+                            this.files[idx].pubNs.push(PubNs(aliasName, tpath, texports))
+                        }
+                    }
+                    fi.aliases[aliasName] = copyStrs(imp.source)
+                    let mk = renderPath(imp.source)
+                    if (!fi.modules.has(mk)) {
+                        fi.modules[mk] = ModuleBinding(exports, none)
+                    }
+                    if (let some(t) = target) {
+                        this.spliceNsReexports(t, fi)
+                    }
+                }
+                case ImportKind.Items(items) -> {
+                    for (item in items) {
+                        var tgt = this.loadItem(importer, imp.source, item)
+                        if (let some(t) = tgt) {
+                            match (t) {
+                                case ItemTarget.ModuleFile(tid, local) -> {
+                                    if (listHasStr(boundAliases, local) || fi.aliases.has(local)) {
+                                        this.diags.emit(Diagnostic.errorAt(item.span, "duplicate import alias `" + local + "`").withCode("E0202"))
+                                    }
+                                    boundAliases.push(local)
+                                    let targetPath = copyStrs(this.files[tid].modulePath)
+                                    let exports = copyStrs(this.files[tid].exports)
+                                    if (imp.isPublic) {
+                                        this.files[idx].pubNs.push(PubNs(local, targetPath, exports))
+                                    }
+                                    fi.aliases[local] = copyStrs(targetPath)
+                                    let mk = renderPath(targetPath)
+                                    if (!fi.modules.has(mk)) {
+                                        fi.modules[mk] = ModuleBinding(exports, none)
+                                    }
+                                    this.spliceNsReexports(tid, fi)
+                                }
+                                case ItemTarget.Symbol(tid, name, local) -> {
+                                    let provider = copyStrs(this.files[tid].modulePath)
+                                    if (imp.isPublic) {
+                                        this.files[idx].pubItems.push(PubItem(name, tid))
+                                    }
+                                    let pk = renderPath(provider)
+                                    if (!fi.modules.has(pk)) {
+                                        fi.modules[pk] = ModuleBinding(copyStrs(this.files[tid].exports), none)
+                                    }
+                                    match (item.alias) {
+                                        case some(_) -> {
+                                            if (fi.renames.has(local) || listHasStr(boundSymbols, local)) {
+                                                this.diags.emit(Diagnostic.errorAt(item.span, "duplicate import alias `" + local + "`").withCode("E0202"))
+                                            }
+                                            boundSymbols.push(local)
+                                            fi.renames[local] = RenameTarget(name, provider)
+                                            0
+                                        }
+                                        case none -> {
+                                            var provs = emptyStrs()
+                                            if (let some(existing) = fi.bindings.get(name)) {
+                                                provs = existing
+                                            }
+                                            provs.push(renderPath(provider))
+                                            fi.bindings[name] = provs
+                                            0
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if (let some(t) = this.loadedFor(importer, imp.source)) {
+                        this.spliceNsReexports(t, fi)
+                    }
+                }
+                case ImportKind.Wildcard -> {
+                    let target = this.ensureModule(importer, imp.source, imp.span)
+                    var exports = emptyStrs()
+                    if (let some(t) = target) {
+                        exports = copyStrs(this.files[t].exports)
+                    }
+                    for (name in exports) {
+                        var def: int? = none
+                        if (let some(t) = target) {
+                            for (pi in this.files[t].pubItems) {
+                                if (pi.name == name) {
+                                    def = pi.idx
+                                }
+                            }
+                        }
+                        var provider = renderPath(imp.source)
+                        if (let some(d) = def) {
+                            provider = renderPath(this.files[d].modulePath)
+                        }
+                        var provs = emptyStrs()
+                        if (let some(existing) = fi.bindings.get(name)) {
+                            provs = existing
+                        }
+                        provs.push(provider)
+                        fi.bindings[name] = provs
+                        if (imp.isPublic) {
+                            if (let some(t) = target) {
+                                var didx = t
+                                if (let some(d2) = def) {
+                                    didx = d2
+                                }
+                                this.files[idx].pubItems.push(PubItem(name, didx))
+                            }
+                        }
+                    }
+                    let mk = renderPath(imp.source)
+                    if (!fi.modules.has(mk)) {
+                        fi.modules[mk] = ModuleBinding(exports, none)
+                    }
+                    if (let some(t) = target) {
+                        this.spliceNsReexports(t, fi)
+                    }
+                }
+            }
+        }
+        let own = this.files[idx].modulePath
+        if (len(own) > 0) {
+            let ownProvider = renderPath(own)
+            for (name in this.files[idx].exports) {
+                var provs = emptyStrs()
+                if (let some(existing) = fi.bindings.get(name)) {
+                    provs = existing
+                }
+                provs.push(ownProvider)
+                fi.bindings[name] = provs
+            }
+            fi.ownModule = ownProvider
+        }
+        this.files[idx].fi = fi
+    }
+
+    fn ensureModule(importer: string, segments: List<string>, span: Span) -> int? {
+        if (len(segments) == 0) {
+            this.diags.emit(Diagnostic.errorAt(span, "module path must not be empty").withCode("E0206"))
+            return none
+        }
+        var loc = this.resolveModuleLoc(importer, segments)
+        if (let some(l) = loc) {
+            match (l) {
+                case ModuleLoc.File(f) -> { return this.loadFile(f, ImportedAs(segments, span)) }
+                case ModuleLoc.Package(d) -> { return this.loadPackage(d, ImportedAs(segments, span)) }
+            }
+        }
+        var note = "searched up the importing file's directory tree, then `<cwd>/src/`"
+        if (let some(dir) = this.workspace.crates.get(segments[0])) {
+            note += "; then inside workspace crate `" + segments[0] + "` at `" + dir + "`"
+        }
+        this.diags.emit(Diagnostic.errorAt(span, "cannot find module `" + renderPath(segments) + "`").withCode("E0206").note(note))
+        none
+    }
+
+    fn loadFile(path: string, importedAs: ImportedAs?) -> int? {
+        if (this.loaded.has(path)) {
+            return this.loaded[path]
+        }
+        if (let some(src) = read_file(path)) {
+            if (let some(pp) = this.parseSource(src, len(this.files) * 1000000000)) {
+                var declared: List<string>? = none
+                if (let some(md) = pp.modDecl) {
+                    declared = md.path
+                }
+                if (let some(dp) = declared) {
+                    if (let some(ia) = importedAs) {
+                        if (!eqStrs(dp, ia.path)) {
+                            this.diags.emit(Diagnostic.errorAt(ia.span, "file `" + path + "` declares module `" + renderPath(dp) + "`, not `" + renderPath(ia.path) + "`").withCode("E0208"))
+                        }
+                    }
+                }
+                var modulePath = emptyStrs()
+                if (let some(d) = declared) {
+                    modulePath = copyStrs(d)
+                } else if (let some(ia) = importedAs) {
+                    modulePath = copyStrs(ia.path)
+                }
+                var exports = emptyStrs()
+                for (item in pp.items) {
+                    exports.push(topLevelName(item))
+                }
+                let idx = len(this.files)
+                this.files.push(ModuleFile(path, modulePath, exports, false, emptyPubNs(), emptyPubItems(), pp.imports, pp, emptyFileImports()))
+                this.loaded[path] = idx
+                this.processImports(idx)
+                this.finishExports(idx)
+                return idx
+            }
+            return none
+        }
+        none
+    }
+
+    fn loadPackage(dir: string, importedAs: ImportedAs?) -> int? {
+        var segments = emptyStrs()
+        var ispan: Span? = none
+        if (let some(ia) = importedAs) {
+            segments = copyStrs(ia.path)
+            ispan = ia.span
+        }
+        var exports = emptyStrs()
+        if (let some(entries) = list_dir(dir)) {
+            for (p in entries) {
+                if (stringEndsWith(p, ".pkl") && isFileP(p)) {
+                    let stem = pathStem(p)
+                    let mpath = copyStrs(segments)
+                    mpath.push(stem)
+                    var iana: ImportedAs? = none
+                    if (let some(s) = ispan) {
+                        iana = ImportedAs(mpath, s)
+                    }
+                    if (let some(idx) = this.loadFile(p, iana)) {
+                        for (n in this.files[idx].exports) {
+                            if (!listHasStr(exports, n)) {
+                                exports.push(n)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let idx = len(this.files)
+        let emptyProg = Program(none, emptyImportDecls(), emptyItems(), false)
+        this.files.push(ModuleFile(dir, segments, exports, true, emptyPubNs(), emptyPubItems(), emptyImportDecls(), emptyProg, emptyFileImports()))
+        this.loaded[dir] = idx
+        var fi = emptyFileImports()
+        if (len(segments) > 0) {
+            let ownProvider = renderPath(segments)
+            for (name in exports) {
+                var provs = emptyStrs()
+                if (let some(existing) = fi.bindings.get(name)) {
+                    provs = existing
+                }
+                provs.push(ownProvider)
+                fi.bindings[name] = provs
+            }
+            fi.ownModule = ownProvider
+        }
+        this.files[idx].fi = fi
+        idx
+    }
+
+    fn finishExports(idx: int) {
+        var i = 0
+        while (i < len(this.files[idx].pubNs)) {
+            let nm = this.files[idx].pubNs[i].name
+            if (!listHasStr(this.files[idx].exports, nm)) {
+                this.files[idx].exports.push(nm)
+            }
+            i = i + 1
+        }
+        var j = 0
+        while (j < len(this.files[idx].pubItems)) {
+            let im = this.files[idx].pubItems[j].name
+            if (!listHasStr(this.files[idx].exports, im)) {
+                this.files[idx].exports.push(im)
+            }
+            j = j + 1
+        }
+    }
+
+    fn loadItem(importer: string, source: List<string>, item: ImportItem) -> ItemTarget? {
+        let n = len(item.path)
+        if (n == 0) {
+            this.diags.emit(Diagnostic.errorAt(item.span, "imported name must not be empty").withCode("E0206"))
+            return none
+        }
+        var t = n
+        while (t >= 1) {
+            let remLen = n - t
+            if (remLen > 1) {
+                t = t - 1
+                continue
+            }
+            let segs = copyStrs(source)
+            var k = 0
+            while (k < t) {
+                segs.push(item.path[k])
+                k = k + 1
+            }
+            var loc = this.resolveModuleLoc(importer, segs)
+            if (let some(l) = loc) {
+                match (l) {
+                    case ModuleLoc.File(f) -> {
+                        if (let some(idx) = this.loadFile(f, ImportedAs(segs, item.span))) {
+                            if (remLen == 1) {
+                                let name = item.path[t]
+                                if (!listHasStr(this.files[idx].exports, name)) {
+                                    this.diags.emit(Diagnostic.errorAt(item.span, "`" + name + "` is not exported by module `" + renderPath(segs) + "`").withCode("E0207"))
+                                    return none
+                                }
+                                var local = name
+                                if (let some(al) = item.alias) {
+                                    local = al
+                                }
+                                return ItemTarget.Symbol(idx, name, local)
+                            }
+                            var local2 = item.path[len(item.path) - 1]
+                            if (let some(al2) = item.alias) {
+                                local2 = al2
+                            }
+                            return ItemTarget.ModuleFile(idx, local2)
+                        }
+                    }
+                    case ModuleLoc.Package(_) -> {}
+                }
+            }
+            t = t - 1
+        }
+        if (let some(idx) = this.ensureModule(importer, source, item.span)) {
+            if (n == 1) {
+                let name = item.path[0]
+                if (listHasStr(this.files[idx].exports, name)) {
+                    var def = idx
+                    for (pi in this.files[idx].pubItems) {
+                        if (pi.name == name) {
+                            def = pi.idx
+                        }
+                    }
+                    var local3 = name
+                    if (let some(al3) = item.alias) {
+                        local3 = al3
+                    }
+                    return ItemTarget.Symbol(def, name, local3)
+                }
+            }
+            this.diags.emit(Diagnostic.errorAt(item.span, "`" + renderPath(item.path) + "` is not exported by module `" + renderPath(source) + "`").withCode("E0207"))
+        }
+        none
+    }
+
+    fn loadedFor(importer: string, segments: List<string>) -> int? {
+        var loc = this.resolveModuleLoc(importer, segments)
+        if (let some(l) = loc) {
+            match (l) {
+                case ModuleLoc.File(f) -> if (let some(i) = this.loaded.get(f)) {
+                    i
+                } else {
+                    none
+                }
+                case ModuleLoc.Package(d) -> if (let some(i) = this.loaded.get(d)) {
+                    i
+                } else {
+                    none
+                }
+            }
+        } else {
+            none
+        }
+    }
+
+    fn spliceNsReexports(tidx: int, fi: FileImports) {
+        let nsPath = this.files[tidx].modulePath
+        for (p in this.files[tidx].pubNs) {
+            let full = copyStrs(nsPath)
+            full.push(p.name)
+            if (fi.modules.has(renderPath(full))) {
+                continue
+            }
+            fi.modules[renderPath(full)] = ModuleBinding(p.exports, p.provider)
+        }
+    }
+
+    fn resolveModuleLoc(importer: string, segments: List<string>) -> ModuleLoc? {
+        if (len(segments) == 0) {
+            return none
+        }
+        let rel = joinPathParts(segments)
+        let relFile = rel + ".pkl"
+        if (let some(crateDir) = this.workspace.crates.get(segments[0])) {
+            if (len(segments) == 1) {
+                var stems = ["lib", "main"]
+                for (stem in stems) {
+                    let f = pathJoin(crateDir, stem + ".pkl")
+                    if (isFileP(f)) {
+                        return ModuleLoc.File(f)
+                    }
+                }
+                return none
+            }
+            let sub = joinPathParts(subListStr(segments, 1, len(segments) - 1))
+            let f = pathJoin(crateDir, sub + ".pkl")
+            if (isFileP(f)) {
+                return ModuleLoc.File(f)
+            }
+            let p = pathJoin(crateDir, sub)
+            if (isDirP(p)) {
+                return ModuleLoc.Package(p)
+            }
+            return none
+        }
+        var bases = emptyStrs()
+        var d: string? = importerDir(importer)
+        while (true) {
+            if (let some(dir) = d) {
+                bases.push(dir)
+                if (dir == "") {
+                    break
+                }
+                d = pathParentP(dir)
+            } else {
+                break
+            }
+        }
+        bases.push("src")
+        for (base in bases) {
+            let f = pathJoin(base, relFile)
+            if (isFileP(f)) {
+                return ModuleLoc.File(f)
+            }
+            let pt = pathJoin(base, rel)
+            if (isDirP(pt)) {
+                return ModuleLoc.Package(pt)
+            }
+        }
+        none
+    }
+}
+
+fn frontend(fileName: string, source: string, diags: DiagnosticSink) -> FrontOutput? {
+    let loader = Loader(diags)
+    if (let some(loaded) = loader.loadRoot(fileName, source)) {
+        var i = 0
+        var paths = emptyStrs()
+        while (i < len(loader.files)) {
+            let rw = Rewriter(loader.files[i].fi, loaded.collided, diags)
+            rw.rewriteItems(loader.files[i].program.items)
+            paths.push(loader.files[i].filePath)
+            i = i + 1
+        }
+        let resolved = Resolver(diags).resolve(loaded.merged)
+        return FrontOutput(loaded.merged, resolved, paths)
+    }
+    none
+}
+
+fn frontendChecked(fileName: string, source: string, diags: DiagnosticSink) -> FrontOutput? {
+    if (let some(out) = frontend(fileName, source, diags)) {
+        checkProgram(out.program, out.resolved, diags)
+        return out
+    }
+    none
+}
+
+class Rewriter {
+    var fi: FileImports
+    var collided: List<string>
+    var diags: DiagnosticSink
+
+    constructor(fi: FileImports, collided: List<string>, diags: DiagnosticSink) {
+        this.fi = fi
+        this.collided = collided
+        this.diags = diags
+    }
+
+    fn rewriteItems(items: List<Item>) {
+        for (item in items) {
+            this.rewriteItem(item)
+        }
+    }
+
+    fn canon(item: string, provider: string) -> string {
+        if (listHasStr(this.collided, item)) {
+            provider + "." + item
+        } else {
+            item
+        }
+    }
+
+    fn renamed(name: string) -> string {
+        if (let some(provider) = this.fi.ownModule) {
+            if (listHasStr(this.collided, name)) {
+                return provider + "." + name
+            }
+        }
+        name
+    }
+
+    fn exportsOf(path: List<string>) -> List<string>? {
+        if (let some(m) = this.fi.modules.get(renderPath(path))) {
+            return m.exports
+        }
+        none
+    }
+
+    fn providerOf(path: List<string>) -> List<string> {
+        if (let some(m) = this.fi.modules.get(renderPath(path))) {
+            if (let some(p) = m.provider) {
+                return p
+            }
+        }
+        copyStrs(path)
+    }
+
+    fn canonicalOrAmbiguous(name: string, providers: List<string>, span: Span) -> Expr? {
+        var uniq = emptyStrs()
+        for (p in providers) {
+            uniq.push(p)
+        }
+        sortStrs(uniq)
+        dedupStrs(uniq)
+        if (len(uniq) == 0) {
+            return none
+        }
+        if (len(uniq) == 1) {
+            return qualifiedExpr(span, singleStr(this.canon(name, uniq[0])))
+        }
+        var diag = Diagnostic.errorAt(span, "ambiguous imported name `" + name + "`").withCode("E0209")
+        var note = "`" + name + "` is provided by module `" + uniq[0] + "`"
+        var j = 1
+        while (j < len(uniq)) {
+            note += " and module `" + uniq[j] + "`"
+            j = j + 1
+        }
+        diag = diag.note(note)
+        var suggestion = ""
+        var t = 0
+        while (t < len(uniq)) {
+            if (t > 0) {
+                suggestion += " / "
+            }
+            suggestion += "import " + name + " from `" + uniq[t] + "` as " + name + aliasSuffix(t)
+            t = t + 1
+        }
+        diag = diag.note(suggestion)
+        this.diags.emit(diag)
+        qualifiedExpr(span, singleStr(name))
+    }
+
+    fn rewriteItem(item: Item) {
+        match (item.kind) {
+            case ItemKind.Fn(f) -> {
+                f.name = this.renamed(f.name)
+                this.rewriteFn(f)
+            }
+            case ItemKind.Test(f) -> {
+                f.name = this.renamed(f.name)
+                this.rewriteFn(f)
+            }
+            case ItemKind.Class(c) -> {
+                if (let some(te) = c.extends) {
+                    this.rewriteType(te)
+                }
+                for (te in c.implements) {
+                    this.rewriteType(te)
+                }
+                for (m in c.members) {
+                    this.rewriteClassMember(m)
+                }
+            }
+            case ItemKind.Struct(s) -> {
+                for (te in s.implements) {
+                    this.rewriteType(te)
+                }
+                for (m in s.members) {
+                    this.rewriteClassMember(m)
+                }
+            }
+            case ItemKind.Enum(e) -> {
+                for (te in e.implements) {
+                    this.rewriteType(te)
+                }
+                for (v in e.variants) {
+                    for (fl in v.fields) {
+                        this.rewriteType(fl.ty)
+                    }
+                }
+            }
+            case ItemKind.Interface(i) -> {
+                for (te in i.extends) {
+                    this.rewriteType(te)
+                }
+                for (m in i.members) {
+                    match (m) {
+                        case InterfaceMember.Method(md) -> this.rewriteMethod(md)
+                        case InterfaceMember.Property(_, ty, _) -> this.rewriteType(ty)
+                        case InterfaceMember.Const(_, value, _) -> this.rewriteExpr(value)
+                    }
+                }
+            }
+            case ItemKind.Const(c) -> {
+                c.name = this.renamed(c.name)
+                if (let some(ty) = c.ty) {
+                    this.rewriteType(ty)
+                }
+                this.rewriteExpr(c.value)
+            }
+            case ItemKind.Global(g) -> {
+                g.name = this.renamed(g.name)
+                if (let some(ty) = g.ty) {
+                    this.rewriteType(ty)
+                }
+                this.rewriteExpr(g.value)
+            }
+        }
+    }
+
+    fn rewriteClassMember(m: ClassMember) {
+        match (m) {
+            case ClassMember.Field(_, ty, init, _, _, _, attrs, _) -> {
+                if (let some(t) = ty) {
+                    this.rewriteType(t)
+                }
+                if (let some(e) = init) {
+                    this.rewriteExpr(e)
+                }
+                for (a in attrs) {
+                    for (e in a.args) {
+                        this.rewriteExpr(e)
+                    }
+                }
+            }
+            case ClassMember.Method(md) -> this.rewriteMethod(md)
+            case ClassMember.Constructor(cd) -> {
+                for (p in cd.params) {
+                    this.rewriteParam(p)
+                }
+                this.rewriteBlock(cd.body)
+            }
+            case ClassMember.Property(p) -> {
+                if (let some(t) = p.ty) {
+                    this.rewriteType(t)
+                }
+                if (let some(g) = p.get) {
+                    this.rewriteAccessor(g)
+                }
+                if (let some(s) = p.set) {
+                    this.rewriteAccessor(s)
+                }
+            }
+            case ClassMember.Init(b) -> this.rewriteBlock(b)
+            case ClassMember.Deinit(b) -> this.rewriteBlock(b)
+            case ClassMember.Const(_, _, ty, value, _) -> {
+                if (let some(t) = ty) {
+                    this.rewriteType(t)
+                }
+                this.rewriteExpr(value)
+            }
+        }
+    }
+
+    fn rewriteAccessor(acc: PropertyAccessor) {
+        match (acc) {
+            case PropertyAccessor.Expr(e) -> this.rewriteExpr(e)
+            case PropertyAccessor.Block(b) -> this.rewriteBlock(b)
+        }
+    }
+
+    fn rewriteFn(f: FnDecl) {
+        for (p in f.params) {
+            this.rewriteParam(p)
+        }
+        if (let some(t) = f.returnTy) {
+            this.rewriteType(t)
+        }
+        if (let some(b) = f.body) {
+            this.rewriteBody(b)
+        }
+    }
+
+    fn rewriteMethod(m: MethodDecl) {
+        for (p in m.params) {
+            this.rewriteParam(p)
+        }
+        if (let some(t) = m.returnTy) {
+            this.rewriteType(t)
+        }
+        if (let some(b) = m.body) {
+            this.rewriteBody(b)
+        }
+    }
+
+    fn rewriteParam(p: Param) {
+        if (let some(t) = p.ty) {
+            this.rewriteType(t)
+        }
+        if (let some(d) = p.default) {
+            this.rewriteExpr(d)
+        }
+        for (a in p.attrs) {
+            for (e in a.args) {
+                this.rewriteExpr(e)
+            }
+        }
+    }
+
+    fn rewriteBody(body: FnBody) {
+        match (body) {
+            case FnBody.Block(b) -> this.rewriteBlock(b)
+            case FnBody.Expr(e) -> this.rewriteExpr(e)
+        }
+    }
+
+    fn rewriteBlock(bl: Block) {
+        var i = 0
+        while (i < len(bl.stmts)) {
+            bl.stmts[i] = this.rewriteStmt(bl.stmts[i])
+            i = i + 1
+        }
+        if (let some(e) = bl.expr) {
+            this.rewriteExpr(e)
+        }
+    }
+
+    fn rewriteStmt(st: Stmt) -> Stmt {
+        match (st) {
+            case Stmt.Let(pattern, ty, init, mutable, attrs, span) -> {
+                let np = this.rewritePattern(pattern)
+                if (let some(t) = ty) {
+                    this.rewriteType(t)
+                }
+                if (let some(e) = init) {
+                    this.rewriteExpr(e)
+                }
+                for (a in attrs) {
+                    for (e in a.args) {
+                        this.rewriteExpr(e)
+                    }
+                }
+                Stmt.Let(np, ty, init, mutable, attrs, span)
+            }
+            case Stmt.Const(_, ty, value, span2) -> {
+                if (let some(t) = ty) {
+                    this.rewriteType(t)
+                }
+                this.rewriteExpr(value)
+                st
+            }
+            case Stmt.Return(value, span2) -> {
+                if (let some(v) = value) {
+                    this.rewriteExpr(v)
+                }
+                st
+            }
+            case Stmt.While(cond, body, span2) -> {
+                this.rewriteExpr(cond)
+                this.rewriteBlock(body)
+                st
+            }
+            case Stmt.For(header, body, span2) -> {
+                var nh = header
+                match (header) {
+                    case ForHeader.In(pattern, seq) -> {
+                        this.rewriteExpr(seq)
+                        nh = ForHeader.In(this.rewritePattern(pattern), seq)
+                    }
+                    case ForHeader.Range(init, cond, step) -> {
+                        nh = ForHeader.Range(this.rewriteStmt(init), cond, step)
+                    }
+                }
+                this.rewriteBlock(body)
+                Stmt.For(nh, body, span2)
+            }
+            case Stmt.Try(body3, binder, handler, fin, span2) -> {
+                // All three blocks carry expressions that can name an imported
+                // item, so a qualified call inside a `try` body, its `catch`, or
+                // its `finally` has to be rewritten like any other. The binder is
+                // a plain name, not an expression, so there is nothing to visit.
+                this.rewriteBlock(body3)
+                if (let some(h) = handler) {
+                    this.rewriteBlock(h)
+                }
+                if (let some(f) = fin) {
+                    this.rewriteBlock(f)
+                }
+                st
+            }
+            case Stmt.Throw(value, span2) -> {
+                this.rewriteExpr(value)
+                st
+            }
+            case Stmt.Expr(e) -> {
+                this.rewriteExpr(e)
+                st
+            }
+            case _ -> st
+        }
+    }
+
+    fn rewriteExpr(e: Expr) {
+        if (let some(segs) = this.flattenMemberSpine(e)) {
+            if (let some(rewritten) = this.matchChain(segs, e.span)) {
+                e.kind = rewritten.kind
+                e.span = rewritten.span
+                return
+            }
+        }
+        match (e.kind) {
+            case ExprKind.Call(callee, args) -> {
+                this.rewriteExpr(callee)
+                for (a in args) {
+                    this.rewriteExpr(a.value)
+                }
+            }
+            case ExprKind.Member(object, _) -> this.rewriteExpr(object)
+            case ExprKind.OptAccess(object, _) -> this.rewriteExpr(object)
+            case ExprKind.Index(object, index) -> {
+                this.rewriteExpr(object)
+                this.rewriteExpr(index)
+            }
+            case ExprKind.Binary(_, lhs, rhs) -> {
+                this.rewriteExpr(lhs)
+                this.rewriteExpr(rhs)
+            }
+            case ExprKind.Unary(_, operand) -> this.rewriteExpr(operand)
+            case ExprKind.Assign(target, _, value) -> {
+                this.rewriteExpr(target)
+                this.rewriteExpr(value)
+            }
+            case ExprKind.Lambda(params, returnTy, _, body) -> {
+                for (p in params) {
+                    this.rewriteParam(p)
+                }
+                if (let some(t) = returnTy) {
+                    this.rewriteType(t)
+                }
+                this.rewriteBody(body)
+            }
+            case ExprKind.If(cond, then, elseElse) -> {
+                match (cond) {
+                    case IfCond.Cond(ce) -> this.rewriteExpr(ce)
+                    case IfCond.Binding(pattern, value) -> {
+                        this.rewritePattern(pattern)
+                        this.rewriteExpr(value)
+                    }
+                }
+                this.rewriteBlock(then)
+                if (let some(ee) = elseElse) {
+                    this.rewriteExpr(ee)
+                }
+            }
+            case ExprKind.Match(scrutinee, arms) -> {
+                this.rewriteExpr(scrutinee)
+                for (arm in arms) {
+                    arm.pattern = this.rewritePattern(arm.pattern)
+                    if (let some(g) = arm.guard) {
+                        this.rewriteExpr(g)
+                    }
+                    this.rewriteExpr(arm.body)
+                }
+            }
+            case ExprKind.Await(ae) -> this.rewriteExpr(ae)
+            case ExprKind.GenericCall(_, typeArgs) -> {
+                for (t in typeArgs) {
+                    this.rewriteType(t)
+                }
+            }
+            case ExprKind.Cast(expr, ty, _) -> {
+                this.rewriteExpr(expr)
+                this.rewriteType(ty)
+            }
+            case ExprKind.Unsafe(b) -> this.rewriteBlock(b)
+            case ExprKind.Block(b) -> this.rewriteBlock(b)
+            case ExprKind.Tuple(parts) -> {
+                for (x in parts) {
+                    this.rewriteExpr(x)
+                }
+            }
+            case ExprKind.Array(parts) -> {
+                for (x in parts) {
+                    this.rewriteExpr(x)
+                }
+            }
+            case ExprKind.Map(entries) -> {
+                for (kv in entries) {
+                    this.rewriteExpr(kv.key)
+                    this.rewriteExpr(kv.value)
+                }
+            }
+            case ExprKind.OptUnwrap(oe) -> this.rewriteExpr(oe)
+            case ExprKind.Range(start, end, _) -> {
+                this.rewriteExpr(start)
+                this.rewriteExpr(end)
+            }
+            case _ -> {}
+        }
+    }
+
+    fn rewriteType(te: TypeExpr) {
+        match (te.kind) {
+            case TypeExprKind.Path(parts) -> {
+                if (let some(np) = this.matchTypePath(parts)) {
+                    if (len(np) == 1) {
+                        if (let some(rt) = this.fi.renames.get(np[0])) {
+                            np[0] = rt.name
+                        }
+                    }
+                    te.kind = TypeExprKind.Path(np)
+                }
+            }
+            case TypeExprKind.Generic(inner, args) -> {
+                this.rewriteType(inner)
+                for (a in args) {
+                    this.rewriteType(a)
+                }
+            }
+            case TypeExprKind.Pointer(t) -> this.rewriteType(t)
+            case TypeExprKind.Ref(t) -> this.rewriteType(t)
+            case TypeExprKind.Option(t) -> this.rewriteType(t)
+            case TypeExprKind.Tuple(ts) -> {
+                for (t in ts) {
+                    this.rewriteType(t)
+                }
+            }
+            case TypeExprKind.Fn(params, ret, _) -> {
+                for (t in params) {
+                    this.rewriteType(t)
+                }
+                if (let some(r) = ret) {
+                    this.rewriteType(r)
+                }
+            }
+            case _ -> {}
+        }
+    }
+
+    fn rewritePattern(p: Pattern) -> Pattern {
+        match (p) {
+            case Pattern.Binding(_, ty) -> {
+                if (let some(t) = ty) {
+                    this.rewriteType(t)
+                }
+                p
+            }
+            case Pattern.Tuple(ps) -> {
+                var i = 0
+                while (i < len(ps)) {
+                    ps[i] = this.rewritePattern(ps[i])
+                    i = i + 1
+                }
+                p
+            }
+            case Pattern.Variant(path, payloads) -> {
+                var np = path
+                var changed = false
+                if (len(path) >= 2) {
+                    if (let some(k) = longestPrefixStr(path, this.fi)) {
+                        np = subListStr(path, k, len(path) - k)
+                        changed = true
+                    } else if (this.fi.aliases.has(path[0])) {
+                        np = subListStr(path, 1, len(path) - 1)
+                        changed = true
+                    }
+                }
+                if (len(np) >= 1) {
+                    if (let some(rt) = this.fi.renames.get(np[0])) {
+                        let np2 = copyStrs(np)
+                        np2[0] = rt.name
+                        np = np2
+                        changed = true
+                    }
+                }
+                var i = 0
+                while (i < len(payloads)) {
+                    payloads[i] = this.rewritePattern(payloads[i])
+                    i = i + 1
+                }
+                if (changed) {
+                    Pattern.Variant(np, payloads)
+                } else {
+                    p
+                }
+            }
+            case Pattern.Or(ps) -> {
+                var i = 0
+                while (i < len(ps)) {
+                    ps[i] = this.rewritePattern(ps[i])
+                    i = i + 1
+                }
+                p
+            }
+            case _ -> p
+        }
+    }
+
+    fn matchChain(segs: List<string>, span: Span) -> Expr? {
+        if (len(segs) == 1) {
+            let name = segs[0]
+            if (let some(rt) = this.fi.renames.get(name)) {
+                return qualifiedExpr(span, singleStr(this.canon(rt.name, renderPath(rt.provider))))
+            }
+            if (let some(providers) = this.fi.bindings.get(name)) {
+                return this.canonicalOrAmbiguous(name, providers, span)
+            }
+            return none
+        }
+        if (let some(k) = longestPrefixStr(segs, this.fi)) {
+            let prefix = subListStr(segs, 0, k)
+            let remaining = subListStr(segs, k, len(segs) - k)
+            if (let some(exports) = this.exportsOf(prefix)) {
+                if (listHasStr(exports, remaining[0])) {
+                    if (len(remaining) == 1 && listHasStr(this.collided, remaining[0])) {
+                        return qualifiedExpr(span, singleStr(this.canon(remaining[0], renderPath(this.providerOf(prefix)))))
+                    }
+                    return qualifiedExpr(span, remaining)
+                }
+            }
+            return none
+        }
+        if (let some(modPath) = this.fi.aliases.get(segs[0])) {
+            let remaining = subListStr(segs, 1, len(segs) - 1)
+            if (len(remaining) > 0) {
+                if (let some(exports) = this.exportsOf(modPath)) {
+                    if (listHasStr(exports, remaining[0])) {
+                        if (len(remaining) == 1 && listHasStr(this.collided, remaining[0])) {
+                            return qualifiedExpr(span, singleStr(this.canon(remaining[0], renderPath(this.providerOf(modPath)))))
+                        }
+                        return qualifiedExpr(span, remaining)
+                    }
+                }
+            }
+            return none
+        }
+        none
+    }
+
+    fn matchTypePath(parts: List<string>) -> List<string>? {
+        if (len(parts) <= 1) {
+            return none
+        }
+        if (let some(k) = longestPrefixStr(parts, this.fi)) {
+            return subListStr(parts, k, len(parts) - k)
+        }
+        if (this.fi.aliases.has(parts[0])) {
+            return subListStr(parts, 1, len(parts) - 1)
+        }
+        none
+    }
+
+    fn flattenMemberSpine(e: Expr) -> List<string>? {
+        match (e.kind) {
+            case ExprKind.Ident(n) -> singleStr(n)
+            case ExprKind.Member(object, name) -> {
+                if (let some(segs) = this.flattenMemberSpine(object)) {
+                    segs.push(name)
+                    return segs
+                }
+                none
+            }
+            case _ -> none
+        }
+    }
+}
+
+fn longestPrefixStr(segs: List<string>, fi: FileImports) -> int? {
+    var k = 0
+    var i = 1
+    while (i < len(segs)) {
+        if (fi.modules.has(renderPath(subListStr(segs, 0, i)))) {
+            k = i
+        }
+        i = i + 1
+    }
+    if (k > 0) {
+        k
+    } else {
+        none
+    }
+}
+
+fn qualifiedExpr(span: Span, remaining: List<string>) -> Expr {
+    var e = Expr(span, ExprKind.Ident(remaining[0]))
+    var i = 1
+    while (i < len(remaining)) {
+        e = Expr(span, ExprKind.Member(e, remaining[i]))
+        i = i + 1
+    }
+    e
+}
+
+fn topLevelName(item: Item) -> string {
+    match (item.kind) {
+        case ItemKind.Fn(f) -> f.name
+        case ItemKind.Class(c) -> c.name
+        case ItemKind.Struct(s) -> s.name
+        case ItemKind.Enum(e) -> e.name
+        case ItemKind.Interface(i) -> i.name
+        case ItemKind.Const(c) -> c.name
+        case ItemKind.Global(g) -> g.name
+        case ItemKind.Test(f) -> f.name
+    }
+}
+
+fn aliasSuffix(i: int) -> string {
+    var n = i
+    var out = ""
+    while (true) {
+        let c = 65 + (n % 26)
+        out += "{c as char}"
+        n = n / 26
+        if (n == 0) {
+            break
+        }
+        n = n - 1
+    }
+    out
+}
+
+fn discoverWorkspace(fileName: string) -> Workspace {
+    var start = pathParentP(fileName)
+    if (let some(s) = start) {
+        if (s == "") {
+            return discoverFrom(".")
+        }
+        return discoverFrom(s)
+    }
+    discoverFrom(".")
+}
+
+fn discoverFrom(start: string) -> Workspace {
+    var dir: string? = start
+    while (true) {
+        if (let some(d) = dir) {
+            let manifest = pathJoin(d, "picklescript.toml")
+            if (isFileP(manifest)) {
+                if (let some(crates) = readWorkspaceMembers(manifest)) {
+                    return Workspace(crates)
+                }
+            }
+            dir = pathParentP(d)
+        } else {
+            break
+        }
+    }
+    emptyWorkspace()
+}
+
+fn readWorkspaceMembers(manifest: string) -> Map<string, string>? {
+    if (let some(text) = read_file(manifest)) {
+        var base: string = ""
+        if (let some(b) = pathParentP(manifest)) {
+            base = b
+        } else {
+            base = "."
+        }
+        let raw = parseWorkspaceMembers(text)
+        if (len(raw.keys()) == 0) {
+            return none
+        }
+        var out = emptyMapStrStr()
+        for (k in raw.keys()) {
+            if (let some(v) = raw.get(k)) {
+                out[k] = pathJoin(base, v)
+            }
+        }
+        return out
+    }
+    none
+}
+
+fn parseWorkspaceMembers(text: string) -> Map<string, string> {
+    var members = emptyMapStrStr()
+    var section = ""
+    var pending: string? = none
+    for (rl in splitLines(text)) {
+        var clean = stringTrim(stripTomlComment(rl))
+        if (clean == "") {
+            continue
+        }
+        if (let some(buf) = pending) {
+            var full = buf + clean + " "
+            if (arrayIsClosed(full)) {
+                parseMembersArray(full, members)
+                pending = none
+            } else {
+                pending = full
+            }
+            continue
+        }
+        if (stringStartsWith(clean, "[") && stringEndsWith(clean, "]")) {
+            section = stringTrim(subStr(clean, 1, len(clean) - 2))
+            continue
+        }
+        if (section == "workspace") {
+            var eq = stringIndexOf(clean, "=")
+            if (eq != -1) {
+                if (stringTrim(subStr(clean, 0, eq)) == "members") {
+                    var value = stringTrim(subStr(clean, eq + 1, len(clean) - eq - 1))
+                    if (stringStartsWith(value, "[")) {
+                        if (arrayIsClosed(value)) {
+                            parseMembersArray(value, members)
+                        } else {
+                            pending = value
+                        }
+                    }
+                }
+            }
+        }
+    }
+    members
+}
+
+fn arrayIsClosed(s: string) -> bool {
+    var depth = 0
+    var inStr: int? = none
+    var prev = 0
+    let bs = bytes(s)
+    var i = 0
+    while (i < len(bs)) {
+        let c = bs[i] as int
+        if (let some(q) = inStr) {
+            if (c == q && prev != 92) {
+                inStr = none
+            }
+        } else {
+            if (c == 34 || c == 39) {
+                inStr = c
+            } else if (c == 91) {
+                depth = depth + 1
+            } else if (c == 93) {
+                depth = depth - 1
+            }
+        }
+        prev = c
+        i = i + 1
+    }
+    depth <= 0
+}
+
+fn parseMembersArray(array: string, out: Map<string, string>) {
+    var rest = array
+    while (true) {
+        var start = -1
+        var startC = 0
+        var i = 0
+        while (i < len(rest)) {
+            let c = rest[i] as int
+            if (c == 123 || c == 34 || c == 39) {
+                start = i
+                startC = c
+                break
+            }
+            i = i + 1
+        }
+        if (start == -1) {
+            break
+        }
+        if (startC == 123) {
+            var after = subStr(rest, start + 1, len(rest) - start - 1)
+            if (let some(cl) = matchingBrace(after)) {
+                let table = subStr(after, 0, cl)
+                if (let some(name) = extractKv(table, "name")) {
+                    if (let some(path) = extractKv(table, "path")) {
+                        out[name] = path
+                    }
+                }
+                rest = subStr(after, cl + 1, len(after) - cl - 1)
+            } else {
+                break
+            }
+        } else {
+            let q = startC
+            var after = subStr(rest, start + 1, len(rest) - start - 1)
+            let end = stringIndexOf(after, "{q as char}")
+            if (end == -1) {
+                break
+            }
+            let value = stringTrim(subStr(after, 0, end))
+            if (value != "") {
+                out[value] = value
+            }
+            rest = subStr(after, end + 1, len(after) - end - 1)
+        }
+    }
+}
+
+fn matchingBrace(table: string) -> int? {
+    var depth = 1
+    var inStr: int? = none
+    var prev = 0
+    let bs = bytes(table)
+    var i = 0
+    while (i < len(bs)) {
+        let c = bs[i] as int
+        if (let some(q) = inStr) {
+            if (c == q && prev != 92) {
+                inStr = none
+            }
+        } else {
+            if (c == 34 || c == 39) {
+                inStr = c
+            } else if (c == 123) {
+                depth = depth + 1
+            } else if (c == 125) {
+                depth = depth - 1
+                if (depth == 0) {
+                    return i
+                }
+            }
+        }
+        prev = c
+        i = i + 1
+    }
+    none
+}
+
+fn extractKv(table: string, want: string) -> string? {
+    var rest = table
+    while (true) {
+        let idx = stringIndexOf(rest, want)
+        if (idx == -1) {
+            return none
+        }
+        var bad = false
+        if (idx > 0) {
+            let b = rest[idx - 1] as int
+            if ((b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95) {
+                bad = true
+            }
+        }
+        if (bad) {
+            rest = subStr(rest, idx + len(want), len(rest) - idx - len(want))
+            continue
+        }
+        let after = stringTrimStart(subStr(rest, idx + len(want), len(rest) - idx - len(want)))
+        if (!stringStartsWith(after, "=")) {
+            rest = subStr(rest, idx + len(want), len(rest) - idx - len(want))
+            continue
+        }
+        let value = stringTrimStart(subStr(after, 1, len(after) - 1))
+        if (stringStartsWith(value, "\"") || stringStartsWith(value, "'")) {
+            var q = 0
+            if (stringStartsWith(value, "\"")) {
+                q = 34
+            } else {
+                q = 39
+            }
+            let body = subStr(value, 1, len(value) - 1)
+            let end = stringIndexOf(body, "{q as char}")
+            if (end == -1) {
+                return none
+            }
+            return subStr(body, 0, end)
+        }
+        var endI = len(value)
+        var k = 0
+        while (k < len(value)) {
+            let c = value[k] as int
+            if (c == 44 || c == 125) {
+                endI = k
+                break
+            }
+            k = k + 1
+        }
+        let bare = stringTrim(subStr(value, 0, endI))
+        if (bare == "") {
+            return none
+        }
+        return bare
+    }
+}
+
+fn stripTomlComment(line: string) -> string {
+    var inStr: int? = none
+    var prev = 0
+    let bs = bytes(line)
+    var i = 0
+    while (i < len(bs)) {
+        let c = bs[i] as int
+        if (let some(q) = inStr) {
+            if (c == q && prev != 92) {
+                inStr = none
+            }
+        } else {
+            if (c == 35) {
+                return subStr(line, 0, i)
+            }
+            if (c == 34 || c == 39) {
+                inStr = c
+            }
+        }
+        prev = c
+        i = i + 1
+    }
+    line
+}
+
+fn stringIndexOf(s: string, needle: string) -> int {
+    let sb = bytes(s)
+    let nb = bytes(needle)
+    if (len(nb) == 0) {
+        return 0
+    }
+    if (len(nb) > len(sb)) {
+        return -1
+    }
+    var i = 0
+    let limit = len(sb) - len(nb)
+    while (i <= limit) {
+        var j = 0
+        var allMatch = true
+        while (j < len(nb)) {
+            if (sb[i + j] != nb[j]) {
+                allMatch = false
+                break
+            }
+            j = j + 1
+        }
+        if (allMatch) {
+            return i
+        }
+        i = i + 1
+    }
+    -1
+}
+
+fn stringStartsWith(s: string, prefix: string) -> bool {
+    let pb = bytes(prefix)
+    let sb = bytes(s)
+    if (len(pb) > len(sb)) {
+        return false
+    }
+    var i = 0
+    while (i < len(pb)) {
+        if (sb[i] != pb[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+fn stringEndsWith(s: string, suffix: string) -> bool {
+    let sb = bytes(suffix)
+    let pb = bytes(s)
+    if (len(sb) > len(pb)) {
+        return false
+    }
+    var i = 0
+    var d = len(pb) - len(sb)
+    while (i < len(sb)) {
+        if (pb[d + i] != sb[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+fn stringTrim(s: string) -> string {
+    let b = bytes(s)
+    var start = 0
+    var end = len(b)
+    while (start < end) {
+        let c = b[start] as int
+        if (c == 32 || c == 9 || c == 10 || c == 13) {
+            start = start + 1
+        } else {
+            break
+        }
+    }
+    while (end > start) {
+        let c = b[end - 1] as int
+        if (c == 32 || c == 9 || c == 10 || c == 13) {
+            end = end - 1
+        } else {
+            break
+        }
+    }
+    var out = [1 as byte]
+    out.pop()
+    var k = start
+    while (k < end) {
+        out.push(b[k])
+        k = k + 1
+    }
+    str(out)
+}
+
+fn stringTrimStart(s: string) -> string {
+    let bs = bytes(s)
+    var start = 0
+    var end = len(bs)
+    while (start < end) {
+        let c = bs[start] as int
+        if (c == 32 || c == 9 || c == 10 || c == 13) {
+            start = start + 1
+        } else {
+            break
+        }
+    }
+    subStr(s, start, end - start)
+}
+
+fn splitLines(s: string) -> List<string> {
+    var out = emptyStrs()
+    let bs = bytes(s)
+    var start = 0
+    var i = 0
+    while (i <= len(bs)) {
+        if (i == len(bs) || bs[i] as int == 10) {
+            var end = i
+            if (end > start && bs[end - 1] as int == 13) {
+                end = end - 1
+            }
+            out.push(seg(bs, start, end))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    out
+}
+
+fn seg(bs: List<byte>, start: int, end: int) -> string {
+    var out = ""
+    var pos = start
+    while (pos < end) {
+        let cp = decodeCp(bs, pos)
+        out += "{cp as char}"
+        pos = pos + cpLen(bs[pos] as int)
+    }
+    out
+}
+
+fn subStr(s: string, start: int, count: int) -> string {
+    let bs = bytes(s)
+    var end = start + count
+    if (end > len(bs)) {
+        end = len(bs)
+    }
+    var out = [1 as byte]
+    out.pop()
+    var i = start
+    while (i < end) {
+        out.push(bs[i])
+        i = i + 1
+    }
+    str(out)
+}
+
+fn isFileP(p: string) -> bool {
+    if (file_exists(p)) {
+        if (let some(_) = list_dir(p)) {
+            return false
+        }
+        return true
+    }
+    false
+}
+
+fn isDirP(p: string) -> bool {
+    if (let some(_) = list_dir(p)) {
+        return true
+    }
+    false
+}
+
+fn pathJoin(base: string, rel: string) -> string {
+    if (rel == "") {
+        return base
+    }
+    if (base == "") {
+        return rel
+    }
+    base + "/" + rel
+}
+
+fn pathParentP(p: string) -> string? {
+    if (p == "") {
+        return none
+    }
+    let bs = bytes(p)
+    var last = -1
+    var i = 0
+    while (i < len(bs)) {
+        let b = bs[i] as int
+        if (b == 47 || b == 92) {
+            last = i
+        }
+        i = i + 1
+    }
+    if (last == -1) {
+        return ""
+    }
+    subStr(p, 0, last)
+}
+
+fn pathStem(p: string) -> string {
+    let bs = bytes(p)
+    var lastSep = -1
+    var i = 0
+    while (i < len(bs)) {
+        let b = bs[i] as int
+        if (b == 47 || b == 92) {
+            lastSep = i
+        }
+        i = i + 1
+    }
+    var start = lastSep + 1
+    var lastDot = -1
+    var k = start
+    while (k < len(bs)) {
+        let b = bs[k] as int
+        if (b == 46) {
+            lastDot = k
+        }
+        k = k + 1
+    }
+    var end = len(bs)
+    if (lastDot != -1) {
+        end = lastDot
+    }
+    subStr(p, start, end - start)
+}
+
+fn joinPathParts(segs: List<string>) -> string {
+    var out = ""
+    var i = 0
+    while (i < len(segs)) {
+        if (i > 0) {
+            out += "/"
+        }
+        out += segs[i]
+        i = i + 1
+    }
+    out
+}
+
+fn renderPath(segs: List<string>) -> string {
+    var out = ""
+    var i = 0
+    while (i < len(segs)) {
+        if (i > 0) {
+            out += "."
+        }
+        out += segs[i]
+        i = i + 1
+    }
+    out
+}
+
+fn importerDir(importer: string) -> string? {
+    var p = pathParentP(importer)
+    if (let some(x) = p) {
+        if (x != "") {
+            return x
+        }
+        return "."
+    }
+    "."
+}
+
+fn copyStrs(l: List<string>) -> List<string> {
+    var out = emptyStrs()
+    for (x in l) {
+        out.push(x)
+    }
+    out
+}
+
+fn singleStr(x: string) -> List<string> {
+    var l = emptyStrs()
+    l.push(x)
+    l
+}
+
+fn listHasStr(l: List<string>, s: string) -> bool {
+    for (x in l) {
+        if (x == s) {
+            return true
+        }
+    }
+    false
+}
+
+fn subListStr(l: List<string>, start: int, count: int) -> List<string> {
+    var out = emptyStrs()
+    var i = start
+    var end = start + count
+    if (end > len(l)) {
+        end = len(l)
+    }
+    while (i < end) {
+        out.push(l[i])
+        i = i + 1
+    }
+    out
+}
+
+fn eqStrs(a: List<string>, b: List<string>) -> bool {
+    if (len(a) != len(b)) {
+        return false
+    }
+    var i = 0
+    while (i < len(a)) {
+        if (a[i] != b[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+fn sortStrs(l: List<string>) {
+    var i = 0
+    while (i < len(l)) {
+        var m = i
+        var j = i + 1
+        while (j < len(l)) {
+            if (strLt(l[j], l[m])) {
+                m = j
+            }
+            j = j + 1
+        }
+        if (m != i) {
+            let t = l[i]
+            l[i] = l[m]
+            l[m] = t
+        }
+        i = i + 1
+    }
+}
+
+fn strLt(a: string, b: string) -> bool {
+    let ab = bytes(a)
+    let bb = bytes(b)
+    var i = 0
+    while (i < len(ab) && i < len(bb)) {
+        let x = ab[i] as int
+        let y = bb[i] as int
+        if (x != y) {
+            return x < y
+        }
+        i = i + 1
+    }
+    len(ab) < len(bb)
+}
+
+fn dedupStrs(l: List<string>) {
+    var i = 1
+    while (i < len(l)) {
+        var advance = 1
+        if (l[i] == l[i - 1]) {
+            l.remove(i)
+            advance = 0
+        } else {
+            advance = 1
+        }
+        i = i + advance
+    }
+}
+
+fn emptyModuleFiles() -> List<ModuleFile> {
+    var l = [ModuleFile("", emptyStrs(), emptyStrs(), false, emptyPubNs(), emptyPubItems(), emptyImportDecls(), Program(none, emptyImportDecls(), emptyItems(), false), emptyFileImports())]
+    l.pop()
+    l
+}
+
+fn emptyFileImports() -> FileImports {
+    FileImports(emptyMapStrBinding(), emptyMapStrStringList(), emptyMapStrRename(), emptyMapStrStringList(), none)
+}
+
+fn emptyPubNs() -> List<PubNs> {
+    var l = [PubNs("x", emptyStrs(), emptyStrs())]
+    l.pop()
+    l
+}
+
+fn emptyPubItems() -> List<PubItem> {
+    var l = [PubItem("x", 0)]
+    l.pop()
+    l
+}
+
+fn emptyWorkspace() -> Workspace {
+    Workspace(emptyMapStrStr())
+}
+
+fn emptyMapStrBinding() -> Map<string, ModuleBinding> {
+    let m = {"::seed::": ModuleBinding(emptyStrs(), none)}
+    m.remove("::seed::")
+    m
+}
+
+fn emptyMapStrStringList() -> Map<string, List<string>> {
+    let m = {"::seed::": emptyStrs()}
+    m.remove("::seed::")
+    m
+}
+
+fn emptyMapStrRename() -> Map<string, RenameTarget> {
+    let m = {"::seed::": RenameTarget("", emptyStrs())}
+    m.remove("::seed::")
+    m
+}
+
+fn emptyMapStrStr() -> Map<string, string> {
+    let m = {"::seed::": ""}
+    m.remove("::seed::")
+    m
+}
+
+fn emptyMapStrInt() -> Map<string, int> {
+    let m = {"::seed::": 0}
+    m.remove("::seed::")
+    m
+}

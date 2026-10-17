@@ -1,0 +1,421 @@
+module compiler.objread
+
+import { sliceRange } from std.text.format
+
+class CoffSection {
+    var name: string
+    var sizeVirt: int
+    var sizeRaw: int
+    var ptrRaw: int
+    var ptrReloc: int
+    var nReloc: int
+    var chars: int
+    var isBss: bool
+    var raw: List<int>
+    var relocs: List<CoffRel>
+
+    constructor(name: string) {
+        this.name = name
+        this.sizeVirt = 0
+        this.sizeRaw = 0
+        this.ptrRaw = 0
+        this.ptrReloc = 0
+        this.nReloc = 0
+        this.chars = 0
+        this.isBss = false
+        this.raw = [0]
+        this.raw.pop()
+        this.relocs = [CoffRel(0, 0, 0)]
+        this.relocs.pop()
+    }
+}
+
+class CoffRel {
+    var va: int
+    var symIdx: int
+    var type: int
+
+    constructor(a: int, b: int, c: int) {
+        this.va = a
+        this.symIdx = b
+        this.type = c
+    }
+}
+
+class CoffSym {
+    var name: string
+    var value: int
+    var sec: int
+    var scl: int
+    var nAux: int
+
+    constructor() {
+        this.name = ""
+        this.value = 0
+        this.sec = 0
+        this.scl = 0
+        this.nAux = 0
+    }
+}
+
+class CoffObj {
+    var file: string
+    var machine: int
+    var secs: List<CoffSection>
+    var syms: List<CoffSym>
+    var strTbl: List<int>
+    var mapIdx: List<int>
+
+    constructor(file: string) {
+        this.file = file
+        this.machine = 0
+        this.secs = [CoffSection("x")]
+        this.secs.pop()
+        this.syms = [CoffSym()]
+        this.syms.pop()
+        this.strTbl = [0]
+        this.strTbl.pop()
+        this.mapIdx = [0]
+        this.mapIdx.pop()
+    }
+}
+
+class ArMember {
+    var name: string
+    var data: List<int>
+
+    constructor(name: string) {
+        this.name = name
+        this.data = [0]
+        this.data.pop()
+    }
+}
+
+class ArInfo {
+    var members: List<ArMember>
+    var longData: List<int>
+
+    constructor() {
+        this.members = [ArMember("x")]
+        this.members.pop()
+        this.longData = [0]
+        this.longData.pop()
+    }
+}
+
+fn chr(c: int) -> string {
+    let b = (c & 255) as byte
+    "{b}"
+}
+
+fn u16At(b: List<int>, at: int) -> int {
+    (b[at] & 255) | ((b[at + 1] & 255) << 8)
+}
+
+fn u32At(b: List<int>, at: int) -> int {
+    var v = 0
+    var i = 0
+    while (i <= 3) {
+        v = v | ((b[at + i] & 255) << (8 * i))
+        i = i + 1
+    }
+    v
+}
+
+fn blobFrom(s: string) -> List<int> {
+    var out = [0]
+    out.pop()
+    var i = 0
+    while (i < len(s)) {
+        out.push(s[i] as int)
+        i = i + 1
+    }
+    out
+}
+
+fn hex4(v: int) -> string {
+    var h = "0123456789abcdef"
+    var t = ""
+    var x = v
+    var n = 0
+    while (n <= 3) {
+        t = chr(h[((x >> (4 * n)) & 15) as int] as int) + t
+        n = n + 1
+    }
+    t
+}
+
+fn nameBytes(b: List<int>, at: int) -> string {
+    var out = ""
+    var i = 0
+    while (i <= 7 && b[at + i] != 0) {
+        out = out + chr(b[at + i])
+        i = i + 1
+    }
+    out
+}
+
+fn symNameAt(tbl: List<int>, off: int) -> string {
+    var out = ""
+    var i = off
+    while (i < len(tbl) && tbl[i] != 0) {
+        out = out + chr(tbl[i])
+        i = i + 1
+    }
+    out
+}
+
+fn objSymName(o: CoffObj, b: List<int>, at: int) -> string {
+    let first = u32At(b, at)
+    if (first == 0) {
+        return symNameAt(o.strTbl, u32At(b, at + 4))
+    }
+    nameBytes(b, at)
+}
+
+fn isDigits(s: string) -> bool {
+    if (s == "") {
+        return false
+    }
+    var i = 0
+    while (i < len(s)) {
+        let c = s[i] as int
+        if (!(c >= 48) || !(c <= 57)) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+fn toDec(s: string) -> int {
+    var v = 0
+    var i = 0
+    while (i < len(s)) {
+        let c = s[i] as int
+        if (c >= 48 && c <= 57) {
+            v = v * 10 + (c - 48)
+        }
+        i = i + 1
+    }
+    v
+}
+
+fn coffRead(name: string, b: List<int>) -> CoffObj {
+    let o = CoffObj(name)
+    if (len(b) < 20) {
+        return o
+    }
+    o.machine = u16At(b, 0)
+    let numSec = u16At(b, 2)
+    let ptrSym = u32At(b, 8)
+    let numSym = u32At(b, 12)
+    let strOff = ptrSym + 18 * numSym
+    var i = 0
+    while (i < numSec) {
+        let at = 20 + 40 * i
+        let cs = CoffSection(nameBytes(b, at))
+        cs.sizeVirt = u32At(b, at + 8)
+        cs.sizeRaw = u32At(b, at + 16)
+        cs.ptrRaw = u32At(b, at + 20)
+        cs.ptrReloc = u32At(b, at + 24)
+        cs.nReloc = u16At(b, at + 32)
+        cs.chars = u32At(b, at + 36)
+        cs.isBss = (cs.chars & 128) != 0
+        var r = 0
+        while (r < cs.sizeRaw && (cs.ptrRaw + r) < len(b)) {
+            cs.raw.push(b[cs.ptrRaw + r])
+            r = r + 1
+        }
+        var j = 0
+        while (j < cs.nReloc && (cs.ptrReloc + 10 * j + 10) <= len(b)) {
+            let ra = cs.ptrReloc + 10 * j
+            cs.relocs.push(CoffRel(u32At(b, ra), u32At(b, ra + 4), u16At(b, ra + 8)))
+            j = j + 1
+        }
+        o.secs.push(cs)
+        i = i + 1
+    }
+    if (numSym > 0) {
+        let tl = u32At(b, strOff)
+        var t = 0
+        while (t < tl && (strOff + t) < len(b)) {
+            o.strTbl.push(b[strOff + t])
+            t = t + 1
+        }
+    }
+    var s2 = 0
+    while (s2 < len(o.secs)) {
+        let nm2 = o.secs[s2].name
+        if (len(nm2) > 1 && (nm2[0] as int) == 47 && isDigits(sliceRange(nm2, 1, len(nm2)))) {
+            o.secs[s2].name = symNameAt(o.strTbl, toDec(sliceRange(nm2, 1, len(nm2))))
+        }
+        s2 = s2 + 1
+    }
+    var k = 0
+    while (k < numSym && (ptrSym + 18 * k + 18) <= len(b)) {
+        let at = ptrSym + 18 * k
+        let s = CoffSym()
+        s.name = objSymName(o, b, at)
+        s.value = u32At(b, at + 8)
+        s.sec = u16At(b, at + 12)
+        s.scl = b[at + 16]
+        s.nAux = b[at + 17]
+        o.syms.push(s)
+        k = k + 1 + s.nAux
+    }
+    var x = 0
+    var y = 0
+    while (y < numSym) {
+        let need = 1 + o.syms[x].nAux
+        var z = 0
+        while (z < need && (y + z) < numSym) {
+            o.mapIdx.push(x)
+            z = z + 1
+        }
+        y = y + need
+        x = x + 1
+    }
+    o
+}
+
+fn fieldStr(b: List<int>, at: int, n: int) -> string {
+    var out = ""
+    var i = 0
+    while (i < n) {
+        let c = b[at + i] & 255
+        if (c >= 33 && c <= 126) {
+            out = out + chr(c)
+        }
+        i = i + 1
+    }
+    var end = len(out)
+    while (end > 0 && (out[end - 1] as int) == 32) {
+        end = end - 1
+    }
+    sliceRange(out, 0, end)
+}
+
+fn isDropSec(nm: string) -> bool {
+    if (len(nm) >= 6 && sliceRange(nm, 0, 6) == ".debug") {
+        return true
+    }
+    if (len(nm) >= 5 && sliceRange(nm, 0, 5) == ".llvm") {
+        return true
+    }
+    nm == ".pdata" || nm == ".xdata" || nm == ".rsrc" || nm == ".reloc"
+}
+
+fn arRead(b: List<int>) -> ArInfo {
+    let a = ArInfo()
+    var at = 8
+    while (at + 60 <= len(b)) {
+        var nm = fieldStr(b, at, 16)
+        var sz = toDec(fieldStr(b, at + 48, 10))
+        at = at + 60
+        let end = at + sz
+        if (end > len(b)) {
+            return a
+        }
+        if (nm == "/" || nm == "/SYM64/") {
+            at = end
+            if (at < len(b) && b[at] == 10) {
+                at = at + 1
+            }
+        } else if (nm == "//") {
+            var q = at
+            while (q < end) {
+                a.longData.push(b[q])
+                q = q + 1
+            }
+            at = end
+            if (at < len(b) && b[at] == 10) {
+                at = at + 1
+            }
+        } else {
+            if (len(nm) > 0 && (nm[len(nm) - 1] as int) == 47) {
+                nm = sliceRange(nm, 0, len(nm) - 1)
+            }
+            if (len(nm) > 1 && (nm[0] as int) == 47 && isDigits(chr(nm[1] as int))) {
+                nm = symNameAt(a.longData, toDec(chr(nm[1] as int)))
+            }
+            let m = ArMember(nm)
+            var m2 = 0
+            while (m2 < sz) {
+                m.data.push(b[at + m2])
+                m2 = m2 + 1
+            }
+            a.members.push(m)
+            at = end
+            if (at < len(b) && b[at] == 10) {
+                at = at + 1
+            }
+        }
+    }
+    a
+}
+
+fn numStr(v: int) -> string {
+    if (v == 0) {
+        return "0"
+    }
+    var x = v
+    var out = ""
+    while (x > 0) {
+        out = chr(48 + (x % 10)) + out
+        x = x / 10
+    }
+    out
+}
+
+fn padField(s: string, n: int) -> string {
+    var out = s
+    while (len(out) < n) {
+        out = out + " "
+    }
+    out
+}
+
+/// ar writer — the inverse of `arRead`, built from strings so a large archive
+/// never materializes every member byte as a `List<int>` (8 bytes/element) at
+/// once. Member names longer than 15 bytes ride in a `//` string table
+/// (NUL-terminated names back to back) referenced as `/offset`; `arRead` maps
+/// those offsets back with `symNameAt`. The format is GNU/BSD-style but only
+/// ever consumed by `arRead`, so no external tool needs to read it.
+fn arWriteStrs(names: List<string>, datas: List<string>) -> string {
+    var out = "!<arch>\n"
+    var longData = ""
+    var offsets = [0]
+    offsets.pop()
+    var mi = 0
+    while (mi < len(names)) {
+        if (len(names[mi]) > 15) {
+            offsets.push(len(longData))
+            longData = longData + names[mi] + chr(0)
+        } else {
+            offsets.push(-1)
+        }
+        mi = mi + 1
+    }
+    if (len(longData) > 0) {
+        var hdrL = padField("//", 16) + padField("0", 12) + padField("0", 6) + padField("0", 6) + padField("0", 8) + padField(numStr(len(longData)), 10) + "`\n"
+        out = out + hdrL + longData
+        if (len(longData) % 2 == 1) {
+            out = out + chr(10)
+        }
+    }
+    mi = 0
+    while (mi < len(names)) {
+        var nm = names[mi]
+        if (offsets[mi] >= 0) {
+            nm = "/" + numStr(offsets[mi])
+        }
+        var hdr = padField(nm, 16) + padField("0", 12) + padField("0", 6) + padField("0", 6) + padField("100644", 8) + padField(numStr(len(datas[mi])), 10) + "`\n"
+        out = out + hdr + datas[mi]
+        if (len(datas[mi]) % 2 == 1) {
+            out = out + chr(10)
+        }
+        mi = mi + 1
+    }
+    out
+}

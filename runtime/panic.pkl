@@ -1,0 +1,115 @@
+module runtime.panic
+
+import { int64ToString } from runtime.strings
+
+/// Port of `runtime/src/panic.rs`: the panic-path contract. The banner
+/// prefix, the internal-error banner, and the standard failure messages are
+/// pure strings; the fatal-vs-capture decision is the state machine worth
+/// owning. Actual process exit / stash-and-unwind stay native (the test
+/// harness ABI owns `CAPTURE`).
+///
+/// Bits that stay native (call these through the ABI):
+///   - `pickle_panic_bytes` / `pickle_panic_cstr` — write `fatal:` then `msg`
+///     to stderr and exit 1; in capture mode stash the message instead.
+///   - `pickle_test_capture_begin` / `pickle_test_capture_take`.
+///   - `install_panic_hook` — Rust hook printing `internal error: <msg> at
+///     <file>:<line>`.
+/// This module therefore exports the message set, the banner composers, and a
+/// `CaptureLedger` mirroring the thread-local capture record (last-wins,
+/// consumed-once) so a future pure test runner can keep the same semantics.
+
+/// `fatal: ` prefix written to stderr before the payload.
+fn fatalPrefix() -> string {
+    "fatal: "
+}
+
+/// `internal error: ` prefix of the Rust panic hook banner.
+fn internalPrefix() -> string {
+    "internal error: "
+}
+
+/// The full `<msg>\n` fatal frame.
+fn fatalBanner(msg: string) -> string {
+    fatalPrefix() + msg + "\n"
+}
+
+/// The full `internal error: <msg> at <file>:<line>\n` hook frame.
+fn internalBanner(msg: string, file: string, line: int) -> string {
+    internalPrefix() + msg + " at " + file + ":" + int64ToString(line) + "\n"
+}
+
+/// A `match` whose scrutinee matched no arm.
+fn msgNoMatch() -> string {
+    "pickle: match is not exhaustive"
+}
+
+/// A `!` unwrap applied to a `none` option.
+fn msgNoneUnwrap() -> string {
+    "pickle: unwrapped none value"
+}
+
+/// An interface dispatch whose receiver implements no such method.
+fn msgNoIfaceMethod() -> string {
+    "pickle: interface method dispatch found no implementation"
+}
+
+/// A `...args` spread whose runtime length disagrees with the static arity
+/// (`pickle_panic_arity_diff`; the compiler emits a static check first).
+fn msgArityDiff() -> string {
+    "pickle: spread list does not match the expected number of arguments"
+}
+
+/// The expected `fatal:` frames for the standard panics.
+fn fatalNoMatch() -> string {
+    fatalBanner(msgNoMatch())
+}
+
+fn fatalNoneUnwrap() -> string {
+    fatalBanner(msgNoneUnwrap())
+}
+
+fn fatalArityDiff() -> string {
+    fatalBanner(msgArityDiff())
+}
+
+fn fatalNoIfaceMethod() -> string {
+    fatalBanner(msgNoIfaceMethod())
+}
+
+/// Mirror of the capture bookkeeping: whether capture mode is on, and the
+/// most recent recorded message (last-wins). `take` consumes the record, so a
+/// second read reports none — matching `pickle_test_capture_take`.
+class CaptureLedger {
+    var on: bool
+    var last: string?
+
+    constructor() {
+        this.on = false
+        this.last = none
+    }
+
+    fn begin() {
+        this.on = true
+    }
+
+    fn endClear() {
+        this.on = false
+        this.last = none
+    }
+
+    fn record(msg: string) {
+        if (!this.on) {
+            return
+        }
+        this.last = msg
+    }
+
+    fn take() -> string? {
+        if (!this.on) {
+            return none
+        }
+        var m = this.last
+        this.last = none
+        m
+    }
+}

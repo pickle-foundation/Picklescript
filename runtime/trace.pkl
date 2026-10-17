@@ -1,0 +1,510 @@
+module runtime.trace
+
+/// Port of `runtime/src/trace.rs`: conservative, worklist-based marking of the
+/// reference graph. `traceFromRoots` marks everything reachable from the root
+/// cells, the manual objects, the temp roots, and each registered thread's
+/// shadow-stack slots; `traceOne` walks an object using its builtin layout or,
+/// for a user class, its descriptor's managed-field bitmask.
+///
+/// Unlike `collector.pkl`, which walks a MODELED graph (edges registered with
+/// `addEdge`), this module reads the REAL layout out of REAL memory. That is
+/// deliberate: the marker's whole job is knowing which words of an object are
+/// managed pointers, and a modeled edge list cannot disagree with itself about
+/// that. Here the offsets, the 8-byte stride, the header packing and the
+/// open-addressing map scan are all load-bearing -- if `LIST_DATA_OFF` were
+/// wrong the list walk would read the wrong word and the marked set would come
+/// out wrong, not merely different from the model.
+///
+/// The one thing that stays modeled is ADDRESSING, for the same reason
+/// `shadow.pkl` models a frame id: Pickle has no pointer-to-integer cast, so an
+/// object is addressed by a small integer into `TraceHeap.blocks` and the real
+/// `*int` block is looked up from it. Object blocks and the auxiliary arrays a
+/// builtin points at (a list's element array, a map's entry table) live in the
+/// same table and are addressed the same way, which mirrors the native code
+/// reading a `*mut *mut PickleObject` payload. Sentinels are reserved negative
+/// addresses that are never allocated, mirroring `object.rs`'s
+/// `NIL_SENTINEL`/`NONE_KEY` statics that are never heap-allocated.
+///
+/// `trace_from_roots` holds the registry lock across the whole shadow walk. The
+/// native reason is that a concurrent register/unregister/push on another OS
+/// thread can free a node mid-iteration. There is no lock to port in a
+/// single-threaded model, so what is preserved instead is the ORDER contract
+/// the lock guarantees: the walk observes one consistent snapshot of every
+/// thread's frames, and every root source is read once, at trace time.
+
+import { HEADER, LIST_LEN_OFF, LIST_CAP_OFF, LIST_DATA_OFF, MAP_CAP_OFF, MAP_ENTRIES_OFF, TUPLE_LEN_OFF, ENUM_HEADER_SLOTS } from runtime.layout
+import { PICKLE_CLASS_STRING, PICKLE_CLASS_LIST, PICKLE_CLASS_MAP, PICKLE_CLASS_ENUM, PICKLE_CLASS_TUPLE, PICKLE_CLASS_FLAG_FINALIZER } from runtime.object
+import { ShadowRegistry } from runtime.shadow
+
+/// The null object pointer. Everything in the native code is guarded by
+/// `is_null()`, so the port's root word is 0 rather than a real address.
+const NULL_ADDR: int = 0
+
+/// Reserved addresses for the two map-key sentinels. `object.rs` gives them
+/// static storage that is never heap-allocated and never swept, so nothing
+/// real can ever compare equal to them.
+const NIL_SENTINEL_ADDR: int = -1
+const NONE_KEY_ADDR: int = -2
+
+/// `PICKLE_FLAG_MARKED` in the header's flags word.
+const PICKLE_FLAG_MARKED: int = 1
+
+/// `PICKLE_FLAG_FINALIZABLE` in the header's flags word: installed by
+/// `#[deinit]` on the object itself. Distinct from
+/// `PICKLE_CLASS_FLAG_FINALIZER`, which is the same bit but lives in the
+/// *descriptor's* flags, not the header's.
+const PICKLE_FLAG_FINALIZABLE: int = 2
+
+/// A `u32` in a `u64` word: class ids and sizes are read out of the low half.
+const U32_MASK: int = 0xFFFFFFFF
+
+/// The managed-field bitmask covers 32 slots per word (`1 << bit`, bit 0..31).
+const SLOTS_PER_MASK_WORD: int = 32
+
+/// Word indices into an object block. The header is 3 words (`next`,
+/// `class_id`|`flags`, `size`|`_pad`) and the payload starts at word 3.
+const W_NEXT: int = 0
+const W_CLASS_FLAGS: int = 1
+const W_SIZE: int = 2
+const W_PAYLOAD: int = HEADER / 8
+
+/// Payload field offsets, as word indices into the object block.
+const W_LIST_LEN: int = LIST_LEN_OFF / 8
+const W_LIST_CAP: int = LIST_CAP_OFF / 8
+const W_LIST_DATA: int = LIST_DATA_OFF / 8
+const W_MAP_CAP: int = MAP_CAP_OFF / 8
+const W_MAP_ENTRIES: int = MAP_ENTRIES_OFF / 8
+const W_TUPLE_LEN: int = TUPLE_LEN_OFF / 8
+
+/// `MapEntry { key, value }` is two words.
+const MAP_ENTRY_WORDS: int = 2
+
+/// An empty `List<int>` (see `object.pkl`: `[]` is `List<?>`).
+fn emptyInts() -> List<int> {
+    var xs = [0]
+    xs.pop()
+    xs
+}
+
+/// A root cell: `*mut *mut PickleObject`. The native trace reads `**cell`, so
+/// a root is an indirection that is followed at trace time -- clearing the cell
+/// before the trace removes the root, and the port models that with a settable
+/// `value` rather than a captured address.
+class RootCell {
+    var value: int
+
+    constructor(value: int) {
+        this.value = value
+    }
+}
+
+/// A `ClassDescriptor` entry for the mark walk: the managed-mask bitmask, the
+/// slot count, and the mask-word count. `object.pkl`'s `ClassDesc` carries only
+/// name/parent/slots/flags (it models the *cast* side of a descriptor, which
+/// needs no mask), so the tracer owns its own table rather than widening it.
+class TraceDesc {
+    var name: string
+    var slotCount: int
+    var maskWords: int
+    var managedMask: List<int>
+    var flags: int
+
+    constructor(name: string, slotCount: int, managedMask: List<int>, flags: int) {
+        this.name = name
+        this.slotCount = slotCount
+        this.managedMask = managedMask
+        this.maskWords = len(managedMask)
+        this.flags = flags
+    }
+
+    /// Whether a class installs a `deinit` finalizer.
+    fn hasFinalizer() -> bool {
+        (this.flags & PICKLE_CLASS_FLAG_FINALIZER) != 0
+    }
+}
+
+/// A descriptor table keyed by class id, indexed (ids are dense and start at
+/// the builtin base), with a `none` for an unregistered id -- which is what
+/// makes `traceOne`'s user-class arm a no-op for an unknown class.
+class DescriptorTable {
+    var descs: List<TraceDesc>
+
+    constructor() {
+        this.descs = emptyDescs()
+    }
+
+    fn get(classId: int) -> TraceDesc? {
+        if (classId < 0) {
+            return none
+        }
+        if (classId >= len(this.descs)) {
+            return none
+        }
+        this.descs[classId]
+    }
+
+    /// Register (or replace) the descriptor for a user class id and return it.
+    fn register(classId: int, name: string, slotCount: int, managedMask: List<int>, flags: int) -> TraceDesc {
+        var d = TraceDesc(name, slotCount, managedMask, flags)
+        while (len(this.descs) <= classId) {
+            this.descs.push(TraceDesc("", 0, emptyInts(), 0))
+        }
+        this.descs[classId] = d
+        d
+    }
+}
+
+/// An empty `List<TraceDesc>` (seed-and-pop: `[]` is `List<?>`).
+fn emptyDescs() -> List<TraceDesc> {
+    var seed = TraceDesc("seed", 0, emptyInts(), 0)
+    var xs = [seed]
+    xs.pop()
+    xs
+}
+
+/// A heap of REAL object blocks addressed by modeled integer addresses.
+///
+/// Addresses are 1-based indices into `blocks`, so 0 stays null. Every block is
+/// a raw `alloc(int, n)` holding `n` 8-byte words: objects carry the 24-byte
+/// `PickleObjectHeader` followed by their payload, and auxiliary arrays (a
+/// list's elements, a map's entry table) are plain word arrays addressed the
+/// same way.
+class TraceHeap {
+    var blocks: List<*int>
+    var words: List<int>
+    /// Pop order of the last trace: the address of every object `traceOne` was
+    /// called on. The worklist is LIFO, so this is the order the native
+    /// `while let Some(obj) = worklist.pop()` loop visits.
+    var visits: List<int>
+
+    constructor() {
+        this.blocks = emptyPointers()
+        this.words = emptyInts()
+        this.visits = emptyInts()
+    }
+
+    /// Allocate a zeroed block of `size` bytes and return its address.
+    /// `size` must be a multiple of 8 and at least the header.
+    fn allocBlock(size: int) -> int {
+        unsafe {
+            var p = alloc(int, size / 8)
+            var i = 0
+            while (i < size / 8) {
+                p[i] = 0
+                i = i + 1
+            }
+            this.blocks.push(p)
+            this.words.push(size / 8)
+            len(this.blocks)
+        }
+    }
+
+    /// Allocate a raw word array (list elements, map entries) and return its
+    /// address.
+    fn allocWords(count: int) -> int {
+        this.allocBlock(8 * count)
+    }
+
+    /// The real block behind an address.
+    fn blockOf(addr: int) -> *int {
+        this.blocks[addr - 1]
+    }
+
+    /// Words in the block at `addr`.
+    fn blockWords(addr: int) -> int {
+        this.words[addr - 1]
+    }
+
+    /// Read word `i` of `addr`, or 0 past the end. The native code never reads
+    /// out of bounds because every field offset is validated by the object's
+    /// size; the port returns 0 instead so a malformed test object is inert
+    /// rather than a wild read (this is the mistake `shadow_test.pkl` caught).
+    fn word(addr: int, i: int) -> int {
+        if (addr <= 0) {
+            return 0
+        }
+        if (i < 0) {
+            return 0
+        }
+        if (i >= this.words[addr - 1]) {
+            return 0
+        }
+        unsafe { this.blocks[addr - 1][i] }
+    }
+
+    fn setWord(addr: int, i: int, v: int) {
+        unsafe {
+            this.blocks[addr - 1][i] = v
+        }
+    }
+
+    // ---- header accessors (`PickleObjectHeader`) ----
+
+    fn next(addr: int) -> int {
+        this.word(addr, W_NEXT)
+    }
+
+    fn setNext(addr: int, v: int) {
+        this.setWord(addr, W_NEXT, v)
+    }
+
+    /// `class_id: u32` in the low half of word 1.
+    fn classId(addr: int) -> int {
+        this.word(addr, W_CLASS_FLAGS) & U32_MASK
+    }
+
+    fn setClassId(addr: int, v: int) {
+        var old = this.word(addr, W_CLASS_FLAGS)
+        this.setWord(addr, W_CLASS_FLAGS, (old & ~U32_MASK) | (v & U32_MASK))
+    }
+
+    /// `flags: u32` in the high half of word 1.
+    fn flags(addr: int) -> int {
+        this.word(addr, W_CLASS_FLAGS) >> 32
+    }
+
+    fn setFlags(addr: int, v: int) {
+        var old = this.word(addr, W_CLASS_FLAGS)
+        this.setWord(addr, W_CLASS_FLAGS, (old & U32_MASK) | ((v << 32) & ~U32_MASK))
+    }
+
+    /// `size: u32` in the low half of word 2.
+    fn size(addr: int) -> int {
+        this.word(addr, W_SIZE) & U32_MASK
+    }
+
+    fn setSize(addr: int, v: int) {
+        var old = this.word(addr, W_SIZE)
+        this.setWord(addr, W_SIZE, (old & ~U32_MASK) | (v & U32_MASK))
+    }
+
+    fn isMarked(addr: int) -> bool {
+        (this.flags(addr) & PICKLE_FLAG_MARKED) != 0
+    }
+
+    fn setMarked(addr: int) {
+        this.setFlags(addr, this.flags(addr) | PICKLE_FLAG_MARKED)
+    }
+
+    fn clearMarked(addr: int) {
+        this.setFlags(addr, this.flags(addr) & ~PICKLE_FLAG_MARKED)
+    }
+
+    /// Payload slot `i` (i.e. byte `HEADER + 8*i`).
+    fn payload(addr: int, i: int) -> int {
+        this.word(addr, W_PAYLOAD + i)
+    }
+
+    fn setPayload(addr: int, i: int, v: int) {
+        this.setWord(addr, W_PAYLOAD + i, v)
+    }
+
+    /// Free every block.
+    fn destroy() {
+        unsafe {
+            var i = 0
+            while (i < len(this.blocks)) {
+                free(this.blocks[i])
+                i = i + 1
+            }
+        }
+        this.blocks = emptyPointers()
+        this.words = emptyInts()
+    }
+
+    /// Addresses of every allocated block that carries the mark bit, in
+    /// allocation order. This is the marker's output, independent of the order
+    /// the worklist happened to visit.
+    fn marked() -> List<int> {
+        var out = emptyInts()
+        var i = 1
+        while (i <= len(this.blocks)) {
+            if (this.isMarked(i)) {
+                out.push(i)
+            }
+            i = i + 1
+        }
+        out
+    }
+
+    /// Clear the mark bit on every block (a collection cycle boundary).
+    fn clearAllMarks() {
+        var i = 1
+        while (i <= len(this.blocks)) {
+            this.clearMarked(i)
+            i = i + 1
+        }
+    }
+}
+
+/// An empty `List<*int>` (seed-and-pop).
+fn emptyPointers() -> List<*int> {
+    unsafe {
+        var seed = alloc(int, 1)
+        var xs = [seed]
+        xs.pop()
+        free(seed)
+        xs
+    }
+}
+
+/// `enqueue`: mark-on-push, skipping null and already-marked objects. Marking
+/// at enqueue time is what makes the walk terminate on a cyclic graph.
+fn enqueue(heap: TraceHeap, worklist: List<int>, obj: int) {
+    if (obj == NULL_ADDR) {
+        return
+    }
+    if (obj == NIL_SENTINEL_ADDR) {
+        return
+    }
+    if (obj == NONE_KEY_ADDR) {
+        return
+    }
+    if (heap.isMarked(obj)) {
+        return
+    }
+    heap.setMarked(obj)
+    worklist.push(obj)
+}
+
+/// `trace_one`: walk one object's managed references according to its class.
+fn traceOne(heap: TraceHeap, descs: DescriptorTable, obj: int, worklist: List<int>) {
+    heap.visits.push(obj)
+    var classId = heap.classId(obj)
+    if (classId == PICKLE_CLASS_STRING) {
+        // A string's bytes are unmanaged; nothing to trace.
+        return
+    }
+    if (classId == PICKLE_CLASS_LIST) {
+        var data = heap.word(obj, W_LIST_DATA)
+        if (data != NULL_ADDR) {
+            var n = heap.word(obj, W_LIST_LEN)
+            var i = 0
+            while (i < n) {
+                enqueue(heap, worklist, heap.word(data, i))
+                i = i + 1
+            }
+        }
+        return
+    }
+    if (classId == PICKLE_CLASS_MAP) {
+        var entries = heap.word(obj, W_MAP_ENTRIES)
+        if (entries != NULL_ADDR) {
+            // Scan the FULL capacity, not `len`: open addressing scatters live
+            // slots across the whole table, so scanning only the first `len`
+            // would strand live entries.
+            var cap = heap.word(obj, W_MAP_CAP)
+            var i = 0
+            while (i < cap) {
+                var k = heap.word(entries, i * MAP_ENTRY_WORDS)
+                // Skip the empty marker and both sentinels: neither is a real
+                // object, and dereferencing one would be undefined.
+                if (k != NULL_ADDR && k != NIL_SENTINEL_ADDR && k != NONE_KEY_ADDR) {
+                    enqueue(heap, worklist, k)
+                }
+                var v = heap.word(entries, i * MAP_ENTRY_WORDS + 1)
+                enqueue(heap, worklist, v)
+                i = i + 1
+            }
+        }
+        return
+    }
+    if (classId == PICKLE_CLASS_ENUM) {
+        // Payload slot 0 is the unmanaged tag; managed fields follow.
+        var n = enumFieldCountOf(heap, obj)
+        var i = 0
+        while (i < n) {
+            enqueue(heap, worklist, heap.payload(obj, ENUM_HEADER_SLOTS + i))
+            i = i + 1
+        }
+        return
+    }
+    if (classId == PICKLE_CLASS_TUPLE) {
+        // Payload slot 0 holds the unmanaged element count; fields follow.
+        var n = heap.word(obj, W_TUPLE_LEN)
+        var i = 0
+        while (i < n) {
+            enqueue(heap, worklist, heap.payload(obj, ENUM_HEADER_SLOTS + i))
+            i = i + 1
+        }
+        return
+    }
+    // User class: follow the descriptor's managed-field bitmask.
+    if (let some(d) = descs.get(classId)) {
+        var w = 0
+        while (w < d.maskWords) {
+            var mask = d.managedMask[w]
+            if (mask != 0) {
+                var baseSlot = w * SLOTS_PER_MASK_WORD
+                var bit = 0
+                while (bit < SLOTS_PER_MASK_WORD) {
+                    if ((mask & (1 << bit)) != 0) {
+                        var idx = baseSlot + bit
+                        if (idx >= d.slotCount) {
+                            break
+                        }
+                        enqueue(heap, worklist, heap.payload(obj, idx))
+                    }
+                    bit = bit + 1
+                }
+            }
+            w = w + 1
+        }
+    }
+}
+
+/// `trace_from_roots`: seed the worklist from every root source, then drain it
+/// LIFO. Returns the number of objects marked.
+///
+/// Root sources, in the native order: the static root CELLS (dereferenced at
+/// trace time), the manual allocations, the temp roots, then every registered
+/// thread's shadow-stack slots. The shadow walk is taken through
+/// `ShadowRegistry.allSlotValues`, which already yields one consistent
+/// innermost-first snapshot of all threads with nulls dropped.
+fn traceFromRoots(heap: TraceHeap, descs: DescriptorTable, shadow: ShadowRegistry, rootCells: List<RootCell>, manual: List<int>, tempRoots: List<int>) -> int {
+    var worklist = emptyInts()
+    var i = 0
+    while (i < len(rootCells)) {
+        var r = rootCells[i].value
+        if (r != NULL_ADDR) {
+            enqueue(heap, worklist, r)
+        }
+        i = i + 1
+    }
+    var m = 0
+    while (m < len(manual)) {
+        if (manual[m] != NULL_ADDR) {
+            enqueue(heap, worklist, manual[m])
+        }
+        m = m + 1
+    }
+    var t = 0
+    while (t < len(tempRoots)) {
+        if (tempRoots[t] != NULL_ADDR) {
+            enqueue(heap, worklist, tempRoots[t])
+        }
+        t = t + 1
+    }
+    var slots = shadow.allSlotValues()
+    var s = 0
+    while (s < len(slots)) {
+        enqueue(heap, worklist, slots[s])
+        s = s + 1
+    }
+    while (len(worklist) > 0) {
+        var obj = worklist[len(worklist) - 1]
+        worklist.remove(len(worklist) - 1)
+        traceOne(heap, descs, obj, worklist)
+    }
+    len(heap.marked())
+}
+
+/// The number of managed fields an enum object carries, from its size:
+/// `(size - (HEADER + 8)) / 8`, saturating at zero (`layout::enum_field_count`).
+fn enumFieldCountOf(heap: TraceHeap, obj: int) -> int {
+    var payloadBytes = heap.size(obj) - (HEADER + 8)
+    if (payloadBytes <= 0) {
+        return 0
+    }
+    payloadBytes / 8
+}

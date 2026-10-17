@@ -1,0 +1,958 @@
+module runtime.abi_gcengine
+
+/// The ported mark-and-sweep collector, ITS automatic trigger, and the
+/// allocation-event seam - hosted in one leaf module so the trigger (called
+/// from the register moment) and the sweep can share state without an import
+/// cycle.
+///
+/// WHY THIS MODULE EXISTS. Native runs a collection from inside `Gc::alloc`
+/// (`maybe_collect`, gc.rs:474): the allocation that crosses `AUTO_THRESHOLD`
+/// (or the `PKL_GC_THRESHOLD` override) triggers a sweep, with the fresh object
+/// pinned across its own collection. In the port, that moment is
+/// `abiRegisterObject`, which lives with the sweepability registry in
+/// `abi_raw`; the sweep lives in `abi_gc`, which imports `abi_raw`. Putting the
+/// trigger in `abiRegisterObject` therefore needs the collect engine reachable
+/// from the register path - and a direct `abi_raw` -> `abi_gc` import would be
+/// the reverse edge of an existing `abi_gc` -> `abi_raw` import (a cycle).
+///
+/// This module breaks the cycle in the only way the language permits: the
+/// registers, the counters, the sweep and the trigger all live together in a
+/// LEAF (it imports only `abi_shadow`, itself a leaf), and the two old homes
+/// keep their public names as thin delegating wrappers - `abi_raw` for
+/// `abiRegisterObject`/`abiUnregisterObject`/`abiRegistered*` and the seam
+/// counters (so every maker that already imports them from `abi_raw` is
+/// unchanged), `abi_gc` for the `#[symbol]` surface. Neither `abi_raw` nor any
+/// maker ever imports `abi_gc`, so the graph stays acyclic:
+///     makers -> abi_raw -> abi_gcengine <- abi_gc <- program
+///
+/// WHICH PORTED SEMANTICS LIVE HERE (moved from `abi_gc`/`abi_raw` unchanged):
+/// the reclamation sweep (`abiEngineCollect`), the shadow/root/manual mark
+/// seeds, the builtin-container walk, the sweepability registry, and the
+/// counters. ADDED here: the threshold trigger (`abiEngineRegister`) and the
+/// one-time environment read it consults (`abiEngineInitFromEnv`).
+///
+/// THE ENVIRONMENT READ MATCHES NATIVE'S PIN. Native reads `PKL_NO_AUTO_GC`
+/// (presence suppresses every automatic collection, even a pinned threshold)
+/// and `PKL_GC_THRESHOLD` (a valid positive value pins the threshold and
+/// disables adaptation) ONCE, and it does so lazily on the first allocation
+/// that reaches `maybe_collect`. The parity battery bakes `PKL_NO_AUTO_GC=1`
+/// into every oracle artifact and inherits it into every ported run, so a port
+/// that ignored the flag would auto-collect where native would not and diverge
+/// on any program that allocates past the threshold. This module reads the
+/// same two variables out of `GetEnvironmentStringsW` (the intrinsic already
+/// used by `abi_process`) so the two agree in both the pinned and unpinned
+/// case. The scan is deliberately minimal: entry-start key match, ASCII
+/// case-insensitive (Rust's `env` is case-insensitive on Windows), integer
+/// parse for the threshold.
+///
+/// NAMING. Internal helpers carry the `ge` prefix (`geMarkedNow`,
+/// `geEnqueue`, ...) because the linker resolves non-`#[symbol]` functions by
+/// BARE NAME across the linked image (see `abi_raw`'s deliberate
+/// `regCapGrown` vs `abi_gc`'s `blockCapGrown`), so a helper reused across
+/// modules would collide. Public entry points are `abiEngine*`.
+
+import { abiShadowHead } from runtime.abi_shadow
+
+/// Managed class ids on object words (mirror of `runtime/object` labels).
+/// Word 1 carries the id; string's id is 0 (see `abi_raw`'s note on word 0's
+/// string flag). Spelled out rather than imported so this leaf drags in no
+/// type definitions.
+const CLA_STRING: int = 0
+const CLA_LIST: int = 1
+const CLA_MAP: int = 2
+const CLA_BOX_INT: int = 3
+const CLA_BOX_FLOAT: int = 4
+const CLA_BOX_BOOL: int = 5
+const CLA_BOX_CHAR: int = 6
+const CLA_ENUM: int = 7
+const CLA_TUPLE: int = 8
+const CLA_STREAM: int = 9
+
+/// Object word layout: 24-byte header + payload words.
+const HEADER_BYTES: int = 24
+const WO_CLASS: int = 1
+const WO_SIZE: int = 2
+const WO_LIST_LEN: int = 3
+const WO_LIST_CAP: int = 4
+const WO_LIST_DATA: int = 5
+const WO_MAP_LEN: int = 3
+const WO_MAP_CAP: int = 4
+const WO_MAP_ENTRIES: int = 5
+const WO_TUPLE_LEN: int = 3
+const WO_PAYLOAD: int = 4
+/// Word 0 of the payload region for user classes: slots at `HEADER + 8*sl`.
+const WO_CLASS_PAYLOAD: int = 3
+
+/// Transient mark stamp (word 0) written into reachable registered objects
+/// during a collect and cleared on survivors.
+const MARK_SENTINEL: int = 1
+
+/// `DEFAULT_AUTO_COLLECT_THRESHOLD` in object bytes (runtime/src/gc.rs:137),
+/// spelled out for image initialisation of `threshold`.
+const DEFAULT_AUTO_COLLECT_THRESHOLD: int = 8388608
+/// Adaptive threshold cap: `next.min(1 << 30)` (gc.rs:470).
+const GC_THRESHOLD_CAP: int = 1073741824
+
+// ---------------------------------------------------------------- counters
+// The allocation-event seam (moved from `abi_raw`): bumped by the register
+// moment for MANAGED objects only, exactly as native's `Gc::alloc` bumps its
+// `ALLOC_SINCE_GC`/`BYTES_SINCE_GC` - never by the raw allocator.
+var rawAllocCount: int = 0
+var rawAllocBytes: int = 0
+
+fn abiEngineAllocCount() -> int {
+    return rawAllocCount
+}
+
+fn abiEngineAllocBytes() -> int {
+    return rawAllocBytes
+}
+
+fn abiEngineResetCounters() {
+    rawAllocCount = 0
+    rawAllocBytes = 0
+}
+
+// ------------------------------------------------------------------- state
+var collections: int = 0
+var threshold: int = 8388608
+var thresholdManual: int = 0
+var overrideThreshold: int = 0
+var noAutoGc: int = 0
+var envInited: int = 0
+/// Non-zero while `abiEngineInitFromEnv` runs: its own `bytes()` scans allocate
+/// managed boxes/lists, and a collection fired by one of those nested registers
+/// would sweep the scan's still-in-use temporaries (plus the object whose
+/// register is in progress). Native's `env_init` allocates nothing, so it can
+/// never re-enter `maybe_collect`; this flag is the port's equivalent - the
+/// threshold check is skipped while set, and the first real collection runs
+/// only after env-init has completed and the outer object is pinned.
+var envPhase: int = 0
+var liveBytes: int = 0
+var collecting: int = 0
+
+/// The mark worklist: a raw word block of object addresses enqueued for
+/// tracing this cycle. Capacity is the registered count at mark start; freed at
+/// cycle end. Pointer + length live as image data so the trace helpers mutate
+/// them without pointer-to-local plumbing.
+var markPending: int = 0
+var markPendingLen: int = 0
+
+/// The membership set for one cycle: an open-addressing table of registered
+/// object addresses, sized to the next power of two at or above twice the
+/// registered count and ZEROED (the raw `alloc` is unzeroed), built once at the
+/// top of `abiEngineCollect` and freed at its end. The conservative user-class
+/// walk hands `geEnqueue` raw payload words that may be scalars, so membership
+/// must be answered WITHOUT dereferencing the candidate (native's exact
+/// managed-mask walk tests the candidate's own mark word instead). A linear
+/// scan over the registry made that test O(regCount) inside an O(edges) walk -
+/// quadratic on the multi-hundred-thousand-object graphs the self-hosted
+/// compiler builds, and the reason auto-collection had to be pinned off. Empty
+/// slots hold 0, which no live object address can be.
+var regSetBase: int = 0
+var regSetCap: int = 0
+
+/// The static-root registry: flat word block of `*mut PickleObject` cell
+/// addresses. Grown by doubling.
+var rootsBase: int = 0
+var rootsCap: int = 0
+var rootsCount: int = 0
+const ROOTS_INITIAL: int = 16
+
+/// The manual-object registry: flat word block of adopted object addresses.
+var manBase: int = 0
+var manCap: int = 0
+var manCount: int = 0
+const MAN_INITIAL: int = 16
+
+// --------------------------------------------------------- block growth
+/// The capacity a block reaches for `idx` items under doubling growth: the
+/// first power-of-2 multiple of `initial` strictly above `idx` (or the input
+/// cap when it already fits).
+fn geCapGrown(cap: int, idx: int, initial: int) -> int {
+    if (idx < cap) {
+        return cap
+    }
+    var c = cap
+    if (c == 0) {
+        c = initial
+    }
+    while (idx >= c) {
+        c = c * 2
+    }
+    return c
+}
+
+/// Grow `base`/`cap` so word index `idx` is in range: allocate a fresh block of
+/// the grown capacity (unzeroed, like every `alloc`), copy the old words, zero
+/// the new tail, release the old block, return the new base. Returns `base`
+/// unchanged when no growth is needed.
+fn geGrow(base: int, cap: int, idx: int, initial: int) -> int {
+    var newCap = geCapGrown(cap, idx, initial)
+    if (newCap == cap) {
+        return base
+    }
+    unsafe {
+        var fresh = alloc(int, newCap)
+        var j = 0
+        while (j < cap) {
+            fresh[j] = (base as *int)[j]
+            j = j + 1
+        }
+        var k = cap
+        while (k < newCap) {
+            fresh[k] = 0
+            k = k + 1
+        }
+        if (base != 0) {
+            free(base as *int)
+        }
+        return fresh as int
+    }
+}
+
+// --------------------------------------------------- sweepability registry
+/// THE PORT-OWNED SWEEPABILITY REGISTRY (moved here from `abi_raw`). A flat set
+/// of managed-object addresses, one per created object, with class and byte
+/// size read from the object's own header (word 1 / word 2). Only managed
+/// objects are registered; raw spans backing them are covered by their owner.
+var regBase: int = 0
+var regCap: int = 0
+var regCount: int = 0
+var regBytes: int = 0
+const REG_INITIAL: int = 16
+
+fn geRegCapGrown(cap: int, idx: int) -> int {
+    if (idx < cap) {
+        return cap
+    }
+    var c = cap
+    if (c == 0) {
+        c = REG_INITIAL
+    }
+    while (idx >= c) {
+        c = c * 2
+    }
+    return c
+}
+
+fn geRegGrow(base: int, cap: int, idx: int) -> int {
+    var newCap = geRegCapGrown(cap, idx)
+    if (newCap == cap) {
+        return base
+    }
+    unsafe {
+        var fresh = alloc(int, newCap)
+        var j = 0
+        while (j < cap) {
+            fresh[j] = (base as *int)[j]
+            j = j + 1
+        }
+        var k = cap
+        while (k < newCap) {
+            fresh[k] = 0
+            k = k + 1
+        }
+        if (base != 0) {
+            free(base as *int)
+        }
+        return fresh as int
+    }
+}
+
+fn abiEngineRegisteredCount() -> int {
+    return regCount
+}
+
+fn abiEngineRegisteredAt(i: int) -> int {
+    if (i < 0 || i >= regCount) {
+        return 0
+    }
+    unsafe {
+        return (regBase as *int)[i]
+    }
+}
+
+fn abiEngineRegisteredBytes() -> int {
+    return regBytes
+}
+
+/// Drop an object from the live population - swap-with-last, tail nulled, size
+/// un-counted the same way it was counted. Null and an unknown address are both
+/// no-ops. The block itself is not freed here.
+fn abiEngineUnregister(obj: *int) {
+    if ((obj as int) == 0) {
+        return
+    }
+    var i = 0
+    var found = false
+    while (i < regCount && !found) {
+        unsafe {
+            if ((regBase as *int)[i] == (obj as int)) {
+                found = true
+            }
+        }
+        if (!found) {
+            i = i + 1
+        }
+    }
+    if (!found) {
+        return
+    }
+    unsafe {
+        (regBase as *int)[i] = (regBase as *int)[regCount - 1]
+        (regBase as *int)[regCount - 1] = 0
+    }
+    var size = 0
+    unsafe {
+        size = obj[2]
+    }
+    regCount = regCount - 1
+    regBytes = regBytes - size
+}
+
+// --------------------------------------------------------------- env read
+/// Mask for one UTF-16 code unit packed four-to-a-64-bit-word.
+const GE_WCHAR_MASK: int = 65535
+
+/// Read unit `i` of a packed UTF-16 buffer: four units share a 64-bit word.
+/// (The `abi_fs` helper of the same shape lives there and cannot be imported -
+/// `abi_fs` imports `abi_raw`, which imports this leaf: a cycle.)
+fn geUnitAt(w: *int, i: int) -> int {
+    unsafe {
+        return (w[i >> 2] >> ((i & 3) * 16)) & GE_WCHAR_MASK
+    }
+}
+
+/// ASCII lower-case of a code unit already known to be <= 0x7F.
+fn geLowerAscii(c: int) -> int {
+    if (c >= 65 && c <= 90) {
+        return c + 32
+    }
+    return c
+}
+
+/// Whether the NUL-terminated entry starting at unit `start` is `pkl_no_auto_gc=`
+/// or `pkl_gc_threshold=`, ASCII case-insensitively: the unit at each offset is
+/// lowered and compared against the key byte spelled out as a constant. These
+/// are the only two keys the engine reads, so the byte values are hardcoded -
+/// a `bytes()` scan would box every char of every entry into managed boxes,
+/// inflating the allocation count seen by the first collection (native's
+/// `gc.rs::env_init` allocates nothing, so our env-init must not either).
+fn geEntryNoAutoGc(w: *int, start: int) -> bool {
+    if (geLowerAscii(geUnitAt(w, start + 0)) != 112) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 1)) != 107) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 2)) != 108) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 3)) != 95) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 4)) != 110) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 5)) != 111) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 6)) != 95) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 7)) != 97) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 8)) != 117) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 9)) != 116) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 10)) != 111) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 11)) != 95) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 12)) != 103) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 13)) != 99) { return false }
+    return geUnitAt(w, start + 14) == 61
+}
+
+fn geEntryThreshold(w: *int, start: int) -> bool {
+    if (geLowerAscii(geUnitAt(w, start + 0)) != 112) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 1)) != 107) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 2)) != 108) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 3)) != 95) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 4)) != 103) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 5)) != 99) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 6)) != 95) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 7)) != 116) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 8)) != 104) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 9)) != 114) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 10)) != 101) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 11)) != 115) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 12)) != 104) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 13)) != 111) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 14)) != 108) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 15)) != 100) { return false }
+    return geUnitAt(w, start + 16) == 61
+}
+
+/// Unit index of `keySel`'s value in the environment block, or -1 when the key
+/// is absent. Walks NUL-terminated entries until the empty terminating entry.
+/// `keySel` selects the hardcoded matcher (0 = no-auto-gc, 1 = threshold).
+fn geEnvFind(w: *int, keySel: int) -> int {
+    var start = 0
+    var guard = 0
+    while (guard < 1048576) {
+        var u = 0
+        while (geUnitAt(w, start + u) != 0) {
+            u = u + 1
+        }
+        if (u == 0) {
+            return -1
+        }
+        if (keySel == 0) {
+            if (geEntryNoAutoGc(w, start)) {
+                return start + 14 + 1
+            }
+        } else if (geEntryThreshold(w, start)) {
+            return start + 16 + 1
+        }
+        start = start + u + 1
+        guard = guard + 1
+    }
+    return -1
+}
+
+/// Decimal value of the NUL-terminated run at unit `start`, or -1 when it holds
+/// no digits. Leading and trailing non-digits are ignored (native `.trim()`s
+/// before parsing); the value saturates so a runaway run cannot spin.
+fn geEnvIntAt(w: *int, start: int) -> int {
+    var i = start
+    // Skip leading whitespace.
+    while (true) {
+        var cu = geUnitAt(w, i)
+        if (cu == 32 || cu == 9) {
+            i = i + 1
+        } else {
+            break
+        }
+    }
+    var v = 0
+    var any = false
+    while (true) {
+        var c = geUnitAt(w, i)
+        if (c < 48 || c > 57) {
+            break
+        }
+        if (v < 1000000000) {
+            v = v * 10 + (c - 48)
+        }
+        any = true
+        i = i + 1
+    }
+    if (!any) {
+        return -1
+    }
+    return v
+}
+
+/// One-time read of `PKL_NO_AUTO_GC` (presence suppresses auto-collection) and
+/// `PKL_GC_THRESHOLD` (a positive value pins the threshold and disables
+/// adaptation) - the port's `gc.rs::env_init`. Idempotent on the `envInited`
+/// flag; also called from the register path so the read is lazy exactly like
+/// native's `ENV_INIT` `Once`.
+fn abiEngineInitFromEnv() {
+    if (envInited != 0) {
+        return
+    }
+    envInited = 1
+    var block = win_get_environment_strings_w()
+    if (block == 0) {
+        return
+    }
+    if (geEnvFind(block as *int, 0) >= 0) {
+        noAutoGc = 1
+    }
+    if (noAutoGc != 0) {
+        }
+    var tstart = geEnvFind(block as *int, 1)
+        if (tstart >= 0) {
+        var n = geEnvIntAt(block as *int, tstart)
+        if (n > 0) {
+            overrideThreshold = n
+thresholdManual = 1
+        }
+    }
+    let _ = win_free_environment_strings_w(block)
+}
+
+// ------------------------------------------------------------- the trigger
+/// Register a managed object and run the automatic-collection trigger - the
+/// port's `Gc::alloc` moment. Called by every maker (through `abi_raw`'s
+/// delegating wrapper). Bumps the seam counters from the object's own size word,
+/// then mirrors `maybe_collect`: on a crossed threshold (with `PKL_NO_AUTO_GC`
+/// absent) collects, pinning `obj` across its own cycle so a not-yet-reachable
+/// object is not swept by the collection it triggered.
+fn abiEngineRegister(obj: *int) {
+    if ((obj as int) == 0) {
+                return
+    }
+        var size = 0
+    unsafe {
+        size = obj[2]
+    }
+    regBase = geRegGrow(regBase, regCap, regCount)
+    regCap = geRegCapGrown(regCap, regCount)
+    unsafe {
+        (regBase as *int)[regCount] = obj as int
+    }
+    regCount = regCount + 1
+    regBytes = regBytes + size
+    rawAllocCount = rawAllocCount + 1
+    rawAllocBytes = rawAllocBytes + size
+    // Pin `obj` for the whole register: env-init and a threshold crossing both
+    // run inside this function, and neither can see an object the constructor
+    // has not yet published to a frame slot or a root cell. Native `Gc::alloc`
+    // does mark -> maybe_collect -> unmark, so an in-flight value always
+    // survives the cycle it triggers.
+    unsafe {
+        obj[0] = MARK_SENTINEL
+    }
+    if (envInited == 0) {
+        envPhase = 1
+        abiEngineInitFromEnv()
+        envPhase = 0
+    }
+    if (noAutoGc != 0) {
+        unsafe {
+            obj[0] = 0
+        }
+        return
+    }
+    var th = threshold
+    if (overrideThreshold != 0) {
+        th = overrideThreshold
+    }
+    if (envPhase == 0 && rawAllocBytes >= th) {
+        abiEngineCollect(false)
+    }
+    // Clear the register pin unconditionally - native clears the mark even when
+    // no collection ran (a surviving sweep also clears, making this a no-op).
+    unsafe {
+        obj[0] = 0
+    }
+}
+
+// ------------------------------------------------------------- the sweep
+/// The adaptive post-cycle target: the larger of the default threshold and
+/// twice the surviving live bytes, capped at 1 << 30 (`gc.rs:467-470`).
+fn geAdaptiveNext(live: int) -> int {
+    var next = DEFAULT_AUTO_COLLECT_THRESHOLD
+    if (live * 2 > next) {
+        next = live * 2
+    }
+    if (next > GC_THRESHOLD_CAP) {
+        next = GC_THRESHOLD_CAP
+    }
+    return next
+}
+
+/// A power-of-two capacity that holds `count` addresses at a load factor below
+/// one half, so linear probing stays short.
+fn geSetCapFor(count: int) -> int {
+    var cap = 16
+    while (cap < count * 2) {
+        cap = cap * 2
+    }
+    return cap
+}
+
+/// Insert `address` into the cycle's membership set (open addressing, linear
+/// probing; address 0 is the empty marker). Idempotent.
+fn geSetInsert(address: int) {
+    var mask = regSetCap - 1
+    var h = (address >> 3) & mask
+    while (true) {
+        var slot = 0
+        unsafe {
+            slot = (regSetBase as *int)[h]
+        }
+        if (slot == 0 || slot == address) {
+            unsafe {
+                (regSetBase as *int)[h] = address
+            }
+            return
+        }
+        h = (h + 1) & mask
+    }
+}
+
+/// Whether `candidate` is a registered object this cycle. Never dereferences the
+/// candidate, so it is safe on a raw payload word that is a scalar. O(1) on
+/// average instead of the old O(regCount) registry scan.
+fn geSetHas(candidate: int) -> bool {
+    var mask = regSetCap - 1
+    var h = (candidate >> 3) & mask
+    while (true) {
+        var slot = 0
+        unsafe {
+            slot = (regSetBase as *int)[h]
+        }
+        if (slot == 0) {
+            return false
+        }
+        if (slot == candidate) {
+            return true
+        }
+        h = (h + 1) & mask
+    }
+}
+
+/// Build the cycle's membership set from the current registry: allocate a
+/// zeroed table and insert every registered address. O(regCount).
+fn geSetBuild() {
+    regSetCap = geSetCapFor(regCount)
+    unsafe {
+        regSetBase = alloc(int, regSetCap) as int
+    }
+    var i = 0
+    while (i < regSetCap) {
+        unsafe {
+            (regSetBase as *int)[i] = 0
+        }
+        i = i + 1
+    }
+    i = 0
+    while (i < regCount) {
+        geSetInsert(abiEngineRegisteredAt(i))
+        i = i + 1
+    }
+}
+
+/// True iff `object` carries the cycle's transient mark (word 0 = 1).
+fn geMarkedNow(object: int) -> bool {
+    unsafe {
+        return ((object as int) as *int)[0] == MARK_SENTINEL
+    }
+}
+
+/// Enqueue `candidate` for tracing if it is a registered, unmarked object. It
+/// is stamped here so a cycle never re-enqueues it.
+fn geEnqueue(candidate: int) {
+    if (candidate == 0) {
+        return
+    }
+    if (!geSetHas(candidate)) {
+        return
+    }
+    if (geMarkedNow(candidate)) {
+        return
+    }
+    unsafe {
+        (markPending as *int)[markPendingLen] = candidate
+        (candidate as *int)[0] = MARK_SENTINEL
+    }
+    markPendingLen = markPendingLen + 1
+}
+
+/// Seed the worklist from the current thread's shadow stack: walk every frame
+/// in the chain and enqueue each spilled managed local. Frame layout is the
+/// reference's `ShadowFrame`: `frame[0]` is `prev`, `frame[1]` the masked
+/// 32-bit `slot_count`, slots follow at `frame[2 + i]`. Only REGISTERED
+/// addresses are edges.
+fn geMarkFromShadow(head: int) {
+    var frame = head
+    while (frame != 0) {
+        unsafe {
+            var slots = frame as *int
+            var count = slots[1] & 0xFFFFFFFF
+            var slot = 0
+            while (slot < count) {
+                geEnqueue(slots[2 + slot])
+                slot = slot + 1
+            }
+            frame = slots[0]
+        }
+    }
+}
+
+/// Trace one object: enqueue every payload word that can reference another
+/// registered object. Exact for builtin containers, conservative for user
+/// classes.
+fn geTrace(object: int) {
+    var classId = 0
+    var size = 0
+    unsafe {
+        var header = object as *int
+        classId = header[WO_CLASS]
+        size = header[WO_SIZE]
+    }
+    if (classId == CLA_LIST) {
+        unsafe {
+            var header = object as *int
+            var length = header[WO_LIST_LEN]
+            var data = header[WO_LIST_DATA] as *int
+            if ((data as int) != 0) {
+                var element = 0
+                while (element < length) {
+                    geEnqueue(data[element])
+                    element = element + 1
+                }
+            }
+        }
+        return
+    }
+    if (classId == CLA_MAP) {
+        unsafe {
+            var header = object as *int
+            var capacity = header[WO_MAP_CAP]
+            var entries = header[WO_MAP_ENTRIES] as *int
+            if ((entries as int) != 0) {
+                var slot = 0
+                while (slot < capacity) {
+                    // Open addressing: key/value word pairs; the marker
+                    // integers (0/1/2) are skipped so a marker is never walked.
+                    var key = entries[slot * 2]
+                    if (key > 2) {
+                        geEnqueue(key)
+                    }
+                    geEnqueue(entries[slot * 2 + 1])
+                    slot = slot + 1
+                }
+            }
+        }
+        return
+    }
+    if (classId == CLA_ENUM) {
+        var slotCount = 0
+        if (size > HEADER_BYTES + 8) {
+            slotCount = (size - HEADER_BYTES - 8) / 8
+        }
+        unsafe {
+            var header = object as *int
+            var slot = 0
+            while (slot < slotCount) {
+                geEnqueue(header[WO_PAYLOAD + slot])
+                slot = slot + 1
+            }
+        }
+        return
+    }
+    if (classId == CLA_TUPLE) {
+        unsafe {
+            var header = object as *int
+            var length = header[WO_TUPLE_LEN]
+            var slot = 0
+            while (slot < length) {
+                geEnqueue(header[WO_PAYLOAD + slot])
+                slot = slot + 1
+            }
+        }
+        return
+    }
+    // Strings (0), boxes (3/4/5/6), streams (9): neither traced.
+    if (classId <= CLA_STREAM) {
+        return
+    }
+    // User class (>= 10): walk every payload word conservatively.
+    var slotCount = 0
+    if (size > HEADER_BYTES) {
+        slotCount = (size - HEADER_BYTES) / 8
+    }
+    unsafe {
+        var header = object as *int
+        var slot = 0
+        while (slot < slotCount) {
+            geEnqueue(header[WO_CLASS_PAYLOAD + slot])
+            slot = slot + 1
+        }
+    }
+}
+
+/// Seed the worklist from the port's root set (static-root cells + manual
+/// registry), the shadow chain, then drain it.
+fn geMarkFromRoots() {
+    markPendingLen = 0
+    var root = 0
+    while (root < rootsCount) {
+        unsafe {
+            var cell = (rootsBase as *int)[root]
+            if (cell != 0) {
+                geEnqueue(((cell as *int)[0]) as int)
+            }
+        }
+        root = root + 1
+    }
+    var manual = 0
+    while (manual < manCount) {
+        unsafe {
+            geEnqueue((manBase as *int)[manual])
+        }
+        manual = manual + 1
+    }
+    geMarkFromShadow(abiShadowHead())
+    while (markPendingLen > 0) {
+        markPendingLen = markPendingLen - 1
+        var object = 0
+        unsafe {
+            object = (markPending as *int)[markPendingLen]
+        }
+        geTrace(object)
+    }
+}
+
+/// Free an object's out-of-line backing span, if any: a list's element block or
+/// a map's entry table (both at word 5).
+fn geReleaseOutOfLine(object: int) {
+    unsafe {
+        var header = object as *int
+        var classId = header[WO_CLASS]
+        var span = 0
+        if (classId == CLA_LIST) {
+            span = header[WO_LIST_DATA]
+        } else if (classId == CLA_MAP) {
+            span = header[WO_MAP_ENTRIES]
+        }
+        if (span != 0) {
+            free(span as *int)
+        }
+    }
+}
+
+/// One collection cycle: mark from the port's roots, sweep the unmarked
+/// registered population back to the OS heap (list/map spans included), refresh
+/// the live figure, zero the seam counters, then adapt the threshold unless a
+/// `set_threshold` (or a `PKL_GC_THRESHOLD` override) pinned it. `force` is
+/// accepted and ignored - native v1 always collects.
+fn abiEngineCollect(force: bool) {
+        if (collecting != 0) {
+                return
+    }
+    collecting = 1
+    collections = collections + 1
+    var workCount = regCount
+    if (workCount < 1) {
+        workCount = 1
+    }
+    unsafe {
+        markPending = alloc(int, workCount) as int
+    }
+    markPendingLen = 0
+    geSetBuild()
+    geMarkFromRoots()
+    unsafe {
+        free(regSetBase as *int)
+    }
+    regSetBase = 0
+    regSetCap = 0
+    // Compact sweep: one O(regCount) pass. Live objects are kept (mark cleared)
+    // and packed toward the front; dead objects release their out-of-line span
+    // and are freed, their bytes un-counted. This replaces a per-dead
+    // swap-with-last `abiEngineUnregister`, whose linear registry scan made the
+    // sweep quadratic. `write <= read` always, so packing never clobbers a slot
+    // that has not been read yet.
+    var write = 0
+    var read = 0
+    while (read < regCount) {
+        var address = abiEngineRegisteredAt(read)
+        if (geMarkedNow(address)) {
+            unsafe {
+                ((address as int) as *int)[0] = 0
+                if (write != read) {
+                    (regBase as *int)[write] = address
+                }
+            }
+            write = write + 1
+        } else {
+            geReleaseOutOfLine(address)
+            // Read the size before freeing: `free` may overwrite the header.
+            var size = 0
+            unsafe {
+                size = (address as *int)[2]
+            }
+            regBytes = regBytes - size
+            unsafe {
+                free(address as *int)
+            }
+        }
+        read = read + 1
+    }
+    regCount = write
+    unsafe {
+        free(markPending as *int)
+    }
+    markPending = 0
+    markPendingLen = 0
+    liveBytes = regBytes
+    rawAllocCount = 0
+    rawAllocBytes = 0
+    if (thresholdManual == 0) {
+        threshold = geAdaptiveNext(liveBytes)
+    }
+    collecting = 0
+}
+
+// ------------------------------------------------------------- accessors
+fn abiEngineCollectionCount() -> int {
+    return collections
+}
+
+fn abiEngineSetThreshold(bytes: int) {
+    threshold = bytes
+    thresholdManual = 1
+}
+
+fn abiEngineThresholdNow() -> int {
+    return threshold
+}
+
+fn abiEngineLiveBytesNow() -> int {
+    return liveBytes
+}
+
+fn abiEngineRootCount() -> int {
+    return rootsCount
+}
+
+fn abiEngineManualCount() -> int {
+    return manCount
+}
+
+/// Register a static root cell (the address of a `*mut PickleObject` slot).
+/// Returns the cell address (emitted callers discard it).
+fn abiEngineRootAdd(cell: int) -> int {
+    rootsBase = geGrow(rootsBase, rootsCap, rootsCount, ROOTS_INITIAL)
+    rootsCap = geCapGrown(rootsCap, rootsCount, ROOTS_INITIAL)
+    unsafe {
+        (rootsBase as *int)[rootsCount] = cell
+    }
+    rootsCount = rootsCount + 1
+    return cell
+}
+
+/// Adopt `obj` as a programmer-owned allocation: register it unless already
+/// present, and return it for chaining. Null is returned unchanged.
+fn abiEngineManualAdopt(obj: *int) -> *int {
+    if ((obj as int) == 0) {
+        return obj
+    }
+    var i = 0
+    while (i < manCount) {
+        unsafe {
+            if ((manBase as *int)[i] == (obj as int)) {
+                return obj
+            }
+        }
+        i = i + 1
+    }
+    manBase = geGrow(manBase, manCap, manCount, MAN_INITIAL)
+    manCap = geCapGrown(manCap, manCount, MAN_INITIAL)
+    unsafe {
+        (manBase as *int)[manCount] = obj as int
+    }
+    manCount = manCount + 1
+    return obj
+}
+
+/// Release an object adopted with `abiEngineManualAdopt`: remove it from the
+/// manual registry (swap-with-last) and release its sweepability entry. Null
+/// and an unknown address are ignored.
+fn abiEngineManualFree(obj: *int) {
+    if ((obj as int) == 0) {
+        return
+    }
+    var i = 0
+    while (i < manCount) {
+        unsafe {
+            if ((manBase as *int)[i] == (obj as int)) {
+                (manBase as *int)[i] = (manBase as *int)[manCount - 1]
+                (manBase as *int)[manCount - 1] = 0
+                manCount = manCount - 1
+                abiEngineUnregister(obj)
+                return
+            }
+        }
+        i = i + 1
+    }
+}

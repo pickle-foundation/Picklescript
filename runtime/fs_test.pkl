@@ -1,0 +1,217 @@
+module runtime.fs_test
+
+import { Fs, Path, File, Dir, pathJoin, isAbsolute, normalize, baseName, dirName, readText, writeText, pathExists, removePath, makeDir, listChildren } from runtime.fs
+
+fn isNone(x: string?) -> bool {
+    if (let some(v) = x) {
+        return false
+    }
+    true
+}
+
+class FakeFs implements Fs {
+    var files: Map<string, string>
+    var dirs: List<string>
+    var log: List<string>
+
+    constructor() {
+        this.files = { "": "" }
+        this.files.remove("")
+        this.dirs = [""]
+        this.dirs.remove(0)
+        this.log = [""]
+        this.log.remove(0)
+    }
+
+    fn read(p: string) -> string? {
+        this.log.push("read:" + p)
+        this.files.get(p)
+    }
+
+    fn write(p: string, t: string) -> bool {
+        this.log.push("write:" + p)
+        this.files[p] = t
+        true
+    }
+
+    fn hasDir(p: string) -> bool {
+        var i = 0
+        while (i < len(this.dirs)) {
+            if (this.dirs[i] == p) {
+                return true
+            }
+            i = i + 1
+        }
+        false
+    }
+
+    fn exists(p: string) -> bool {
+        this.log.push("exists:" + p)
+        if (this.files.has(p)) {
+            return true
+        }
+        this.hasDir(p)
+    }
+
+    fn remove(p: string) -> bool {
+        this.log.push("remove:" + p)
+        if (this.files.has(p)) {
+            this.files.remove(p)
+            return true
+        }
+        var i = 0
+        while (i < len(this.dirs)) {
+            if (this.dirs[i] == p) {
+                this.dirs.remove(i)
+                return true
+            }
+            i = i + 1
+        }
+        false
+    }
+
+    fn mkdir(p: string) -> bool {
+        this.log.push("mkdir:" + p)
+        this.dirs.push(p)
+        true
+    }
+
+    fn list(p: string) -> List<string>? {
+        this.log.push("list:" + p)
+        var out = [""]
+        out.remove(0)
+        var i = 0
+        while (i < len(this.dirs)) {
+            out.push(this.dirs[i])
+            i = i + 1
+        }
+        out
+    }
+}
+
+test fn normalize_collapses_dots_and_slashes() {
+    expect(normalize("a//b/./c/")).toBe("a/b/c")
+    expect(normalize("/a/b/../c")).toBe("/a/c")
+    expect(normalize("../a")).toBe("../a")
+    expect(normalize("a/..")).toBe(".")
+    expect(normalize("/./")).toBe("/")
+}
+
+test fn normalize_dotdot_at_root_stays() {
+    expect(normalize("/..")).toBe("/")
+    expect(normalize("/..//./x")).toBe("/x")
+}
+
+test fn is_absolute_detects_leading_slash() {
+    expect(isAbsolute("/x")).toBe(true)
+    expect(isAbsolute("x")).toBe(false)
+    expect(isAbsolute("")).toBe(false)
+}
+
+test fn join_single_slash() {
+    expect(pathJoin("a/", "b")).toBe("a/b")
+    expect(pathJoin("", "x")).toBe("x")
+    expect(pathJoin("a", "")).toBe("a")
+    expect(pathJoin("/a", "b")).toBe("/a/b")
+}
+
+test fn base_and_dir_name() {
+    expect(baseName("/a/b/c.txt")).toBe("c.txt")
+    expect(baseName("/a/b/")).toBe("b")
+    expect(baseName("")).toBe("")
+    expect(dirName("/a/b/c.txt")).toBe("/a/b")
+    expect(dirName("x")).toBe("")
+    expect(dirName("/")).toBe("")
+}
+
+test fn read_text_normalizes_and_surfaces_none() {
+    let fake = FakeFs()
+    fake.files["a/b"] = "hi"
+    if (let some(txt) = readText(fake, "a//b")) {
+        expect(txt).toBe("hi")
+    } else {
+        expect("x").toBe("y")
+    }
+    expect(isNone(readText(fake, "missing"))).toBe(true)
+    expect(fake.log[0]).toBe("read:a/b")
+}
+
+test fn write_text_normalizes() {
+    let fake = FakeFs()
+    expect(writeText(fake, "x//y", "t")).toBe(true)
+    if (let some(txt) = fake.files.get("x/y")) {
+        expect(txt).toBe("t")
+    } else {
+        expect("x").toBe("y")
+    }
+    expect(fake.log[0]).toBe("write:x/y")
+}
+
+test fn exists_and_remove_contract() {
+    let fake = FakeFs()
+    fake.files["z"] = "1"
+    expect(pathExists(fake, "z")).toBe(true)
+    expect(removePath(fake, "z")).toBe(true)
+    expect(pathExists(fake, "z")).toBe(false)
+    expect(removePath(fake, "z")).toBe(false)
+}
+
+test fn make_dir_and_list_children() {
+    let fake = FakeFs()
+    expect(makeDir(fake, "d")).toBe(true)
+    expect(makeDir(fake, "d2/x")).toBe(true)
+    expect(fake.dirs[0]).toBe("d")
+    if (let some(list) = listChildren(fake, "root")) {
+        expect(len(list)).toBe(2)
+    } else {
+        expect("x").toBe("y")
+    }
+}
+
+test fn file_bound_routes_through_seam() {
+    let fake = FakeFs()
+    let f = File(fake, "p//q.txt")
+    expect(f.path()).toBe("p/q.txt")
+    expect(f.name()).toBe("q.txt")
+    expect(f.dir()).toBe("p")
+    expect(f.write("body")).toBe(true)
+    if (let some(txt) = f.read()) {
+        expect(txt).toBe("body")
+    } else {
+        expect("x").toBe("y")
+    }
+    expect(f.exists()).toBe(true)
+    expect(f.remove()).toBe(true)
+    expect(f.exists()).toBe(false)
+}
+
+test fn dir_bound_routes_through_seam() {
+    let fake = FakeFs()
+    let d = Dir(fake, "base//sub")
+    expect(d.path()).toBe("base/sub")
+    expect(d.create()).toBe(true)
+    expect(d.exists()).toBe(true)
+    if (let some(list) = d.list()) {
+        expect(len(list)).toBe(1)
+    } else {
+        expect("x").toBe("y")
+    }
+    expect(d.remove()).toBe(true)
+}
+
+test fn path_join_keeps_seam_and_normalizes() {
+    let fake = FakeFs()
+    let p = Path(fake, "/a/./b")
+    expect(p.text()).toBe("/a/b")
+    let q = p.join("c/../d")
+    expect(q.text()).toBe("/a/b/d")
+    expect(q.exists()).toBe(false)
+    expect(q.write("ok")).toBe(true)
+    expect(q.exists()).toBe(true)
+}
+
+test fn file_read_none_when_missing() {
+    let fake = FakeFs()
+    let f = File(fake, "nope")
+    expect(isNone(f.read())).toBe(true)
+}

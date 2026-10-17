@@ -1,0 +1,140 @@
+module runtime.strings
+
+/// Port of `runtime/src/strings.rs` (pure, portable contracts).
+///
+/// The Rust runtime's raw allocation/copy machinery (`string_from_bytes`,
+/// `string_from_cstr`, `string_concat` at the pointer level) is intrinsic; what
+/// survives a self-hosted port is the SEMANTIC surface:
+///
+///   - `int64ToString`: decimal text for an `i64` (mirror of
+///     `strings.rs::int64_to_string`, the `i64::MIN` magnitude handled without
+///     overflow).
+///   - `stringConcat`: null operand treated as `""` (`strings.rs::string_concat`).
+///   - `stringGet`: byte-at-index (`pickle_str_get`).
+///   - `strFromBytes`: byte list -> string (`pickle_str_from_list` contract).
+///   - `charToUtf8`: UCS-4 code point -> UTF-8 text; non-scalars collapse to
+///     U+FFFD like Rust `char::from_u32(...).unwrap_or('\u{FFFD}')`.
+///   - `float64ToString`: the Rust side uses `format!("{}", f64)` (Rust's
+///     shortest round-trip). The exact IEEE-754 shortest-digits algorithm is
+///     deferred to the ABI `str(v)` seam — see the ABI note below.
+///
+/// ABI note: a self-hosted runtime still needs the native bridge for raw string
+/// allocation and float formatting. `strFromBytes` and `charToUtf8` build packed
+/// text through the language `str(List<byte>)` bridge; a turnkey runtime would
+/// route these to `pickle_str_from_bytes`. The runtime module does not depend on
+/// `std.*` — it sits below `std` in the stack.
+
+fn utf8Replacement() -> string {
+    var bs: List<byte> = bytes("")
+    bs.push(0xEF as byte)
+    bs.push(0xBF as byte)
+    bs.push(0xBD as byte)
+    str(bs)
+}
+
+/// `true` when `cp` is a valid Unicode scalar value (no surrogates, within
+/// U+0000..U+10FFFF). Mirrors Rust `char::from_u32` returning `Some`.
+fn isScalarCp(cp: int) -> bool {
+    if (cp < 0) {
+        return false
+    }
+    if (cp > 0x10FFFF) {
+        return false
+    }
+    if (cp >= 0xD800 && cp <= 0xDFFF) {
+        return false
+    }
+    true
+}
+
+/// Encode a UCS-4 code point as its UTF-8 byte sequence (1-4 bytes). Non-scalar
+/// or out-of-range values produce the Unicode replacement character. Mirror of
+/// `char::encode_utf8` in `strings.rs::pickle_print_char`, expressed as packed
+/// text so a caller emits exactly those bytes.
+fn charToUtf8(cp: int) -> string {
+    if (!isScalarCp(cp)) {
+        return utf8Replacement()
+    }
+    if (cp < 0x80) {
+        var b1: List<byte> = bytes("")
+        b1.push(cp as byte)
+        return str(b1)
+    }
+    if (cp < 0x800) {
+        var b2: List<byte> = bytes("")
+        b2.push((0xC0 | (cp >> 6)) as byte)
+        b2.push((0x80 | (cp & 0x3F)) as byte)
+        return str(b2)
+    }
+    if (cp < 0x10000) {
+        var b3: List<byte> = bytes("")
+        b3.push((0xE0 | (cp >> 12)) as byte)
+        b3.push((0x80 | ((cp >> 6) & 0x3F)) as byte)
+        b3.push((0x80 | (cp & 0x3F)) as byte)
+        return str(b3)
+    }
+    var b4: List<byte> = bytes("")
+    b4.push((0xF0 | (cp >> 18)) as byte)
+    b4.push((0x80 | ((cp >> 12) & 0x3F)) as byte)
+    b4.push((0x80 | ((cp >> 6) & 0x3F)) as byte)
+    b4.push((0x80 | (cp & 0x3F)) as byte)
+    str(b4)
+}
+
+/// Format an `i64` as decimal text. The `i64::MIN` magnitude is handled
+/// without overflow (mirror of `strings.rs::int64_to_string`).
+fn int64ToString(v: int) -> string {
+    if (v == (0 - 9223372036854775807) - 1) {
+        return "-9223372036854775808"
+    }
+    var neg = false
+    var n = v
+    if (n < 0) {
+        neg = true
+        n = -n
+    }
+    var digs: List<int> = [0]
+    digs.pop()
+    while (true) {
+        digs.push(n % 10)
+        n = n / 10
+        if (n == 0) {
+            break
+        }
+    }
+    var out = ""
+    if (neg) {
+        out = out + "-"
+    }
+    var k = len(digs) - 1
+    while (k >= 0) {
+        out = out + charToUtf8(48 + digs[k])
+        k = k - 1
+    }
+    out
+}
+
+/// Concatenate two strings, treating a null operand as `""` (mirror of
+/// `strings.rs::string_concat`'s null operand rule). The nullable signature
+/// models an uninitialized string value.
+fn stringConcat(a: string?, b: string?) -> string {
+    var left = ""
+    if (let some(av) = a) {
+        left = av
+    }
+    var right = ""
+    if (let some(bv) = b) {
+        right = bv
+    }
+    left + right
+}
+
+/// Byte value at `index` of `s` (0-based), mirror of `pickle_str_get`.
+fn stringGet(s: string, index: int) -> int {
+    s[index] as int
+}
+
+/// Reassemble a string from its raw byte sequence (`pickle_str_from_list`).
+fn strFromBytes(xs: List<byte>) -> string {
+    str(xs)
+}

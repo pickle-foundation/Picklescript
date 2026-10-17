@@ -1,0 +1,143 @@
+module cli.runone
+
+import { Lexer } from compiler.lexer
+import { DiagnosticSink } from compiler.diag
+import { parse } from compiler.parser
+import { Resolver } from compiler.resolve
+import { checkProgram } from compiler.check
+import { emitIr } from compiler.emit
+import { irModuleStr } from compiler.ir
+
+fn lex(src: string) -> List<LexedToken> {
+    let lx = Lexer(bytes(src), 0, 0, none, range(0), 0)
+    lx.run()
+}
+
+fn irSource(src: string) -> string {
+    let toks = lex(src)
+    println("P:lexed " + str(len(toks)) + " tokens")
+    let diags = DiagnosticSink()
+    if (let some(prog) = parse(toks, diags)) {
+        println("P:parsed")
+        let r = Resolver(diags)
+        let resolved = r.resolve(prog)
+        println("P:resolved")
+        checkProgram(prog, resolved, diags)
+        println("P:checked")
+        if (diags.anyError()) {
+            dumpDiags(diags)
+            return "irfail"
+        }
+        println("P:emitting")
+        if (let some(m) = emitIr(prog, resolved, diags)) {
+            println("P:emitdone")
+            irModuleStr(m)
+        } else {
+            println("P:irfail")
+            dumpDiags(diags)
+            "irfail"
+        }
+    } else {
+        "irfail"
+    }
+}
+
+fn pathBase(p: string) -> string {
+    let bs = bytes(p)
+    var last = -1
+    var i = 0
+    while (i < len(bs)) {
+        let b = bs[i] as int
+        if (b == 47 || b == 92) {
+            last = i
+        }
+        i = i + 1
+    }
+    if (last == -1) {
+        return p
+    }
+    var out = ""
+    var k = last + 1
+    while (k < len(bs)) {
+        out += "{bs[k] as char}"
+        k = k + 1
+    }
+    out
+}
+
+fn main() {
+    var targets = emptyStrs()
+    let argv = args()
+    if (len(argv) > 0) {
+        for (a in argv) {
+            targets.push(a)
+        }
+    } else if (let some(tf) = read_file("tools/diff/target.txt")) {
+        var i = 0
+        var start = 0
+        while (i <= len(tf)) {
+if (i == len(tf) || tf[i] == 10 as int) {
+                    if (i > start) {
+                        var line = ""
+                    var k = start
+                    var tb = bytes(tf)
+                    while (k < i) {
+                        if (tb[k] == 13 as int) {
+                            k = k + 1
+                        } else {
+                            line = line + "{tb[k] as char}"
+                            k = k + 1
+                        }
+                    }
+                    targets.push(line)
+                    }
+                    start = i + 1
+                }
+            i = i + 1
+        }
+    }
+    if (len(targets) == 0) {
+        targets.push("tests/pickle/contextual_test.pkl")
+    }
+    for (target in targets) {
+        if (let some(src) = read_file(target)) {
+            var base = pathBase(target)
+            var outName = "one_ir.txt"
+            var bs0 = bytes(base)
+            if (len(bs0) > 4 && bs0[len(bs0)-4] == 46 && bs0[len(bs0)-3] == 112 && bs0[len(bs0)-2] == 107 && bs0[len(bs0)-1] == 108) {
+                    var out = ""
+                    var k = 0
+                    while (k < len(bs0) - 4) {
+                        out += "{bs0[k] as char}"
+                        k = k + 1
+                    }
+                    outName = out + "_self.ir"
+                }
+            write_file("tools/diff/port/" + outName, irSource(src) + "\n")
+            println("IR DONE: " + target)
+        } else {
+            println("NO FILE: " + target)
+        }
+    }
+}
+
+fn emptyStrs() -> List<string> {
+    var l = [""]
+    l.pop()
+    l
+}
+
+fn dumpDiags(diags: DiagnosticSink) {
+    let ds = diags.diagnostics
+    var i = 0
+    while (i < len(ds)) {
+        let d = ds[i]
+        println("P:diag sev=" + (if (d.severity == Severity.Error) { "Error" } else { "Warning" }) + " msg=" + d.message + " span=" + (if (let some(sp) = d.span) { "(" + str(sp.start) + "," + str(sp.end) + ")" } else { "none" }))
+        var j = 0
+        while (j < len(d.notes)) {
+            println("P:diag   note=" + d.notes[j].message)
+            j = j + 1
+        }
+        i = i + 1
+    }
+}

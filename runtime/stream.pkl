@@ -1,0 +1,165 @@
+module runtime.stream
+
+/// Port of `runtime/src/stream.rs`: the `Stream` state machine and its full
+/// result contract. Raw I/O is a seam, exactly like the native split between
+/// the `PStream` object metadata and `StreamInner`'s buffered `File` target.
+///
+/// A `PStream` knows its open mode (`kind`) and whether it is closed; every
+/// call answers through that state plus a host-supplied `Stdio`, whose four fn
+/// fields perform the actual read/write/flush/release. The port fixes the
+/// DECISIONS (`read` returns none for closed/readerless/nonpositive/EOF,
+/// `write` reports 0 for closed/unwritable, `flush` is a no-op truth for
+/// readers, `close` is idempotent and flushes before releasing) while the I/O
+/// effects stay native.
+///
+/// `Stdio` also carries host-side state (the byte store, cursor, flush/drop
+/// accounting) so an in-memory fake under test needs no module globals.
+///
+/// Open modes map to the native targets:
+///   reader   — `pickle_stream_open_read`
+///   writer   — `pickle_stream_open_write` / `pickle_stream_open_append`
+///   stdout   — `pickle_stdout_stream` (routes through the console bridge)
+///   stderr   — `pickle_stderr_stream`
+/// A failed open acquires no `PStream` (native returns `none`).
+
+const STREAM_READER: int = 0
+const STREAM_WRITER: int = 1
+const STREAM_STDOUT: int = 2
+const STREAM_STDERR: int = 3
+
+/// Host I/O seam desc behind a `PStream`. The four fn fields are set by the
+/// native boundary (or by an in-memory fake under test) when the stream is
+/// created; the defaults refuse the operation. `store`/`cursor`/`flushOk`/
+/// `dropCount` are host-side state the seam fns act on.
+class Stdio {
+    var readUpTo: fn (Stdio, int) -> List<byte>?
+    var writeBytes: fn (Stdio, List<byte>) -> int
+    var flushIo: fn (Stdio) -> bool
+    var dropIo: fn (Stdio) -> bool
+    var store: List<int>
+    var cursor: int
+    var flushOk: bool
+    var dropCount: int
+
+    constructor() {
+        this.readUpTo = neverRead
+        this.writeBytes = neverWrite
+        this.flushIo = neverFlush
+        this.dropIo = neverDrop
+        this.store = [0]
+        this.store.pop()
+        this.cursor = 0
+        this.flushOk = true
+        this.dropCount = 0
+    }
+}
+
+fn neverRead(s: Stdio, n: int) -> List<byte>? {
+    none
+}
+
+fn neverWrite(s: Stdio, bytes: List<byte>) -> int {
+    0
+}
+
+fn neverFlush(s: Stdio) -> bool {
+    false
+}
+
+fn neverDrop(s: Stdio) -> bool {
+    false
+}
+
+/// A managed stream value (the runtime calls this a `PStream`). `kind` is one
+/// of the `STREAM_*` constants.
+class PStream {
+    var closed: bool
+    var kind: int
+    var io: Stdio
+
+    constructor(kind: int, io: Stdio) {
+        this.kind = kind
+        this.io = io
+        this.closed = false
+    }
+
+    fn isReadable() -> bool {
+        this.kind == STREAM_READER
+    }
+
+    fn isWritable() -> bool {
+        !this.isReadable()
+    }
+
+    /// Read up to `n` bytes. `none` when closed, not a reader, `n <= 0`, at
+    /// end of stream, or the underlying read fails. A short list means the
+    /// stream was exhausted partway.
+    fn read(n: int) -> List<byte>? {
+        if (this.closed) {
+            return none
+        }
+        if (!this.isReadable()) {
+            return none
+        }
+        if (n <= 0) {
+            return none
+        }
+        this.io.readUpTo(this.io, n)
+    }
+
+    /// Append `bytes` (a `List<byte>`) to the stream and report the number of
+    /// bytes written. `0` when closed or not writable; less than `len(bytes)`
+    /// when the write fails partway (the typed port has no null slots, so the
+    /// native stop-at-first-null-slot rule is vacuous here).
+    fn write(bytes: List<byte>) -> int {
+        if (this.closed) {
+            return 0
+        }
+        if (!this.isWritable()) {
+            return 0
+        }
+        var n = this.io.writeBytes(this.io, bytes)
+        if (n < 0) {
+            return 0
+        }
+        n
+    }
+
+    /// Push buffered (or console) bytes to the host. `false` when closed;
+    /// `true` for a reader (nothing buffered); otherwise the seam's `flushIo`.
+    fn flush() -> bool {
+        if (this.closed) {
+            return false
+        }
+        if (!this.isWritable()) {
+            return true
+        }
+        this.io.flushIo(this.io)
+    }
+
+    /// Close the stream, flushing buffered output and releasing the handle.
+    /// Flushes (reader: no-op) then reports flush success; `false` on a second
+    /// close (`closed` is checked first).
+    fn close() -> bool {
+        if (this.closed) {
+            return false
+        }
+        this.closed = true
+        var ok = true
+        if (this.isWritable()) {
+            ok = this.io.flushIo(this.io)
+        }
+        this.io.dropIo(this.io)
+        ok
+    }
+
+    /// The collector seam: a stream swept without `close()` must release its
+    /// handle (mirror of `stream_finalizer`). Same flush-then-release path as
+    /// `close`; idempotent on a stream already closed.
+    fn onSweep() {
+        if (this.closed) {
+            return
+        }
+        this.close()
+    }
+}

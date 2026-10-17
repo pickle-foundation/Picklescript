@@ -1,0 +1,174 @@
+module runtime.abi_sync_test
+
+import { abiMutexNew, abiMutexLock, abiMutexTryLock, abiMutexUnlock } from runtime.abi_sync
+import { abiCondNew, abiCondSignal, abiCondBroadcast, abiCondWait } from runtime.abi_sync
+import { abiSemNew, abiSemAcquire, abiSemTryAcquire, abiSemRelease } from runtime.abi_sync
+import { abiAtomicNew, abiAtomicLoad, abiAtomicStore, abiAtomicAdd, abiAtomicCas } from runtime.abi_sync
+import { abiChannelNew, abiChannelCap, abiChannelLen, abiChannelSend, abiChannelTrySend, abiChannelRecv, abiChannelTryRecv, abiChannelClose, abiChannelClosed } from runtime.abi_sync
+import { abiUnboxI64 } from runtime.abi_box
+
+/// The unit suite for the data-sync port bodies.
+///
+/// Handle VALUES are process-global and the runtime suite runs tests in an
+/// unspecified order, so assertions only ever say "positive" and "distinct
+/// within this test" - never a fixed number. The register table is append-only
+/// for the process lifetime, so a handle created here can never collide with
+/// one from a later test.
+///
+/// NO TEST REACHES A FATAL PATH. The wrong-kind and channel-protocol failures
+/// print `fatal: ...` and `ExitProcess(1)` (the expect-slice suite-trap
+/// contract): exercising them here would end the whole `pickle test
+/// pickle\runtime` run. They are verified by the standalone parity probes.
+///
+/// NO TEST BLOCKS. `take` on a permit nobody will hand over spins forever
+/// (the nostd single-thread hang). Every test keeps a permit available at
+/// every blocking call.
+
+test fn handles_are_positive_and_distinct() {
+    var m = abiMutexNew()
+    var c = abiCondNew()
+    var s = abiSemNew(2)
+    var a = abiAtomicNew(3)
+    var ch = abiChannelNew(2)
+    expect(m > 0).toBe(true)
+    expect(c > 0).toBe(true)
+    expect(s > 0).toBe(true)
+    expect(a > 0).toBe(true)
+    expect(ch > 0).toBe(true)
+    expect(m == c).toBe(false)
+    expect(m == s).toBe(false)
+    expect(m == a).toBe(false)
+    expect(m == ch).toBe(false)
+    expect(c == s).toBe(false)
+    expect(c == a).toBe(false)
+    expect(s == a).toBe(false)
+}
+
+test fn mutex_trylock_excludes_and_unlock_restores() {
+    var m = abiMutexNew()
+    expect(abiMutexTryLock(m)).toBe(true)
+    expect(abiMutexTryLock(m)).toBe(false)
+    abiMutexUnlock(m)
+    expect(abiMutexTryLock(m)).toBe(true)
+    abiMutexUnlock(m)
+    abiMutexUnlock(m)
+    expect(abiMutexTryLock(m)).toBe(true)
+    abiMutexUnlock(m)
+}
+
+test fn mutex_lock_takes_the_held_permit() {
+    var m = abiMutexNew()
+    abiMutexLock(m)
+    expect(abiMutexTryLock(m)).toBe(false)
+    abiMutexUnlock(m)
+    expect(abiMutexTryLock(m)).toBe(true)
+    abiMutexUnlock(m)
+}
+
+test fn cond_signal_is_remembered_for_the_next_wait() {
+    var c = abiCondNew()
+    abiCondSignal(c)
+    abiCondWait(c, 0)
+}
+
+test fn cond_broadcast_with_no_waiter_hands_out_nothing() {
+    var c = abiCondNew()
+    abiCondBroadcast(c)
+    abiCondSignal(c)
+    abiCondWait(c, 0)
+}
+
+test fn cond_wait_releases_and_retakes_the_mutex() {
+    var m = abiMutexNew()
+    var c = abiCondNew()
+    abiMutexLock(m)
+    abiCondSignal(c)
+    abiCondWait(c, m)
+    expect(abiMutexTryLock(m)).toBe(false)
+    abiMutexUnlock(m)
+}
+
+test fn semaphore_counts_down_and_releases() {
+    var s = abiSemNew(2)
+    expect(abiSemTryAcquire(s, 1)).toBe(true)
+    expect(abiSemTryAcquire(s, 1)).toBe(true)
+    expect(abiSemTryAcquire(s, 1)).toBe(false)
+    abiSemRelease(s, 1)
+    expect(abiSemTryAcquire(s, 1)).toBe(true)
+    expect(abiSemTryAcquire(s, 1)).toBe(false)
+}
+
+test fn semaphore_acquire_caps_n_at_one() {
+    var s = abiSemNew(3)
+    expect(abiSemTryAcquire(s, 0)).toBe(true)
+    expect(abiSemTryAcquire(s, 0)).toBe(true)
+    expect(abiSemTryAcquire(s, 0)).toBe(true)
+    expect(abiSemTryAcquire(s, 0)).toBe(false)
+    abiSemRelease(s, 0)
+    expect(abiSemTryAcquire(s, 1)).toBe(true)
+}
+
+test fn semaphore_new_clamps_negative_permits_to_zero() {
+    var s = abiSemNew(-5)
+    expect(abiSemTryAcquire(s, 1)).toBe(false)
+    abiSemRelease(s, 1)
+    expect(abiSemTryAcquire(s, 1)).toBe(true)
+}
+
+test fn atomic_load_store_add_and_cas() {
+    var a = abiAtomicNew(5)
+    expect(abiAtomicLoad(a)).toBe(5)
+    expect(abiAtomicAdd(a, 3)).toBe(5)
+    expect(abiAtomicLoad(a)).toBe(8)
+    abiAtomicStore(a, 1)
+    expect(abiAtomicCas(a, 1, 9)).toBe(true)
+    expect(abiAtomicLoad(a)).toBe(9)
+    expect(abiAtomicCas(a, 1, 0)).toBe(false)
+    expect(abiAtomicLoad(a)).toBe(9)
+}
+
+test fn channel_forwards_values_in_order() {
+    var ch = abiChannelNew(3)
+    expect(abiChannelCap(ch)).toBe(3)
+    expect(abiChannelLen(ch)).toBe(0)
+    expect(abiChannelTryRecv(ch) == 0 as *int).toBe(true)
+    expect(abiChannelTrySend(ch, 42)).toBe(true)
+    expect(abiChannelLen(ch)).toBe(1)
+    expect(abiUnboxI64(abiChannelTryRecv(ch))).toBe(42)
+    expect(abiChannelLen(ch)).toBe(0)
+    abiChannelSend(ch, 43)
+    abiChannelSend(ch, 44)
+    expect(abiChannelRecv(ch)).toBe(43)
+    expect(abiChannelRecv(ch)).toBe(44)
+    expect(abiChannelLen(ch)).toBe(0)
+}
+
+test fn channel_is_bounded() {
+    var ch = abiChannelNew(1)
+    expect(abiChannelTrySend(ch, 49)).toBe(true)
+    expect(abiChannelTrySend(ch, 50)).toBe(false)
+    expect(abiChannelRecv(ch)).toBe(49)
+    expect(abiChannelTrySend(ch, 51)).toBe(true)
+}
+
+test fn channel_ring_wraps_head() {
+    var ch = abiChannelNew(2)
+    abiChannelSend(ch, 10)
+    abiChannelSend(ch, 20)
+    expect(abiChannelRecv(ch)).toBe(10)
+    abiChannelSend(ch, 30)
+    expect(abiChannelRecv(ch)).toBe(20)
+    expect(abiChannelRecv(ch)).toBe(30)
+}
+
+test fn channel_close_drains_then_reports_closed() {
+    var ch = abiChannelNew(2)
+    abiChannelSend(ch, 65)
+    expect(abiChannelClosed(ch)).toBe(false)
+    abiChannelClose(ch)
+    expect(abiChannelClosed(ch)).toBe(true)
+    var got = abiChannelTryRecv(ch)
+    expect(got == 0 as *int).toBe(false)
+    expect(abiUnboxI64(got)).toBe(65)
+    expect(abiChannelTryRecv(ch) == 0 as *int).toBe(true)
+}

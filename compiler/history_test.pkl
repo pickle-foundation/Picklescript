@@ -1,0 +1,427 @@
+module compiler.history_test
+
+import * from compiler.history
+import * from compiler.ast
+import { Span, DiagnosticSink } from compiler.diag
+import { frontend, strLt } from compiler.front
+
+fn userV1() -> string {
+    var s = "class User \{\n"
+    s += "    name: string\n"
+    s += "    age: int\n"
+    s += "\n"
+    s += "    constructor(name: string, age: int) \{\n"
+    s += "        this.name = name\n"
+    s += "        this.age = age\n"
+    s += "    \}\n"
+    s += "\n"
+    s += "    fn greet() -> string \{\n"
+    s += "        return this.name\n"
+    s += "    \}\n"
+    s += "\}\n"
+    s += "\n"
+    s += "fn main() \{\n"
+    s += "    let u = User(\"ada\", 120)\n"
+    s += "    println(u.greet())\n"
+    s += "\}"
+    s
+}
+
+fn userV2() -> string {
+    var s = "class User \{\n"
+    s += "    name: string?\n"
+    s += "    age: int\n"
+    s += "    admin: bool\n"
+    s += "\n"
+    s += "    constructor(name: string, age: int) \{\n"
+    s += "        this.name = name\n"
+    s += "        this.age = age\n"
+    s += "    \}\n"
+    s += "\n"
+    s += "    fn greet() -> string \{\n"
+    s += "        return this.name\n"
+    s += "    \}\n"
+    s += "\}\n"
+    s += "\n"
+    s += "fn main() \{\n"
+    s += "    let u = User(\"ada\", 120)\n"
+    s += "    println(u.greet())\n"
+    s += "\}"
+    s
+}
+
+fn miscFixture() -> string {
+    var s = "enum Color \{\n"
+    s += "    case Red\n"
+    s += "    case Rgb(r: int, g: int, b: int)\n"
+    s += "\}\n"
+    s += "\n"
+    s += "interface Runnable \{\n"
+    s += "    fn run() -> string\n"
+    s += "\}\n"
+    s += "\n"
+    s += "struct Point \{\n"
+    s += "    var x: int\n"
+    s += "    var y: int\n"
+    s += "\}\n"
+    s += "\n"
+    s += "const VERSION: int = 1\n"
+    s
+}
+
+fn parseMust(src: string) -> Program {
+    let diags = DiagnosticSink()
+    match (frontend("test.pk", src, diags)) {
+        case some(out) -> out.program
+        case none -> {
+            expect(true).toBe(false)
+            Program(emptyModuleDecls()[0], emptyImportDecls(), emptyItems(), false)
+        }
+    }
+}
+
+fn hasItem(items: List<PublicItem>, kind: string, name: string) -> bool {
+    var i = 0
+    while (i < len(items)) {
+        if (items[i].kind == kind && items[i].name == name) {
+            return true
+        }
+        i = i + 1
+    }
+    false
+}
+
+fn sortedOk(items: List<PublicItem>) -> bool {
+    var i = 0
+    while (i < len(items) - 1) {
+        let a = items[i]
+        let b = items[i + 1]
+        if (strLt(b.kind, a.kind)) {
+            return false
+        }
+        if (a.kind == b.kind && strLt(b.name, a.name)) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+fn countChange(changes: List<SurfaceChange>, status: string) -> int {
+    var n = 0
+    var i = 0
+    while (i < len(changes)) {
+        if (changes[i].status == status) {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    n
+}
+
+fn findStatus(changes: List<SurfaceChange>, status: string) -> SurfaceChange? {
+    var i = 0
+    while (i < len(changes)) {
+        if (changes[i].status == status) {
+            return changes[i]
+        }
+        i = i + 1
+    }
+    none
+}
+
+fn findStatusName(changes: List<SurfaceChange>, status: string, name: string) -> SurfaceChange? {
+    var i = 0
+    while (i < len(changes)) {
+        if (changes[i].status == status && changes[i].name == name) {
+            return changes[i]
+        }
+        i = i + 1
+    }
+    none
+}
+
+fn optVal(o: string?) -> string {
+    match (o) {
+        case some(s) -> s
+        case none -> ""
+    }
+}
+
+fn noneOf(o: string?) -> bool {
+    match (o) {
+        case none -> true
+        case some(_) -> false
+    }
+}
+
+fn snapNone(o: Snapshot?) -> bool {
+    match (o) {
+        case none -> true
+        case some(_) -> false
+    }
+}
+
+fn strsEq(a: List<string>, b: List<string>) -> bool {
+    if (len(a) != len(b)) {
+        return false
+    }
+    var i = 0
+    while (i < len(a)) {
+        if (a[i] != b[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+fn itemsEq(a: List<PublicItem>, b: List<PublicItem>) -> bool {
+    if (len(a) != len(b)) {
+        return false
+    }
+    var i = 0
+    while (i < len(a)) {
+        if (a[i].kind != b[i].kind) {
+            return false
+        }
+        if (a[i].name != b[i].name) {
+            return false
+        }
+        if (a[i].vis != b[i].vis) {
+            return false
+        }
+        if (a[i].sig != b[i].sig) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+fn snapEq(a: Snapshot, b: Snapshot) -> bool {
+    if (a.commit != b.commit) {
+        return false
+    }
+    if (a.short != b.short) {
+        return false
+    }
+    if (a.date != b.date) {
+        return false
+    }
+    if (a.message != b.message) {
+        return false
+    }
+    if (a.file != b.file) {
+        return false
+    }
+    if (a.hash != b.hash) {
+        return false
+    }
+    if (a.ok != b.ok) {
+        return false
+    }
+    if (!strsEq(a.codes, b.codes)) {
+        return false
+    }
+    if (!strsEq(a.deps, b.deps)) {
+        return false
+    }
+    itemsEq(a.items, b.items)
+}
+
+test fn type_expr_renders_all_kinds() {
+    let abc = TypeExpr(Span(0, 0), TypeExprKind.Path(["a", "b"]))
+    expect(typeExprToStr(abc)).toBe("a.b")
+
+    let nmap = TypeExpr(Span(0, 0), TypeExprKind.Generic(
+        TypeExpr(Span(0, 0), TypeExprKind.Path(["Map"])),
+        [
+            TypeExpr(Span(0, 0), TypeExprKind.Path(["string"])),
+            TypeExpr(Span(0, 0), TypeExprKind.Generic(
+                TypeExpr(Span(0, 0), TypeExprKind.Path(["List"])),
+                [
+                    TypeExpr(Span(0, 0), TypeExprKind.Option(
+                        TypeExpr(Span(0, 0), TypeExprKind.Path(["int"]))
+                    ))
+                ]
+            ))
+        ]
+    ))
+    expect(typeExprToStr(nmap)).toBe("Map<string, List<int?>>")
+
+    let starT = TypeExpr(Span(0, 0), TypeExprKind.Pointer(
+        TypeExpr(Span(0, 0), TypeExprKind.Path(["T"]))
+    ))
+    expect(typeExprToStr(starT)).toBe("*T")
+
+    let refT = TypeExpr(Span(0, 0), TypeExprKind.Ref(
+        TypeExpr(Span(0, 0), TypeExprKind.Path(["T"]))
+    ))
+    expect(typeExprToStr(refT)).toBe("&T")
+
+    let tup = TypeExpr(Span(0, 0), TypeExprKind.Tuple([
+        TypeExpr(Span(0, 0), TypeExprKind.Path(["int"])),
+        TypeExpr(Span(0, 0), TypeExprKind.Path(["string"]))
+    ]))
+    expect(typeExprToStr(tup)).toBe("(int, string)")
+
+    let asyncFn = TypeExpr(Span(0, 0), TypeExprKind.Fn(
+        [TypeExpr(Span(0, 0), TypeExprKind.Path(["int"]))],
+        TypeExpr(Span(0, 0), TypeExprKind.Path(["bool"])),
+        true
+    ))
+    expect(typeExprToStr(asyncFn)).toBe("async (int) -> bool")
+
+    let infer = TypeExpr(Span(0, 0), TypeExprKind.Infer)
+    expect(typeExprToStr(infer)).toBe("_")
+}
+
+test fn surface_extraction_has_flat_membership() {
+    let p = parseMust(userV1())
+    let items = extractSurface(p)
+    expect(hasItem(items, "class", "User")).toBe(true)
+    expect(hasItem(items, "field", "User.name")).toBe(true)
+    expect(hasItem(items, "field", "User.age")).toBe(true)
+    expect(hasItem(items, "ctor", "User.<init>")).toBe(true)
+    expect(hasItem(items, "method", "User.greet")).toBe(true)
+    expect(hasItem(items, "fn", "main")).toBe(true)
+
+    if (let some(name) = findItem(items, "field", "User.name")) {
+        expect(name.sig).toBe("name: string")
+    } else {
+        expect(true).toBe(false)
+    }
+
+    expect(sortedOk(items)).toBe(true)
+}
+
+test fn surface_covers_enums_interfaces_structs_consts() {
+    let p = parseMust(miscFixture())
+    let items = extractSurface(p)
+    expect(hasItem(items, "enum", "Color")).toBe(true)
+    expect(hasItem(items, "variant", "Color.Red")).toBe(true)
+    expect(hasItem(items, "variant", "Color.Rgb")).toBe(true)
+    expect(hasItem(items, "interface", "Runnable")).toBe(true)
+    expect(hasItem(items, "imethod", "Runnable.run")).toBe(true)
+    expect(hasItem(items, "struct", "Point")).toBe(true)
+    expect(hasItem(items, "field", "Point.x")).toBe(true)
+    expect(hasItem(items, "field", "Point.y")).toBe(true)
+    expect(hasItem(items, "const", "VERSION")).toBe(true)
+
+    if (let some(rgb) = findItem(items, "variant", "Color.Rgb")) {
+        expect(rgb.sig).toBe("(r: int, g: int, b: int)")
+    } else {
+        expect(true).toBe(false)
+    }
+
+    if (let some(cst) = findItem(items, "const", "VERSION")) {
+        expect(cst.sig).toBe("VERSION: int")
+    } else {
+        expect(true).toBe(false)
+    }
+}
+
+test fn diff_reports_add_remove_change() {
+    let before = extractSurface(parseMust(userV1()))
+    let after = extractSurface(parseMust(userV2()))
+    let changes = diffSurfaces(before, after)
+
+    expect(countChange(changes, "~")).toBe(1)
+    if (let some(change) = findStatus(changes, "~")) {
+        expect(change.name).toBe("User.name")
+        expect(optVal(change.before)).toBe("name: string")
+        expect(optVal(change.after)).toBe("name: string?")
+    } else {
+        expect(true).toBe(false)
+    }
+
+    if (let some(add) = findStatusName(changes, "+", "User.admin")) {
+        expect(optVal(add.after)).toBe("admin: bool")
+    } else {
+        expect(true).toBe(false)
+    }
+
+    expect(countChange(changes, "-")).toBe(0)
+}
+
+test fn transit_labels_are_honest() {
+    expect(optVal(transitLabel("name: string", "name: string?"))).toBe("made nullable")
+    expect(optVal(transitLabel("name: string?", "name: string"))).toBe("no longer optional")
+    expect(noneOf(transitLabel("a: int", "a: float"))).toBe(true)
+    expect(optVal(transitLabel("xs: List<int>", "xs: List<int>?"))).toBe("made nullable")
+    expect(noneOf(transitLabel("xs: List<int?>", "xs: List<int>?"))).toBe(true)
+    expect(noneOf(transitLabel("a: int", "b: int?"))).toBe(true)
+}
+
+test fn snapshot_json_round_trips() {
+    var items = emptyPublicItems()
+    items.push(PublicItem("field", "User.name", "def", "name: string?"))
+    items.push(PublicItem("fn", "say\"hi\"_☃", "pub", "say\"hi\"(s: string) -> string"))
+
+    var codes = [""]
+    codes.pop()
+
+    var deps = ["import a.b as c"]
+    deps.push("use x.y.z")
+
+    let msg = "make User.name optional\n(with \"escapes\" and unicode ☃)"
+    let snap = Snapshot(
+        "0123456789abcdef0123456789abcdef01234567",
+        "0123456",
+        "2026-09-20 10:00:00 +0000",
+        msg,
+        "src/User.pkl",
+        fnv1a64(bytes("contents of file")),
+        true,
+        codes,
+        deps,
+        items
+    )
+
+    let json = snap.toJson()
+    match (Snapshot.fromJson(json)) {
+        case some(back) -> expect(snapEq(back, snap)).toBe(true)
+        case none -> expect(true).toBe(false)
+    }
+
+    expect(snapNone(Snapshot.fromJson("not json"))).toBe(true)
+    expect(snapNone(Snapshot.fromJson("\{\"commit\":1\}"))).toBe(true)
+}
+
+test fn snapshot_json_with_errors_and_unknown_kind() {
+    var codes = ["E0308"]
+    codes.push("E0351")
+    var deps = [""]
+    deps.pop()
+    var items = emptyPublicItems()
+    items.push(PublicItem("field", "A.b", "priv", "b: int"))
+
+    let snap = Snapshot("abc", "abc", "d", "m", "f.pkl", fnv1a64(bytes("x")), false, codes, deps, items)
+    let json = snap.toJson()
+
+    match (Snapshot.fromJson(json)) {
+        case some(back) -> {
+            expect(back.ok).toBe(false)
+            expect(len(back.codes)).toBe(2)
+            expect(back.codes[0]).toBe("E0308")
+            expect(back.codes[1]).toBe("E0351")
+            expect(back.items[0].vis).toBe("priv")
+        }
+        case none -> expect(true).toBe(false)
+    }
+
+    let tampered = strReplaceAll(json, "\"kind\":\"field\"", "\"kind\":\"wat\"")
+    match (Snapshot.fromJson(tampered)) {
+        case some(back) -> expect(len(back.items)).toBe(0)
+        case none -> expect(true).toBe(false)
+    }
+}
+
+test fn fnv1a64_is_deterministic_and_differs() {
+    expect(fnv1a64(bytes("hello"))).toBe(fnv1a64(bytes("hello")))
+    expect(fnv1a64(bytes("hello")) != fnv1a64(bytes("hellp"))).toBe(true)
+    expect(fnv1a64(bytes(""))).toBe("cbf29ce484222325")
+    expect(fnv1a64(bytes("hello"))).toBe("a430d84680aabd0b")
+    expect(fnv1a64(bytes("x"))).toBe("af63f54c86021707")
+}

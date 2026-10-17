@@ -1,0 +1,45 @@
+module runtime.panic_test
+
+import { fatalPrefix, internalPrefix, fatalBanner, internalBanner, msgNoMatch, msgNoneUnwrap, msgNoIfaceMethod, msgArityDiff, fatalNoMatch, fatalNoneUnwrap, fatalArityDiff, fatalNoIfaceMethod, CaptureLedger } from runtime.panic
+
+test fn banner_frames() {
+    expect(fatalPrefix()).toBe("fatal: ")
+    expect(internalPrefix()).toBe("internal error: ")
+    expect(fatalBanner("boom")).toBe("fatal: boom\n")
+    expect(internalBanner("boom", "a.pkl", 12)).toBe("internal error: boom at a.pkl:12\n")
+}
+
+test fn standard_messages_match_runtime() {
+    expect(msgNoMatch()).toBe("pickle: match is not exhaustive")
+    expect(msgNoneUnwrap()).toBe("pickle: unwrapped none value")
+    expect(msgNoIfaceMethod()).toBe("pickle: interface method dispatch found no implementation")
+    expect(msgArityDiff()).toBe("pickle: spread list does not match the expected number of arguments")
+    expect(fatalNoneUnwrap()).toBe("fatal: pickle: unwrapped none value\n")
+    expect(fatalArityDiff()).toBe("fatal: pickle: spread list does not match the expected number of arguments\n")
+    expect(fatalNoMatch()).toBe("fatal: pickle: match is not exhaustive\n")
+    expect(fatalNoIfaceMethod()).toBe("fatal: pickle: interface method dispatch found no implementation\n")
+}
+
+test fn capture_ledger_records_consumes_once() {
+    var l = CaptureLedger()
+    expect(l.take()).toBe(none)
+    l.begin()
+    l.record("first")
+    l.record("second")
+    expect(l.take()).toBe("second")
+    expect(l.take()).toBe(none)
+}
+
+test fn capture_ledger_off_records_nothing() {
+    var l = CaptureLedger()
+    l.record("ignored")
+    expect(l.take()).toBe(none)
+}
+
+test fn end_clears_pending() {
+    var l = CaptureLedger()
+    l.begin()
+    l.record("pending")
+    l.endClear()
+    expect(l.take()).toBe(none)
+}

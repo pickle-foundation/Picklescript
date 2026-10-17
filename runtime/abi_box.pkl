@@ -1,0 +1,374 @@
+module runtime.abi_box
+
+/// Sovereign boxed-scalar ABI bodies, ported from `runtime/src/boxscalar.rs`.
+///
+/// Follows `runtime.abi_string`: `#[symbol]` puts the exact export name in a real
+/// C ABI slot so emitted code calling `pickle_box_i64` lands here instead of in the
+/// Rust runtime. This is the widest-breach tranche measured by
+/// `tools/extern_surface.ps1` - `pickle_box_i64` is referenced by 163 program shapes
+/// and `pickle_unbox_i64` by 166, because every `list`/`map` element write, every
+/// `str` index and every interface call boxes its scalar.
+///
+/// Layout is `runtime.layout`: a 24-byte header (`next`, `class_id`/`flags`, `size`),
+/// then the 8-byte payload at `BOX_PAYLOAD_OFF` (word 3). A box is therefore 4 words /
+/// 32 bytes, matching `BOX_OBJECT_SIZE`.
+///
+/// The header's `class_id` word is what makes this work: `alloc` returns zeroed-by-
+/// luck memory and the GC does not know a box exists, so the body writes all three
+/// header words itself. Setting `class_id` to the box family (3..6) is also what lets
+/// `isBoxClass` / `pickle_print_obj` recognise the object later.
+///
+/// GAP - `pickle_unbox_*` panics with "pickle: cannot unbox null as <t>" on a null
+/// pointer. Pickle has no null pointer literal, so the check is not expressible in
+/// source; these bodies assume a non-null operand, which is what the compiler emits
+/// for a boxed value. Same GAP, same remedy (a null-pointer primitive) as the one
+/// recorded in `abi_string.pkl`.
+///
+/// BOTH HALVES OF THE FLOAT PAIR ARE PORTABLE - and the second one took two
+/// corrections to get right. The first note here said both directions were
+/// blocked; then only the `bits -> float` direction was ported and
+/// `pickle_box_f64` was recorded as "genuinely blocked ... needs a real
+/// `floatBits` intrinsic, not a cleverer body" (PICKLE_AUDIT.md 17.1). That
+/// conclusion is wrong, and the argument that reached it is worth naming: it
+/// enumerated every *cast* between `float` and `int` - `x as int` is numeric,
+/// `p as *int` from `*float` is `E0363`, `addrOf` does not exist - and, having
+/// exhausted type-punning, stopped. But punning was never the only route. The
+/// body below *decomposes* the value into its IEEE-754 fields using arithmetic,
+/// which is the exact mirror of the reconstruction `abiF64FromBits` already
+/// performs, and it lands on the same bit pattern rather than a close one.
+///
+/// WHY DECOMPOSITION IS EXACT where a naive mantissa extraction would not be.
+/// Three operations carry the proof, each a well-known IEEE-754 identity:
+///
+///   - scaling by a power of two is exact, provided no overflow or underflow
+///     occurs - it only moves the exponent field;
+///   - for `a` in `[1, 2)`, the quantity `a - 1` is a multiple of `2^-52` with
+///     at most 52 significant bits, so the subtraction is exact and the
+///     subsequent `* 2^52` is a power-of-two scaling of an already-exact value;
+///   - normalising by repeated `* 2.0` / `* 0.5` is exact for the same reason
+///     as the first bullet, including while the value is still subnormal.
+///
+/// So the loop that walks `a` into `[1, 2)` cannot round, `a - 1` cannot round,
+/// and `m` comes out an integer that `as int` merely re-labels. The proof is
+/// conditional only on not overflowing, which is why `+inf` is tested for and
+/// returned before the loop - otherwise `inf * 0.5` would spin forever.
+///
+/// WHAT IS NOT REPRODUCED - the NaN *payload and sign*. A NaN reaches this body
+/// only as "a value that is not equal to itself"; by the time it is in a
+/// register the original bit pattern is not recoverable from the value by any
+/// arithmetic, because every NaN compares equal to every other NaN in the
+/// `!=` test that detects it. The body therefore answers the canonical quiet
+/// NaN. That is unobservable at Pickle's source level for the same reasons
+/// recorded under `abiF64FromBits`: `==` answers false for every NaN either
+/// way, there is no `to_bits`, and every formatter writes `NaN` regardless of
+/// payload or sign. Every *finite* value and both infinities are bit-exact.
+///
+/// VERIFIED BY DIFFERENTIAL SWEEP, not by inspection - and against the inverse
+/// function already in this file, which makes the check self-contained: take
+/// `bits`, rebuild `v = f64FromBits(bits)`, decompose `f64Bits(v)`, require the
+/// original word back. All 65536 patterns of (every exponent x 16 significands
+/// x both signs) and 50000 random words round-trip exactly, the only rejections
+/// being the NaN rows, which this function deliberately canonicalises.
+///
+/// WHAT THAT LEAVES FOR THE ARCHIVE - nothing in this pair. `pickle_f64_from_bits`
+/// (the free function behind the `f64FromBits` builtin) and `pickle_box_f64`
+/// both have bodies below, and neither needs the Rust runtime.
+///
+/// KNOWN LIMITATION - like `abi_string`, boxes come from `alloc`, which the GC does
+/// not track: correct, never reclaimed.
+
+import { PICKLE_CLASS_BOX_INT, PICKLE_CLASS_BOX_FLOAT, PICKLE_CLASS_BOX_BOOL, PICKLE_CLASS_BOX_CHAR } from runtime.object
+// Every body below starts with `alloc(int, n)`, so this module cannot be free
+// of the raw-allocation slots. Importing `runtime.abi_raw` puts
+// `pickle_raw_alloc` / `pickle_raw_free` in the object alongside the box slots,
+// which is what lets a link that carries these bodies drop the Rust pair too.
+// `abiRegisterObject` rides the same import: every box is a managed object and
+// is recorded in the port's sweepability registry as it is created
+// (`abi_raw`).
+import { abiRawAlloc, abiRegisterObject } from runtime.abi_raw
+
+const PAYLOAD_WORD: int = 3
+const BOX_WORDS: int = 4
+
+/// Allocate a 32-byte box object carrying `bits` in its payload.
+/// Mirrors `boxscalar.rs::new_box`: one `gc.alloc(32, class_id)` and a single
+/// payload store. `p[2]` is the byte size the rest of the runtime reads to learn
+/// an object's extent, so it must be 32 and not the word count.
+fn newBox(classId: int, bits: int) -> *int {
+    unsafe {
+        var p = alloc(int, BOX_WORDS)
+        p[0] = 0
+        p[1] = classId
+        p[2] = BOX_WORDS * 8
+        p[3] = bits
+        abiRegisterObject(p)
+        return p
+    }
+}
+
+/// Read the raw 8 payload bits of a box. Mirrors `boxscalar.rs::box_bits`.
+/// The null check lives in the native `unbox_bits` helper; see the GAP above.
+fn boxBits(obj: *int) -> int {
+    unsafe {
+        return obj[PAYLOAD_WORD]
+    }
+}
+
+/// Box an `int` as a managed object. Mirrors `boxscalar.rs::pickle_box_i64`.
+#[symbol("pickle_box_i64")]
+fn abiBoxI64(v: int) -> *int {
+    return newBox(PICKLE_CLASS_BOX_INT, v)
+}
+
+/// Box a `bool` as a managed object (`0`/`1` payload).
+/// Mirrors `boxscalar.rs::pickle_box_bool`, which stores `v as i64`.
+#[symbol("pickle_box_bool")]
+fn abiBoxBool(v: bool) -> *int {
+    var bits = 0
+    if (v) {
+        bits = 1
+    }
+    return newBox(PICKLE_CLASS_BOX_BOOL, bits)
+}
+
+/// Box a `char` as a managed object. `char` is an i32 scalar at the IR boundary
+/// (`IrTy::Char`); the native body stores `v as i64` unchanged.
+/// Mirrors `boxscalar.rs::pickle_box_char`.
+#[symbol("pickle_box_char")]
+fn abiBoxChar(v: int) -> *int {
+    return newBox(PICKLE_CLASS_BOX_CHAR, v)
+}
+
+/// Unbox a managed `int` object back to a raw `i64`.
+/// Mirrors `boxscalar.rs::pickle_unbox_i64`.
+#[symbol("pickle_unbox_i64")]
+fn abiUnboxI64(obj: *int) -> int {
+    return boxBits(obj)
+}
+
+/// Unbox a managed `bool` object. Mirrors `boxscalar.rs::pickle_unbox_bool`,
+/// which is `unbox_bits(obj, "bool") != 0` - any non-zero payload is `true`.
+#[symbol("pickle_unbox_bool")]
+fn abiUnboxBool(obj: *int) -> bool {
+    return boxBits(obj) != 0
+}
+
+/// Unbox a managed `char` object back to an i32 scalar.
+/// Mirrors `boxscalar.rs::pickle_unbox_char`, which truncates with `as i32`.
+#[symbol("pickle_unbox_char")]
+fn abiUnboxChar(obj: *int) -> int {
+    return boxBits(obj)
+}
+
+/// `2^n` for `n` in `-1074..1023`, built by repeated halving or doubling.
+///
+/// Every intermediate is a power of two, and a product of powers of two is
+/// exact in IEEE-754 as long as it neither overflows nor underflows - so no
+/// rounding can creep in anywhere on this path. The reachable range is bounded
+/// by construction: `n` is either `exp - 1023` with `exp <= 2046` (giving
+/// `2^1023`, the largest finite power of two) or the fixed `-1074` (the
+/// smallest subnormal). Both endpoints are representable, so the loop never
+/// steps off the end into zero or infinity.
+fn pow2(n: int) -> float {
+    var r = 1.0
+    var i = 0
+    var count = n
+    if (count < 0) {
+        count = 0 - count
+        while (i < count) {
+            r = r / 2.0
+            i = i + 1
+        }
+    } else {
+        while (i < count) {
+            r = r * 2.0
+            i = i + 1
+        }
+    }
+    return r
+}
+
+/// ABI: reinterpret an `i64` as an IEEE-754 `f64`.
+/// Mirrors `boxscalar.rs::pickle_f64_from_bits`, which is a single
+/// `f64::from_bits(bits as u64)` - a pure bit reinterpret with no arithmetic
+/// and therefore no rounding.
+///
+/// THE PORT CANNOT REINTERPRET, SO IT REBUILDS. Pickle has no `floatBits`, so
+/// the value is reconstructed from `(sign, exp, frac)` instead:
+///
+///   - `exp == 2047` - infinity and NaN are not reachable by finite
+///     arithmetic, so they are produced directly. `1.0 / 0.0` is evaluated with
+///     IEEE semantics and yields `+inf`, `inf - inf` yields a quiet NaN, and
+///     the sign bit is applied afterwards. The exact NaN payload of
+///     `f64::from_bits` is *not* reproduced, which is unobservable: Pickle
+///     cannot read a float's bits back, `==` answers false for every NaN, and
+///     the value formats as `NaN` regardless of sign.
+///   - `exp == 0` - zero or subnormal. A subnormal is `frac * 2^-1074`, built
+///     from the same `pow2`, so the smallest subnormal (`frac == 1`) survives
+///     exactly rather than collapsing to zero under a normalised multiply.
+///   - otherwise - a normal number is `(1 + frac * 2^-52) * 2^(exp - 1023)`.
+///     `frac` is at most `2^52 - 1`, so `frac as float` is exact, as is the
+///     division by `2^52`; the sum stays within 53 significant bits, and the
+///     final scaling is a power of two. The result is therefore bit-exact, not
+///     merely close.
+///
+/// The negative case applies the sign by multiplication rather than by
+/// subtraction, and that distinction is load-bearing for zero. The previous
+/// text here asserted the opposite - "by negation ... because `0.0 - v` is
+/// exactly `-v` for every IEEE-754 `v` - including `v == 0.0`, where it
+/// correctly yields `-0.0`" - which is false: IEEE-754 defines `(+0) - (+0)`
+/// as `+0`, so `0.0 - 0.0` is `+0.0` and the sign bit of a negative zero was
+/// silently lost. `v * -1.0` is `-0.0` for `v == 0.0`, as IEEE-754 requires of
+/// multiplication, and is otherwise an exact sign flip for every finite value
+/// and for the infinities.
+///
+/// The old test could not see this because `toBe` compares values and
+/// `-0.0 == +0.0` answers true. It was caught instead by the differential
+/// sweep in `abi_box_test.pkl`, which round-trips through `pickle_box_f64` and
+/// compares the *word*; `-0.0` is the one pattern in the whole space where a
+/// value-level comparison and a bit-level one disagree. `f64Bits` was already
+/// returning the right word - `1.0 / v` recovers the sign of `-0.0` precisely
+/// because `v < 0.0` cannot - so the defect was here and only here.
+///
+/// Verified by differential sweep rather than by inspection: every exponent
+/// `0..2047` crossed with eight significands and both signs - 32768 patterns -
+/// compared equal to the Rust `f64::from_bits` it replaces, plus a hand-picked
+/// corpus of 44 named constants.
+#[symbol("pickle_f64_from_bits")]
+fn abiF64FromBits(bits: int) -> float {
+    var u = bits
+    var neg = false
+    if (u < 0) {
+        neg = true
+        u = u & 9223372036854775807
+    }
+    var exp = (u >> 52) & 2047
+    var frac = u & 4503599627370495
+    if (exp == 2047) {
+        if (frac == 0) {
+            if (neg) {
+                return 0.0 - (1.0 / 0.0)
+            }
+            return 1.0 / 0.0
+        }
+        var nan = (1.0 / 0.0) - (1.0 / 0.0)
+        if (neg) {
+            return 0.0 - nan
+        }
+        return nan
+    }
+    var v = 0.0
+    if (exp == 0) {
+        v = (frac as float) * pow2(0 - 1074)
+    } else {
+        var m = 1.0 + (frac as float) / 4503599627370496.0
+        v = m * pow2(exp - 1023)
+    }
+    if (neg) {
+        return v * (0.0 - 1.0)
+    }
+    return v
+}
+
+/// Decompose an IEEE-754 `f64` back into its 64-bit word. The inverse of
+/// `abiF64FromBits`, and the missing half of `pickle_box_f64`.
+///
+/// See the module header for why this is exact without a `floatBits` intrinsic.
+/// The shape of the routine is: recover the sign, reject the two special cases
+/// that would break the normalisation loop (zero, infinity), walk the value into
+/// `[1, 2)` with exact power-of-two scalings, then read the exponent field off
+/// the loop counter and the significand off `a - 1`.
+///
+/// The sign comes from `v < 0.0` ORed with `1.0 / v < 0.0`, because neither
+/// test alone is complete. `v < 0.0` misses `-0.0`, which compares *equal* to
+/// zero - and `-0.0` must round-trip with its sign bit intact. Reciprocation
+/// recovers it: `1.0 / -0.0` is `-inf`, which does answer less than zero.
+///
+/// That second test is also why the two infinities are rejected *before* it
+/// runs. `1.0 / -inf` is `-0.0`, and `-0.0 < 0.0` is false - so the sign of
+/// `-inf` is invisible to both tests, `a` stays negative, the normalisation
+/// loops never fire, and the body falls through to `a * 2.0` on `-inf`, which
+/// is `-inf` again: an infinite loop. The first version of this routine hung
+/// exactly there. Returning both infinities up front removes the operand that
+/// cannot be sign-tested, and is required anyway - the loop below must never see
+/// an infinity, since `inf * 0.5` is still `inf`.
+///
+/// Subnormals branch separately: once `e < -1022` the significand is no longer
+/// `a - 1` scaled to `2^52`, because the value's low bits are not aligned to
+/// that grid. `m = a * 2^(e + 1074)` re-aligns it instead, and `e + 1074` lands
+/// in `0..51` by construction - `e` cannot go below `-1074`, which is where the
+/// smallest subnormal sits - so the product stays in `1..2^52` and cannot
+/// overflow. That keeps the smallest subnormal (`m == 1`) exact rather than
+/// collapsing it to zero.
+///
+/// Field assembly uses `|`, and the sign word is `0 - i64::MAX - 1` because the
+/// literal `-9223372036854775808` is one past the most positive `int` and will
+/// not lex.
+fn f64Bits(v: float) -> int {
+    if (v != v) {
+        return 9221120237041090560
+    }
+    var inf = 1.0 / 0.0
+    if (v == inf) {
+        return 9218868437227405312
+    }
+    if (v == 0.0 - inf) {
+        return 0 - 4503599627370496
+    }
+    var neg = false
+    if (v < 0.0) {
+        neg = true
+    }
+    if (1.0 / v < 0.0) {
+        neg = true
+    }
+    var a = v
+    if (neg) {
+        a = 0.0 - v
+    }
+    var sign = 0
+    if (neg) {
+        sign = 0 - 9223372036854775807 - 1
+    }
+    if (a == 0.0) {
+        return sign
+    }
+    var e = 0
+    while (a >= 2.0) {
+        a = a * 0.5
+        e = e + 1
+    }
+    while (a < 1.0) {
+        a = a * 2.0
+        e = e - 1
+    }
+    if (e >= -1022) {
+        var m = ((a - 1.0) * 4503599627370496.0) as int
+        var expBits = (e + 1023) * 4503599627370496
+        return sign | expBits | m
+    }
+    var m = (a * pow2(e + 1074)) as int
+    return sign | m
+}
+
+/// Box a `float` as a managed object (bits stored bit-for-bit).
+/// Mirrors `boxscalar.rs::pickle_box_f64`, which is
+/// `new_box(PICKLE_CLASS_BOX_FLOAT, v.to_bits() as i64)`.
+///
+/// The payload is the exact word, not a rounded stand-in, so `unbox_f64` reads
+/// back the original value and `print_obj` formats it identically to the
+/// runtime it replaces.
+#[symbol("pickle_box_f64")]
+fn abiBoxF64(v: float) -> *int {
+    return newBox(PICKLE_CLASS_BOX_FLOAT, f64Bits(v))
+}
+
+/// Unbox a managed `float` object back to a raw `f64`.
+/// Mirrors `boxscalar.rs::pickle_unbox_f64`, which is
+/// `f64::from_bits(unbox_bits(obj, "float") as u64)`. The payload holds the raw
+/// bit pattern, and `f64FromBits` is the bit reinterpret - `x as float` would be
+/// a numeric conversion and would answer something else entirely.
+#[symbol("pickle_unbox_f64")]
+fn abiUnboxF64(obj: *int) -> float {
+    return f64FromBits(boxBits(obj))
+}

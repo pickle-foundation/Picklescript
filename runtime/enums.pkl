@@ -1,0 +1,131 @@
+module runtime.enums
+
+/// Port of `runtime/src/enum.rs`: portable enum equality policy.
+///
+/// The ABI stays native: enums are boxed `enum_value` objects holding a tag
+/// plus a fixed array of payload structs (each: kind, union {int,float} +
+/// secondary, pointer-ish refs). `pickle_enum_value_new` builds them;
+/// `pickle_enum_value_eq` compares two pairs with this exact policy.
+///
+/// What a self-hosted runtime owns is the EQUALITY CONTRACT:
+///   - tags must match; payload arities must match;
+///   - KIND_NOTES/int/byte/bool/char compare by integer bits;
+///   - KIND_NOTE_FLOAT compares by IEEE f64 value, so NaN != NaN and
+///     -0.0 == 0.0;
+///   - KIND_NOTE_TYPE compares strings by content;
+///   - KIND_NOTE_ENUM recurses into the nested enum;
+///   - KIND_NOTE_OTHER (and plain null boxes) compare by identity;
+///   - a null box never equals a non-null box.
+
+import { PICKLE_CLASS_STRING, PICKLE_CLASS_ENUM, PICKLE_CLASS_BOX_INT, PICKLE_CLASS_BOX_FLOAT, PICKLE_CLASS_BOX_BOOL, PICKLE_CLASS_BOX_CHAR } from runtime.object
+
+const KIND_STRING: int = 0
+const KIND_INT: int = 1
+const KIND_FLOAT: int = 2
+const KIND_BOOL: int = 3
+const KIND_CHAR: int = 4
+const KIND_NONE: int = 5
+const KIND_OTHER: int = 6
+const KIND_ENUM: int = 7
+
+/// Class-id dispatch used by the runtime's field-kind resolution.
+fn payloadKindOf(cid: int) -> int {
+    if (cid == PICKLE_CLASS_STRING) {
+        return KIND_STRING
+    }
+    if (cid == PICKLE_CLASS_BOX_INT) {
+        return KIND_INT
+    }
+    if (cid == PICKLE_CLASS_BOX_FLOAT) {
+        return KIND_FLOAT
+    }
+    if (cid == PICKLE_CLASS_BOX_BOOL) {
+        return KIND_BOOL
+    }
+    if (cid == PICKLE_CLASS_BOX_CHAR) {
+        return KIND_CHAR
+    }
+    if (cid == PICKLE_CLASS_ENUM) {
+        return KIND_ENUM
+    }
+    KIND_OTHER
+}
+
+/// A single enum variant payload slot (mirror of the native payload struct).
+class EnumPayload {
+    var kind: int
+    var num: int
+    var f: float
+    var text: string
+    var nested: EnumValue?
+    var identity: int
+
+    constructor(initKind: int, initNum: int, initF: float, initText: string, initNested: EnumValue?, initIdentity: int) {
+        this.kind = initKind
+        this.num = initNum
+        this.f = initF
+        this.text = initText
+        this.nested = initNested
+        this.identity = initIdentity
+    }
+}
+
+/// A boxed enum value (mirror of `pickle_enum_value_new` output).
+class EnumValue {
+    var tag: int
+    var fields: List<EnumPayload>
+
+    constructor(initTag: int, initFields: List<EnumPayload>) {
+        this.tag = initTag
+        this.fields = initFields
+    }
+}
+
+/// Mirror of `pickle_enum_value_eq`.
+fn enumEqValue(a: EnumValue, b: EnumValue) -> bool {
+    if (a.tag != b.tag) {
+        return false
+    }
+    if (len(a.fields) != len(b.fields)) {
+        return false
+    }
+    var i = 0
+    while (i < len(a.fields)) {
+        if (!payloadEq(a.fields[i], b.fields[i])) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+/// Mirror of the native `enum_field_eq` policy over a single payload slot.
+fn payloadEq(a: EnumPayload, b: EnumPayload) -> bool {
+    if (a.kind != b.kind) {
+        return false
+    }
+    if (a.kind == KIND_NONE) {
+        return true
+    }
+    if (a.kind == KIND_INT || a.kind == KIND_BOOL || a.kind == KIND_CHAR) {
+        return a.num == b.num
+    }
+    if (a.kind == KIND_FLOAT) {
+        return a.f == b.f
+    }
+    if (a.kind == KIND_STRING) {
+        return a.text == b.text
+    }
+    if (a.kind == KIND_OTHER) {
+        return a.identity == b.identity
+    }
+    if (a.kind == KIND_ENUM) {
+        if (let some(x) = a.nested) {
+            if (let some(y) = b.nested) {
+                return enumEqValue(x, y)
+            }
+        }
+        return false
+    }
+    false
+}

@@ -1,0 +1,840 @@
+module compiler.lexer
+
+import { Span } from compiler.diag
+import * from compiler.token
+
+class Lexer {
+    var bs: List<byte>
+    var pos: int
+    var base: int
+    var nesting: int
+    var pending: string?
+    var frames: List<int>
+
+    constructor(bs: List<byte>, pos: int, nesting: int, pending: string?, frames: List<int>, base: int) {
+        this.bs = bs
+        this.pos = pos
+        this.base = base
+        this.nesting = nesting
+        this.pending = pending
+        this.frames = frames
+    }
+
+    fn atCp() -> int {
+        if (this.pos >= len(this.bs)) {
+            return -1
+        }
+        decodeCp(this.bs, this.pos)
+    }
+
+    fn bumpCp() -> int {
+        if (this.pos >= len(this.bs)) {
+            return -1
+        }
+        let cp = decodeCp(this.bs, this.pos)
+        this.pos = this.pos + cpLen(this.bs[this.pos] as int)
+        cp
+    }
+
+    fn peekCp(ahead: int) -> int {
+        let save = this.pos
+        var i = 0
+        while (i < ahead) {
+            this.bumpCp()
+            i = i + 1
+        }
+        let cp = this.atCp()
+        this.pos = save
+        cp
+    }
+
+    fn appendDoc(text: string) {
+        if (len(text) == 0) {
+            return
+        }
+        match (this.pending) {
+            case some(p) -> this.pending = p + "\n" + text
+            case none -> this.pending = text
+        }
+    }
+
+    fn run() -> List<LexedToken> {
+        var out = emptyToks()
+        while (true) {
+            let t = this.nextToken()
+            let eofs = match (t.token.kind) {
+                case Tok.Eof -> true
+                case _ -> false
+            }
+            out.push(t)
+            if (eofs) {
+                break
+            }
+        }
+        out
+    }
+
+    fn skipWs() {
+        while (true) {
+            let c = this.atCp()
+            if (c == (' ' as int) || c == ('\t' as int) || c == ('\r' as int)) {
+                this.bumpCp()
+                continue
+            }
+            if (c == ('\n' as int)) {
+                return
+            }
+            if (c == ('/' as int) && this.peekCp(1) == ('/' as int)) {
+                if (this.peekCp(2) == ('/' as int)) {
+                    this.bumpCp()
+                    this.bumpCp()
+                    this.bumpCp()
+                    var text = ""
+                    while (true) {
+                        let c2 = this.atCp()
+                        if (c2 == ('\n' as int) || c2 == -1) {
+                            break
+                        }
+                        text += "{c2 as char}"
+                        this.bumpCp()
+                    }
+                    var clean = stripLeadSpace(text)
+                    clean = trimEndStr(clean)
+                    this.appendDoc(clean)
+                } else {
+                    while (true) {
+                        let c2 = this.atCp()
+                        if (c2 == ('\n' as int) || c2 == -1) {
+                            break
+                        }
+                        this.bumpCp()
+                    }
+                }
+                continue
+            }
+            if (c == ('/' as int) && this.peekCp(1) == ('*' as int)) {
+                let isDoc = this.peekCp(2) == ('*' as int)
+                this.bumpCp()
+                this.bumpCp()
+                var depth = 1
+                var text = ""
+                while (depth > 0) {
+                    let c2 = this.atCp()
+                    if (c2 == -1) {
+                        break
+                    }
+                    if (c2 == ('/' as int) && this.peekCp(1) == ('*' as int)) {
+                        depth = depth + 1
+                        this.bumpCp()
+                        this.bumpCp()
+                        continue
+                    }
+                    if (c2 == ('*' as int) && this.peekCp(1) == ('/' as int)) {
+                        depth = depth - 1
+                        this.bumpCp()
+                        this.bumpCp()
+                        continue
+                    }
+                    text += "{c2 as char}"
+                    this.bumpCp()
+                }
+                if (isDoc) {
+                    if (len(text) > 0 && text[0] == ('*' as int)) {
+                        var body = dropFirstStr(text)
+                        body = stripLeadSpace(body)
+                        body = trimEndStr(body)
+                        this.appendDoc(body)
+                    }
+                }
+                continue
+            }
+            return
+        }
+    }
+
+    fn nextToken() -> LexedToken {
+        this.skipWs()
+        if (this.atCp() == ('\n' as int)) {
+            let start = this.pos
+            this.bumpCp()
+            let base = if (len(this.frames) == 0) { 0 } else { this.frames[len(this.frames) - 1] }
+            if (this.nesting <= base) {
+                return plainTok(Tok.Newline, Span(start + this.base, this.pos + this.base))
+            }
+            return this.nextToken()
+        }
+        if (this.atCp() == -1) {
+            return plainTok(Tok.Eof, Span(this.pos + this.base, this.pos + this.base))
+        }
+        var t = this.lexTok()
+        if (!isTriviaKind(t.token.kind)) {
+            t.data.doc = this.pending
+            this.pending = none
+        }
+        t
+    }
+
+    fn lexTok() -> LexedToken {
+        let start = this.pos
+        let c = this.bumpCp()
+
+        if (c == ('r' as int) && this.atCp() == ('"' as int)) {
+            return this.lexRaw(start)
+        }
+
+        if (isAlphaCp(c) || c == ('_' as int)) {
+            while (true) {
+                let ch = this.atCp()
+                if (isAlnumCp(ch) || ch == ('_' as int)) {
+                    this.bumpCp()
+                } else {
+                    break
+                }
+            }
+            var word = ""
+            var k = start
+            while (k < this.pos) {
+                word += "{this.bs[k] as char}"
+                k = k + 1
+            }
+            let kw = keywordTok(word)
+            if (let some(kind) = kw) {
+                return plainTok(kind, Span(start + this.base, this.pos + this.base))
+            }
+            return plainTok(Tok.Ident(word), Span(start + this.base, this.pos + this.base))
+        }
+
+        if (isDigitCp(c)) {
+            this.pos = this.pos - 1
+            return this.lexNumber()
+        }
+
+        if (c == ('\'' as int)) {
+            this.pos = this.pos - 1
+            return this.lexChar()
+        }
+
+        if (c == ('"' as int)) {
+            if (this.atCp() == ('"' as int) && this.peekCp(1) == ('"' as int)) {
+                this.pos = this.pos - 1
+                return this.lexMultiline()
+            }
+            this.pos = this.pos - 1
+            return this.lexString()
+        }
+
+        if (c == ('(' as int)) {
+            this.nesting = this.nesting + 1
+            return plainTok(Tok.LParen, Span(start + this.base, start + 1 + this.base))
+        }
+        if (c == (')' as int)) {
+            if (this.nesting > 0) {
+                this.nesting = this.nesting - 1
+            }
+            return plainTok(Tok.RParen, Span(start + this.base, start + 1 + this.base))
+        }
+        if (c == ('[' as int)) {
+            this.nesting = this.nesting + 1
+            return plainTok(Tok.LBracket, Span(start + this.base, start + 1 + this.base))
+        }
+        if (c == (']' as int)) {
+            if (this.nesting > 0) {
+                this.nesting = this.nesting - 1
+            }
+            return plainTok(Tok.RBracket, Span(start + this.base, start + 1 + this.base))
+        }
+        if (c == ('{' as int)) {
+            this.frames.push(this.nesting)
+            return plainTok(Tok.LBrace, Span(start + this.base, start + 1 + this.base))
+        }
+        if (c == ('}' as int)) {
+            if (len(this.frames) > 0) {
+                this.frames.pop()
+            }
+            return plainTok(Tok.RBrace, Span(start + this.base, start + 1 + this.base))
+        }
+        if (c == (',' as int)) {
+            return plainTok(Tok.Comma, Span(start + this.base, start + 1 + this.base))
+        }
+        if (c == ('.' as int)) {
+            if (this.atCp() == ('.' as int)) {
+                this.bumpCp()
+                if (this.atCp() == ('.' as int)) {
+                    this.bumpCp()
+                    return plainTok(Tok.Ellipsis, Span(start + this.base, this.pos + this.base))
+                }
+                if (this.atCp() == ('=' as int)) {
+                    this.bumpCp()
+                    return plainTok(Tok.RangeIncl, Span(start + this.base, this.pos + this.base))
+                }
+                return plainTok(Tok.Range, Span(start + this.base, this.pos + this.base))
+            }
+            if (isDigitCp(this.atCp())) {
+                var dotText = "."
+                while (true) {
+                    let d = this.atCp()
+                    if (isDigitCp(d) || d == ('_' as int)) {
+                        dotText += "{this.bumpCp() as char}"
+                    } else {
+                        break
+                    }
+                }
+                return this.numberTok(dotText, Span(start + this.base, this.pos + this.base))
+            }
+            return plainTok(Tok.Dot, Span(start + this.base, start + 1 + this.base))
+        }
+        if (c == (':' as int)) {
+            if (this.atCp() == (':' as int)) {
+                this.bumpCp()
+                return plainTok(Tok.ColonColon, Span(start + this.base, this.pos + this.base))
+            }
+            if (this.atCp() == ('=' as int)) {
+                this.bumpCp()
+                return plainTok(Tok.Assign, Span(start + this.base, this.pos + this.base))
+            }
+            return plainTok(Tok.Colon, Span(start + this.base, start + 1 + this.base))
+        }
+        if (c == (';' as int)) {
+            return plainTok(Tok.Semicolon, Span(start + this.base, start + 1 + this.base))
+        }
+        if (c == ('=' as int)) {
+            if (this.atCp() == ('=' as int)) {
+                this.bumpCp()
+                return plainTok(Tok.EqEq, Span(start + this.base, this.pos + this.base))
+            }
+            if (this.atCp() == ('>' as int)) {
+                this.bumpCp()
+                return plainTok(Tok.FatArrow, Span(start + this.base, this.pos + this.base))
+            }
+            return plainTok(Tok.Assign, Span(start + this.base, start + 1 + this.base))
+        }
+        if (c == ('-' as int)) {
+            if (this.atCp() == ('>' as int)) {
+                this.bumpCp()
+                return plainTok(Tok.Arrow, Span(start + this.base, this.pos + this.base))
+            }
+            if (this.atCp() == ('=' as int)) {
+                this.bumpCp()
+                return plainTok(Tok.MinusEq, Span(start + this.base, this.pos + this.base))
+            }
+            return plainTok(Tok.Minus, Span(start + this.base, start + 1 + this.base))
+        }
+        if (c == ('+' as int)) {
+            if (this.atCp() == ('=' as int)) {
+                this.bumpCp()
+                return plainTok(Tok.PlusEq, Span(start + this.base, this.pos + this.base))
+            }
+            return plainTok(Tok.Plus, Span(start + this.base, start + 1 + this.base))
+        }
+        if (c == ('*' as int)) {
+            if (this.atCp() == ('*' as int)) {
+                this.bumpCp()
+                return plainTok(Tok.StarStar, Span(start + this.base, this.pos + this.base))
+            }
+            if (this.atCp() == ('=' as int)) {
+                this.bumpCp()
+                return plainTok(Tok.StarEq, Span(start + this.base, this.pos + this.base))
+            }
+            return plainTok(Tok.Star, Span(start + this.base, start + 1 + this.base))
+        }
+        if (c == ('/' as int)) {
+            if (this.atCp() == ('=' as int)) {
+                this.bumpCp()
+                return plainTok(Tok.SlashEq, Span(start + this.base, this.pos + this.base))
+            }
+            return plainTok(Tok.Slash, Span(start + this.base, start + 1 + this.base))
+        }
+        if (c == ('%' as int)) {
+            if (this.atCp() == ('=' as int)) {
+                this.bumpCp()
+                return plainTok(Tok.PercentEq, Span(start + this.base, this.pos + this.base))
+            }
+            return plainTok(Tok.Percent, Span(start + this.base, start + 1 + this.base))
+        }
+        if (c == ('!' as int)) {
+            if (this.atCp() == ('=' as int)) {
+                this.bumpCp()
+                return plainTok(Tok.NotEq, Span(start + this.base, this.pos + this.base))
+            }
+            return plainTok(Tok.Bang, Span(start + this.base, start + 1 + this.base))
+        }
+        if (c == ('~' as int)) {
+            return plainTok(Tok.Tilde, Span(start + this.base, start + 1 + this.base))
+        }
+        if (c == ('#' as int)) {
+            return plainTok(Tok.Hash, Span(start + this.base, start + 1 + this.base))
+        }
+        if (c == ('&' as int)) {
+            if (this.atCp() == ('&' as int)) {
+                this.bumpCp()
+                return plainTok(Tok.AndAnd, Span(start + this.base, this.pos + this.base))
+            }
+            if (this.atCp() == ('=' as int)) {
+                this.bumpCp()
+                return plainTok(Tok.AndEq, Span(start + this.base, this.pos + this.base))
+            }
+            return plainTok(Tok.Amp, Span(start + this.base, start + 1 + this.base))
+        }
+        if (c == ('|' as int)) {
+            if (this.atCp() == ('|' as int)) {
+                this.bumpCp()
+                return plainTok(Tok.OrOr, Span(start + this.base, this.pos + this.base))
+            }
+            if (this.atCp() == ('=' as int)) {
+                this.bumpCp()
+                return plainTok(Tok.OrEq, Span(start + this.base, this.pos + this.base))
+            }
+            return plainTok(Tok.Pipe, Span(start + this.base, start + 1 + this.base))
+        }
+        if (c == ('^' as int)) {
+            if (this.atCp() == ('=' as int)) {
+                this.bumpCp()
+                return plainTok(Tok.XorEq, Span(start + this.base, this.pos + this.base))
+            }
+            return plainTok(Tok.Caret, Span(start + this.base, start + 1 + this.base))
+        }
+        if (c == ('<' as int)) {
+            if (this.atCp() == ('<' as int)) {
+                this.bumpCp()
+                if (this.atCp() == ('=' as int)) {
+                    this.bumpCp()
+                    return plainTok(Tok.ShlEq, Span(start + this.base, this.pos + this.base))
+                }
+                return plainTok(Tok.Shl, Span(start + this.base, this.pos + this.base))
+            }
+            if (this.atCp() == ('=' as int)) {
+                this.bumpCp()
+                return plainTok(Tok.Le, Span(start + this.base, this.pos + this.base))
+            }
+            if (this.atCp() == ('-' as int)) {
+                this.bumpCp()
+                return plainTok(Tok.SendOp, Span(start + this.base, this.pos + this.base))
+            }
+            return plainTok(Tok.Lt, Span(start + this.base, start + 1 + this.base))
+        }
+        if (c == ('>' as int)) {
+            if (this.atCp() == ('>' as int)) {
+                this.bumpCp()
+                if (this.atCp() == ('=' as int)) {
+                    this.bumpCp()
+                    return plainTok(Tok.ShrEq, Span(start + this.base, this.pos + this.base))
+                }
+                return plainTok(Tok.Shr, Span(start + this.base, this.pos + this.base))
+            }
+            if (this.atCp() == ('=' as int)) {
+                this.bumpCp()
+                return plainTok(Tok.Ge, Span(start + this.base, this.pos + this.base))
+            }
+            return plainTok(Tok.Gt, Span(start + this.base, start + 1 + this.base))
+        }
+        if (c == ('?' as int)) {
+            if (this.atCp() == ('?' as int)) {
+                this.bumpCp()
+                return plainTok(Tok.QuestionQuestion, Span(start + this.base, this.pos + this.base))
+            }
+            if (this.atCp() == ('.' as int)) {
+                this.bumpCp()
+                return plainTok(Tok.QuestionDot, Span(start + this.base, this.pos + this.base))
+            }
+            if (this.atCp() == (':' as int)) {
+                this.bumpCp()
+                return plainTok(Tok.QuestionColon, Span(start + this.base, this.pos + this.base))
+            }
+            return plainTok(Tok.Question, Span(start + this.base, start + 1 + this.base))
+        }
+        if (c == ('@' as int)) {
+            return plainTok(Tok.At, Span(start + this.base, start + 1 + this.base))
+        }
+        this.nextToken()
+    }
+
+    fn numberTok(text: string, span: Span) -> LexedToken {
+        var t = plainTok(Tok.Number, span)
+        t.data.text = text
+        let ival = parseIntLiteral(text)
+        t.data.ival = ival
+        var isfloat = containsDotE(text)
+        if (let some(_v) = ival) {
+            isfloat = false
+        }
+        t.data.isf = isfloat
+        t
+    }
+
+    fn lexNumber() -> LexedToken {
+        let start = this.pos
+        var text = ""
+        var radix = 10
+        if (this.atCp() == ('0' as int) && (this.peekCp(1) == ('x' as int) || this.peekCp(1) == ('X' as int) || this.peekCp(1) == ('b' as int) || this.peekCp(1) == ('B' as int) || this.peekCp(1) == ('o' as int) || this.peekCp(1) == ('O' as int))) {
+            let p = this.peekCp(1)
+            this.bumpCp()
+            this.bumpCp()
+            if (p == ('x' as int) || p == ('X' as int)) {
+                radix = 16
+            } else if (p == ('b' as int) || p == ('B' as int)) {
+                radix = 2
+            } else {
+                radix = 8
+            }
+            text += "0"
+            text += "{p as char}"
+        }
+
+        var isFloat = false
+        if (radix == 10) {
+            while (true) {
+                let c = this.atCp()
+                if (c != ('.' as int) && c != ('e' as int) && c != ('E' as int) && !isDigitCp(c) && c != ('_' as int)) {
+                    break
+                }
+                if (c == ('.' as int)) {
+                    if (isFloat) {
+                        break
+                    }
+                    if (isDigitCp(this.peekCp(1))) {
+                        isFloat = true
+                        text += "{this.bumpCp() as char}"
+                        continue
+                    }
+                    break
+                }
+                if (c == ('e' as int) || c == ('E' as int)) {
+                    let n1 = this.peekCp(1)
+                    let n2 = this.peekCp(2)
+                    if (isDigitCp(n1) || ((n1 == ('+' as int) || n1 == ('-' as int)) && isDigitCp(n2))) {
+                        isFloat = true
+                        text += "{this.bumpCp() as char}"
+                        let a = this.atCp()
+                        if (a == ('+' as int) || a == ('-' as int)) {
+                            text += "{this.bumpCp() as char}"
+                        }
+                        continue
+                    }
+                    break
+                }
+                text += "{this.bumpCp() as char}"
+            }
+        } else {
+            while (true) {
+                let c = this.atCp()
+                if (isHexCp(c) || c == ('_' as int)) {
+                    text += "{this.bumpCp() as char}"
+                } else {
+                    break
+                }
+            }
+        }
+
+        var suffix = ""
+        while (true) {
+            let c = this.atCp()
+            if (isAlnumCp(c)) {
+                suffix += "{this.bumpCp() as char}"
+            } else {
+                break
+            }
+        }
+        var t = this.numberTok(text, Span(start + this.base, this.pos + this.base))
+        t.data.suf = suffix
+        t.data.isf = isFloat
+        t
+    }
+
+    fn lexRaw(start: int) -> LexedToken {
+        this.bumpCp()
+        var text = ""
+        while (true) {
+            let c = this.atCp()
+            if (c == ('"' as int)) {
+                this.bumpCp()
+                return plainTok(Tok.Str(StrLit([StrSeg.Text(text)])), Span(start + this.base, this.pos + this.base))
+            }
+            if (c == -1) {
+                return plainTok(Tok.Str(StrLit([StrSeg.Text(text)])), Span(start + this.base, this.pos + this.base))
+            }
+            text += "{c as char}"
+            this.bumpCp()
+        }
+    }
+
+    fn lexMultiline() -> LexedToken {
+        let start = this.pos
+        this.bumpCp()
+        this.bumpCp()
+        this.bumpCp()
+        var segs = emptySegs()
+        while (true) {
+            var text = ""
+            var done = false
+            while (true) {
+                let c = this.atCp()
+                if (c == ('"' as int) && this.peekCp(1) == ('"' as int) && this.peekCp(2) == ('"' as int)) {
+                    this.bumpCp()
+                    this.bumpCp()
+                    this.bumpCp()
+                    if (len(text) > 0) {
+                        segs.push(StrSeg.Text(text))
+                    }
+                    done = true
+                    break
+                }
+                if (c == ('{' as int) && this.peekCp(1) != ('{' as int)) {
+                    this.bumpCp()
+                    if (len(text) > 0) {
+                        segs.push(StrSeg.Text(text))
+                    }
+                    let tokStart = this.pos
+                    let expr = this.lexInterp(tokStart)
+                    segs.push(StrSeg.Expr(expr))
+                    break
+                }
+                if (c == ('{' as int)) {
+                    this.bumpCp()
+                    this.bumpCp()
+                    text += "\{"
+                    continue
+                }
+                if (c == ('}' as int) && this.peekCp(1) == ('}' as int)) {
+                    this.bumpCp()
+                    this.bumpCp()
+                    text += "}"
+                    continue
+                }
+                if (c == ('\\' as int)) {
+                    text = this.stringEsc(text)
+                    continue
+                }
+                if (c == -1) {
+                    segs.push(StrSeg.Text(text))
+                    done = true
+                    break
+                }
+                text += "{c as char}"
+                this.bumpCp()
+            }
+            if (done) {
+                break
+            }
+        }
+        plainTok(Tok.Str(StrLit(segs)), Span(start + this.base, this.pos + this.base))
+    }
+
+    fn lexString() -> LexedToken {
+        let start = this.pos
+        this.bumpCp()
+        var segs = emptySegs()
+        while (true) {
+            var text = ""
+            var done = false
+            while (true) {
+                let c = this.atCp()
+                if (c == ('"' as int)) {
+                    this.bumpCp()
+                    if (len(text) > 0) {
+                        segs.push(StrSeg.Text(text))
+                    }
+                    done = true
+                    break
+                }
+                if (c == ('{' as int) && this.peekCp(1) != ('{' as int)) {
+                    this.bumpCp()
+                    if (len(text) > 0) {
+                        segs.push(StrSeg.Text(text))
+                    }
+                    let tokStart = this.pos
+                    let expr = this.lexInterp(tokStart)
+                    segs.push(StrSeg.Expr(expr))
+                    break
+                }
+                if (c == ('{' as int)) {
+                    this.bumpCp()
+                    this.bumpCp()
+                    text += "\{"
+                    continue
+                }
+                if (c == ('}' as int) && this.peekCp(1) == ('}' as int)) {
+                    this.bumpCp()
+                    this.bumpCp()
+                    text += "}"
+                    continue
+                }
+                if (c == ('\\' as int)) {
+                    text = this.stringEsc(text)
+                    continue
+                }
+                if (c == -1) {
+                    segs.push(StrSeg.Text(text))
+                    done = true
+                    break
+                }
+                text += "{c as char}"
+                this.bumpCp()
+            }
+            if (done) {
+                break
+            }
+        }
+        plainTok(Tok.Str(StrLit(segs)), Span(start + this.base, this.pos + this.base))
+    }
+
+    fn stringEsc(text: string) -> string {
+        this.bumpCp()
+        var out = text
+        let e = this.bumpCp()
+        if (e == ('n' as int)) {
+            return out + "\n"
+        }
+        if (e == ('t' as int)) {
+            return out + "\t"
+        }
+        if (e == ('r' as int)) {
+            return out + "\r"
+        }
+        if (e == ('\\' as int)) {
+            return out + "\\"
+        }
+        if (e == ('"' as int)) {
+            return out + "\""
+        }
+        if (e == ('{' as int)) {
+            return out + "\{"
+        }
+        if (e == ('}' as int)) {
+            return out + "}"
+        }
+        if (e == ('0' as int)) {
+            return out + "\0"
+        }
+        if (e == ('u' as int)) {
+            if (this.atCp() == ('{' as int)) {
+                this.bumpCp()
+                var hex = ""
+                while (isHexCp(this.atCp())) {
+                    hex += "{this.bumpCp() as char}"
+                }
+                if (this.atCp() == ('}' as int)) {
+                    this.bumpCp()
+                    let cp = parseHexStr(hex)
+                    if (let some(h) = cp) {
+                        return out + "{h as char}"
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn lexInterp(start: int) -> List<LexedToken> {
+        var out = emptyToks()
+        var braceDepth = 1
+        let savedNesting = this.nesting
+        let savedFramesLen = len(this.frames)
+        let savedDoc = this.pending
+        this.pending = none
+        this.nesting = 0
+        while (true) {
+            this.skipWs()
+            if (this.atCp() == ('}' as int) && braceDepth == 1) {
+                this.bumpCp()
+                break
+            }
+            if (this.atCp() == -1) {
+                break
+            }
+            let t = this.nextToken()
+            match (t.token.kind) {
+                case Tok.LBrace -> braceDepth = braceDepth + 1
+                case Tok.RBrace -> braceDepth = braceDepth - 1
+                case Tok.Newline -> {
+                    continue
+                }
+                case Tok.Eof -> {
+                    break
+                }
+                case _ -> {}
+            }
+            out.push(t)
+        }
+        this.nesting = savedNesting
+        while (len(this.frames) > savedFramesLen) {
+            this.frames.pop()
+        }
+        this.pending = savedDoc
+        out.push(plainTok(Tok.Eof, Span(this.pos + this.base, this.pos + this.base)))
+        out
+    }
+
+    fn lexChar() -> LexedToken {
+        let start = this.pos
+        this.bumpCp()
+        var value = this.lexCharValue()
+        if (this.atCp() != ('\'' as int)) {
+            value = none
+        }
+        if (this.atCp() == ('\'' as int)) {
+            this.bumpCp()
+        }
+        var payload = '\0'
+        if (let some(v) = value) {
+            payload = v as char
+        }
+        var t = plainTok(Tok.Char(payload), Span(start + this.base, this.pos + this.base))
+        t.data.ival = value
+        t
+    }
+
+    fn lexCharValue() -> int? {
+        let c = this.atCp()
+        if (c == ('\'' as int) || c == -1) {
+            return none
+        }
+        if (c == ('\\' as int)) {
+            return this.lexCharEscape()
+        }
+        this.bumpCp()
+        c
+    }
+
+    fn lexCharEscape() -> int? {
+        this.bumpCp()
+        let e = this.bumpCp()
+        if (e == ('n' as int)) {
+            return ('\n' as int)
+        }
+        if (e == ('t' as int)) {
+            return ('\t' as int)
+        }
+        if (e == ('r' as int)) {
+            return ('\r' as int)
+        }
+        if (e == ('\\' as int)) {
+            return ('\\' as int)
+        }
+        if (e == ('\'' as int)) {
+            return ('\'' as int)
+        }
+        if (e == ('"' as int)) {
+            return ('"' as int)
+        }
+        if (e == ('0' as int)) {
+            return ('\0' as int)
+        }
+        if (e == ('u' as int)) {
+            if (this.atCp() == ('{' as int)) {
+                this.bumpCp()
+                var hex = ""
+                while (isHexCp(this.atCp())) {
+                    hex += "{this.bumpCp() as char}"
+                }
+                if (this.atCp() == ('}' as int)) {
+                    this.bumpCp()
+                    let cp = parseHexStr(hex)
+                    if (let some(h) = cp) {
+                        return h
+                    }
+                }
+            }
+        }
+        none
+    }
+}

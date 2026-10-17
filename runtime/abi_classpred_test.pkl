@@ -1,0 +1,145 @@
+module runtime.abi_classpred_test
+
+/// Unit coverage for the class-predicate/interface cluster, mirroring the two
+/// native tests that pin these paths - `class_is_walks_parent_chain` and
+/// `interface_buckets_lookup_and_parent_walk` (`runtime/src/class.rs`) - plus
+/// the guard arms those tests do not reach (null objects, negative ids,
+/// interface 0, dedup, empty buckets).
+///
+/// The fatal arms cannot be covered in-process: a failed cast calls
+/// `fatalMsg`, which is `win_exit(1)` - it would kill the whole run, exactly
+/// like `abi_class_cast`'s native `pickle_panic_cstr`. Those paths are
+/// exercised by the byte-compare probes instead (`tests/tmp/sl_castpanic`
+/// family); here only the SUCCESS sides of `abiClassCast`/`abiIfaceCast`
+/// appear, as they do in the native test.
+
+import { abiClassRegister, classParentOf } from runtime.abi_class_extra
+import { abiClassNew } from runtime.abi_class
+import { abiRuntimeInit } from runtime.abi_runtime
+import { abiStrLen, abiStrCmp, abiStrFromByte, abiStrConcat } from runtime.abi_string
+import { STR_BYTES_OFF } from runtime.layout
+import { abiClassIs, abiClassCast, abiClassImplements, abiIfaceMethod, abiIfaceCast, abiClassAddInterface, abiClassAddIfaceMethod } from runtime.abi_classpred
+
+/// Byte builders, identical to `abi_class_extra_test` (the ABI symbols take
+/// `*int`, so a test string is built from single bytes).
+fn b1(a: int) -> *int {
+    return abiStrFromByte(a)
+}
+fn b2(a: int, x: int) -> *int {
+    return abiStrConcat(b1(a), b1(x))
+}
+fn b3(a: int, x: int, y: int) -> *int {
+    return abiStrConcat(b2(a, x), b1(y))
+}
+fn b4(a: int, x: int, y: int, z: int) -> *int {
+    return abiStrConcat(b2(a, x), b2(y, z))
+}
+fn b6(a: int, x: int, y: int, z: int, w: int, v: int) -> *int {
+    return abiStrConcat(b4(a, x, y, z), b2(w, v))
+}
+
+/// Raw byte address of a string object's inline payload (see
+/// `abi_class_extra_test`).
+fn plPtr(s: *int) -> *int {
+    unsafe {
+        return ((s as int) + STR_BYTES_OFF) as *int
+    }
+}
+
+/// Register a class the way the emitter does: payload address, name length,
+/// everything native stores beyond name/parent ignored by the ported registry.
+fn reg(nm: *int, n: int, parent: int) -> int {
+    return abiClassRegister(plPtr(nm), n, 1, 1, 0, 0, parent)
+}
+
+/// Mirror of native `class_is_walks_parent_chain`: Animal(0)/Dog(animal),
+/// instances of each, the is/is-not matrix across the chain, and the arms a
+/// user instance can never satisfy (id 0, unregistered, negative, null).
+test fn class_is_walks_the_parent_chain() {
+    abiRuntimeInit()
+    var animal = reg(b6(65, 110, 105, 109, 97, 108), 6, 0)  // Animal
+    var dog = reg(b3(68, 111, 103), 3, animal)               // Dog
+    expect(classParentOf(dog)).toBe(animal)
+    var d = abiClassNew(dog, 1)
+    var a = abiClassNew(animal, 1)
+    // An instance is its own class; a subclass instance is-an an ancestor.
+    expect(abiClassIs(d, dog)).toBe(true)
+    expect(abiClassIs(d, animal)).toBe(true)
+    // A superclass instance is not the subclass; id 0 is never a user ancestor.
+    expect(abiClassIs(a, dog)).toBe(false)
+    expect(abiClassIs(a, 0)).toBe(false)
+    // The exported wrapper's own guards: unregistered and negative targets.
+    expect(abiClassIs(d, animal + 5)).toBe(false)
+    expect(abiClassIs(d, 0 - 1)).toBe(false)
+    // Null object: false without touching a header.
+    expect(abiClassIs(0 as *int, dog)).toBe(false)
+    // A builtin-class instance (string, class id 0) IS class 0 - the walk
+    // matches before the first parent step - and nothing else.
+    var s = abiStrFromByte(120)  // "x", class id 0
+    expect(abiClassIs(s, 0)).toBe(true)
+    expect(abiClassIs(s, animal)).toBe(false)
+    expect(abiStrLen(s)).toBe(1)
+    expect(abiStrCmp(s, b1(120))).toBe(0)
+}
+
+/// Mirror of native `interface_buckets_lookup_and_parent_walk`: two
+/// interfaces on `animal`, an override plus inherited method on `dog`,
+/// nearest-first resolution, and every miss arm the wrapper guards.
+test fn interface_buckets_lookup_and_parent_walk() {
+    abiRuntimeInit()
+    var animal = reg(b6(65, 110, 105, 109, 97, 108), 6, 0)  // Animal
+    var dog = reg(b3(68, 111, 103), 3, animal)               // Dog
+    // `animal` implements iface 1 with two methods; iface 2 with none; `dog`
+    // adds one override of method 0.
+    abiClassAddInterface(animal, 1)
+    abiClassAddInterface(animal, 2)
+    abiClassAddIfaceMethod(animal, 1, 0, 4369)    // 0x1111
+    abiClassAddIfaceMethod(animal, 1, 1, 8738)    // 0x2222
+    abiClassAddIfaceMethod(dog, 1, 0, 13107)      // 0x3333
+    var d = abiClassNew(dog, 1)
+    var a = abiClassNew(animal, 1)
+    // `is` checks: a dog is-an animal, so it carries animal's interfaces -
+    // including the methodless bucket, which still proves membership.
+    expect(abiClassImplements(d, 1)).toBe(true)
+    expect(abiClassImplements(d, 2)).toBe(true)
+    expect(abiClassImplements(a, 1)).toBe(true)
+    expect(abiClassImplements(d, 3)).toBe(false)      // unregistered interface
+    expect(abiClassImplements(a, 4)).toBe(false)
+    expect(abiClassImplements(0 as *int, 1)).toBe(false)  // null object
+    expect(abiClassImplements(d, 0)).toBe(false)      // interface 0
+    expect(abiClassImplements(d, 0 - 1)).toBe(false)  // negative guard
+    // Resolution walks up: dog overrides method 0, inherits method 1.
+    expect(abiIfaceMethod(d, 1, 0)).toBe(13107)  // 0x3333
+    expect(abiIfaceMethod(d, 1, 1)).toBe(8738)   // 0x2222
+    expect(abiIfaceMethod(a, 1, 0)).toBe(4369)   // 0x1111
+    expect(abiIfaceMethod(a, 2, 0)).toBe(0)      // empty interface has no methods
+    expect(abiIfaceMethod(d, 3, 0)).toBe(0)      // unknown interface resolves 0
+    expect(abiIfaceMethod(d, 1, 9)).toBe(0)      // missing method index resolves 0
+    expect(abiIfaceMethod(0 as *int, 1, 0)).toBe(0)    // null object
+    expect(abiIfaceMethod(d, 1, 0 - 1)).toBe(0)        // negative midx guard
+    expect(abiIfaceMethod(d, 0 - 1, 0)).toBe(0)        // negative iid guard
+    // Downcasts that succeed return the SAME pointer (the success arms of
+    // pickle_class_cast / pickle_iface_cast; the failure arms exit and are
+    // probe territory).
+    expect(abiClassCast(d, animal) == d).toBe(true)
+    expect(abiClassCast(d, dog) == d).toBe(true)
+    expect(abiIfaceCast(d, 2) == d).toBe(true)
+    // Duplicate registration is a no-op - the native `any`/`all` dedup keeps
+    // the FIRST record, so a second method row with a fresh fp is ignored and
+    // the bucket row is never doubled.
+    abiClassAddInterface(animal, 1)
+    abiClassAddIfaceMethod(animal, 1, 0, 17477)  // 0x4444 must not land
+    expect(abiIfaceMethod(a, 1, 0)).toBe(4369)
+    expect(abiClassImplements(a, 1)).toBe(true)
+    // Interface 0 and negative adds never write: iface 0 stays unimplemented
+    // and a negative pair cannot poison a later lookup.
+    abiClassAddInterface(animal, 0)
+    abiClassAddIfaceMethod(animal, 0, 0, 4369)
+    abiClassAddInterface(animal, 0 - 1)
+    abiClassAddIfaceMethod(animal, 0 - 1, 0, 4369)
+    expect(abiClassImplements(a, 0)).toBe(false)
+    expect(abiClassImplements(d, 0)).toBe(false)
+    // The parent link stays intact through the interface writes above.
+    expect(classParentOf(dog)).toBe(animal)
+    expect(classParentOf(animal)).toBe(0)
+}

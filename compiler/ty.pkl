@@ -1,0 +1,391 @@
+module compiler.ty
+
+enum Ty {
+    Bool
+    Char
+    Byte
+    Int
+    Float
+    String
+    None
+    Option(of: Ty)
+    Class(name: string, args: List<Ty>)
+    Struct(name: string, args: List<Ty>)
+    Enum(name: string, args: List<Ty>)
+    Interface(name: string, args: List<Ty>)
+    List(of: Ty)
+    Map(k: Ty, v: Ty)
+    Tuple(parts: List<Ty>)
+    Stream
+    Fn(params: List<Ty>, ret: Ty)
+    Empty
+    Unknown
+    Var(name: string)
+    Range(of: Ty)
+    Ptr(of: Ty)
+    Ref(of: Ty)
+}
+
+fn isPrimitive(t: Ty) -> bool {
+    t == Ty.Bool || t == Ty.Char || t == Ty.Byte || t == Ty.Int || t == Ty.Float || t == Ty.String
+}
+
+fn isNumeric(t: Ty) -> bool {
+    t == Ty.Int || t == Ty.Float || t == Ty.Byte
+}
+
+/// True for a raw pointer type such as `*int`. Needed because `Ty.Ptr` carries a
+/// pointee argument and so is never a type expression on its own.
+fn isPtr(t: Ty) -> bool {
+    match (t) {
+        case Ty.Ptr(_) -> true
+        case _ -> false
+    }
+}
+
+fn elem(t: Ty) -> Ty? {
+    match (t) {
+        case Ty.List(x) -> x
+        case Ty.Range(x) -> x
+        case Ty.Map(_, v) -> v
+        case _ -> none
+    }
+}
+
+fn optOf(t: Ty) -> Ty {
+    match (t) {
+        case Ty.Option(_) -> t
+        case _ -> Ty.Option(t)
+    }
+}
+
+fn isOption(t: Ty) -> bool {
+    match (t) {
+        case Ty.Option(_) -> true
+        case _ -> false
+    }
+}
+
+fn isNone(t: Ty) -> bool {
+    t == Ty.None
+}
+
+fn innerOption(t: Ty) -> Ty? {
+    match (t) {
+        case Ty.Option(x) -> x
+        case _ -> none
+    }
+}
+
+fn isNever(t: Ty) -> bool {
+    t == Ty.Empty
+}
+
+fn hasVar(t: Ty) -> bool {
+    match (t) {
+        case Ty.Var(_) -> true
+        case Ty.Option(x) -> hasVar(x)
+        case Ty.List(x) -> hasVar(x)
+        case Ty.Range(x) -> hasVar(x)
+        case Ty.Ptr(x) -> hasVar(x)
+        case Ty.Ref(x) -> hasVar(x)
+        case Ty.Class(_, a) -> anyHasVar(a)
+        case Ty.Struct(_, a) -> anyHasVar(a)
+        case Ty.Enum(_, a) -> anyHasVar(a)
+        case Ty.Interface(_, a) -> anyHasVar(a)
+        case Ty.Tuple(a) -> anyHasVar(a)
+        case Ty.Map(k, v) -> hasVar(k) || hasVar(v)
+        case Ty.Fn(ps, r) -> anyHasVar(ps) || hasVar(r)
+        case _ -> false
+    }
+}
+
+fn anyHasVar(ts: List<Ty>) -> bool {
+    var i = 0
+    while (i < len(ts)) {
+        if (hasVar(ts[i])) {
+            return true
+        }
+        i = i + 1
+    }
+    false
+}
+
+fn subst(t: Ty, map: Map<string, Ty>) -> Ty {
+    match (t) {
+        case Ty.Var(n) -> if (map.has(n)) { map[n] } else { Ty.Var(n) }
+        case Ty.Option(x) -> optOf(subst(x, map))
+        case Ty.Class(n, a) -> Ty.Class(n, substTys(a, map))
+        case Ty.Struct(n, a) -> Ty.Struct(n, substTys(a, map))
+        case Ty.Enum(n, a) -> Ty.Enum(n, substTys(a, map))
+        case Ty.Interface(n, a) -> Ty.Interface(n, substTys(a, map))
+        case Ty.List(x) -> Ty.List(subst(x, map))
+        case Ty.Map(k, v) -> Ty.Map(subst(k, map), subst(v, map))
+        case Ty.Tuple(items) -> Ty.Tuple(substTys(items, map))
+        case Ty.Fn(ps, r) -> Ty.Fn(substTys(ps, map), subst(r, map))
+        case Ty.Range(x) -> Ty.Range(subst(x, map))
+        case Ty.Ptr(x) -> Ty.Ptr(subst(x, map))
+        case Ty.Ref(x) -> Ty.Ref(subst(x, map))
+        case other -> other
+    }
+}
+
+fn substTys(ts: List<Ty>, map: Map<string, Ty>) -> List<Ty> {
+    var out = emptyTys()
+    var i = 0
+    while (i < len(ts)) {
+        out.push(subst(ts[i], map))
+        i = i + 1
+    }
+    out
+}
+
+fn kindName(t: Ty) -> string {
+    match (t) {
+        case Ty.Class(_, _) -> "class"
+        case Ty.Struct(_, _) -> "struct"
+        case Ty.Enum(_, _) -> "enum"
+        case Ty.Interface(_, _) -> "interface"
+        case Ty.List(_) -> "list"
+        case Ty.Map(_, _) -> "map"
+        case Ty.Tuple(_) -> "tuple"
+        case Ty.Stream -> "stream"
+        case Ty.Fn(_, _) -> "function"
+        case Ty.Option(_) -> "optional"
+        case _ -> "type"
+    }
+}
+
+fn bareName(t: Ty) -> string {
+    match (t) {
+        case Ty.Bool -> "bool"
+        case Ty.Char -> "char"
+        case Ty.Byte -> "byte"
+        case Ty.Int -> "int"
+        case Ty.Float -> "float"
+        case Ty.String -> "string"
+        case Ty.None -> "none"
+        case Ty.Option(x) -> bareName(x) + "?"
+        case Ty.Class(n, args) -> bareGeneric(n, args)
+        case Ty.Struct(n, args) -> bareGeneric(n, args)
+        case Ty.Enum(n, args) -> bareGeneric(n, args)
+        case Ty.Interface(n, args) -> bareGeneric(n, args)
+        case Ty.List(x) -> "List<" + bareName(x) + ">"
+        case Ty.Map(k, v) -> "Map<" + bareName(k) + ", " + bareName(v) + ">"
+        case Ty.Stream -> "stream"
+        case Ty.Tuple(items) -> "(" + bareJoin(items, ", ") + ")"
+        case Ty.Fn(params, ret) -> "(" + bareJoin(params, ", ") + ") -> " + bareName(ret)
+        case Ty.Empty -> "void"
+        case Ty.Unknown -> "?"
+        case Ty.Var(n) -> n
+        case Ty.Range(x) -> "Range<" + bareName(x) + ">"
+        case Ty.Ptr(x) -> "*" + bareName(x)
+        case Ty.Ref(x) -> "&" + bareName(x)
+    }
+}
+
+fn bareGeneric(n: string, args: List<Ty>) -> string {
+    if (len(args) == 0) {
+        return n
+    }
+    n + "<" + bareJoin(args, ", ") + ">"
+}
+
+fn bareJoin(ts: List<Ty>, sep: string) -> string {
+    var out = ""
+    var i = 0
+    while (i < len(ts)) {
+        if (i > 0) {
+            out += sep
+        }
+        out += bareName(ts[i])
+        i = i + 1
+    }
+    out
+}
+
+fn named(t: Ty) -> string? {
+    match (t) {
+        case Ty.Class(n, _) -> n
+        case Ty.Struct(n, _) -> n
+        case Ty.Enum(n, _) -> n
+        case Ty.Interface(n, _) -> n
+        case Ty.String -> "string"
+        case Ty.List(_) -> "list"
+        case Ty.Map(_, _) -> "map"
+        case Ty.Stream -> "stream"
+        case _ -> none
+    }
+}
+
+fn inferFrom(want: Ty, got: Ty, map: Map<string, Ty>) {
+    match (want) {
+        case Ty.Var(n) -> {
+            if (got == Ty.Unknown || got == Ty.None) {
+                return
+            }
+            if (hasVar(got)) {
+                return
+            }
+            if (!map.has(n)) {
+                map[n] = got
+            }
+        }
+        case Ty.Unknown -> {}
+        case Ty.Class(a, wa) -> match (got) {
+            case Ty.Class(b, ga) -> if (a == b) {
+                inferPairs(wa, ga, map)
+            }
+            case _ -> {}
+        }
+        case Ty.Struct(a, wa) -> match (got) {
+            case Ty.Struct(b, ga) -> if (a == b) {
+                inferPairs(wa, ga, map)
+            }
+            case _ -> {}
+        }
+        case Ty.Enum(a, wa) -> match (got) {
+            case Ty.Enum(b, ga) -> if (a == b) {
+                inferPairs(wa, ga, map)
+            }
+            case _ -> {}
+        }
+        case Ty.Interface(a, wa) -> match (got) {
+            case Ty.Interface(b, ga) -> if (a == b) {
+                inferPairs(wa, ga, map)
+            }
+            case _ -> {}
+        }
+        case Ty.List(w) -> match (got) {
+            case Ty.List(g) -> inferFrom(w, g, map)
+            case _ -> {}
+        }
+        case Ty.Range(w) -> match (got) {
+            case Ty.Range(g) -> inferFrom(w, g, map)
+            case _ -> {}
+        }
+        case Ty.Map(kw, vw) -> match (got) {
+            case Ty.Map(kg, vg) -> {
+                inferFrom(kw, kg, map)
+                inferFrom(vw, vg, map)
+            }
+            case _ -> {}
+        }
+        case Ty.Tuple(wa) -> match (got) {
+            case Ty.Tuple(ga) -> inferPairs(wa, ga, map)
+            case _ -> {}
+        }
+        case Ty.Option(w) -> match (got) {
+            case Ty.Option(g) -> inferFrom(w, g, map)
+            case g -> if (g != Ty.None) {
+                inferFrom(w, g, map)
+            }
+        }
+        case Ty.Fn(wp, wr) -> match (got) {
+            case Ty.Fn(gp, gr) -> {
+                inferPairs(wp, gp, map)
+                inferFrom(wr, gr, map)
+            }
+            case _ -> {}
+        }
+        case Ty.Ref(w) -> match (got) {
+            case _ -> inferFrom(w, got, map)
+        }
+        case _ -> {}
+    }
+}
+
+fn inferPairs(ws: List<Ty>, gs: List<Ty>, map: Map<string, Ty>) {
+    var i = 0
+    while (i < len(ws) && i < len(gs)) {
+        inferFrom(ws[i], gs[i], map)
+        i = i + 1
+    }
+}
+
+fn tyEq(a: Ty, b: Ty) -> bool {
+    match (a) {
+        case Ty.Bool -> b == Ty.Bool
+        case Ty.Char -> b == Ty.Char
+        case Ty.Byte -> b == Ty.Byte
+        case Ty.Int -> b == Ty.Int
+        case Ty.Float -> b == Ty.Float
+        case Ty.String -> b == Ty.String
+        case Ty.None -> b == Ty.None
+        case Ty.Option(x) -> match (b) {
+            case Ty.Option(y) -> tyEq(x, y)
+            case _ -> false
+        }
+        case Ty.Class(n, aa) -> match (b) {
+            case Ty.Class(m, bb) -> n == m && tyListEq(aa, bb)
+            case _ -> false
+        }
+        case Ty.Struct(n, aa) -> match (b) {
+            case Ty.Struct(m, bb) -> n == m && tyListEq(aa, bb)
+            case _ -> false
+        }
+        case Ty.Enum(n, aa) -> match (b) {
+            case Ty.Enum(m, bb) -> n == m && tyListEq(aa, bb)
+            case _ -> false
+        }
+        case Ty.Interface(n, aa) -> match (b) {
+            case Ty.Interface(m, bb) -> n == m && tyListEq(aa, bb)
+            case _ -> false
+        }
+        case Ty.List(x) -> match (b) {
+            case Ty.List(y) -> tyEq(x, y)
+            case _ -> false
+        }
+        case Ty.Map(k, v) -> match (b) {
+            case Ty.Map(k2, v2) -> tyEq(k, k2) && tyEq(v, v2)
+            case _ -> false
+        }
+        case Ty.Tuple(ps) -> match (b) {
+            case Ty.Tuple(qs) -> tyListEq(ps, qs)
+            case _ -> false
+        }
+        case Ty.Stream -> b == Ty.Stream
+        case Ty.Fn(ps, r) -> match (b) {
+            case Ty.Fn(qs, s) -> tyListEq(ps, qs) && tyEq(r, s)
+            case _ -> false
+        }
+        case Ty.Empty -> b == Ty.Empty
+        case Ty.Unknown -> b == Ty.Unknown
+        case Ty.Var(n) -> match (b) {
+            case Ty.Var(m) -> n == m
+            case _ -> false
+        }
+        case Ty.Range(x) -> match (b) {
+            case Ty.Range(y) -> tyEq(x, y)
+            case _ -> false
+        }
+        case Ty.Ptr(x) -> match (b) {
+            case Ty.Ptr(y) -> tyEq(x, y)
+            case _ -> false
+        }
+        case Ty.Ref(x) -> match (b) {
+            case Ty.Ref(y) -> tyEq(x, y)
+            case _ -> false
+        }
+    }
+}
+
+fn tyListEq(a: List<Ty>, b: List<Ty>) -> bool {
+    if (len(a) != len(b)) {
+        return false
+    }
+    var i = 0
+    while (i < len(a)) {
+        if (!tyEq(a[i], b[i])) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+fn emptyTys() -> List<Ty> {
+    var l = [Ty.Bool]
+    l.pop()
+    l
+}

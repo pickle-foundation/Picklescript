@@ -1,0 +1,261 @@
+module runtime.bstr
+
+import { cpLen, decodeCp, encodeCp, isScalar } from std.text.utf8
+
+/// Port slice 5 of the memory core (decision 2026-09-25): byte-strings — a
+/// length-prefixed byte buffer with a scalar-count cache, copy-on-write views,
+/// UTF-8-aware mutation, byte-content equality, and the map-key string hash
+/// (FNV-1a-64, `runtime/src/map.rs`). Merges the `std.text.{utf8,stringbuilder,
+/// format}` machinery into a single mutable runtime byte-string type.
+///
+/// The buffer keeps the raw bytes in `data` (a `List<byte>`); the window this
+/// instance covers is `data[off .. off+len)`. An OWNED byte-string always has
+/// `off == 0`. A `slice()` view aliases the parent buffer with a nonzero
+/// `off`, is marked `shared`, and only records its window length. The first
+/// mutation of a shared view calls `materialize()` (copy just the window into
+/// a fresh, owned buffer) — the same copy-on-write contract the runtime
+/// strings satisfy at the language level (`s[i] = v` writes copy).
+///
+/// The scalar-count cache is invalidated by any byte-level mutation (`setByte`
+/// may split a UTF-8 sequence, so the count is recomputed on demand).
+
+/// A mutable byte-string. `off` is the window start within `data` (0 for
+/// owned buffers); every reader indexes `data[off + i]`.
+class BStr {
+    var data: List<byte>
+    var off: int
+    var len: int
+    var scalars: int
+    var shared: bool
+
+    constructor(bs: List<byte>, o: int, n: int, sc: int, sh: bool) {
+        this.data = bs
+        this.off = o
+        this.len = n
+        this.scalars = sc
+        this.shared = sh
+    }
+
+    /// Logical byte length (the window, for shared views).
+    fn byteLength() -> int {
+        this.len
+    }
+
+    /// Whether this view aliases another buffer (a slice result).
+    fn isShared() -> bool {
+        this.shared
+    }
+
+    /// Own the buffer: copy the window into a fresh buffer when shared.
+    fn materialize() {
+        if (this.shared) {
+            var fresh = bytes("")
+            var i = 0
+            while (i < this.len) {
+                fresh.push(this.data[this.off + i])
+                i = i + 1
+            }
+            this.data = fresh
+            this.off = 0
+            this.shared = false
+        }
+    }
+
+    /// A detached copy of the window bytes.
+    fn toBytes() -> List<byte> {
+        var out = bytes("")
+        var i = 0
+        while (i < this.len) {
+            out.push(this.data[this.off + i])
+            i = i + 1
+        }
+        out
+    }
+
+    /// Byte-exact write at window index `i` (the runtime `s[i] = v` byte
+    /// write). A shared view is detached first; the scalar cache is dirtied (a
+    /// write can split a multi-byte sequence).
+    fn setByte(i: int, v: byte) {
+        this.materialize()
+        this.data[this.off + i] = v
+        this.scalars = -1
+    }
+
+    /// Append one raw byte (no re-encoding).
+    fn pushByte(b: byte) {
+        this.materialize()
+        this.data.push(b)
+        this.len = this.len + 1
+        this.scalars = -1
+    }
+
+    /// Append a whole string's raw bytes.
+    fn appendStr(s: string) {
+        let bs = bytes(s)
+        this.materialize()
+        var i = 0
+        while (i < len(bs)) {
+            this.data.push(bs[i])
+            i = i + 1
+        }
+        this.len = this.len + len(bs)
+        this.scalars = -1
+    }
+
+    /// Append another byte-string's window bytes.
+    fn appendB(other: BStr) {
+        this.materialize()
+        var i = 0
+        while (i < other.len) {
+            this.data.push(other.data[other.off + i])
+            i = i + 1
+        }
+        this.len = this.len + other.len
+        this.scalars = -1
+    }
+
+    /// Append one Unicode scalar as its UTF-8 sequence.
+    fn pushCp(cp: int) {
+        if (isScalar(cp)) {
+            let enc = encodeCp(cp)
+            this.materialize()
+            var i = 0
+            while (i < len(enc)) {
+                this.data.push(enc[i])
+                i = i + 1
+            }
+            this.len = this.len + len(enc)
+            this.scalars = -1
+        }
+    }
+
+    /// Number of scalars in the window, cached until the next byte mutation.
+    fn scalarCount() -> int {
+        if (this.scalars >= 0) {
+            return this.scalars
+        }
+        var n = 0
+        var i = 0
+        while (i < this.len) {
+            i = i + cpLen(this.data[this.off + i] as int)
+            n = n + 1
+        }
+        this.scalars = n
+        n
+    }
+
+    /// A COW view of the byte window `[lo, hi)` (clamped; `lo >= hi` yields an
+    /// empty view). The view aliases this buffer and is marked shared — the
+    /// parent is untouched until the view mutates.
+    fn slice(lo: int, hi: int) -> BStr {
+        var a = lo
+        var b = hi
+        if (a < 0) {
+            a = 0
+        }
+        if (b > this.len) {
+            b = this.len
+        }
+        if (a > b) {
+            a = b
+        }
+        BStr(this.data, this.off + a, b - a, -1, true)
+    }
+
+    /// A COW view over `n` scalars starting at scalar `start` (byte-exact,
+    /// walks the UTF-8 boundaries); an empty view when `start` is past the
+    /// end.
+    fn sliceScalars(start: int, n: int) -> BStr {
+        var i = 0
+        var k = 0
+        var lo = this.len
+        var hi = this.len
+        var found = false
+        while (i < this.len) {
+            let l = cpLen(this.data[this.off + i] as int)
+            if (k == start) {
+                lo = i
+                found = true
+            }
+            if (found && k == start + n) {
+                hi = i
+                return this.slice(lo, hi)
+            }
+            i = i + l
+            k = k + 1
+        }
+        if (found) {
+            this.slice(lo, this.len)
+        } else {
+            this.slice(0, 0)
+        }
+    }
+
+    /// FNV-1a-64 over the window bytes, as the runtime hashes string map keys
+    /// (`runtime/src/map.rs`). Pickle `int` arithmetic wraps mod 2^64, so the
+    /// u64 hash is returned in i64 two's-complement.
+    fn hashCode() -> int {
+        var h = -3750763034362895579
+        var i = 0
+        while (i < this.len) {
+            h = h ^ (this.data[this.off + i] as int)
+            h = h * 1099511628211
+            i = i + 1
+        }
+        h
+    }
+
+    /// Byte-window equality (same content, shared or not).
+    fn equals(b: BStr) -> bool {
+        if (this.len != b.len) {
+            return false
+        }
+        var i = 0
+        while (i < this.len) {
+            if (this.data[this.off + i] != b.data[b.off + i]) {
+                return false
+            }
+            i = i + 1
+        }
+        true
+    }
+
+    /// Decode the scalar starting at byte offset `i`; `none` on an invalid or
+    /// truncated sequence (including one that crosses the window end).
+    fn decodeCpAt(i: int) -> int? {
+        if (i < 0 || i >= this.len) {
+            return none
+        }
+        decodeCp(this.toBytes(), i)
+    }
+
+    /// The string with the window bytes verbatim.
+    fn toString() -> string {
+        str(this.toBytes())
+    }
+}
+
+/// A fresh, empty byte-string (owned).
+fn bstr() -> BStr {
+    BStr(bytes(""), 0, 0, 0, false)
+}
+
+/// A byte-string over string `s`'s raw UTF-8 bytes (owned).
+fn bstrOf(s: string) -> BStr {
+    let bs = bytes(s)
+    BStr(bs, 0, len(bs), -1, false)
+}
+
+/// A byte-string that owns the given byte list (owned; scalar cache dirty).
+fn bstrFrom(bs: List<byte>) -> BStr {
+    BStr(bs, 0, len(bs), -1, false)
+}
+
+/// A new owned byte-string of the concatenation of `a` and `b` (does not
+/// alias either input).
+fn concat(a: BStr, b: BStr) -> BStr {
+    let out = BStr(bytes(""), 0, 0, -1, false)
+    out.appendB(a)
+    out.appendB(b)
+    out
+}

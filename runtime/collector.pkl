@@ -1,0 +1,561 @@
+module runtime.collector
+
+/// Port slice 4 of the memory core (decision 2026-09-25): the mark-and-sweep
+/// collector over the modeled heap. Mirrors `runtime/src/gc.rs::collect`
+/// (worklist mark from `trace.rs`, deferred finalizers, live-bytes accounting)
+/// against `runtime.memory`'s block model.
+///
+/// The reference walk (`trace_one`) reads each object's fields through its
+/// class descriptor's managed mask. This collector supports BOTH:
+///
+///   - the REAL layout path (`newUserObject` / `setField`): the object's words
+///     live in the heap span itself, so `traceReal` reads a genuine
+///     `class_id` header and walks the descriptor's managed mask. This is what
+///     `trace.pkl` does, over this collector's own heap.
+///   - the MODELED path (`addEdge`): a declared edge list, kept because the
+///     builtin containers (list/map/tuple/enum) still have no real payload
+///     view here.
+///
+/// An object is walked by whichever path it was built with, so a graph can mix
+/// them. Finalizer presence mirrors the class descriptor's
+/// `PICKLE_CLASS_FLAG_FINALIZER` (or an owned-`#[manualAlloc]`-field mask).
+
+import { Memory, INVALID_ADDR } from runtime.memory
+import { HEADER, LIST_LEN_OFF, LIST_CAP_OFF, LIST_DATA_OFF, MAP_CAP_OFF, MAP_ENTRIES_OFF, TUPLE_LEN_OFF, ENUM_HEADER_SLOTS, LIST_OBJECT_SIZE, MAP_OBJECT_SIZE, STREAM_OBJECT_SIZE, tupleObjectSize, enumObjectSize, stringObjectSize, classObjectSize, userClassMaskWords } from runtime.layout
+import { PICKLE_CLASS_USER_BASE, PICKLE_CLASS_LIST, PICKLE_CLASS_MAP, PICKLE_CLASS_TUPLE, PICKLE_CLASS_ENUM, PICKLE_CLASS_STRING, PICKLE_CLASS_STREAM } from runtime.object
+
+/// A `MapEntry { key, value }` is two words.
+const MAP_ENTRY_WORDS: int = 2
+
+/// Byte offsets to word indices: the header is 3 words, payload starts at 3.
+const W_LIST_LEN: int = LIST_LEN_OFF / 8
+const W_LIST_CAP: int = LIST_CAP_OFF / 8
+const W_LIST_DATA: int = LIST_DATA_OFF / 8
+const W_MAP_CAP: int = MAP_CAP_OFF / 8
+const W_MAP_ENTRIES: int = MAP_ENTRIES_OFF / 8
+const W_TUPLE_LEN: int = TUPLE_LEN_OFF / 8
+const W_PAYLOAD: int = HEADER / 8
+
+/// The null object pointer, and the two map-key sentinels reserved by
+/// `object.rs` and never heap-allocated. Mirrors `trace.pkl`.
+const NULL_ADDR: int = 0
+const NIL_SENTINEL_ADDR: int = -1
+const NONE_KEY_ADDR: int = -2
+
+/// An empty `List<int>` (seed-and-pop: `[]` is `List<?>`).
+fn emptyMask() -> List<int> {
+    var xs = [0]
+    xs.pop()
+    xs
+}
+
+class Collector {
+    var mem: Memory
+    var roots: List<int>
+    var manual: List<int>
+    var tempRoots: List<int>
+    var children: Map<int, List<int>>
+    var finalizable: Map<int, bool>
+    var log: List<int>
+    var collecting: bool
+    var collections: int
+    var liveBytes: int
+    /// Per-class `(slotCount, managedMask)` for the real-layout path, indexed by
+    /// class id the way the native descriptor table is.
+    var slotCounts: List<int>
+    var masks: List<List<int>>
+    /// Addresses allocated as real user objects (their words are in the heap,
+    /// not in `children`). Membership decides which walk an object gets.
+    var realObjects: Map<int, bool>
+
+    constructor() {
+        this.mem = Memory()
+        this.roots = [0]
+        this.roots.remove(0)
+        this.manual = [0]
+        this.manual.remove(0)
+        this.tempRoots = [0]
+        this.tempRoots.remove(0)
+        var c = {0: [0]}
+        c.remove(0)
+        this.children = c
+        var f = {0: false}
+        f.remove(0)
+        this.finalizable = f
+        this.log = [0]
+        this.log.remove(0)
+        this.collecting = false
+        this.collections = 0
+        this.liveBytes = 0
+        this.slotCounts = [0]
+        this.slotCounts.remove(0)
+        var ms = [emptyMask()]
+        ms.pop()
+        this.masks = ms
+        this.realObjects = {0: false}
+        this.realObjects.remove(0)
+    }
+
+    /// Write the 24-byte header `next` | `class_id|flags` | `size` that every
+    /// managed object carries, matching `trace.pkl`'s packing exactly.
+    fn setHeader(addr: int, classId: int, size: int) {
+        this.mem.setWord(addr, 0, INVALID_ADDR)
+        this.mem.setWord(addr, 1, classId)
+        this.mem.setWord(addr, 2, size)
+        this.realObjects[addr] = true
+    }
+
+    /// Allocate a user-class object of `slotCount` managed fields and register
+    /// its descriptor. The object's words live in the heap span, so the mark
+    /// walk reads the real layout. Returns the block address.
+    fn newUserObject(slotCount: int) -> int {
+        var cid = this.registerUserClass(slotCount)
+        var addr = this.mem.alloc(classObjectSize(slotCount))
+        this.setHeader(addr, cid, classObjectSize(slotCount))
+        addr
+    }
+
+    /// A real `List<T>` object holding `len` managed elements out of `cap`,
+    /// with the element array as a raw word span. This is the storage layer
+    /// `list.pkl` still delegates to the native `pickle_list_*` builtins.
+    fn newList(len: int, cap: int) -> int {
+        var addr = this.mem.alloc(LIST_OBJECT_SIZE)
+        this.setHeader(addr, PICKLE_CLASS_LIST, LIST_OBJECT_SIZE)
+        var data = this.newWordSpan(cap)
+        this.mem.setWord(addr, W_LIST_LEN, len)
+        this.mem.setWord(addr, W_LIST_CAP, cap)
+        this.mem.setWord(addr, W_LIST_DATA, data)
+        addr
+    }
+
+    /// Append to a list built by `newList`, growing the element array by
+    /// doubling from `cap` (`list.rs`'s growth). Returns the new element index.
+    fn listPush(list: int, child: int) -> int {
+        var n = this.mem.word(list, W_LIST_LEN)
+        var cap = this.mem.word(list, W_LIST_CAP)
+        var data = this.mem.word(list, W_LIST_DATA)
+        if (n == cap) {
+            var grown = cap * 2
+            if (grown < 4) { grown = 4 }
+            var fresh = this.newWordSpan(grown)
+            var i = 0
+            while (i < n) {
+                this.mem.setWord(fresh, i, this.mem.word(data, i))
+                i = i + 1
+            }
+            data = fresh
+            cap = grown
+            this.mem.setWord(list, W_LIST_CAP, cap)
+            this.mem.setWord(list, W_LIST_DATA, data)
+        }
+        this.mem.setWord(data, n, child)
+        this.mem.setWord(list, W_LIST_LEN, n + 1)
+        n
+    }
+
+    /// Element `i` of a list built by `newList`.
+    fn listGet(list: int, i: int) -> int {
+        var data = this.mem.word(list, W_LIST_DATA)
+        if (data == NULL_ADDR || i < 0 || i >= this.mem.word(list, W_LIST_LEN)) {
+            return NULL_ADDR
+        }
+        this.mem.word(data, i)
+    }
+
+    /// A real `Map` object with an open-addressed `cap`-slot entry array of
+    /// `MAP_ENTRY_WORDS` words per slot. Slot 0 is the empty marker.
+    fn newMap(cap: int) -> int {
+        var addr = this.mem.alloc(MAP_OBJECT_SIZE)
+        this.setHeader(addr, PICKLE_CLASS_MAP, MAP_OBJECT_SIZE)
+        var entries = this.newWordSpan(cap * MAP_ENTRY_WORDS)
+        this.mem.setWord(addr, W_MAP_CAP, cap)
+        this.mem.setWord(addr, W_MAP_ENTRIES, entries)
+        addr
+    }
+
+    /// Store `value` under `key` in a map built by `newMap`, at slot index
+    /// `slot` (`map.rs`'s open addressing decides the index; the collector only
+    /// needs the key and value words present so the mark walk can find them).
+    fn mapPut(map: int, slot: int, key: int, value: int) {
+        var entries = this.mem.word(map, W_MAP_ENTRIES)
+        this.mem.setWord(entries, slot * MAP_ENTRY_WORDS, key)
+        this.mem.setWord(entries, slot * MAP_ENTRY_WORDS + 1, value)
+    }
+
+    /// A real `Tuple` of `fieldCount` managed fields.
+    fn newTuple(fieldCount: int) -> int {
+        var size = tupleObjectSize(fieldCount)
+        var addr = this.mem.alloc(size)
+        this.setHeader(addr, PICKLE_CLASS_TUPLE, size)
+        this.mem.setWord(addr, W_TUPLE_LEN, fieldCount)
+        addr
+    }
+
+    /// A real `Enum` variant with `fieldCount` managed payload fields. Slot 0 is
+    /// the unmanaged tag, so managed fields start at `ENUM_HEADER_SLOTS`.
+    fn newEnum(fieldCount: int, tag: int) -> int {
+        var size = enumObjectSize(fieldCount)
+        var addr = this.mem.alloc(size)
+        this.setHeader(addr, PICKLE_CLASS_ENUM, size)
+        this.mem.setWord(addr, W_PAYLOAD, tag)
+        addr
+    }
+
+    /// Set field `i` of a tuple built by `newTuple`.
+    fn tupleSet(tup: int, i: int, child: int) {
+        this.mem.setWord(tup, W_PAYLOAD + ENUM_HEADER_SLOTS + i, child)
+    }
+
+    /// Set managed field `i` of an enum built by `newEnum` (past the tag slot).
+    fn enumSet(en: int, i: int, child: int) {
+        this.mem.setWord(en, W_PAYLOAD + ENUM_HEADER_SLOTS + i, child)
+    }
+
+    /// A raw unmanaged word span of `count` words — the array behind a list's
+    /// elements or a map's entry table. Not a managed object: the mark walk
+    /// never enqueues the span itself, only the object that points at it.
+    fn newWordSpan(count: int) -> int {
+        var addr = this.mem.alloc(8 * count)
+        this.mem.setWord(addr, 0, NULL_ADDR)
+        addr
+    }
+
+    /// A real `String` holding `len` unmanaged inline bytes. Nothing inside is
+    /// managed, so the mark walk stops at the header.
+    fn newString(len: int) -> int {
+        var size = stringObjectSize(len)
+        var addr = this.mem.alloc(size)
+        this.setHeader(addr, PICKLE_CLASS_STRING, size)
+        this.mem.setWord(addr, W_PAYLOAD, len)
+        addr
+    }
+
+    /// A real `Stream` whose payload slot 0 is an unmanaged raw pointer to the
+    /// inner state. The mark walk must not follow it.
+    fn newStream(rawInner: int) -> int {
+        var addr = this.mem.alloc(STREAM_OBJECT_SIZE)
+        this.setHeader(addr, PICKLE_CLASS_STREAM, STREAM_OBJECT_SIZE)
+        this.mem.setWord(addr, W_PAYLOAD, rawInner)
+        addr
+    }
+
+    /// Register (or reuse) a user class with `slotCount` all-managed fields and
+    /// return its class id.
+    fn registerUserClass(slotCount: int) -> int {
+        var cid = PICKLE_CLASS_USER_BASE + len(this.slotCounts)
+        while (len(this.slotCounts) <= cid - PICKLE_CLASS_USER_BASE) {
+            this.slotCounts.push(0)
+            this.masks.push(emptyMask())
+        }
+        this.slotCounts[cid - PICKLE_CLASS_USER_BASE] = slotCount
+        this.masks[cid - PICKLE_CLASS_USER_BASE] = userClassMaskWords(slotCount)
+        cid
+    }
+
+    /// Store a managed pointer in field `i` of a real user object.
+    fn setField(addr: int, i: int, child: int) {
+        this.mem.setWord(addr, HEADER / 8 + i, child)
+    }
+
+    /// Read field `i` of a real user object.
+    fn field(addr: int, i: int) -> int {
+        this.mem.word(addr, HEADER / 8 + i)
+    }
+
+    /// The class id recorded in a real object's header word.
+    fn classIdOf(addr: int) -> int {
+        this.mem.word(addr, 1)
+    }
+
+    /// Allocate `size` bytes in the modeled heap (the collector owns the
+    /// memory, mirroring `Gc::new` owning the Heap).
+    fn alloc(size: int) -> int {
+        this.mem.alloc(size)
+    }
+
+    /// Head address of the collector's free bin (a bin is empty at -1).
+    fn freeHeadOf(bin: int) -> int {
+        this.mem.freeHeadOf(bin)
+    }
+
+    /// Mark-root registry (`gc.rs`: static roots, manual objects, and
+    /// per-collection temp roots seed the trace; the layout-driven walk is the
+    /// registered edges).
+    fn addRoot(addr: int) {
+        this.roots.push(addr)
+    }
+
+    fn dropRoot(addr: int) {
+        var i = 0
+        while (i < len(this.roots)) {
+            if (this.roots[i] == addr) {
+                this.roots.remove(i)
+                return
+            }
+            i = i + 1
+        }
+    }
+
+    fn adoptManual(addr: int) {
+        this.manual.push(addr)
+    }
+
+    fn releaseManual(addr: int) {
+        var i = 0
+        while (i < len(this.manual)) {
+            if (this.manual[i] == addr) {
+                this.manual.remove(i)
+                return
+            }
+            i = i + 1
+        }
+    }
+
+    fn addTempRoot(addr: int) {
+        this.tempRoots.push(addr)
+    }
+
+    /// Record a modeled reference from `parent` to `child` (placeholder for
+    /// the class-mask field walk of `trace_one`).
+    fn addEdge(parent: int, child: int) {
+        var list = [0]
+        list.remove(0)
+        if (let some(xs) = this.children.get(parent)) {
+            list = xs
+        }
+        list.push(child)
+        this.children[parent] = list
+    }
+
+    /// Record that the object at `addr` carries a `deinit` finalizer.
+    fn setFinalizable(addr: int) {
+        this.finalizable[addr] = true
+    }
+
+    /// Whether the object at `addr` is marked live this cycle.
+    fn marked(addr: int) -> bool {
+        this.mem.isBlockMarked(addr)
+    }
+
+    /// Every block carrying this cycle's mark, in allocation order.
+    fn allMarked() -> List<int> {
+        var out = [0]
+        out.remove(0)
+        var all = this.mem.allBlocks()
+        var i = 0
+        while (i < len(all)) {
+            if (this.mem.isBlockMarked(all[i])) {
+                out.push(all[i])
+            }
+            i = i + 1
+        }
+        out
+    }
+
+    /// Whether `addr` is marked. Distinct from `marked` only in intent: the
+    /// tests use it to ask "did this survive" after a `collect()` has already
+    /// cleared marks on the way to the sweep, so it re-runs a mark pass over
+    /// the roots first.
+    fn isReachable(addr: int) -> bool {
+        var before = this.collections
+        this.markFromRoots()
+        this.collections = before
+        this.mem.isBlockMarked(addr)
+    }
+
+    /// Addresses finalized by this collector (the order they were finalized).
+    fn finalized() -> List<int> {
+        this.log
+    }
+
+    fn hasFinalizer(addr: int) -> bool {
+        this.finalizable.has(addr)
+    }
+
+    fn enqueue(worklist: List<int>, obj: int) {
+        if (obj == INVALID_ADDR) { return }
+        if (this.mem.isBlockMarked(obj)) { return }
+        this.mem.mark(obj)
+        worklist.push(obj)
+    }
+
+    fn seed(worklist: List<int>, src: List<int>) {
+        var i = 0
+        while (i < len(src)) {
+            this.enqueue(worklist, src[i])
+            i = i + 1
+        }
+    }
+
+    /// Worklist mark over the modeled graph (`trace.rs::trace_from_roots` /
+    /// `trace_one`).
+    fn markFromRoots() {
+        var worklist = [0]
+        worklist.remove(0)
+        this.seed(worklist, this.roots)
+        this.seed(worklist, this.manual)
+        this.seed(worklist, this.tempRoots)
+        while (len(worklist) > 0) {
+            var obj = worklist[len(worklist) - 1]
+            worklist.remove(len(worklist) - 1)
+            if (this.realObjects.has(obj)) {
+                this.traceReal(worklist, obj)
+            }
+            // Modeled edges are followed for EVERY object, real or not: a real
+            // user class can still hold a builtin container (a list/map field),
+            // and those only have a declared edge list until §17.1 gives them a
+            // real payload view.
+            if (let some(kids) = this.children.get(obj)) {
+                var i = 0
+                while (i < len(kids)) {
+                    this.enqueue(worklist, kids[i])
+                    i = i + 1
+                }
+            }
+        }
+    }
+
+    /// Walk a REAL object by reading its own layout — the collector's copy of
+    /// `trace_one`. Every builtin container is handled from the same header
+    /// `trace.pkl` uses, so no object needs a declared edge list.
+    ///
+    /// The user-class arm mirrors `trace_one` exactly, including the
+    /// `idx >= slotCount` break, so a mask that over-claims its slots does not
+    /// read past the object's view.
+    fn traceReal(worklist: List<int>, obj: int) {
+        var classId = this.classIdOf(obj)
+        if (classId == PICKLE_CLASS_STRING) {
+            // A string's bytes are unmanaged; nothing to trace.
+            return
+        }
+        if (classId == PICKLE_CLASS_STREAM) {
+            // Payload slot 0 is an unmanaged raw pointer to the Rust-heap inner
+            // state, dropped by the finalizer — never traced.
+            return
+        }
+        if (classId == PICKLE_CLASS_LIST) {
+            var data = this.mem.word(obj, W_LIST_DATA)
+            if (data != NULL_ADDR) {
+                var n = this.mem.word(obj, W_LIST_LEN)
+                var i = 0
+                while (i < n) {
+                    this.enqueue(worklist, this.mem.word(data, i))
+                    i = i + 1
+                }
+            }
+            return
+        }
+        if (classId == PICKLE_CLASS_MAP) {
+            var entries = this.mem.word(obj, W_MAP_ENTRIES)
+            if (entries != NULL_ADDR) {
+                // Scan the FULL capacity, not the live length: open addressing
+                // scatters live slots across the whole table, so scanning only
+                // the occupied prefix would strand live entries.
+                var cap = this.mem.word(obj, W_MAP_CAP)
+                var i = 0
+                while (i < cap) {
+                    var k = this.mem.word(entries, i * MAP_ENTRY_WORDS)
+                    // Skip the empty marker and both sentinels: neither is a
+                    // real object, and dereferencing one would be undefined.
+                    if (k != NULL_ADDR && k != NIL_SENTINEL_ADDR && k != NONE_KEY_ADDR) {
+                        this.enqueue(worklist, k)
+                    }
+                    this.enqueue(worklist, this.mem.word(entries, i * MAP_ENTRY_WORDS + 1))
+                    i = i + 1
+                }
+            }
+            return
+        }
+        if (classId == PICKLE_CLASS_ENUM) {
+            // Payload slot 0 is the unmanaged tag; managed fields follow.
+            var n = this.enumFieldCount(obj)
+            var i = 0
+            while (i < n) {
+                this.enqueue(worklist, this.mem.word(obj, W_PAYLOAD + ENUM_HEADER_SLOTS + i))
+                i = i + 1
+            }
+            return
+        }
+        if (classId == PICKLE_CLASS_TUPLE) {
+            var tn = this.mem.word(obj, W_TUPLE_LEN)
+            var ti = 0
+            while (ti < tn) {
+                this.enqueue(worklist, this.mem.word(obj, W_PAYLOAD + ENUM_HEADER_SLOTS + ti))
+                ti = ti + 1
+            }
+            return
+        }
+        // User class: follow the descriptor's managed-field bitmask.
+        var slot = classId - PICKLE_CLASS_USER_BASE
+        if (slot < 0 || slot >= len(this.masks)) {
+            return
+        }
+        var slotCount = this.slotCounts[slot]
+        var mask = this.masks[slot]
+        var w = 0
+        while (w < len(mask)) {
+            var m = mask[w]
+            if (m != 0) {
+                var base = w * 32
+                var bit = 0
+                while (bit < 32) {
+                    if ((m & (1 << bit)) != 0) {
+                        var idx = base + bit
+                        if (idx >= slotCount) {
+                            break
+                        }
+                        this.enqueue(worklist, this.field(obj, idx))
+                    }
+                    bit = bit + 1
+                }
+            }
+            w = w + 1
+        }
+    }
+
+    /// Managed payload fields of a real enum, from its stored size (the
+    /// saturating subtract `enum.rs` uses).
+    fn enumFieldCount(obj: int) -> int {
+        var size = this.mem.word(obj, 2)
+        if (size <= HEADER + 8) {
+            return 0
+        }
+        (size - HEADER - 8) / 8
+    }
+
+    /// Run a full mark-and-sweep cycle (`gc.rs::collect`). Returns the number
+    /// of coalesced runs released to the free lists; finalizers run (recorded
+    /// on the log) before each deferred block is returned to a bin alone,
+    /// untouched by coalescing. Temp roots live for exactly one cycle.
+    fn collect() -> int {
+        if (this.collecting) { return 0 }
+        this.collecting = true
+        this.collections = this.collections + 1
+        this.markFromRoots()
+        this.liveBytes = this.mem.liveBytes()
+        var deferred = [0]
+        deferred.remove(0)
+        var all = this.mem.allBlocks()
+        var i = 0
+        while (i < len(all)) {
+            var b = all[i]
+            if (!this.mem.isBlockMarked(b) && !this.mem.isBlockFree(b) && this.hasFinalizer(b)) {
+                this.mem.mark(b)
+                deferred.push(b)
+            }
+            i = i + 1
+        }
+        var runs = this.mem.sweep()
+        var j = 0
+        while (j < len(deferred)) {
+            var d = deferred[j]
+            this.log.push(d)
+            this.mem.freeObject(d)
+            j = j + 1
+        }
+        this.tempRoots = [0]
+        this.tempRoots.remove(0)
+        this.collecting = false
+        runs
+    }
+}

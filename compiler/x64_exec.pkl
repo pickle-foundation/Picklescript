@@ -1,0 +1,180 @@
+module compiler.x64_exec
+
+import { IrTy, IrConst, IrUnOp, IrBinOp, IrInstr, IrTerm, IrParam, IrExtern, IrBlock, IrFunc, IrModule, Callee, emptyIrTys, emptyIrParams } from compiler.ir
+import { X64Func, X64Out, x64LowerModule, hex2, emptyRelocs } from compiler.x64
+import { DiagnosticSink } from compiler.diag
+
+fn emptyInstrs() -> List<IrInstr> {
+    var l = [IrInstr.Const(0, IrConst.Int(0))]
+    l.pop()
+    l
+}
+
+fn emptyTags() -> List<string> {
+    var l = [""]
+    l.pop()
+    l
+}
+
+fn emptyBlocks() -> List<IrBlock> {
+    var l = [IrBlock(0, emptyInstrs(), IrTerm.Unreachable)]
+    l.pop()
+    l
+}
+
+fn mkFunc(name: string, symbol: string, ret: IrTy, slots: List<IrTy>, blocks: List<IrBlock>) -> IrFunc {
+    IrFunc(name, symbol, emptyIrParams(), ret, slots, 0, blocks, false, false, emptyTags())
+}
+
+fn mkFuncParams(name: string, symbol: string, params: List<IrParam>, ret: IrTy, slots: List<IrTy>, blocks: List<IrBlock>) -> IrFunc {
+    IrFunc(name, symbol, params, ret, slots, 0, blocks, false, false, emptyTags())
+}
+
+fn mkModuleOne(f: IrFunc) -> IrModule {
+    var fs = [IrFunc("x", "", emptyIrParams(), IrTy.Unit, emptyIrTys(), 0, emptyBlocks(), false, false, emptyTags())]
+    fs.pop()
+    fs.push(f)
+    var es = [IrExtern("x", emptyIrTys(), IrTy.Unit)]
+    es.pop()
+    var bn = {"::seed::": 0}
+    bn.remove("::seed::")
+    var ss = [[0]]
+    ss.pop()
+    IrModule(fs, es, bn, ss, emptyIrGlobals())
+}
+
+fn takeF(out: X64Out?) -> X64Func {
+    match (out) {
+        case some(o) -> {
+            if (len(o.funcs) >= 1) {
+                o.funcs[0]
+            } else {
+                X64Func("bad", [0], emptyRelocs(), 0, 0)
+            }
+        }
+        case none -> X64Func("bad", [0], emptyRelocs(), 0, 0)
+    }
+}
+
+fn lowerF(f: IrFunc) -> X64Func {
+    let m = mkModuleOne(f)
+    let d = DiagnosticSink()
+    takeF(x64LowerModule(m, d))
+}
+
+fn oneBlockTerm(term: IrTerm, instrs: List<IrInstr>) -> List<IrBlock> {
+    var l = [IrBlock(0, emptyInstrs(), IrTerm.Unreachable)]
+    l.pop()
+    l.push(IrBlock(0, instrs, term))
+    l
+}
+
+fn asmBytes(bytes: List<int>) -> string {
+    var out = "  .byte"
+    var i = 0
+    var j = 0
+    while (i < len(bytes)) {
+        if (i > 0 && j == 0) {
+            out = out + "\n  .byte"
+        }
+        if (j == 0) {
+            out = out + " 0x" + hex2(bytes[i])
+        } else {
+            out = out + ", 0x" + hex2(bytes[i])
+        }
+        j = j + 1
+        if (j == 16) {
+            j = 0
+        }
+        i = i + 1
+    }
+    out + "\n"
+}
+
+fn pair(label: string, asm: string) -> string {
+    "  .balign 16\n  .globl " + label + "\n" + label + ":\n" + asm
+}
+
+fn buildAsm(funcs: List<X64Func>) -> string {
+    var out = "  .text\n"
+    var i = 0
+    while (i < len(funcs)) {
+        out = out + pair(funcs[i].symbol, asmBytes(funcs[i].bytes))
+        i = i + 1
+    }
+    out
+}
+
+fn buildStub(funcs: List<X64Func>) -> string {
+    "#include <stdio.h>\n" + stubTail()
+}
+
+fn stubTail() -> string {
+    "long long const0(void);\n" +
+    "long long addf(long long, long long);\n" +
+    "long long divf(long long, long long);\n" +
+    "long long negf(long long);\n" +
+    "long long ltf(long long, long long);\n" +
+    "double fadd(double, double);\n" +
+    "double fcon(void);\n" +
+    "double itof(long long);\n" +
+    "long long ftoi(double);\n" +
+    "int main(void)\{\n" +
+    "  printf(\"const() = %lld (42)\\n\", const0());\n" +
+    "  printf(\"add(7,2) = %lld (9)\\n\", addf(7, 2));\n" +
+    "  printf(\"div(9,4) = %lld (2)\\n\", divf(9, 4));\n" +
+    "  printf(\"div(-9,4) = %lld (-2)\\n\", divf(-9, 4));\n" +
+    "  printf(\"neg(5) = %lld (-5)\\n\", negf(5));\n" +
+    "  printf(\"lt(3,8) = %u (1)\\n\", (unsigned char)ltf(3, 8));\n" +
+    "  printf(\"lt(8,3) = %u (0)\\n\", (unsigned char)ltf(8, 3));\n" +
+    "  printf(\"fadd(1.5,2.25) = %.4f (3.7500)\\n\", fadd(1.5, 2.25));\n" +
+    "  printf(\"fcon() = %.4f (2.5000)\\n\", fcon());\n" +
+    "  printf(\"itof(7) = %.2f (7.00)\\n\", itof(7));\n" +
+    "  printf(\"ftoi(3.7) = %lld (3)\\n\", ftoi(3.7));\n" +
+    "  printf(\"ftoi(1e300) = %lld (9223372036854775807)\\n\", ftoi(1e300));\n" +
+    "  printf(\"ftoi(-1e300) = %lld (-9223372036854775808)\\n\", ftoi(-1e300));\n" +
+    "  return 0;\n" +
+    "\}\n"
+}
+
+fn main() {
+    var funcs = [X64Func("seed", [0], emptyRelocs(), 0, 0)]
+    funcs.pop()
+
+    funcs.push(lowerF(mkFunc("c", "const0", IrTy.Int, emptyIrTys(), oneBlockTerm(
+        IrTerm.Return(0), [IrInstr.Const(0, IrConst.Int(42))]))))
+
+    funcs.push(lowerF(mkFuncParams("a", "addf", [IrParam("x", IrTy.Int), IrParam("y", IrTy.Int)], IrTy.Int, [IrTy.Int, IrTy.Int], oneBlockTerm(
+        IrTerm.Return(2), [IrInstr.LoadSlot(0, 0), IrInstr.LoadSlot(1, 1), IrInstr.BinOp(2, IrBinOp.Add, 0, 1)]))))
+
+    funcs.push(lowerF(mkFuncParams("d", "divf", [IrParam("x", IrTy.Int), IrParam("y", IrTy.Int)], IrTy.Int, [IrTy.Int, IrTy.Int], oneBlockTerm(
+        IrTerm.Return(2), [IrInstr.LoadSlot(0, 0), IrInstr.LoadSlot(1, 1), IrInstr.BinOp(2, IrBinOp.Div, 0, 1)]))))
+
+    funcs.push(lowerF(mkFuncParams("n", "negf", [IrParam("x", IrTy.Int)], IrTy.Int, [IrTy.Int], oneBlockTerm(
+        IrTerm.Return(1), [IrInstr.LoadSlot(0, 0), IrInstr.UnOp(1, IrUnOp.Neg, 0)]))))
+
+    funcs.push(lowerF(mkFuncParams("l", "ltf", [IrParam("x", IrTy.Int), IrParam("y", IrTy.Int)], IrTy.Bool, [IrTy.Int, IrTy.Int], oneBlockTerm(
+        IrTerm.Return(2), [IrInstr.LoadSlot(0, 0), IrInstr.LoadSlot(1, 1), IrInstr.BinOp(2, IrBinOp.Lt, 0, 1)]))))
+
+    funcs.push(lowerF(mkFuncParams("fa", "fadd", [IrParam("x", IrTy.Float), IrParam("y", IrTy.Float)], IrTy.Float, [IrTy.Float, IrTy.Float], oneBlockTerm(
+        IrTerm.Return(2), [IrInstr.LoadSlot(0, 0), IrInstr.LoadSlot(1, 1), IrInstr.BinOp(2, IrBinOp.Add, 0, 1)]))))
+
+    funcs.push(lowerF(mkFunc("fc", "fcon", IrTy.Float, emptyIrTys(), oneBlockTerm(
+        IrTerm.Return(0), [IrInstr.Const(0, IrConst.Float(2.5))]))))
+
+    funcs.push(lowerF(mkFuncParams("io", "itof", [IrParam("x", IrTy.Int)], IrTy.Float, [IrTy.Int], oneBlockTerm(
+        IrTerm.Return(1), [IrInstr.LoadSlot(0, 0), IrInstr.Itof(1, 0)]))))
+
+    funcs.push(lowerF(mkFuncParams("fi", "ftoi", [IrParam("x", IrTy.Float)], IrTy.Int, [IrTy.Float], oneBlockTerm(
+        IrTerm.Return(1), [IrInstr.LoadSlot(0, 0), IrInstr.Ftoi(1, 0)]))))
+
+    let dir = "C:/Users/vilni/AppData/Local/Temp/opencode/x64exec"
+    write_file(dir + "/funcs.s", buildAsm(funcs))
+    write_file(dir + "/stub.c", buildStub(funcs))
+    print("wrote " + dir + "/funcs.s and " + dir + "/stub.c")
+    var i = 0
+    while (i < len(funcs)) {
+        print("fn " + funcs[i].symbol + " len=" + str(len(funcs[i].bytes)) + " ncells=" + str(funcs[i].ncells) + " totalK=" + str(funcs[i].totalK))
+        i = i + 1
+    }
+}

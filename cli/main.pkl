@@ -1,0 +1,619 @@
+module cli.main
+
+import { Lexer } from compiler.lexer
+import { LexedToken, canonTok } from compiler.token
+import { DiagnosticSink } from compiler.diag
+import { parse } from compiler.parser
+import { Resolver } from compiler.resolve
+import { checkProgram } from compiler.check
+import { frontendChecked } from compiler.front
+import { emitIr } from compiler.emit
+import { irModuleStr, irxModuleStr } from compiler.ir
+import { recordedDeps, lookup, store } from compiler.cache
+import { catalogue, explainById, normalizeId } from compiler.error
+import { splitLines, subStr } from compiler.front
+import { renderHistory, renderBuilds, renderExplainHistory, gitRoot, historyFor } from cli.history
+import { currentDir } from std.process
+import { writeStderr } from runtime.abi_stdio
+import { STR_BYTES_OFF } from runtime.layout
+import { abiStrFromF64 } from runtime.abi_float
+import { abiShadowPush, abiShadowPop } from runtime.abi_shadow
+import { abiClassRegister, abiClassName } from runtime.abi_class_extra
+import { abiRuntimeInit } from runtime.abi_runtime
+import { abiStaticGet, abiStaticSet } from runtime.abi_statics
+import { abiArgs, abiRunCmd } from runtime.abi_process
+import { abiPanicNoMatch } from runtime.abi_panic
+import { abiClassNew, abiObjSlotGet, abiObjSlotSet, abiSizeWords } from runtime.abi_class
+import { abiPrintObj, abiPrintNewline } from runtime.abi_console
+import { abiExit } from runtime.abi_os
+import { abiExcUncaught } from runtime.abi_exception
+import { abiFileExists, abiMkdir, abiCurrentDir, abiReadFile, abiWriteFile, abiListDir } from runtime.abi_fs
+import { abiEnumNew, abiEnumTag, abiEnumField, abiEnumSetField, abiEnumEq } from runtime.abi_enum
+import { abiMapNew, abiMapSet, abiMapGetBoxed, abiMapGet, abiMapHas, abiMapRemove, abiMapLen, abiMapKeys, abiMapValues } from runtime.abi_map
+import { abiTupleNew, abiTupleLen, abiTupleSetField, abiTupleField } from runtime.abi_tuple
+
+fn lex(src: string) -> List<LexedToken> {
+    let lx = Lexer(bytes(src), 0, 0, none, range(0), 0)
+    lx.run()
+}
+
+fn lexSource(src: string) -> string {
+    var out = ""
+    for (t in lex(src)) {
+        out += canonTok(t)
+        out += "\n"
+    }
+    out
+}
+
+fn pathBase(p: string) -> string {
+    let bs = bytes(p)
+    var last = -1
+    var i = 0
+    while (i < len(bs)) {
+        let b = bs[i] as int
+        if (b == 47 || b == 92) {
+            last = i
+        }
+        i = i + 1
+    }
+    if (last == -1) {
+        return p
+    }
+    var out = ""
+    var k = last + 1
+    while (k < len(bs)) {
+        out += "{bs[k] as char}"
+        k = k + 1
+    }
+    out
+}
+
+fn hasSuffix(s: string, suf: string) -> bool {
+    let sb = bytes(suf)
+    let bs = bytes(s)
+    if (len(sb) > len(bs)) {
+        return false
+    }
+    var i = 0
+    var diff = len(bs) - len(sb)
+    while (i < len(sb)) {
+        if (bs[diff + i] != sb[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+fn emptyStrs() -> List<string> {
+    var l = [""]
+    l.pop()
+    l
+}
+
+fn parseSource(src: string) -> string {
+    let toks = lex(src)
+    let diags = DiagnosticSink()
+    if (let some(_) = parse(toks, diags)) {
+        "ok"
+    } else {
+        "fail"
+    }
+}
+
+fn resolveSource(src: string) -> string {
+    let toks = lex(src)
+    let diags = DiagnosticSink()
+    if (let some(prog) = parse(toks, diags)) {
+        let r = Resolver(diags)
+        let _ = r.resolve(prog)
+        if (diags.anyError()) {
+            "fail"
+        } else {
+            "ok"
+        }
+    } else {
+        "fail"
+    }
+}
+
+fn checkSource(src: string) -> string {
+    let toks = lex(src)
+    let diags = DiagnosticSink()
+    if (let some(prog) = parse(toks, diags)) {
+        let r = Resolver(diags)
+        let resolved = r.resolve(prog)
+        checkProgram(prog, resolved, diags)
+        if (diags.anyError()) {
+            "fail"
+        } else {
+            "ok"
+        }
+    } else {
+        "fail"
+    }
+}
+
+/// Must take the file name, not just the source: the loader needs it to find
+/// the module's own imports and the workspace manifest, so a module with an
+/// `import` cannot be lowered from its text alone.
+fn irSource(fileName: string, src: string) -> string {
+    let diags = DiagnosticSink()
+    if (let some(out) = frontendChecked(fileName, src, diags)) {
+        if (let some(m) = emitIr(out.program, out.resolved, diags)) {
+            irModuleStr(m)
+        } else {
+            report(diags, fileName)
+            "irfail"
+        }
+    } else {
+        report(diags, fileName)
+        "irfail"
+    }
+}
+
+/// Print why a lowering failed. A bare "irfail" sends the reader looking for the
+/// problem instead of at it.
+fn report(diags: DiagnosticSink, fileName: string) {
+    let text = diags.renderAll()
+    if (text == "") {
+        println("error: while lowering " + fileName + " (no diagnostic)")
+    } else {
+        print(text)
+    }
+}
+
+/// Where `irx` keeps its cached modules.
+///
+/// There is no environment intrinsic, so the cache location comes from the
+/// command line: `--no-cache` disables it, `--cache-dir <dir>` moves it.
+class CacheConfig {
+    var dir: string
+
+    constructor(dir: string) {
+        this.dir = dir
+    }
+}
+
+/// Like `irSource`, but emits the lossless IRX text. Like `irSource` it takes
+/// the file name, because the loader needs it to find the module's own imports
+/// and the workspace manifest.
+///
+/// With a cache config, a lowering whose inputs are unchanged is served from
+/// disk instead of re-derived; see `compiler.cache`. The cache is a shortcut
+/// only: a miss falls through to the full lowering below.
+fn irxSource(fileName: string, src: string, cfg: CacheConfig?) -> string {
+    if (let some(c) = cfg) {
+        if (let some(deps) = recordedDeps(c.dir, fileName)) {
+            if (let some(hit) = lookup(c.dir, "irx", deps)) {
+                return hit
+            }
+        }
+    }
+    let diags = DiagnosticSink()
+    if (let some(out) = frontendChecked(fileName, src, diags)) {
+        if (let some(m) = emitIr(out.program, out.resolved, diags)) {
+            let text = irxModuleStr(m)
+            if (let some(c) = cfg) {
+                store(c.dir, "irx", fileName, out.paths, text)
+            }
+            text
+        } else {
+            report(diags, fileName)
+            "irfail"
+        }
+    } else {
+        report(diags, fileName)
+        "irfail"
+    }
+}
+
+fn defaultCacheDir() -> string {
+    "target/pickle-cache/pkl"
+}
+
+fn runIrx(argv: List<string>) {
+    var cfg: CacheConfig? = CacheConfig(defaultCacheDir())
+    var files = emptyStrs()
+    var i = 1
+    while (i < len(argv)) {
+        let a = argv[i]
+        if (a == "--no-cache") {
+            cfg = none
+            i = i + 1
+        } else if (a == "--cache-dir") {
+            if (i + 1 < len(argv)) {
+                cfg = CacheConfig(argv[i + 1])
+                i = i + 2
+            } else {
+                println("error: --cache-dir needs a directory")
+                exit(1)
+            }
+        } else {
+            files.push(a)
+            i = i + 1
+        }
+    }
+    var k = 0
+    while (k < len(files)) {
+        let f = files[k]
+        match (read_file(f)) {
+            case none -> {
+                println("error: cannot read " + f)
+                exit(1)
+            }
+            case some(src) -> {
+                let out = irxSource(f, src, cfg)
+                if (out == "irfail") {
+                    println("error: while lowering " + f)
+                    exit(1)
+                }
+                print(out)
+            }
+        }
+        k = k + 1
+    }
+}
+
+fn explainText(raw: string) -> string? {
+    let id = normalizeId(raw)
+    if (let some(e) = explainById(id)) {
+        var out = "error[" + id + "] -- " + e.title + "\n\n"
+        out += e.rule + "\n\n"
+        out += "example:\n"
+        for (line in splitLines(e.example)) {
+            out += "    " + line + "\n"
+        }
+        return out
+    }
+    none
+}
+
+fn runExplain(argv: List<string>) {
+    var wantHistory = false
+    var codeArg: string? = none
+    var i = 1
+    while (i < len(argv)) {
+        let a = argv[i]
+        if (a == "--history") {
+            wantHistory = true
+        }
+        match (codeArg) {
+            case none -> codeArg = a
+            case some(_) -> {}
+        }
+        i = i + 1
+    }
+    match (codeArg) {
+        case none -> {
+            for (e in catalogue()) {
+                println("error[" + e.code + "] -- " + e.title)
+            }
+        }
+        case some(raw) -> {
+            let id = normalizeId(raw)
+            if (!wantHistory) {
+                if (let some(txt) = explainText(id)) {
+                    print(txt)
+                } else {
+                    // Straight to the stderr handle - `writeStderr` writes to
+                    // `STD_ERROR_HANDLE`, and this is what the Rust CLI's
+                    // `eprintln!` bottoms out in on the freestanding build
+                    // (`nostd::console_error_write`). Writing through
+                    // `stderr_stream()` would work but would drag
+                    // `pickle_stderr_stream` and `pickle_stream_write` into a
+                    // program whose own source has no reason to need them.
+                    unsafe {
+                        let msg = "error: unknown error code `" + id + "`\n"
+                        var p = &msg
+                        let _ = writeStderr((p as int) + STR_BYTES_OFF, len(msg))
+                    }
+                    exit(1)
+                }
+            } else {
+                if (let some(txt) = explainText(id)) {
+                    print(txt)
+                    println("")
+                } else {
+                    println("(not in the error catalogue -- checking its history anyway)")
+                    println("")
+                }
+                explainHistory(id)
+            }
+        }
+    }
+}
+
+fn explainHistory(id: string) {
+    match (currentDir()) {
+        case none -> { exit(1) }
+        case some(cwd) -> {
+            match (gitRoot(cwd)) {
+                case none -> { exit(1) }
+                case some(root) -> {
+                    match (historyFor(root)) {
+                        case none -> { exit(1) }
+                        case some(all) -> renderExplainHistory(all, id)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn runHistoryCmd(argv: List<string>) {
+    var fileArg: string? = none
+    var limit = 10
+    var i = 1
+    while (i < len(argv)) {
+        let a = argv[i]
+        if (a == "--file") {
+            i = i + 1
+            if (i < len(argv)) {
+                fileArg = argv[i]
+            }
+        } else if (hasPrefixStr(a, "--file=")) {
+            fileArg = subStr(a, 7, len(a) - 7)
+        } else if (a == "--limit") {
+            i = i + 1
+            if (i < len(argv)) {
+                limit = parseIntOf(argv[i])
+            }
+        } else if (hasPrefixStr(a, "--limit=")) {
+            limit = parseIntOf(subStr(a, 8, len(a) - 8))
+        }
+        i = i + 1
+    }
+    match (currentDir()) {
+        case none -> { exit(1) }
+        case some(cwd) -> {
+            match (gitRoot(cwd)) {
+                case none -> { exit(1) }
+                case some(root) -> {
+                    match (historyFor(root)) {
+                        case none -> { exit(1) }
+                        case some(all) -> {
+                            if (len(all) == 0) {
+                                println("no `*.pkl` files in git history yet")
+                            } else {
+                                renderHistory(all, fileArg, limit)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn runBuildsCmd(argv: List<string>) {
+    var limit = 20
+    var i = 1
+    while (i < len(argv)) {
+        let a = argv[i]
+        if (a == "--limit") {
+            i = i + 1
+            if (i < len(argv)) {
+                limit = parseIntOf(argv[i])
+            }
+        } else if (hasPrefixStr(a, "--limit=")) {
+            limit = parseIntOf(subStr(a, 8, len(a) - 8))
+        }
+        i = i + 1
+    }
+    match (currentDir()) {
+        case none -> { exit(1) }
+        case some(cwd) -> {
+            match (gitRoot(cwd)) {
+                case none -> { exit(1) }
+                case some(root) -> {
+                    match (historyFor(root)) {
+                        case none -> { exit(1) }
+                        case some(all) -> {
+                            if (len(all) == 0) {
+                                println("no `*.pkl` files in git history yet")
+                            } else {
+                                renderBuilds(all, limit)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn hasPrefixStr(s: string, p: string) -> bool {
+    let sb = bytes(p)
+    let bs = bytes(s)
+    if (len(sb) > len(bs)) {
+        return false
+    }
+    var i = 0
+    while (i < len(sb)) {
+        if (bs[i] != sb[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+fn parseIntOf(s: string) -> int {
+    let bs = bytes(s)
+    var n = 0
+    var i = 0
+    while (i < len(bs)) {
+        let c = bs[i] as int
+        if (c >= 48 && c <= 57) {
+            n = n * 10 + (c - 48)
+            i = i + 1
+        } else {
+            break
+        }
+    }
+    n
+}
+
+/// `pickle lex <file>`: print the canonical token stream, one token per line.
+/// Uses the same `lexSource` the batch driver writes to its `.lex` artifacts, so
+/// the two agree byte for byte with the Rust compiler's `lex` output.
+fn runLexCmd(argv: List<string>) {
+    if (len(argv) < 2) {
+        println("error: `lex` needs a file")
+        exit(1)
+    }
+    let f = argv[1]
+    match (read_file(f)) {
+        case none -> {
+            println("error: cannot read " + f)
+            exit(1)
+        }
+        case some(src) -> {
+            print(lexSource(src))
+        }
+    }
+}
+
+/// `pickle ir <file>`: lower a checked module to PickleIR and print it. On a
+/// lowering failure the diagnostics go out and the exit code is 1, matching the
+/// Rust CLI (which exits 1 without printing IR).
+fn runIrCmd(argv: List<string>) {
+    if (len(argv) < 2) {
+        println("error: `ir` needs a file")
+        exit(1)
+    }
+    let f = argv[1]
+    match (read_file(f)) {
+        case none -> {
+            println("error: cannot read " + f)
+            exit(1)
+        }
+        case some(src) -> {
+            let diags = DiagnosticSink()
+            if (let some(out) = frontendChecked(f, src, diags)) {
+                if (let some(m) = emitIr(out.program, out.resolved, diags)) {
+                    print(irModuleStr(m))
+                    return
+                }
+            }
+            report(diags, f)
+            exit(1)
+        }
+    }
+}
+
+/// `pickle check <file>`: parse, resolve and type-check, reporting diagnostics.
+/// A clean module prints nothing and exits 0; any error exits 1.
+fn runCheckCmd(argv: List<string>) {
+    if (len(argv) < 2) {
+        println("error: `check` needs a file")
+        exit(1)
+    }
+    let f = argv[1]
+    match (read_file(f)) {
+        case none -> {
+            println("error: cannot read " + f)
+            exit(1)
+        }
+        case some(src) -> {
+            let diags = DiagnosticSink()
+            let okd = frontendChecked(f, src, diags)
+            let text = diags.renderAll()
+            if (text != "") {
+                print(text)
+            }
+            match (okd) {
+                case none -> { exit(1) }
+                case some(_) -> {
+                    if (diags.anyError()) {
+                        exit(1)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn main() {
+    let argv = args()
+    if (len(argv) >= 1) {
+        if (argv[0] == "--version" || argv[0] == "-V") {
+            println("pickle 0.1.0")
+            return
+        }
+        if (argv[0] == "jar") {
+            println("🥒 Pickle Jar Diagnostics")
+            println("")
+            println("Compiler: healthy")
+            println("Parser: fermented")
+            println("Resolver: brined")
+            println("Emitter: still soaking")
+            println("")
+            println("Vinegar: ██████████ 100%")
+            println("Jar integrity: acceptable")
+            return
+        }
+        if (argv[0] == "explain") {
+            runExplain(argv)
+            return
+        }
+        if (argv[0] == "history") {
+            runHistoryCmd(argv)
+            return
+        }
+        if (argv[0] == "builds") {
+            runBuildsCmd(argv)
+            return
+        }
+        if (argv[0] == "irx") {
+            runIrx(argv)
+            return
+        }
+        if (argv[0] == "lex") {
+            runLexCmd(argv)
+            return
+        }
+        if (argv[0] == "ir") {
+            runIrCmd(argv)
+            return
+        }
+        if (argv[0] == "check") {
+            runCheckCmd(argv)
+            return
+        }
+    }
+    mkdir("tools/diff/port")
+    var names = emptyStrs()
+    if (len(argv) > 0) {
+        for (a in argv) {
+            names.push(a)
+        }
+    } else if (let some(files) = list_dir("tests/pickle")) {
+        for (f in files) {
+            if (hasSuffix(f, ".pkl")) {
+                names.push(f)
+            }
+        }
+    }
+    for (f in names) {
+        if (let some(src) = read_file(f)) {
+            println("PROC " + f)
+            let out = lexSource(src)
+            let base = pathBase(f)
+            write_file("tools/diff/port/" + base + ".lex", out)
+            write_file("tools/diff/port/" + base + ".parse", parseSource(src) + "\n")
+            write_file("tools/diff/port/" + base + ".resolve", resolveSource(src) + "\n")
+            write_file("tools/diff/port/" + base + ".check", checkSource(src) + "\n")
+            write_file("tools/diff/port/" + base + ".ir", irSource(f, src))
+            // The per-phase dump path is the comparison harness's reference output, so it
+            // always lowers from source (`cfg = none`) rather than trusting a
+            // cached rendering.
+            write_file("tools/diff/port/" + base + ".irx", irxSource(f, src, none))
+        } else {
+            println("error: cannot read " + f)
+            exit(1)
+        }
+    }
+}

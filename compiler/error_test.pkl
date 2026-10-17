@@ -1,0 +1,129 @@
+module compiler.error_test
+
+import { CatalogueEntry, catalogue, explainById, normalizeId, allIds } from compiler.error
+
+fn isWellFormedId(id: string) -> bool {
+    let bs = bytes(id)
+    if (len(bs) != 5) {
+        return false
+    }
+    if ((bs[0] as int) != 69) {
+        return false
+    }
+    var i = 1
+    while (i < 5) {
+        let b = bs[i] as int
+        if (b < 48) {
+            return false
+        }
+        if (b > 57) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+test fn catalogue_has_52_entries() {
+    expect(len(catalogue())).toBe(52)
+}
+
+test fn ids_are_well_formed_and_distinct() {
+    let seen = [
+        CatalogueEntry("", "", "", "")
+    ]
+    seen.pop()
+    for (e in catalogue()) {
+        expect(isWellFormedId(e.code)).toBe(true)
+        var dup = false
+        for (s in seen) {
+            if (s.code == e.code) {
+                dup = true
+            }
+        }
+        expect(dup).toBe(false)
+        seen.push(e)
+    }
+    expect(len(seen)).toBe(52)
+}
+
+test fn every_id_lookup_resolves() {
+    for (e in catalogue()) {
+        if (let some(found) = explainById(e.code)) {
+            expect(found.title).toBe(e.title)
+        } else {
+            expect("missed " + e.code).toBe("")
+        }
+    }
+}
+
+test fn spot_check_e0203_multiline() {
+    if (let some(e) = explainById("E0203")) {
+        expect(e.title).toBe("duplicate member")
+        expect(e.example).toBe("class P \{\n    var x: int\n    var x: string\n\}")
+    } else {
+        expect("missed E0203").toBe("")
+    }
+}
+
+test fn spot_check_e0342_emdash() {
+    if (let some(e) = explainById("E0342")) {
+        expect(e.title).toBe("map keys must be a supported type")
+        expect(e.example).toBe("(1, 2) as a map key \u{2014} \{ (1, 2): \"a\" \} is not lowered")
+    } else {
+        expect("missed E0342").toBe("")
+    }
+}
+
+test fn spot_check_e0400() {
+    if (let some(e) = explainById("E0400")) {
+        expect(e.title).toBe("attribute error")
+        expect(e.rule).toBe("an attribute name is unknown, repeated, or given arguments it does not take.")
+        expect(e.example).toBe("#[wat] let x = 1")
+    } else {
+        expect("missed E0400").toBe("")
+    }
+}
+
+test fn spot_check_e0900() {
+    if (let some(e) = explainById("E0900")) {
+        expect(e.title).toBe("not lowered yet")
+        expect(e.example).toBe("let t = (1, 2)  // tuples check but have no lowering")
+    } else {
+        expect("missed E0900").toBe("")
+    }
+}
+
+test fn spot_check_e0700() {
+    if (let some(e) = explainById("E0700")) {
+        expect(e.title).toBe("reference outside parameter")
+        expect(e.example).toBe("let r: &int = &x")
+    } else {
+        expect("missed E0700").toBe("")
+    }
+}
+
+test fn unknown_id_is_not_found() {
+    expect(explainById("E9999")).not().toExist()
+    expect(explainById("wat")).not().toExist()
+}
+
+test fn normalize_id_cases() {
+    expect(normalizeId("E0308")).toBe("E0308")
+    expect(normalizeId("e0308")).toBe("E0308")
+    expect(normalizeId("  e0310\t")).toBe("E0310")
+    expect(normalizeId("0308")).toBe("E0308")
+    expect(normalizeId("Ee0308")).toBe("E0308")
+    expect(normalizeId(" E0203 ")).toBe("E0203")
+}
+
+test fn all_ids_matches_catalogue_codes() {
+    let entries = catalogue()
+    let ids = allIds()
+    expect(len(ids)).toBe(52)
+    var i = 0
+    while (i < len(entries)) {
+        expect(ids[i]).toBe(entries[i].code)
+        i = i + 1
+    }
+}

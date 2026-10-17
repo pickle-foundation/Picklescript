@@ -1,0 +1,231 @@
+module runtime.abi_string_test
+
+import { wordsFor, abiStrLen, abiStrConcat, abiStrCmp, abiStrGet, abiStrSet, abiStrFromBool, abiStrFromByte, abiStrFromChar, abiStrToBytes, abiStrFromList, isScalar, utf8Len, leadByte } from runtime.abi_string
+import { abiListNew, abiListLen, abiListGet, abiListPush } from runtime.abi_list
+import { abiBoxI64, abiUnboxI64 } from runtime.abi_box
+
+/// WHY THE TESTS BUILD STRINGS INSTEAD OF WRITING THEM.
+///
+/// The ABI bodies take the `*int` the IR carries, and Pickle has NO source-level
+/// `string` -> `*int` conversion: E0363 rejects the cast and E0308 rejects the
+/// argument. That is not an oversight to work around in each test - it is the
+/// contract. The emitter never converts a string in Pickle code either; it hands
+/// the pointer straight through (emit.rs:6548 maps `IrTy::Str` to the call
+/// unchanged). A test that needs a string object therefore has to get it from a
+/// body that already returns `*int`, which is exactly the path the compiler
+/// takes. `pickle_str_from_byte` is the natural constructor: it is the one
+/// native body whose input is a plain `int` byte.
+fn bytes1(a: int) -> *int {
+    return abiStrFromByte(a)
+}
+
+fn bytes2(a: int, b: int) -> *int {
+    return abiStrConcat(abiStrFromByte(a), abiStrFromByte(b))
+}
+
+fn bytes3(a: int, b: int, c: int) -> *int {
+    return abiStrConcat(bytes2(a, b), abiStrFromByte(c))
+}
+
+test fn wordsFor_rounds_up_to_whole_words() {
+    expect(wordsFor(0)).toBe(4)
+    expect(wordsFor(1)).toBe(5)
+    expect(wordsFor(8)).toBe(5)
+    expect(wordsFor(9)).toBe(6)
+}
+
+test fn wordsFor_always_reserves_header_and_len() {
+    // 3 header words plus the length word, so even a 0-byte string has a
+    // payload slot to zero.
+    expect(wordsFor(0)).toBe(4)
+    expect(wordsFor(32)).toBe(8)
+}
+
+test fn str_get_reads_bytes_by_index() {
+    let x = bytes3(97, 98, 99)
+    expect(abiStrLen(x)).toBe(3)
+    expect(abiStrGet(x, 0)).toBe(97)
+    expect(abiStrGet(x, 1)).toBe(98)
+    expect(abiStrGet(x, 2)).toBe(99)
+}
+
+test fn str_get_reads_bytes_of_multibyte_text() {
+    // "e-acute" is C3 A9: the port reads raw bytes, not code points.
+    let x = bytes2(195, 169)
+    expect(abiStrLen(x)).toBe(2)
+    expect(abiStrGet(x, 0)).toBe(195)
+    expect(abiStrGet(x, 1)).toBe(169)
+}
+
+test fn str_get_out_of_range_returns_zero() {
+    // GAP: native panics. See the abiStrGet doc comment.
+    let x = bytes2(97, 98)
+    expect(abiStrGet(x, 2)).toBe(0)
+    expect(abiStrGet(x, 0 - 1)).toBe(0)
+    expect(abiStrGet(abiStrFromByte(0), 1)).toBe(0)
+}
+
+test fn str_set_is_copy_on_write_and_leaves_the_original_alone() {
+    let x = bytes3(97, 98, 99)
+    let t = abiStrSet(x, 1, 122)
+    expect(abiStrLen(t)).toBe(3)
+    expect(abiStrGet(t, 0)).toBe(97)
+    expect(abiStrGet(t, 1)).toBe(122)
+    expect(abiStrGet(t, 2)).toBe(99)
+    // The original is untouched: native allocates a fresh string, it does not
+    // mutate in place.
+    expect(abiStrGet(x, 1)).toBe(98)
+    expect((t as int) == (x as int)).toBe(false)
+}
+
+test fn str_set_truncates_the_value_to_a_byte() {
+    // Native writes `v as u8`, so 321 is 0x41 = 'A'.
+    let t = abiStrSet(bytes1(63), 0, 321)
+    expect(abiStrGet(t, 0)).toBe(65)
+    expect(abiStrLen(t)).toBe(1)
+}
+
+test fn str_set_out_of_range_returns_the_input_unchanged() {
+    // GAP: native panics. See the abiStrGet doc comment.
+    let x = bytes2(97, 98)
+    expect((abiStrSet(x, 5, 65) as int) == (x as int)).toBe(true)
+    expect((abiStrSet(x, 0 - 1, 65) as int) == (x as int)).toBe(true)
+}
+
+test fn str_from_bool_spellings() {
+    expect(abiStrLen(abiStrFromBool(true))).toBe(4)
+    expect(abiStrLen(abiStrFromBool(false))).toBe(5)
+    // "true" is 74 72 75 65 and "false" is 66 61 6C 73 65.
+    expect(abiStrGet(abiStrFromBool(true), 0)).toBe(116)
+    expect(abiStrGet(abiStrFromBool(true), 3)).toBe(101)
+    expect(abiStrGet(abiStrFromBool(false), 0)).toBe(102)
+    expect(abiStrGet(abiStrFromBool(false), 4)).toBe(101)
+}
+
+test fn str_from_byte_is_one_raw_byte() {
+    expect(abiStrLen(abiStrFromByte(65))).toBe(1)
+    expect(abiStrGet(abiStrFromByte(65), 0)).toBe(65)
+    // Raw, not re-encoded: 0xC3 stays a single byte, which is what makes the
+    // multi-byte text model round-trip.
+    expect(abiStrLen(abiStrFromByte(195))).toBe(1)
+    // Truncation, matching native `v as u8`.
+    expect(abiStrGet(abiStrFromByte(321), 0)).toBe(65)
+    expect(abiStrLen(abiStrFromByte(0))).toBe(1)
+}
+
+test fn utf8_length_matches_the_encoding_width() {
+    expect(utf8Len(0)).toBe(1)
+    expect(utf8Len(127)).toBe(1)
+    expect(utf8Len(128)).toBe(2)
+    expect(utf8Len(2047)).toBe(2)
+    expect(utf8Len(2048)).toBe(3)
+    expect(utf8Len(65535)).toBe(3)
+    expect(utf8Len(65536)).toBe(4)
+    expect(utf8Len(1114111)).toBe(4)
+}
+
+test fn scalar_range_excludes_surrogates_and_overflow() {
+    expect(isScalar(0)).toBe(true)
+    expect(isScalar(65)).toBe(true)
+    expect(isScalar(1114111)).toBe(true)
+    // D800..=DFFF are not Unicode scalar values.
+    expect(isScalar(55296)).toBe(false)
+    expect(isScalar(57343)).toBe(false)
+    expect(isScalar(55295)).toBe(true)
+    expect(isScalar(57344)).toBe(true)
+    // Above U+10FFFF, and below zero.
+    expect(isScalar(1114112)).toBe(false)
+    expect(isScalar(0 - 1)).toBe(false)
+}
+
+test fn lead_byte_masks_the_code_point() {
+    expect(leadByte(2, 0)).toBe(192)
+    expect(leadByte(3, 0)).toBe(224)
+    expect(leadByte(4, 0)).toBe(240)
+    // U+00E9 -> C3 A9, U+FFFD -> EF BF BD, U+1F600 -> F0 9F 98 80.
+    expect(leadByte(2, 233)).toBe(195)
+    expect(leadByte(3, 65533)).toBe(239)
+    expect(leadByte(4, 128512)).toBe(240)
+}
+
+test fn str_from_char_encodes_one_two_three_and_four_byte_forms() {
+    // 'A'
+    let one = abiStrFromChar(65)
+    expect(abiStrLen(one)).toBe(1)
+    expect(abiStrGet(one, 0)).toBe(65)
+    // U+00E9 -> C3 A9
+    let two = abiStrFromChar(233)
+    expect(abiStrLen(two)).toBe(2)
+    expect(abiStrGet(two, 0)).toBe(195)
+    expect(abiStrGet(two, 1)).toBe(169)
+    // U+FFFD -> EF BF BD
+    let three = abiStrFromChar(65533)
+    expect(abiStrLen(three)).toBe(3)
+    expect(abiStrGet(three, 0)).toBe(239)
+    expect(abiStrGet(three, 1)).toBe(191)
+    expect(abiStrGet(three, 2)).toBe(189)
+    // U+1F600 -> F0 9F 98 80
+    let four = abiStrFromChar(128512)
+    expect(abiStrLen(four)).toBe(4)
+    expect(abiStrGet(four, 0)).toBe(240)
+    expect(abiStrGet(four, 1)).toBe(159)
+    expect(abiStrGet(four, 2)).toBe(152)
+    expect(abiStrGet(four, 3)).toBe(128)
+}
+
+test fn str_from_char_replaces_invalid_code_points() {
+    // Native: char::from_u32(v).unwrap_or('\u{FFFD}').
+    let want = abiStrFromChar(65533)
+    expect(abiStrCmp(abiStrFromChar(55296), want)).toBe(0)
+    expect(abiStrCmp(abiStrFromChar(57343), want)).toBe(0)
+    expect(abiStrCmp(abiStrFromChar(1114112), want)).toBe(0)
+    expect(abiStrCmp(abiStrFromChar(0 - 1), want)).toBe(0)
+}
+
+test fn str_to_bytes_boxes_every_byte() {
+    let bs = abiStrToBytes(bytes3(97, 98, 99))
+    expect(abiListLen(bs)).toBe(3)
+    expect(abiUnboxI64(abiListGet(bs, 0))).toBe(97)
+    expect(abiUnboxI64(abiListGet(bs, 1))).toBe(98)
+    expect(abiUnboxI64(abiListGet(bs, 2))).toBe(99)
+}
+
+test fn str_to_bytes_of_an_empty_string_is_an_empty_list() {
+    // The empty string has to come from `str_from_list`, since `from_byte`
+    // always produces exactly one byte.
+    let empty = abiStrFromList(abiListNew(0))
+    expect(abiStrLen(empty)).toBe(0)
+    expect(abiListLen(abiStrToBytes(empty))).toBe(0)
+}
+
+test fn str_to_bytes_preserves_multibyte_content() {
+    // bytes()/str() must round-trip exactly, which is the whole point of the
+    // std.text model: "e-acute" + "euro sign".
+    let bs = abiStrToBytes(bytes3(195, 169, 226))
+    expect(abiListLen(bs)).toBe(3)
+    expect(abiUnboxI64(abiListGet(bs, 0))).toBe(195)
+    expect(abiUnboxI64(abiListGet(bs, 1))).toBe(169)
+    expect(abiUnboxI64(abiListGet(bs, 2))).toBe(226)
+}
+
+test fn str_from_list_reverses_str_to_bytes() {
+    let x = bytes3(104, 233, 108)
+    let bs = abiStrToBytes(x)
+    let back = abiStrFromList(bs)
+    expect(abiStrLen(back)).toBe(abiStrLen(x))
+    expect(abiStrCmp(back, x)).toBe(0)
+}
+
+test fn str_from_list_of_an_empty_list_is_an_empty_string() {
+    let empty = abiListNew(0)
+    expect(abiStrLen(abiStrFromList(empty))).toBe(0)
+}
+
+test fn str_from_list_truncates_out_of_range_bytes() {
+    // GAP: native panics via the private pickle_panic_cstr. See abiStrFromList.
+    // The checker keeps a `byte` in 0..=255, so an out-of-range element has to
+    // be built through the raw ABI.
+    let bs = abiListNew(1)
+    abiListPush(bs, abiBoxI64(321))
+    expect(abiStrGet(abiStrFromList(bs), 0)).toBe(65)
+}

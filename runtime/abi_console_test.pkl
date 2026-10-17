@@ -1,0 +1,45 @@
+module runtime.abi_console_test
+
+import { emitCstr, abiPrintI64, abiPrintU64, abiPrintBool, abiPrintByte, abiPrintChar } from runtime.abi_console
+
+/// The scalar print bodies all return 0 in the reference (they are `-> ()` with no
+/// tail value, and the emitter gives the slot a zero). Asserting the return value
+/// exercises the body end to end - including its call into `abiStrFromI64`,
+/// `abiStrFromByte` or `abiStrFromChar` and the stdout write - without asserting on
+/// captured bytes, which the test harness owns.
+test fn scalar_printers_return_zero() {
+    expect(abiPrintI64(0)).toBe(0)
+    expect(abiPrintI64(-1)).toBe(0)
+    expect(abiPrintI64(9223372036854775807)).toBe(0)
+    // i64::MIN has no literal spelling; see MEMORIES.md.
+    expect(abiPrintI64(0 - 9223372036854775807 - 1)).toBe(0)
+    expect(abiPrintU64(0)).toBe(0)
+    expect(abiPrintU64(9223372036854775807)).toBe(0)
+    expect(abiPrintBool(true)).toBe(0)
+    expect(abiPrintBool(false)).toBe(0)
+    expect(abiPrintByte(0)).toBe(0)
+    // Truncation is the trap: 300 & 255 is 44. Any body that skipped the mask
+    // would push a different byte, and a byte mid-copy must survive verbatim.
+    expect(abiPrintByte(300)).toBe(0)
+    expect(abiPrintByte(0 - 1)).toBe(0)
+    expect(abiPrintChar(65)).toBe(0)
+    expect(abiPrintChar(0x1F600)).toBe(0)
+    // Surrogates and out-of-range values take the U+FFFD replacement path in
+    // `abiStrFromChar`; the print body must not reject them itself.
+    expect(abiPrintChar(55296)).toBe(0)
+    expect(abiPrintChar(1114112)).toBe(0)
+    expect(abiPrintChar(0 - 65)).toBe(0)
+}
+
+test fn emitCstr_returns_zero() {
+    // Exercises the stdout write path end to end without asserting on captured
+    // bytes (the test harness owns stdout).
+    expect(emitCstr("")).toBe(0)
+    expect(emitCstr("abc")).toBe(0)
+    expect(emitCstr("unicode: h\u{e9}llo")).toBe(0)
+}
+
+test fn emitCstr_handles_empty_and_long_payloads() {
+    expect(emitCstr("")).toBe(0)
+    expect(emitCstr("0123456789012345678901234567890123456789")).toBe(0)
+}

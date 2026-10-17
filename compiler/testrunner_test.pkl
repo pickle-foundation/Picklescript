@@ -1,0 +1,109 @@
+module compiler.testrunner_test
+
+import { TestCase, Hook, runTests, NameParts, splitTestName, groupPrefixes } from std.test
+
+test fn split_test_name_root() {
+    let p = splitTestName("pass_a")
+    expect(p.group).toBe("")
+    expect(p.desc).toBe("pass_a")
+}
+
+test fn split_test_name_nested() {
+    let p = splitTestName("math > nested > square")
+    expect(p.group).toBe("math > nested")
+    expect(p.desc).toBe("square")
+}
+
+test fn split_test_name_single_group() {
+    let p = splitTestName("strings > concat joins")
+    expect(p.group).toBe("strings")
+    expect(p.desc).toBe("concat joins")
+}
+
+test fn group_prefixes_root_empty() {
+    let ps = groupPrefixes("")
+    expect(ps).toHaveLength(0)
+}
+
+test fn group_prefixes_cumulative() {
+    let ps = groupPrefixes("a > b")
+    expect(ps).toHaveLength(2)
+    expect(ps[0]).toBe("a")
+    expect(ps[1]).toBe("a > b")
+}
+
+fn pass() -> string? {
+    none
+}
+
+fn failMsg() -> string? {
+    "nope"
+}
+
+fn failAssert() -> string? {
+    "assertion failed"
+}
+
+fn emptyTests() -> List<TestCase> {
+    var l = [TestCase("x", pass)]
+    l.pop()
+    l
+}
+
+fn emptyHooks() -> List<Hook> {
+    var l = [Hook("", 0, mark)]
+    l.pop()
+    l
+}
+
+fn mark() {}
+
+class LogSink {
+    static var entries: List<int> = [0]
+}
+
+fn logPush(v: int) {
+    LogSink.entries.push(v)
+}
+
+fn logClear() {
+    var fresh: List<int> = [0]
+    fresh.pop()
+    LogSink.entries = fresh
+}
+
+test fn all_pass_returns_zero_and_reports() {
+    let tests = [TestCase("pass_a", pass), TestCase("pass_b", pass)]
+    let hooks = emptyHooks()
+    let code = runTests(tests, hooks)
+    expect(code).toBe(0)
+}
+
+test fn failing_body_records_and_reports() {
+    let tests = [
+        TestCase("ok", pass),
+        TestCase("bad", failMsg),
+        TestCase("boom", failAssert),
+    ]
+    let hooks = emptyHooks()
+    let code = runTests(tests, hooks)
+    expect(code).toBe(1)
+}
+
+test fn hook_scheduling_before_all_then_test() {
+    logClear()
+    var logHooks = [
+        Hook("math", 0, () => { logPush(0) }),
+        Hook("math", 1, () => { logPush(1) }),
+        Hook("math", 2, () => { logPush(2) }),
+        Hook("math", 3, () => { logPush(3) }),
+    ]
+    var tests = [TestCase("math > sq", pass)]
+    let code = runTests(tests, logHooks)
+    expect(code).toBe(0)
+    expect(LogSink.entries).toHaveLength(4)
+    expect(LogSink.entries[0]).toBe(0)
+    expect(LogSink.entries[1]).toBe(1)
+    expect(LogSink.entries[2]).toBe(2)
+    expect(LogSink.entries[3]).toBe(3)
+}

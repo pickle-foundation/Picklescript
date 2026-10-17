@@ -1,0 +1,83 @@
+module compiler.linker
+
+import { CoffObj, coffRead, arRead, blobFrom } from compiler.objread
+import { buildExe, FailBox } from compiler.pelink
+import { OrderedMap } from std.collections.orderedmap
+import { isCo, scanDefs, select, mergeAll, strFrom } from compiler.linklib
+
+fn emptyCoffObjs() -> List<CoffObj> {
+    var l = [CoffObj("x")]
+    l.pop()
+    l
+}
+
+fn emptyInts() -> List<int> {
+    var l = [0]
+    l.pop()
+    l
+}
+
+fn emptyStrs() -> List<string> {
+    var l = [""]
+    l.pop()
+    l
+}
+
+fn main() {
+    let argv = args()
+    if (len(argv) < 3) {
+        println("LINKER NO ARGS")
+        return
+    }
+    if (let some(mainSrc) = read_file(argv[0])) {
+        let mainOb = coffRead(argv[0], blobFrom(mainSrc))
+        if (!isCo(mainOb)) {
+            println("LINKER main not amd64 coff")
+            return
+        }
+        if (let some(arSrc) = read_file(argv[1])) {
+            let ar = arRead(blobFrom(arSrc))
+            var objs = emptyCoffObjs()
+            objs.push(mainOb)
+            var i = 0
+            while (i < len(ar.members)) {
+                let mem = ar.members[i]
+                objs.push(coffRead(mem.name, mem.data))
+                i = i + 1
+            }
+            let defs = OrderedMap<string, int>("", 0)
+            scanDefs(objs, defs)
+            let chosen = emptyInts()
+            let bad = emptyStrs()
+            select(objs, defs, chosen, bad)
+            if (len(bad) > 0) {
+                println("LINKER UNRESOLVED: " + bad[0])
+                return
+            }
+            println("LINKER selected " + str(len(chosen)) + " members")
+            // No `#[symbol]` overrides here: this entry point is handed a pre-lowered
+// COFF object and never sees the IR, so it cannot tell an intentional ABI
+// replacement from an ordinary name that merely also exists in the archive.
+// Erring toward "archive keeps its own copies" is the safe default, and the
+// override path is exercised by cli/buildlib's `lowerProgram` instead.
+if (let some(merged) = mergeAll(objs, chosen, "merged.obj", emptyStrs())) {
+                let fb = FailBox()
+                if (let some(blob) = buildExe(merged, "pickle_main", fb)) {
+                    if (write_file(argv[2], strFrom(blob))) {
+                        println("LINKER WROTE " + str(len(blob)) + " bytes")
+                    } else {
+                        println("LINKER WRITE FAIL")
+                    }
+                } else {
+                    println("LINKER PE FAIL: " + fb.text)
+                }
+            } else {
+                println("LINKER MERGE FAIL")
+            }
+        } else {
+            println("LINKER AR READ FAIL")
+        }
+    } else {
+        println("LINKER MAIN READ FAIL")
+    }
+}

@@ -1,0 +1,406 @@
+module runtime.abi_float
+
+import { f64Bits } from runtime.abi_box
+import { newStr, byteInto } from runtime.abi_string
+
+const MASK32: int = 4294967295
+const CHUNK: int = 1000000000
+
+fn emptyInts() -> List<int> {
+    var xs = [0]
+    xs.pop()
+    xs
+}
+
+fn trimLimbs(a: List<int>) {
+    while (len(a) > 1 && a[len(a) - 1] == 0) { a.pop() }
+}
+
+fn limbsOf(v: int) -> List<int> {
+    var a = [v & MASK32]
+    a.push((v >> 32) & MASK32)
+    trimLimbs(a)
+    a
+}
+
+fn mulSmallAdd(a: List<int>, mul: int, add: int) {
+    var carry = add
+    var i = 0
+    while (i < len(a)) {
+        var t = a[i] * mul + carry
+        a[i] = t & MASK32
+        carry = t >> 32
+        i = i + 1
+    }
+    while (carry > 0) {
+        a.push(carry & MASK32)
+        carry = carry >> 32
+    }
+}
+
+fn shlLimbs(a: List<int>, n: int) {
+    if (n <= 0) { return }
+    var limbs = n / 32
+    var bits = n % 32
+    if (bits > 0) {
+        var carry = 0
+        var j = 0
+        while (j < len(a)) {
+            var v = a[j]
+            a[j] = ((v << bits) | carry) & MASK32
+            carry = v >> (32 - bits)
+            j = j + 1
+        }
+        if (carry > 0) { a.push(carry & MASK32) }
+    }
+    if (limbs > 0) {
+        var z = 0
+        while (z < limbs) {
+            a.push(0)
+            z = z + 1
+        }
+        var w = len(a) - limbs - 1
+        while (w >= 0) {
+            a[w + limbs] = a[w]
+            w = w - 1
+        }
+        var k = 0
+        while (k < limbs) {
+            a[k] = 0
+            k = k + 1
+        }
+    }
+}
+
+fn divSmall(a: List<int>, k: int) -> int {
+    var rem = 0
+    var i = len(a) - 1
+    while (i >= 0) {
+        var cur = rem * 4294967296 + a[i]
+        a[i] = cur / k
+        rem = cur % k
+        i = i - 1
+    }
+    trimLimbs(a)
+    rem
+}
+
+fn isZero(a: List<int>) -> bool {
+    var i = 0
+    while (i < len(a)) {
+        if (a[i] != 0) { return false }
+        i = i + 1
+    }
+    true
+}
+
+fn pow2Limbs(s: int, t: int) -> List<int> {
+    var a = limbsOf(s)
+    if (t >= 0) {
+        shlLimbs(a, t)
+    } else {
+        var i = 0
+        var n = 0 - t
+        while (i < n) {
+            mulSmallAdd(a, 5, 0)
+            i = i + 1
+        }
+    }
+    a
+}
+
+fn decExp(t: int) -> int {
+    if (t < 0) { return t }
+    0
+}
+
+fn digitsOf(a: List<int>) -> List<int> {
+    var b = emptyInts()
+    var i = 0
+    while (i < len(a)) {
+        b.push(a[i])
+        i = i + 1
+    }
+    var chunks = emptyInts()
+    var any = false
+    while (!isZero(b)) {
+        chunks.push(divSmall(b, CHUNK))
+        any = true
+    }
+    var out = emptyInts()
+    if (!any) {
+        out.push(0)
+        return out
+    }
+    var pows = emptyInts()
+    var pv = 1
+    var e = 0
+    while (e < 9) {
+        pows.push(pv)
+        pv = pv * 10
+        e = e + 1
+    }
+    var top = len(chunks) - 1
+    var t = chunks[top]
+    var nd = 1
+    var q = t
+    while (q >= 10) {
+        q = q / 10
+        nd = nd + 1
+    }
+    var d = nd - 1
+    while (d >= 0) {
+        out.push((t / pows[d]) % 10)
+        d = d - 1
+    }
+    var c = top - 1
+    while (c >= 0) {
+        var v = chunks[c]
+        var j = 8
+        while (j >= 0) {
+            out.push((v / pows[j]) % 10)
+            j = j - 1
+        }
+        c = c - 1
+    }
+    out
+}
+
+fn roundToN(a: List<int>, n: int) -> List<int> {
+    var L = len(a)
+    var out = emptyInts()
+    var i = 0
+    if (L <= n) {
+        while (i < L) {
+            out.push(a[i])
+            i = i + 1
+        }
+        return out
+    }
+    while (i < n) {
+        out.push(a[i])
+        i = i + 1
+    }
+    var up = false
+    var d0 = a[n]
+    if (d0 > 5) {
+        up = true
+    } else {
+        if (d0 == 5) {
+            var more = false
+            var j = n + 1
+            while (j < L) {
+                if (a[j] != 0) { more = true }
+                j = j + 1
+            }
+            if (more) {
+                up = true
+            } else {
+                if (out[n - 1] % 2 == 1) { up = true }
+            }
+        }
+    }
+    if (up) {
+        var k = n - 1
+        var carry = true
+        while (k >= 0 && carry) {
+            var v = out[k] + 1
+            if (v == 10) {
+                out[k] = 0
+                carry = true
+            } else {
+                out[k] = v
+                carry = false
+            }
+            k = k - 1
+        }
+        if (carry) {
+            out.push(0)
+            var m = len(out) - 1
+            while (m >= 1) {
+                out[m] = 0
+                m = m - 1
+            }
+            out[0] = 1
+        }
+    }
+    out
+}
+
+fn cmpDec(a: List<int>, ea: int, b: List<int>, eb: int) -> int {
+    var ma = len(a) + ea
+    var mb = len(b) + eb
+    if (ma < mb) { return -1 }
+    if (ma > mb) { return 1 }
+    var n = len(a)
+    if (len(b) > n) { n = len(b) }
+    var da = 0
+    var db = 0
+    var i = 0
+    while (i < n) {
+        da = 0
+        if (i < len(a)) { da = a[i] }
+        db = 0
+        if (i < len(b)) { db = b[i] }
+        if (da < db) { return -1 }
+        if (da > db) { return 1 }
+        i = i + 1
+    }
+    0
+}
+
+fn fromCodes(codes: List<int>) -> *int {
+    var n = len(codes)
+    var p = newStr(n)
+    var i = 0
+    while (i < n) {
+        byteInto(p, i, codes[i])
+        i = i + 1
+    }
+    p
+}
+
+fn fmtF64(v: float) -> *int {
+    var bits = f64Bits(v)
+    var neg = bits < 0
+    var E = (bits >> 52) & 0x7FF
+    var M52 = bits & 0xFFFFFFFFFFFFF
+    if (E == 0x7FF) {
+        if (M52 == 0) {
+            if (neg) { return fromCodes([45, 105, 110, 102]) }
+            return fromCodes([105, 110, 102])
+        }
+        return fromCodes([78, 97, 78])
+    }
+    if ((bits & 0x7FFFFFFFFFFFFFFF) == 0) {
+        if (neg) { return fromCodes([45, 48]) }
+        return fromCodes([48])
+    }
+    var vS = 0
+    var vT = 0
+    var loS = 0
+    var loT = 0
+    var hiS = 0
+    var hiT = 0
+    if (E == 0) {
+        vS = M52
+        vT = -1074
+        loT = -1075
+        hiT = -1075
+        if (M52 == 1) {
+            loS = 1
+        } else {
+            loS = 2 * M52 - 1
+        }
+        if (M52 == 0xFFFFFFFFFFFFF) {
+            hiS = 0x1FFFFFFFFFFFFF
+        } else {
+            hiS = 2 * M52 + 1
+        }
+    } else {
+        var Sig = M52 + 0x10000000000000
+        vS = Sig
+        vT = E - 1075
+        if (M52 == 0) {
+            if (E == 1) {
+                loS = 0x1FFFFFFFFFFFFF
+                loT = -1075
+            } else {
+                loS = 0x3FFFFFFFFFFFFF
+                loT = E - 1077
+            }
+        } else {
+            loS = 2 * Sig - 1
+            loT = E - 1076
+        }
+        if (M52 == 0xFFFFFFFFFFFFF) {
+            hiS = 0x3FFFFFFFFFFFFF
+        } else {
+            hiS = 2 * Sig + 1
+        }
+        hiT = E - 1076
+    }
+    var Adig = digitsOf(pow2Limbs(vS, vT))
+    var k = decExp(vT)
+    var LO = digitsOf(pow2Limbs(loS, loT))
+    var LOk = decExp(loT)
+    var HI = digitsOf(pow2Limbs(hiS, hiT))
+    var HIk = decExp(hiT)
+    var L = len(Adig)
+    var D = emptyInts()
+    var p = 0
+    var n = 1
+    var useLen = 0
+    var c1 = 0
+    var c2 = 0
+    while (n <= 17) {
+        useLen = n
+        if (useLen > L) { useLen = L }
+        D = roundToN(Adig, n)
+        p = k + L - useLen
+        c1 = cmpDec(D, p, LO, LOk)
+        c2 = cmpDec(D, p, HI, HIk)
+        if (c1 >= 0 && c2 <= 0) {
+            var tie = c1 == 0 || c2 == 0
+            if (!tie || M52 % 2 == 0) { break }
+        }
+        if (n == 17) { break }
+        n = n + 1
+    }
+    // Rounding can carry past the leading digit, growing `D` by a trailing
+    // zero (rounding `988...` to one digit yields `[1, 0]`). The value is right,
+    // but Rust's shortest formatting never keeps that zero: it prints `1e-323`,
+    // not `10e-324`. Fold each trailing zero back into the exponent so the
+    // decimal point position (`m + p`) is unchanged but the digits are minimal.
+    var tz = 0
+    while (len(D) > 1 && D[len(D) - 1] == 0) {
+        D.pop()
+        tz = tz + 1
+    }
+    p = p + tz
+    var m = len(D)
+    var dp = m + p
+    var codes = emptyInts()
+    var i = 0
+    var j = 0
+    if (neg) { codes.push(45) }
+    if (p >= 0) {
+        while (i < m) {
+            codes.push(48 + D[i])
+            i = i + 1
+        }
+        while (j < p) {
+            codes.push(48)
+            j = j + 1
+        }
+    } else {
+        if (dp > 0) {
+            while (i < dp) {
+                codes.push(48 + D[i])
+                i = i + 1
+            }
+            codes.push(46)
+            while (i < m) {
+                codes.push(48 + D[i])
+                i = i + 1
+            }
+        } else {
+            codes.push(48)
+            codes.push(46)
+            while (j < 0 - dp) {
+                codes.push(48)
+                j = j + 1
+            }
+            while (i < m) {
+                codes.push(48 + D[i])
+                i = i + 1
+            }
+        }
+    }
+    fromCodes(codes)
+}
+
+#[symbol("pickle_str_from_f64")]
+fn abiStrFromF64(v: float) -> *int {
+    fmtF64(v)
+}

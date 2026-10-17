@@ -1,0 +1,249 @@
+module runtime.abi_stream_test
+
+import { abiStreamOpenRead, abiStreamOpenWrite, abiStreamOpenAppend, abiStdoutStream, abiStderrStream, abiStreamRead, abiStreamWrite, abiStreamFlush, abiStreamClose } from runtime.abi_stream
+import { abiListNew, abiListPush, abiListGet, abiListLen } from runtime.abi_list
+import { abiBoxI64, abiUnboxI64 } from runtime.abi_box
+import { abiFileExists, abiDelete, abiReadFile } from runtime.abi_fs
+
+/// The byte-runs below come from `streams_test.pkl`, which already locks the
+/// full `Stream` surface end-to-end against the native archive. This module
+/// drives the same behaviours straight through the ported bodies - same open
+/// modes, same buffered-write boundary, same read-at-EOF answer - so GATE10
+/// exercises `abi_stream.pkl` without needing `combined.lib`.
+
+/// Build a `List<byte>` as the write symbol expects one on the wire: boxed
+/// byte values.
+fn bytesOf(s: string) -> *int {
+    var l = abiListNew(len(s))
+    var i = 0
+    while (i < len(s)) {
+        abiListPush(l, abiBoxI64(s[i] as int))
+        i = i + 1
+    }
+    return l
+}
+
+/// Read up to `n` bytes from `s` and return them as a `string`; null/EOF
+/// answers the empty string. Covers enough of the read path for the ranged
+/// checks below without duplicating `streams_test.pkl`'s byte-level reads.
+fn readBytes(s: *int, n: int) -> string {
+    var out = bytes("")
+    let l = abiStreamRead(s, n)
+    if (l == 0 as *int) {
+        return str(out)
+    }
+    var i = 0
+    while (i < abiListLen(l)) {
+        var e = abiListGet(l, i)
+        out.push(abiUnboxI64(e) as byte)
+        i = i + 1
+    }
+    return str(out)
+}
+
+/// `List<byte>` with `n` copies of byte value `v`, for the boundary test.
+fn runOf(v: int, n: int) -> *int {
+    var l = abiListNew(n)
+    var i = 0
+    while (i < n) {
+        abiListPush(l, abiBoxI64(v))
+        i = i + 1
+    }
+    return l
+}
+
+fn isNone(x: string?) -> bool {
+    if (let some(_) = x) {
+        return false
+    }
+    return true
+}
+
+fn isEmptyString(x: string?) -> bool {
+    if (let some(v) = x) {
+        return len(v) == 0
+    }
+    return false
+}
+
+test fn open_write_then_read_round_trips() {
+    let p = "abi_stream_test_scratch.txt"
+    if (abiFileExists(p)) {
+        abiDelete(p)
+    }
+
+    let w = abiStreamOpenWrite(p)
+    expect(w == 0 as *int).toBe(false)
+    expect(abiStreamWrite(w, bytesOf("abc"))).toBe(3)
+    expect(abiStreamFlush(w)).toBe(true)
+    expect(abiStreamClose(w)).toBe(true)
+    // Idempotent close: a second close reports failure.
+    expect(abiStreamClose(w)).toBe(false)
+    // Write after close is refused.
+    expect(abiStreamWrite(w, bytesOf("z"))).toBe(0)
+    expect(abiStreamFlush(w)).toBe(false)
+    expect(abiStreamRead(w, 3)).toBe(0 as *int)
+
+    let r = abiStreamOpenRead(p)
+    expect(r == 0 as *int).toBe(false)
+    expect(readBytes(r, 3)).toBe("abc")
+    // End of file answers the null pointer.
+    expect(abiStreamRead(r, 3)).toBe(0 as *int)
+    expect(abiStreamClose(r)).toBe(true)
+
+    // Reading a writer is not readable and nulls out.
+    expect(abiStreamRead(w, 3)).toBe(0 as *int)
+    expect(abiStreamClose(w)).toBe(false)
+
+    abiDelete(p)
+    expect(abiFileExists(p)).toBe(false)
+}
+
+test fn write_survives_close_without_explicit_flush() {
+    // `BufferedFile::drop` flushes on the way out, so a file written through
+    // `open_write` and closed is complete on disk.
+    let p = "abi_stream_test_close_flush.txt"
+    if (abiFileExists(p)) {
+        abiDelete(p)
+    }
+
+    let w = abiStreamOpenWrite(p)
+    expect(abiStreamWrite(w, bytesOf("hello"))).toBe(5)
+    expect(abiStreamClose(w)).toBe(true)
+
+    let r = abiStreamOpenRead(p)
+    expect(readBytes(r, 10)).toBe("hello")
+    expect(abiStreamClose(r)).toBe(true)
+
+    abiDelete(p)
+}
+
+test fn append_extends_instead_of_truncating() {
+    let p = "abi_stream_test_append.txt"
+    if (abiFileExists(p)) {
+        abiDelete(p)
+    }
+
+    let a = abiStreamOpenAppend(p)
+    expect(a == 0 as *int).toBe(false)
+    expect(abiStreamWrite(a, bytesOf("a"))).toBe(1)
+    expect(abiStreamClose(a)).toBe(true)
+
+    // `append` opens with `OPEN_ALWAYS` and `FILE_APPEND_DATA`: existing
+    // content stays, the new bytes follow it.
+    let a2 = abiStreamOpenAppend(p)
+    expect(abiStreamWrite(a2, bytesOf("bc"))).toBe(2)
+    expect(abiStreamClose(a2)).toBe(true)
+
+    let r = abiStreamOpenRead(p)
+    expect(readBytes(r, 10)).toBe("abc")
+    expect(abiStreamClose(r)).toBe(true)
+
+    abiDelete(p)
+}
+
+test fn read_zero_or_negative_answers_end_of_stream() {
+    let p = "abi_stream_test_read0.txt"
+    if (abiFileExists(p)) {
+        abiDelete(p)
+    }
+
+    let w = abiStreamOpenWrite(p)
+    expect(abiStreamWrite(w, bytesOf("x"))).toBe(1)
+    expect(abiStreamClose(w)).toBe(true)
+
+    let r = abiStreamOpenRead(p)
+    // `pickle_stream_read` clamps a non-positive count to an empty output,
+    // which is answered `0`/end-of-stream - no OS read happens.
+    expect(abiStreamRead(r, 0)).toBe(0 as *int)
+    expect(abiStreamRead(r, -5)).toBe(0 as *int)
+    // A positive count still reads the byte through.
+    expect(readBytes(r, 1)).toBe("x")
+    expect(abiStreamClose(r)).toBe(true)
+
+    abiDelete(p)
+}
+
+test fn read_follows_the_8192_byte_buffer_boundary() {
+    // A writer buffers up to `STREAM_BUFFER` and flush-drains the moment the
+    // buffer outgrows it; a reader refills at most 8192 per call. Writing
+    // 9000 bytes and reading them back in two 8192 slices proves both halves
+    // sit on the same boundary the native `BufferedFile` uses.
+    let p = "abi_stream_test_big.txt"
+    if (abiFileExists(p)) {
+        abiDelete(p)
+    }
+
+    let w = abiStreamOpenWrite(p)
+    expect(abiStreamWrite(w, runOf(120, 9000))).toBe(9000)
+    expect(abiStreamClose(w)).toBe(true)
+
+    let r = abiStreamOpenRead(p)
+    let first = readBytes(r, 8192)
+    expect(len(first)).toBe(8192)
+    var allSame = true
+    var i = 0
+    while (i < len(first)) {
+        if (first[i] as int != 120) {
+            allSame = false
+        }
+        i = i + 1
+    }
+    expect(allSame).toBe(true)
+    let second = readBytes(r, 8192)
+    expect(len(second)).toBe(808)
+    // Everything is consumed: another read is end of stream.
+    expect(abiStreamRead(r, 8192)).toBe(0 as *int)
+    expect(abiStreamClose(r)).toBe(true)
+
+    abiDelete(p)
+}
+
+test fn unflushed_writes_stay_buffered_until_flush() {
+    let p = "abi_stream_test_buffered.txt"
+    if (abiFileExists(p)) {
+        abiDelete(p)
+    }
+    // A write under 8192 bytes is not on the OS until flush/close. Because the
+    // file was created by `open_write`, it exists with zero bytes: `abiReadFile`
+    // answers `none` until the buffered bytes are emptied out.
+    let w = abiStreamOpenWrite(p)
+    expect(abiStreamWrite(w, bytesOf("buffered"))).toBe(8)
+    // Buffered bytes are not on the OS yet: the on-disk file reads back empty.
+    let before = abiReadFile(p)
+    expect(isNone(before) || isEmptyString(before)).toBe(true)
+    expect(abiStreamFlush(w)).toBe(true)
+    let after = abiReadFile(p)
+    if (let some(v) = after) {
+        expect(v).toBe("buffered")
+    } else {
+        expect(false).toBe(true)
+    }
+    expect(abiStreamClose(w)).toBe(true)
+
+    abiDelete(p)
+}
+
+test fn console_streams_accept_everything_and_report_the_count() {
+    // stdout/stderr accept every byte and report it; whether the OS write
+    // happens is not part of the answer. Both also flush cleanly.
+    let out = abiStdoutStream()
+    expect(out == 0 as *int).toBe(false)
+    expect(abiStreamWrite(out, bytesOf("hi"))).toBe(2)
+    expect(abiStreamFlush(out)).toBe(true)
+    expect(abiStreamClose(out)).toBe(true)
+    expect(abiStreamClose(out)).toBe(false)
+
+    let err = abiStderrStream()
+    expect(err == 0 as *int).toBe(false)
+    expect(abiStreamWrite(err, bytesOf("e"))).toBe(1)
+    expect(abiStreamClose(err)).toBe(true)
+}
+
+test fn a_null_stream_is_refused_everywhere() {
+    let nullStream = 0 as *int
+    expect(abiStreamRead(nullStream, 1)).toBe(0 as *int)
+    expect(abiStreamWrite(nullStream, bytesOf("x"))).toBe(0)
+    expect(abiStreamFlush(nullStream)).toBe(false)
+    expect(abiStreamClose(nullStream)).toBe(false)
+}

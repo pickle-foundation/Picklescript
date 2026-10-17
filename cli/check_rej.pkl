@@ -1,0 +1,101 @@
+module cli.check_rej
+
+import { Lexer } from compiler.lexer
+import { DiagnosticSink, Severity } from compiler.diag
+import { parse } from compiler.parser
+import { Resolver } from compiler.resolve
+import { checkProgram, classifyMessage } from compiler.check
+
+fn pathBase(p: string) -> string {
+    let bs = bytes(p)
+    var last = -1
+    var i = 0
+    while (i < len(bs)) {
+        let b = bs[i] as int
+        if (b == 47 || b == 92) {
+            last = i
+        }
+        i = i + 1
+    }
+    if (last == -1) {
+        return p
+    }
+    var out = ""
+    var k = last + 1
+    while (k < len(bs)) {
+        out += "{bs[k] as char}"
+        k = k + 1
+    }
+    out
+}
+
+fn hasSuffix(s: string, suf: string) -> bool {
+    let sb = bytes(suf)
+    let bs = bytes(s)
+    if (len(sb) > len(bs)) {
+        return false
+    }
+    var i = 0
+    var diff = len(bs) - len(sb)
+    while (i < len(sb)) {
+        if (bs[diff + i] != sb[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+fn emptyStrs() -> List<string> {
+    var l = [""]
+    l.pop()
+    l
+}
+
+fn checkOne(src: string) -> string {
+    let toks = Lexer(bytes(src), 0, 0, none, range(0), 0).run()
+    let diags = DiagnosticSink()
+    if (let some(prog) = parse(toks, diags)) {
+        let r = Resolver(diags)
+        let resolved = r.resolve(prog)
+        checkProgram(prog, resolved, diags)
+    }
+    var codes = ""
+    let ds = diags.diagnostics
+    var i = 0
+    while (i < len(ds)) {
+        if (ds[i].severity == Severity.Error) {
+            let code = classifyMessage(ds[i].message)
+            if (codes != "") {
+                codes = codes + " "
+            }
+            if (let some(c) = code) {
+                codes = codes + c
+            } else {
+                codes = codes + "?"
+            }
+        }
+        i = i + 1
+    }
+    if (codes == "") {
+        "ok"
+    } else {
+        codes
+    }
+}
+
+fn main() {
+    if (let some(files) = list_dir("tools/diff/port_rej_check")) {
+        var names = emptyStrs()
+        for (f in files) {
+            if (hasSuffix(f, ".pkl")) {
+                names.push(f)
+            }
+        }
+        for (f in names) {
+            if (let some(src) = read_file(f)) {
+                write_file("tools/diff/port/" + pathBase(f) + ".rcheck", checkOne(src) + "\n")
+            }
+        }
+    }
+}

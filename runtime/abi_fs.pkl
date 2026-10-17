@@ -1,0 +1,774 @@
+module runtime.abi_fs
+
+/// Port of `runtime/src/fs.rs`: the host-filesystem syscalls as `#[symbol]`
+/// bodies, so a build can answer `file_exists`, `delete`, `mkdir`, and
+/// `current_dir` with `combined.lib` absent.
+///
+/// WHY THE WHOLE OF `fs.rs` IS HERE. Every entry point is a KERNEL32 call
+/// taking a wide path, plus object marshalling that `runtime.abi_string` and
+/// `runtime.abi_list` already own: `GetFileAttributesW`, `DeleteFileW`,
+/// `CreateDirectoryW`, `GetCurrentDirectoryW`, `CreateFileW`/`ReadFile`/
+/// `WriteFile`, `FindFirstFileW`/`FindNextFileW`/`FindClose`. The last of those
+/// added a `WIN32_FIND_DATAW` to lay out by hand and nothing else. None of it
+/// touches a collector, a shadow stack, or a class registry - which is exactly
+/// the line `abi_raw.pkl` drew when it separated the allocatable from the
+/// GC-coupled, and it is what lets the whole directory operate with
+/// `combined.lib` absent.
+///
+/// WHY THE PARAMETERS ARE `string` AND NOT `*int`. The intrinsic that reaches
+/// these bodies is declared `IrTy.Str` - `emit.pkl` calls
+/// `pickle_read_file` with `[IrTy.Str]` - and `fs.rs` takes `&[u8]`, not an
+/// object address the caller has already walked. `string` is therefore the
+/// type that describes the contract; `*int` would describe an implementation
+/// detail the caller never agreed to. The two are not convertible in either
+/// direction (`cast_related` has no arm for them, and only *literals* coerce
+/// to `*int`), so the choice has to be made once, here, at the boundary. It is
+/// safe to make: `emit.rs` already hands an `IrTy::Str` value to an extern
+/// declared `IrTy::Ptr` (`pickle_str_len`, for `len()` on a string), so the
+/// two lower to the same machine word.
+///
+/// THE UTF-8/UTF-16 BOUNDARY. Every path enters as UTF-8 and every entry point
+/// below is wide. The reference conversion is `fs.rs::path_w`:
+///
+///     let s = core::str::from_utf8(path).unwrap_or("");
+///     s.encode_utf16().collect() then a NUL
+///
+/// so the contract is not "decode best effort" but "invalid UTF-8 is an empty
+/// path". That branch is reachable: `pickle_str_from_list` copies list bytes
+/// into the string object verbatim, so a `string` can hold a byte sequence
+/// `from_utf8` rejects. `wideUnits` answers -1 for one of those - overlong
+/// forms, stray continuation bytes, truncated sequences, encoded surrogates,
+/// code points past U+10FFFF - and `wideBuf` turns -1 into the single NUL that
+/// an empty path encodes to. `std`'s `path_of` runs the same `unwrap_or("")`,
+/// so both builds see an empty path and let the syscall report the miss.
+/// Decoding on the way out mirrors `String::from_utf16_lossy`, so a lone
+/// surrogate becomes U+FFFD on both builds.
+///
+/// WHY THE BUFFER IS EXPLICITLY ZEROED. `alloc(int, n)` hands back
+/// UNINITIALISED memory - `abi_list.pkl` records the same measurement about
+/// `heap::raw_alloc` - because `HeapAlloc(GetProcessHeap(), 0, size)` does not
+/// zero, deliberately, for parity with Rust's `System` allocator. `putUnit`
+/// writes by masked replace rather than by store, four UTF-16 units to a
+/// 64-bit word, so a mask over garbage would leave high bits set that Win32
+/// reads as more units. Zeroing here is what makes the mask sound.
+///
+/// OWNERSHIP. The wide buffer is a raw block with a manual lifetime: allocate,
+/// syscall, read the answer out, `free` before returning. `alloc`/`free` are
+/// the same pair `shadow.pkl` and `trace.pkl` already use.
+
+// `str(...)` lowers to `pickle_str_from_list` and `len(...)` on a string to
+// `pickle_str_len`; both bodies live in `abi_string`, which in turn imports
+// `abi_list` for the `List<byte>` these paths are built from. Linking the
+// module is what puts those bodies in the object, so the extern references
+// they satisfy resolve here rather than to `combined.lib`.
+import { abiStrFromList, rawByteAt } from runtime.abi_string
+// The wide buffers are raw blocks, so the raw-allocation slots must travel
+// with this module. See `abi_raw.pkl`.
+import { abiRawAlloc } from runtime.abi_raw
+
+/// `INVALID_FILE_ATTRIBUTES`. Read back as a 64-bit value; see `dword`.
+const INVALID_FILE_ATTRIBUTES: int = 4294967295
+
+/// A UTF-16 code unit, for the mask `putUnit` builds.
+const WCHAR_MASK: int = 65535
+
+/// Replacement code point `from_utf16_lossy` emits for an unpaired surrogate.
+const REPLACEMENT: int = 65533
+
+// --------------------------------------------------- open/create parameters
+//
+// The five values `fs.rs::imp` passes to `CreateFileW`, spelled out because
+// there is no `nostd.rs` constant to name here. `READ_*` and `WRITE_*` open the
+// handle; `SHARE_ALL` is `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`
+// so a file this module has open can still be observed by `abiFileExists` and
+// removed by `abiDelete` in the same run, which is what the reference asks for.
+const GENERIC_READ: int = 2147483648
+const GENERIC_WRITE: int = 1073741824
+const FILE_SHARE_ALL: int = 7
+const OPEN_EXISTING: int = 3
+const CREATE_ALWAYS: int = 2
+const FILE_ATTRIBUTE_NORMAL: int = 128
+
+/// `INVALID_HANDLE_VALUE`: `(-1isize) as WinHandle`, every bit set. This is
+/// what a failed `CreateFileW` answers - not `NULL`, which is why the guard
+/// below tests for both values the way `fs.rs` does. It is unrelated to
+/// `INVALID_FILE_ATTRIBUTES`, which is a `DWORD` sentinel for a *different*
+/// call.
+const INVALID_HANDLE: int = -1
+
+/// The read chunk `fs.rs::imp` uses: `16 * 1024` bytes, i.e. 2048 64-bit
+/// words. The reference deliberately does not size the buffer from the file -
+/// the same path has to work for pipes and other handles with no size - so the
+/// chunk is fixed and the loop is driven by the answer each call gives.
+const READ_CHUNK_BYTES: int = 16384
+const READ_CHUNK_WORDS: int = 2048
+
+// ------------------------------------------------------- `WIN32_FIND_DATAW`
+//
+// WHAT THE CALLER MUST PROVIDE, AND WHAT THE CALLER MAY READ. `FindFirstFileW`
+// writes the SDK's whole `WIN32_FIND_DATAW` - 592 bytes, because the SDK's
+// struct ends with `cFileName[MAX_PATH]` *and* `cAlternateFileName[14]` -
+// while `cFileName` starts at byte 44 either way. `nostd.rs` declares a struct
+// that stops at `cFileName` and asserts it is 564 bytes, which is 28 short of
+// what the syscall writes; that block is a `MaybeUninit` on the stack, where
+// the overshoot has padding to land in. This module's block comes from
+// `HeapAlloc`, where 28 bytes past the end is the allocator's own metadata, so
+// it is sized for the write and not for the declaration. Either way the layout
+// *read* back is the same: `cFileName` at unit 22, 260 units.
+const FIND_DATA_BYTES: int = 592
+const FIND_DATA_WORDS: int = 74
+/// Byte 44 is UTF-16 unit 22, so `cFileName` sits on a whole unit boundary and
+/// `unitAt(data, FIND_NAME_UNIT + k)` reads the name straight out of the
+/// layout - no offset arithmetic, and no chance of the two drifting apart.
+const FIND_NAME_UNIT: int = 22
+const FIND_NAME_UNITS: int = 260
+
+
+// ---------------------------------------------------------------- UTF-8 side
+
+/// The byte length of the sequence whose lead byte sits at `i`, or 0 when that
+/// byte cannot start one. `C0`/`C1` can only ever introduce an overlong form
+/// and continuation bytes cannot lead at all, so both answer 0; `F5` and above
+/// would encode past U+10FFFF.
+fn leadLen(s: string, i: int) -> int {
+    let b = s[i] as int
+    if (b < 128) {
+        return 1
+    }
+    if (b < 194) {
+        return 0
+    }
+    if (b < 224) {
+        return 2
+    }
+    if (b < 240) {
+        return 3
+    }
+    if (b < 245) {
+        return 4
+    }
+    return 0
+}
+
+/// Whether byte `i + k` is a continuation byte, `10xxxxxx`.
+fn contOk(s: string, i: int, k: int) -> bool {
+    let c = s[i + k] as int
+    c >= 128 && c <= 191
+}
+
+/// The code point a sequence of `l` bytes at `i` encodes, assuming its
+/// continuations are well formed (the caller has checked them).
+fn cpAt(s: string, i: int, l: int) -> int {
+    if (l == 1) {
+        return s[i] as int
+    }
+    var cp = 0
+    if (l == 2) {
+        cp = (s[i] as int) - 192
+    } else if (l == 3) {
+        cp = (s[i] as int) - 224
+    } else {
+        cp = (s[i] as int) - 240
+    }
+    var k = 1
+    while (k < l) {
+        cp = cp * 64 + ((s[i + k] as int) - 128)
+        k = k + 1
+    }
+    return cp
+}
+
+/// Whether `cp` is one a well-formed `l`-byte sequence may encode: not
+/// overlong for its length, inside Unicode, and never a UTF-16 surrogate.
+fn cpOk(l: int, cp: int) -> bool {
+    if (l == 1) {
+        return true
+    }
+    if (l == 2) {
+        return cp >= 128
+    }
+    if (l == 3) {
+        return cp >= 2048
+    }
+    if (cp < 65536 || cp > 1114111) {
+        return false
+    }
+    !(cp >= 55296 && cp <= 57343)
+}
+
+/// The number of UTF-16 units `s` encodes to, or -1 when `s` is not valid
+/// UTF-8. Mirrors `core::str::from_utf8`, which `path_w` runs before it will
+/// look at a path - see the header.
+fn wideUnits(s: string) -> int {
+    let n = len(s)
+    var i = 0
+    var units = 0
+    while (i < n) {
+        let l = leadLen(s, i)
+        if (l == 0) {
+            return -1
+        }
+        if (i + l > n) {
+            return -1
+        }
+        var k = 1
+        while (k < l) {
+            if (!contOk(s, i, k)) {
+                return -1
+            }
+            k = k + 1
+        }
+        if (!cpOk(l, cpAt(s, i, l))) {
+            return -1
+        }
+        if (cpAt(s, i, l) > 65535) {
+            units = units + 2
+        } else {
+            units = units + 1
+        }
+        i = i + l
+    }
+    return units
+}
+
+/// Whether the path already ends in `\` or `/`, so the search pattern should
+/// not gain a second separator.
+///
+/// This asks the RAW bytes, not decoded text, exactly as `ends_with_sep` in
+/// `fs.rs` does. For a path that is not valid UTF-8 the two answers can differ
+/// - `path_w` has thrown the bytes away and `endsWithSep` has not - and the
+/// raw one is the one the reference uses to build the pattern, so it is the
+/// one kept here.
+fn endsWithSep(path: string) -> bool {
+    let n = len(path)
+    if (n == 0) {
+        return false
+    }
+    let b = path[n - 1] as int
+    b == 92 || b == 47
+}
+
+// --------------------------------------------------------------- UTF-16 side
+
+/// Read unit `i` of a packed UTF-16 buffer: four units share a 64-bit word.
+fn unitAt(w: *int, i: int) -> int {
+    unsafe {
+        return (w[i >> 2] >> ((i & 3) * 16)) & WCHAR_MASK
+    }
+}
+
+/// Pack unit `i` of `w`, replacing exactly the 16 bits it owns. The buffer is
+/// zeroed on allocation (see the header), so the masked replace starts from a
+/// known state rather than from whatever `HeapAlloc` left behind.
+fn putUnit(w: *int, i: int, u: int) {
+    unsafe {
+        let sh = (i & 3) * 16
+        let mask = WCHAR_MASK << sh
+        w[i >> 2] = (w[i >> 2] & ((0 - 1) ^ mask)) | (u << sh)
+    }
+}
+
+/// The length of the NUL-terminated run of units starting at `start`, capped
+/// at `cap`. `fs.rs` reads `position(|&c| c == 0).unwrap_or(name.len())` off
+/// the fixed 260-unit `cFileName` field, which is this loop with that `cap`.
+fn unitRun(w: *int, start: int, cap: int) -> int {
+    unsafe {
+        var k = 0
+        while (k < cap) {
+            if (unitAt(w, start + k) == 0) {
+                return k
+            }
+            k = k + 1
+        }
+        return cap
+    }
+}
+
+/// Units the sequence at `i` occupies: 2 for a well-formed surrogate pair,
+/// 1 otherwise. A lone surrogate consumes 1 so that both passes over a buffer
+/// walk it identically while the value decodes to U+FFFD.
+fn wideStep(w: *int, i: int, n: int) -> int {
+    let u = unitAt(w, i)
+    if (u >= 55296 && u <= 56319 && (i + 1) < n) {
+        let lo = unitAt(w, i + 1)
+        if (lo >= 56320 && lo <= 57343) {
+            return 2
+        }
+    }
+    1
+}
+
+/// The code point at `i`, with an unpaired surrogate reported as U+FFFD to
+/// match `String::from_utf16_lossy`.
+fn wideCp(w: *int, i: int, n: int) -> int {
+    let u = unitAt(w, i)
+    if (wideStep(w, i, n) == 2) {
+        let lo = unitAt(w, i + 1)
+        return 65536 + ((u - 55296) * 1024) + (lo - 56320)
+    }
+    if (u >= 55296 && u <= 57343) {
+        return REPLACEMENT
+    }
+    u
+}
+
+/// UTF-8 bytes `cp` needs.
+fn utf8LenOf(cp: int) -> int {
+    if (cp < 128) {
+        return 1
+    }
+    if (cp < 2048) {
+        return 2
+    }
+    if (cp < 65536) {
+        return 3
+    }
+    4
+}
+
+/// Append `cp` to `out`, answering the bytes written.
+fn pushCp(out: List<byte>, cp: int) -> int {
+    if (cp < 128) {
+        out.push(cp as byte)
+        return 1
+    }
+    if (cp < 2048) {
+        out.push((192 + (cp / 64)) as byte)
+        out.push((128 + (cp % 64)) as byte)
+        return 2
+    }
+    if (cp < 65536) {
+        out.push((224 + (cp / 4096)) as byte)
+        out.push((128 + ((cp / 64) % 64)) as byte)
+        out.push((128 + (cp % 64)) as byte)
+        return 3
+    }
+    out.push((240 + (cp / 262144)) as byte)
+    out.push((128 + ((cp / 4096) % 64)) as byte)
+    out.push((128 + ((cp / 64) % 64)) as byte)
+    out.push((128 + (cp % 64)) as byte)
+    return 4
+}
+
+/// The `n` units at `w` as a `string`. Mirrors
+/// `String::from_utf16_lossy(&w)`, which `nostd.rs::pickle_current_dir` and
+/// the `std` build's `to_string_lossy` both end up doing. The bytes reach the
+/// object unvalidated, which is what `fs.rs` passes around.
+fn wideToStr(w: *int, n: int) -> string {
+    let out = bytes("")
+    var i = 0
+    while (i < n) {
+        pushCp(out, wideCp(w, i, n))
+        i = i + wideStep(w, i, n)
+    }
+    return str(out)
+}
+
+// ------------------------------------------------------------------- buffers
+
+/// A Win32 `DWORD` answer narrowed to 32 bits. The Windows x64 convention
+/// returns 32-bit results in `EAX`, which zeroes the upper half, but masking
+/// makes that a property this module chose rather than one it depends on -
+/// `GetFileAttributesW` distinguishes failure only by the sentinel value, and
+/// one garbage bit above bit 31 would read as "attributes are 0xFFFFFFFF".
+fn dword(v: int) -> int {
+    return v & INVALID_FILE_ATTRIBUTES
+}
+
+/// Pack the UTF-8 string `s` into `w` as UTF-16. Called only for a `s` that
+/// `wideUnits` accepted, so `leadLen`/`cpAt` here are decoding known-good
+/// input.
+fn writeWide(s: string, w: *int, units: int) -> int {
+    unsafe {
+        let n = len(s)
+        var b = 0
+        var u = 0
+        while (b < n) {
+            let l = leadLen(s, b)
+            let cp = cpAt(s, b, l)
+            if (cp > 65535) {
+                let v = cp - 65536
+                putUnit(w, u, 55296 + (v >> 10))
+                putUnit(w, u + 1, 56320 + (v & 1023))
+                u = u + 2
+            } else {
+                putUnit(w, u, cp)
+                u = u + 1
+            }
+            b = b + l
+        }
+        return u
+    }
+}
+
+/// A NUL-terminated UTF-16 copy of `s` for a wide entry point. An invalid path
+/// and an empty path both come back as the single NUL that encodes `""`, which
+/// is what `fs.rs::path_w` produces for both.
+fn wideBuf(s: string) -> *int {
+    unsafe {
+        var units = wideUnits(s)
+        if (units < 0) {
+            units = 0
+        }
+        // One extra unit for the terminator, rounded up to whole 64-bit words.
+        let words = (units + 4) / 4
+        var w = alloc(int, words)
+        var i = 0
+        while (i < words) {
+            w[i] = 0
+            i = i + 1
+        }
+        if (units > 0) {
+            writeWide(s, w, units)
+        }
+        return w
+    }
+}
+
+/// Pack byte `b` of a RAW buffer with `v`.
+///
+/// This is `byteOverwrite`'s masked replace pointed at bare memory: eight
+/// bytes to a 64-bit word, so the byte lives at `b >> 3` words in with
+/// `(b & 7) * 8` bits of shift, and there is no `BYTES_WORD` header in front
+/// of it. The clear covers exactly the addressed byte, so the word's other
+/// seven survive - which is what makes writing over an allocation this module
+/// did not zero sound, and what `rawByteAt` reads back.
+fn putRawByte(buf: *int, b: int, v: int) {
+    unsafe {
+        let sh = (b & 7) * 8
+        let mask = 255 << sh
+        buf[b >> 3] = (buf[b >> 3] & ((0 - 1) ^ mask)) | ((v & 255) << sh)
+    }
+}
+
+/// A raw copy of a non-empty `s`, for a call that takes a buffer pointer
+/// rather than a `string`.
+///
+/// `WriteFile` is handed the length alongside the pointer, so it reads exactly
+/// `n` bytes and never the words past the end - but every byte in `0..n` is
+/// written here, which is why the block needs no zeroing first. The copy exists
+/// because the bytes of a `string` sit inside its object where there is no
+/// address to hand over: `addrOf` is not a thing this language has, and the
+/// reference passes `data.as_ptr()` from a `&[u8]` it already owned.
+fn rawBuf(s: string) -> *int {
+    unsafe {
+        let n = len(s)
+        var buf = alloc(int, (n + 7) / 8)
+        var b = 0
+        while (b < n) {
+            putRawByte(buf, b, s[b] as int)
+            b = b + 1
+        }
+        return buf
+    }
+}
+
+// ------------------------------------------------------------------ syscalls
+
+/// `pickle_file_exists`: whether *anything* lives at `path`.
+///
+/// `GetFileAttributesW` answers a sentinel rather than a status, and Rust's
+/// `backend::exists` compares against exactly that sentinel - not against 0,
+/// because 0 is a legitimate attribute set (a file with no attributes set).
+#[symbol("pickle_file_exists")]
+fn abiFileExists(path: string) -> bool {
+    unsafe {
+        var w = wideBuf(path)
+        let attrs = dword(win_get_file_attributes_w(w))
+        free(w)
+        return attrs != INVALID_FILE_ATTRIBUTES
+    }
+}
+
+/// `pickle_delete`: remove a file, or an empty directory when it is one.
+///
+/// Order is load-bearing. Rust tries `remove_file` first and falls back to
+/// `remove_dir`, and `RemoveDirectoryW` on a path that is not a directory
+/// fails anyway - so the outcome agrees either way. The order is kept because
+/// it is what the reference does, not because it happens not to matter today.
+#[symbol("pickle_delete")]
+fn abiDelete(path: string) -> bool {
+    unsafe {
+        var w = wideBuf(path)
+        if (dword(win_delete_file_w(w)) != 0) {
+            free(w)
+            return true
+        }
+        let r = dword(win_remove_directory_w(w))
+        free(w)
+        return r != 0
+    }
+}
+
+/// `pickle_mkdir`: create one directory level, and fail if it exists.
+///
+/// The second `CreateDirectoryW` parameter is a security descriptor, which the
+/// reference passes as null for "inherit the parent's". It is a real parameter
+/// and not something the ABI can omit - calling a two-parameter import through
+/// a one-parameter declaration would leave the second argument as whatever the
+/// caller last put in `RDX`.
+#[symbol("pickle_mkdir")]
+fn abiMkdir(path: string) -> bool {
+    unsafe {
+        var w = wideBuf(path)
+        let r = dword(win_create_directory_w(w, 0))
+        free(w)
+        return r != 0
+    }
+}
+
+/// `pickle_current_dir`: the working directory, or `none`.
+///
+/// Two-call sizing, exactly as `nostd.rs::current_dir_wide`: `(0, null)`
+/// reports the units a real call needs *including* the terminator, and the
+/// second call reports the units it wrote *excluding* it. The second call can
+/// also report a value `>= need`, which means the directory changed between
+/// the two - the reference treats that as "unset" rather than returning a
+/// truncated path, and the same guard is kept here for the same reason.
+///
+/// The buffer comes from `alloc`, not from a frame, for the reason
+/// `nostd.rs` records: a freestanding PE has no CRT to have probed a default
+/// stack, so a large frame can span uncommitted pages and fault with
+/// `0xC0000005`. Heap memory is always mapped.
+#[symbol("pickle_current_dir")]
+fn abiCurrentDir() -> string? {
+    unsafe {
+        let need = dword(win_get_current_directory_w(0, 0))
+        if (need == 0) {
+            return none
+        }
+        let words = (need + 3) / 4
+        var w = alloc(int, words)
+        var i = 0
+        while (i < words) {
+            w[i] = 0
+            i = i + 1
+        }
+        let written = dword(win_get_current_directory_w(need, w))
+        if (written == 0 || written >= need) {
+            free(w)
+            return none
+        }
+        let s = wideToStr(w, written)
+        free(w)
+        return s
+    }
+}
+
+/// `pickle_read_file`: the bytes at `path`, or `none` when they could not be
+/// read at all.
+///
+/// Two decisions belong to `fs.rs::imp::read` and are copied rather than
+/// improved upon. The buffer is a fixed 16 KiB chunk and the loop runs until
+/// the handle stops giving - never a size taken up front - because the same
+/// code has to serve a pipe, where there is no size to take. And the answer is
+/// `Some` once *any* `ReadFile` has succeeded, even if the file turned out to
+/// be empty: a failed *first* call is `none`, a successful one that reads zero
+/// bytes is `some("")`. That distinction is the whole difference between "no
+/// such file" and "a zero-length file", and both ends of it have to survive
+/// the port.
+///
+/// What comes back is not revalidated. `pickle_str_from_list` copies list
+/// bytes into the object verbatim and `fs.rs` hands `&[u8]` to
+/// `string_from_bytes`, so bytes that are not valid UTF-8 - a file that is not
+/// text - arrive exactly as they went out. Test setup that writes one of those
+/// and reads it back is what pins that down.
+#[symbol("pickle_read_file")]
+fn abiReadFile(path: string) -> string? {
+    unsafe {
+        var w = wideBuf(path)
+        let h = win_create_file_w(w, GENERIC_READ, FILE_SHARE_ALL, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0)
+        free(w)
+        if (h == INVALID_HANDLE || h == 0) {
+            return none
+        }
+        let chunk = alloc(int, READ_CHUNK_WORDS)
+        let pN = alloc(int, 1)
+        let out = bytes("")
+        var readAny = false
+        var done = false
+        while (!done) {
+            // The reference initialises its out-parameter to 0 before every
+            // call and ignores it when `ReadFile` fails; `pN` is an 8-byte
+            // block the syscall only fills the low half of, so the whole word
+            // is cleared to keep the high half from reading as part of a count.
+            pN[0] = 0
+            if (dword(win_read_file(h, chunk, READ_CHUNK_BYTES, pN, 0)) == 0) {
+                done = true
+            } else {
+                readAny = true
+                let n = dword(pN[0])
+                if (n == 0) {
+                    done = true
+                } else {
+                    var b = 0
+                    while (b < n) {
+                        out.push(rawByteAt(chunk, b) as byte)
+                        b = b + 1
+                    }
+                }
+            }
+        }
+        free(pN)
+        free(chunk)
+        win_close_handle(h)
+        if (!readAny) {
+            return none
+        }
+        return str(out)
+    }
+}
+
+/// `pickle_write_file`: overwrite `path` with `text`'s bytes.
+///
+/// `CREATE_ALWAYS` truncates what is already there rather than appending, so a
+/// second write replaces the first outright - `std::fs::write` does the same,
+/// and a test that writes twice and reads back only the second string is what
+/// proves it. An empty `text` never reaches `WriteFile`: the reference
+/// short-circuits to success, which both avoids asking Win32 to write zero
+/// bytes and makes the answer not depend on what it would have made of a null
+/// buffer.
+///
+/// The whole body runs under `unsafe` because it owns two raw blocks and reads
+/// the string it is packing through `unsafe` indexing; every one of them is
+/// released on every path out, including the two early returns for a handle
+/// that never opened.
+#[symbol("pickle_write_file")]
+fn abiWriteFile(path: string, text: string) -> bool {
+    unsafe {
+        var w = wideBuf(path)
+        let h = win_create_file_w(w, GENERIC_WRITE, FILE_SHARE_ALL, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0)
+        free(w)
+        if (h == INVALID_HANDLE || h == 0) {
+            return false
+        }
+        var ok = true
+        let n = len(text)
+        if (n != 0) {
+            let buf = rawBuf(text)
+            let pW = alloc(int, 1)
+            pW[0] = 0
+            let r = dword(win_write_file(h, buf, n, pW, 0))
+            ok = r != 0 && dword(pW[0]) == n
+            free(pW)
+            free(buf)
+        }
+        win_close_handle(h)
+        return ok
+    }
+}
+
+/// `pickle_list_dir`: the full paths of everything in the directory, or `none`
+/// when it cannot be listed at all.
+///
+/// The pattern and every child path are assembled here in UTF-16 units rather
+/// than by appending to a `string` and re-encoding, because that is what the
+/// reference does and because the difference is observable. `fs.rs` starts from
+/// the units `path_w` already produced - which for a path that is not valid
+/// UTF-8 are *none of them*, leaving just `\*` and a listing of the drive root
+/// - and a round trip through UTF-8 would instead collapse the whole pattern to
+/// the empty string. Building from the same units keeps both that quirk and the
+/// separator rule (`endsWithSep`, asked of the raw bytes) intact.
+///
+/// `.` and `..` are dropped, which is the part `std::fs::read_dir` does for the
+/// std build and `FindFirstFileW` does *not* do for this one: the entries come
+/// back either way, so the skip has to happen here. An empty directory still
+/// answers `some` with nothing in it - `.` alone satisfies `FindFirstFileW` -
+/// and only a path that is not a directory answers `none`.
+///
+/// The structure has `cFileName` at unit 22; see the constants above for the
+/// size this module has to provide and why it is not the one `nostd.rs` uses.
+#[symbol("pickle_list_dir")]
+fn abiListDir(path: string) -> List<string>? {
+    unsafe {
+        var wlen = wideUnits(path)
+        if (wlen < 0) {
+            wlen = 0
+        }
+        let needSep = !endsWithSep(path)
+        let w = wideBuf(path)
+
+        // `path` (minus its terminator) + an optional separator + `*` + NUL.
+        var pUnits = wlen
+        if (needSep) {
+            pUnits = pUnits + 1
+        }
+        pUnits = pUnits + 1
+        let pWords = (pUnits + 4) / 4
+        var pw = alloc(int, pWords)
+        var i = 0
+        while (i < pWords) {
+            pw[i] = 0
+            i = i + 1
+        }
+        i = 0
+        while (i < wlen) {
+            putUnit(pw, i, unitAt(w, i))
+            i = i + 1
+        }
+        if (needSep) {
+            putUnit(pw, wlen, 92)
+        }
+        putUnit(pw, pUnits - 1, 42)
+
+        var data = alloc(int, FIND_DATA_WORDS)
+        i = 0
+        while (i < FIND_DATA_WORDS) {
+            data[i] = 0
+            i = i + 1
+        }
+
+        let find = win_find_first_file_w(pw, data)
+        free(pw)
+        if (find == INVALID_HANDLE || find == 0) {
+            free(data)
+            free(w)
+            return none
+        }
+
+        var out = [""]
+        out.pop()
+        var more = true
+        while (more) {
+            let nlen = unitRun(data, FIND_NAME_UNIT, FIND_NAME_UNITS)
+            let isDot = nlen == 1 && unitAt(data, FIND_NAME_UNIT) == 46
+            let isDotDot = nlen == 2 && unitAt(data, FIND_NAME_UNIT) == 46 && unitAt(data, FIND_NAME_UNIT + 1) == 46
+            if (!isDot && !isDotDot) {
+                var base = wlen
+                if (needSep) {
+                    base = base + 1
+                }
+                let cUnits = base + nlen
+                let cWords = (cUnits + 4) / 4
+                var cw = alloc(int, cWords)
+                var j = 0
+                while (j < cWords) {
+                    cw[j] = 0
+                    j = j + 1
+                }
+                j = 0
+                while (j < wlen) {
+                    putUnit(cw, j, unitAt(w, j))
+                    j = j + 1
+                }
+                if (needSep) {
+                    putUnit(cw, wlen, 92)
+                }
+                j = 0
+                while (j < nlen) {
+                    putUnit(cw, base + j, unitAt(data, FIND_NAME_UNIT + j))
+                    j = j + 1
+                }
+                out.push(wideToStr(cw, cUnits))
+                free(cw)
+            }
+            if (dword(win_find_next_file_w(find, data)) == 0) {
+                more = false
+            }
+        }
+        win_find_close(find)
+        free(data)
+        free(w)
+        return out
+    }
+}

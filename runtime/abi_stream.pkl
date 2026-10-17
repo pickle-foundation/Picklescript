@@ -1,0 +1,471 @@
+module runtime.abi_stream
+
+/// Port of `runtime/src/stream.rs` plus the buffered-file half of
+/// `runtime/src/nostd.rs`: the nine symbols that make up the `Stream`
+/// surface, as `#[symbol]` bodies a build can answer with `combined.lib`
+/// absent. These are the last host-facing sealed surface whose ready-made
+/// bodies still lived in Rust.
+///
+/// WHY THE FINALIZER IS SAFE TO IGNORE. The native `Stream` class carries
+/// `PICKLE_CLASS_FLAG_FINALIZER`; `stream_finalizer` does a
+/// `Box::from_raw` on the inner pointer a stream object holds at
+/// `STREAM_INNER_OFF` and drops it, releasing the file handle. Nothing here
+/// replicates that, and it must not. The native collector only ever sweeps
+/// objects it allocated itself on its own heap; the objects these bodies
+/// create come from `alloc(int, n)`, which is raw-heap memory the port
+/// already uses for every box, list, and class instance (`abi_box.pkl`,
+/// `abi_list.pkl` record the same arrangement). A port-created stream is
+/// invisible to the native collector, and every battery run sets
+/// `PKL_NO_AUTO_GC=1`, so the finalizer can never run on it. Divergence on
+/// the operating-point: a stream that is neither closed nor leaked-under-GC
+/// holds its OS handle until the process exits, where the native build's
+/// finalizer released it when GC reclaimed the object. The same leak-vs-drop
+/// story already applies to every port-allocated class instance, and the
+/// explicit `close` path below still releases the handle.
+///
+/// WHY THE OBJECTS ARE HAND-BUILT. `abiClassNew` clamps external class ids
+/// below `PICKLE_CLASS_USER_BASE` (the compiler's static class check), so a
+/// `Stream` cannot come from it. `stream_new`'s contract is directly re-
+/// implemented instead: a 4-word object with the stream class id, byte size
+/// `STREAM_OBJECT_SIZE`, and the inner block pointer in slot 0 (word 3).
+///
+/// THE INNER BLOCK IS PORT-OWNED. The native stores a `Box<StreamInner>` of
+/// `{ closed, target }` behind the object. The port keeps an 8-word raw
+/// block with the observable fields spelled out: closed / kind / handle /
+/// rpos / rend / wlen / rbuf / wbuf (see the consts below). Only these
+/// bodies read it, so the layout is free to be explicit; it is zero-filled
+/// at `newStream` because `alloc` hands back uninitialised memory.
+///
+/// WHY THE BUFFERS ARE EXACTLY 8192 BYTES. `nostd.rs`'s `BufferedFile`
+/// reads through a refill buffer of `STREAM_BUFFER` and writes through an
+/// accumulator flushed the moment it reaches `STREAM_BUFFER`; the `std`
+/// build's `BufReader`/`BufWriter` default to the same 8192 constant. The
+/// buffering is observable - a `read(1)` on a pipe serves from the buffer
+/// a previous `read(2)` filled, and a `write` under 8192 bytes is not on
+/// the OS until `flush` - so the port reproduces the sizes, the lazy first
+/// refill, and the flush boundary exactly. The rbuf/wbuf blocks come from
+/// `alloc(int, 1024)` = 8192 bytes and are freed on `close`.
+///
+/// WHY WRITES STOP AT THE FIRST BAD SLOT. `write_slots` walks the list
+/// slots, asks each to "accept one byte", and counts accepts, breaking on
+/// a null slot or a failed accept. A writer's accept is "append to the
+/// buffer; flush when it outgrows 8192" (so a full-buffer flush failure
+/// stops the count mid-list), while stdout/stderr accept everything and
+/// hand the whole collected run to the OS once. The port reproduces both
+/// arms: the writer path buffers per byte with a lazy 8192 block, and the
+/// console paths fill a temporary byte block and make one
+/// `writeStdout`/`writeStderr` call, returning the count whether or not the
+/// OS write succeeded - exactly what `pickle_stream_write` answers for
+/// `stdout_stream()`.
+///
+/// WHY STDOUT/STDERR ROUTE THROUGH `abi_stdio`. The console write and the
+/// exceptions path must agree on one `GetStdHandle` story; `abi_stdio` is
+/// that seam, and the exceptions/report modules already use it. These two
+/// bodies call it by name and declare no symbols, so importing this module
+/// adds the nine stream symbols and nothing else.
+///
+/// WHY THE CLI MUST NOT IMPORT THIS MODULE. A `#[symbol]` body is wired in
+/// by an import (measured, see `abi_exception`'s header). `cli/main` and
+/// `cli/history` import their write path through `abi_stdio`; importing
+/// `runtime.abi_stream` from the CLI would activate these bodies in the
+/// self-host gap and stop the firmware-surface number from measuring the
+/// archive the editor runs on. Verification goes through `pickle test` and
+/// the `sl_stream` selflink probe, never through the CLI.
+
+import { PICKLE_CLASS_STREAM, PICKLE_CLASS_BOX_INT } from runtime.object
+import { newBox, boxBits } from runtime.abi_box
+import { abiListNew, abiListLen, abiListGet, abiListPush } from runtime.abi_list
+import { rawByteAt } from runtime.abi_string
+import { wideBuf, putRawByte, dword, GENERIC_READ, GENERIC_WRITE, FILE_SHARE_ALL, OPEN_EXISTING, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, INVALID_HANDLE } from runtime.abi_fs
+import { writeStdout, writeStderr } from runtime.abi_stdio
+import { STREAM_OBJECT_SIZE } from runtime.layout
+import { STREAM_PROC, abiProcClose } from runtime.abi_process
+// Stream objects are built with `alloc(int, 4)` and are managed objects like
+// any box/list; record them in the port's sweepability registry. The inner
+// block they point at is raw backing (see "THE INNER BLOCK IS PORT-OWNED"),
+// never registered.
+import { abiRegisterObject } from runtime.abi_raw
+
+/// `nostd.rs`'s `STREAM_BUFFER`, the `std` build's `BufReader`/`BufWriter`
+/// default: 8 KiB. Buffers this big; see the header.
+const STREAM_BUFFER: int = 8192
+
+/// Buffer word counts: 8192 bytes = 1024 64-bit words.
+const STREAM_WORDS: int = 1024
+
+/// `CreateFileW` disposition and access right the reference uses for
+/// append (not in `abi_fs.pkl`, which only spells the ones `fs.rs` uses).
+const FILE_APPEND_DATA: int = 4
+const OPEN_ALWAYS: int = 4
+
+/// The inner-block word offsets. `CLOSED` and `KIND` gate the method bodies;
+/// `HANDLE` is the Win32 handle; `RPOS`/`REND` bound the unread region of
+/// `RBUF`; `WLEN` is how many bytes of `WBUF` are waiting on the OS.
+const CLOSED: int = 0
+const KIND: int = 1
+const HANDLE: int = 2
+const RBUF: int = 3
+const RPOS: int = 4
+const REND: int = 5
+const WBUF: int = 6
+const WLEN: int = 7
+
+const INNER_WORDS: int = 8
+
+/// The stream kind, as the reference's `StreamTarget` variants map onto the
+/// operations one can perform. Matches `runtime/stream.pkl`'s own constants.
+const STREAM_READER: int = 0
+const STREAM_WRITER: int = 1
+const STREAM_STDOUT: int = 2
+const STREAM_STDERR: int = 3
+
+/// The word holding the inner pointer: `STREAM_INNER_OFF` is `HEADER` = 24
+/// bytes = word 3.
+const STREAM_INNER_WORD: int = 3
+
+/// Allocate a zeroed 8-word inner block for `kind` with handle `handle`.
+fn newInner(kind: int, handle: int) -> *int {
+    unsafe {
+        var p = alloc(int, INNER_WORDS)
+        p[CLOSED] = 0
+        p[KIND] = kind
+        p[HANDLE] = handle
+        p[RBUF] = 0
+        p[RPOS] = 0
+        p[REND] = 0
+        p[WBUF] = 0
+        p[WLEN] = 0
+        return p
+    }
+}
+
+/// Build the 32-byte `PStream` object for `inner`, mirroring
+/// `stream_new`: object size `STREAM_OBJECT_SIZE`, stream class id, inner in
+/// slot 0. Word layout matches what `abi_box.newBox` produces for a box.
+fn makeStream(inner: *int) -> *int {
+    unsafe {
+        var obj = alloc(int, 4)
+        obj[0] = 0
+        obj[1] = PICKLE_CLASS_STREAM
+        obj[2] = STREAM_OBJECT_SIZE
+        obj[3] = inner as int
+        abiRegisterObject(obj)
+        return obj
+    }
+}
+
+/// The share mode `nostd::BufferedFile::open` passes: read|write|delete,
+/// so a file held by a stream stays observable and deletable by the file
+/// ABI in the same run. (Imported from `abi_fs` as `FILE_SHARE_ALL`.)
+fn openFile(path: string, access: int, disposition: int, kind: int) -> *int {
+    unsafe {
+        var w = wideBuf(path)
+        let h = win_create_file_w(w, access, FILE_SHARE_ALL, 0, disposition, FILE_ATTRIBUTE_NORMAL, 0)
+        free(w)
+        if (h == INVALID_HANDLE || h == 0) {
+            return 0 as *int
+        }
+        var inner = newInner(kind, h)
+        return makeStream(inner)
+    }
+}
+
+/// Refill `rbuf` from the handle. `true` when anything was read; `false`
+/// at end of input or on error. Mirrors `BufferedFile::refill`: lazily
+/// allocate the 8192-byte buffer, zero the read-count cell before the call
+/// (`ReadFile` only fills the low half of a word), then set `rpos = 0` and
+/// `rend = n` whether or not the call succeeded.
+fn refill(inner: *int) -> bool {
+    unsafe {
+        var rbuf = inner[RBUF] as *int
+        if (rbuf == 0 as *int) {
+            rbuf = alloc(int, STREAM_WORDS)
+            inner[RBUF] = rbuf as int
+        }
+        var pN = alloc(int, 1)
+        pN[0] = 0
+        let ok = dword(win_read_file(inner[HANDLE], rbuf, STREAM_BUFFER, pN, 0)) != 0
+        let n = dword(pN[0])
+        free(pN)
+        inner[RPOS] = 0
+        inner[REND] = n
+        return ok && n > 0
+    }
+}
+
+/// Hand every buffered byte to the OS. `true` when all `WLEN` bytes were
+/// accepted; `false` on a short or failed write. Mirrors
+/// `BufferedFile::flush`: loop `WriteFile` over the remaining tail, break on
+/// error or a zero count, then clear the buffer whether or not the loop
+/// completed (the reference calls `wbuf.clear()` unconditionally).
+fn flushWriter(inner: *int) -> bool {
+    unsafe {
+        var wbuf = inner[WBUF] as *int
+        var total = inner[WLEN]
+        if (total == 0) {
+            return true
+        }
+        var done = 0
+        while (done < total) {
+            var pW = alloc(int, 1)
+            pW[0] = 0
+            let ok = dword(win_write_file(inner[HANDLE], (wbuf as int) + done, total - done, pW, 0)) != 0
+            let n = dword(pW[0])
+            free(pW)
+            if (!ok || n == 0) {
+                break
+            }
+            done = done + n
+        }
+        inner[WLEN] = 0
+        return done == total
+    }
+}
+
+/// Accept one byte into a writer, buffering it. Mirrors
+/// `BufferedFile::write_all`: append, and flush the moment the buffer
+/// reaches `STREAM_BUFFER`. The reference extends a `Vec` and flushes at
+/// `>= STREAM_BUFFER`; a fixed 8192 block is indistinguishable because a
+/// write never appends more than one byte before checking.
+fn putWriter(inner: *int, byte: int) -> bool {
+    unsafe {
+        var wbuf = inner[WBUF] as *int
+        if (wbuf == 0 as *int) {
+            wbuf = alloc(int, STREAM_WORDS)
+            inner[WBUF] = wbuf as int
+        }
+        putRawByte(wbuf, inner[WLEN], byte)
+        inner[WLEN] = inner[WLEN] + 1
+        if (inner[WLEN] < STREAM_BUFFER) {
+            return true
+        }
+        return flushWriter(inner)
+    }
+}
+
+/// Open `path` for reading, or `0` when it cannot be opened.
+#[symbol("pickle_stream_open_read")]
+fn abiStreamOpenRead(path: string) -> *int {
+    return openFile(path, GENERIC_READ, OPEN_EXISTING, STREAM_READER)
+}
+
+/// Open `path` for writing, truncating any existing content, or `0` when
+/// the path cannot be opened.
+#[symbol("pickle_stream_open_write")]
+fn abiStreamOpenWrite(path: string) -> *int {
+    return openFile(path, GENERIC_WRITE, CREATE_ALWAYS, STREAM_WRITER)
+}
+
+/// Open `path` for appending, creating it if absent.
+#[symbol("pickle_stream_open_append")]
+fn abiStreamOpenAppend(path: string) -> *int {
+    return openFile(path, FILE_APPEND_DATA, OPEN_ALWAYS, STREAM_WRITER)
+}
+
+/// A `Stream` bound to the process's stdout.
+#[symbol("pickle_stdout_stream")]
+fn abiStdoutStream() -> *int {
+    var inner = newInner(STREAM_STDOUT, 0)
+    return makeStream(inner)
+}
+
+/// A `Stream` bound to the process's stderr.
+#[symbol("pickle_stderr_stream")]
+fn abiStderrStream() -> *int {
+    var inner = newInner(STREAM_STDERR, 0)
+    return makeStream(inner)
+}
+
+/// Read up to `n` bytes from `stream`. Returns a fresh `List<byte>` of
+/// exactly the bytes read (a short list means the stream was exhausted
+/// partway), or `0` at end of stream / when the stream is closed, is not a
+/// reader, or the underlying read fails.
+///
+/// Mirrors `pickle_stream_read`: clamp a negative `n` to zero, serve from
+/// the refill buffer (refilling once when `rpos == rend`), cap the result
+/// by both `n` and what the buffer holds, and box each byte as a `Box_int`.
+/// A `read(0)` (or `read(negative)`) is an empty output, which the
+/// reference answers `0`/`none` without touching the OS.
+#[symbol("pickle_stream_read")]
+fn abiStreamRead(stream: *int, n: int) -> *int {
+    unsafe {
+        if (stream == 0 as *int) {
+            return 0 as *int
+        }
+        var inner = stream[STREAM_INNER_WORD] as *int
+        if (inner[CLOSED] != 0) {
+            return 0 as *int
+        }
+        if (inner[KIND] != STREAM_READER) {
+            return 0 as *int
+        }
+        var cap = n
+        if (cap < 0) {
+            cap = 0
+        }
+        if (cap == 0) {
+            return 0 as *int
+        }
+        if (inner[RPOS] == inner[REND] && !refill(inner)) {
+            return 0 as *int
+        }
+        var avail = inner[REND] - inner[RPOS]
+        var got = avail
+        if (cap < got) {
+            got = cap
+        }
+        if (got == 0) {
+            return 0 as *int
+        }
+        var l = abiListNew(got)
+        var rbuf = inner[RBUF] as *int
+        var i = 0
+        while (i < got) {
+            abiListPush(l, newBox(PICKLE_CLASS_BOX_INT, rawByteAt(rbuf, inner[RPOS] + i)))
+            i = i + 1
+        }
+        inner[RPOS] = inner[RPOS] + got
+        return l
+    }
+}
+
+/// Write `bytes` (a `List<byte>`) to `stream`, returning the number of
+/// bytes written - `0` when the stream is closed, is not writable (a
+/// reader), or the write immediately fails; less than `bytes.len()` when it
+/// fails partway.
+///
+/// Mirrors `write_slots` + the three targets: a writer accepts each byte
+/// through `putWriter` (buffered, flushed at 8192); stdout and stderr
+/// collect every byte into a temporary block and make exactly one
+/// `writeStdout`/`writeStderr` call when anything was collected, then report
+/// the count - the reference's console accept is "always true" and the OS
+/// result is discarded. Stops at the first null slot.
+#[symbol("pickle_stream_write")]
+fn abiStreamWrite(stream: *int, bytes: *int) -> int {
+    unsafe {
+        if (stream == 0 as *int) {
+            return 0
+        }
+        var inner = stream[STREAM_INNER_WORD] as *int
+        if (inner[CLOSED] != 0) {
+            return 0
+        }
+        let kind = inner[KIND]
+        if (kind != STREAM_WRITER && kind != STREAM_STDOUT && kind != STREAM_STDERR) {
+            return 0
+        }
+        let n = abiListLen(bytes)
+        var tmp: *int = 0 as *int
+        if (kind != STREAM_WRITER) {
+            tmp = alloc(int, (n + 7) / 8)
+        }
+        var written = 0
+        var i = 0
+        while (i < n) {
+            var e = abiListGet(bytes, i)
+            if (e == 0 as *int) {
+                break
+            }
+            let byte = boxBits(e) & 255
+            var ok = false
+            if (kind == STREAM_WRITER) {
+                ok = putWriter(inner, byte)
+            } else {
+                putRawByte(tmp, written, byte)
+                ok = true
+            }
+            if (ok) {
+                written = written + 1
+            } else {
+                break
+            }
+            i = i + 1
+        }
+        if (kind == STREAM_STDOUT) {
+            if (written > 0) {
+                let _ = writeStdout((tmp as int), written)
+            }
+            free(tmp)
+        } else if (kind == STREAM_STDERR) {
+            if (written > 0) {
+                let _ = writeStderr((tmp as int), written)
+            }
+            free(tmp)
+        }
+        return written
+    }
+}
+
+/// Push buffered writer bytes out to the host. `true` when the flush
+/// succeeded; `false` for a closed stream; `true` for a reader (nothing
+/// buffered) and for the console streams (their writes are unbuffered).
+#[symbol("pickle_stream_flush")]
+fn abiStreamFlush(stream: *int) -> bool {
+    unsafe {
+        if (stream == 0 as *int) {
+            return false
+        }
+        var inner = stream[STREAM_INNER_WORD] as *int
+        if (inner[CLOSED] != 0) {
+            return false
+        }
+        if (inner[KIND] == STREAM_WRITER) {
+            return flushWriter(inner)
+        }
+        if (inner[KIND] == STREAM_READER || inner[KIND] == STREAM_STDOUT || inner[KIND] == STREAM_STDERR) {
+            return true
+        }
+        if (inner[KIND] == STREAM_PROC) {
+            // The reference's `StreamTarget::Proc` arm: nothing to flush.
+            return true
+        }
+        return false
+    }
+}
+
+/// Close `stream`, flushing any buffered output and releasing the handle.
+/// Idempotent: `true` on the first close, `false` for a closed or foreign
+/// stream. Releases the raw buffer blocks allocated along the way. Closing a
+/// process handle kills, reaps, and releases the child's handles — the
+/// `ProcInner::drop` path, owned entirely by `abi_process.abiProcClose`.
+#[symbol("pickle_stream_close")]
+fn abiStreamClose(stream: *int) -> bool {
+    unsafe {
+        if (stream == 0 as *int) {
+            return false
+        }
+        var inner = stream[STREAM_INNER_WORD] as *int
+        if (inner[CLOSED] != 0) {
+            return false
+        }
+        inner[CLOSED] = 1
+        let kind = inner[KIND]
+        if (kind == STREAM_PROC) {
+            // The proc inner is a 22-word block whose first eight slots only
+            // share the first three meanings; `abiProcClose` owns its whole
+            // layout, so the generic buffer-free below must not run on it.
+            return abiProcClose(inner)
+        }
+        var result = false
+        if (kind == STREAM_WRITER) {
+            result = flushWriter(inner)
+            let _ = win_close_handle(inner[HANDLE])
+        } else if (kind == STREAM_READER) {
+            result = true
+            let _ = win_close_handle(inner[HANDLE])
+        } else if (kind == STREAM_STDOUT || kind == STREAM_STDERR) {
+            result = true
+        }
+        var rbuf = inner[RBUF] as *int
+        if (rbuf != 0 as *int) {
+            free(rbuf)
+            inner[RBUF] = 0
+        }
+        var wbuf = inner[WBUF] as *int
+        if (wbuf != 0 as *int) {
+            free(wbuf)
+            inner[WBUF] = 0
+        }
+        return result
+    }
+}

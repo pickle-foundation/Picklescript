@@ -1,0 +1,178 @@
+module runtime.arena_test
+
+import { arena, arenaOf, Arena, RawChunk, DEFAULT_CHUNK_ELEMS, INVALID_ADDR } from runtime.arena
+
+test fn default_slab_size_is_64() {
+    expect(DEFAULT_CHUNK_ELEMS).toBe(64)
+    expect(INVALID_ADDR).toBe(-1)
+    var a = arena()
+    expect(a.chunkElems).toBe(64)
+}
+
+test fn fresh_arena_is_empty() {
+    var a = arenaOf(4)
+    expect(a.capacity()).toBe(0)
+    expect(a.elementsInUse()).toBe(0)
+    expect(a.unallocated()).toBe(0)
+    expect(a.chunksHeld).toBe(0)
+}
+
+test fn bump_alloc_hands_contiguous_addresses() {
+    var a = arenaOf(8)
+    var x = a.alloc(1)
+    var y = a.alloc(1)
+    var z = a.alloc(1)
+    expect(x).toBe(0)
+    expect(y).toBe(1)
+    expect(z).toBe(2)
+    expect(a.elementsInUse()).toBe(3)
+    expect(a.chunksHeld).toBe(1)
+}
+
+test fn alloc_consumes_n_elements() {
+    var a = arenaOf(8)
+    expect(a.alloc(3)).toBe(0)
+    expect(a.alloc(2)).toBe(3)
+    expect(a.allocElems).toBe(5)
+}
+
+test fn first_alloc_chains_the_initial_slab() {
+    var a = arenaOf(4)
+    expect(a.alloc(1)).toBe(0)
+    expect(a.chunksHeld).toBe(1)
+    expect(a.capacity()).toBe(4)
+}
+
+test fn chunk_boundary_never_straddles() {
+    var a = arenaOf(4)
+    expect(a.alloc(2)).toBe(0)
+    expect(a.alloc(3)).toBe(4)
+    expect(a.chunksHeld).toBe(2)
+    expect(a.capacity()).toBe(8)
+    expect(a.elementsInUse()).toBe(7)
+}
+
+test fn has_room_checks_the_current_slab_only() {
+    var a = arenaOf(4)
+    a.alloc(3)
+    expect(a.hasRoom(1)).toBe(true)
+    expect(a.hasRoom(2)).toBe(false)
+}
+
+test fn align_pads_within_the_chunk() {
+    var a = arenaOf(16)
+    a.alloc(1)
+    a.align(4)
+    expect(a.cursorElems).toBe(4)
+    expect(a.alloc(1)).toBe(4)
+    a.align(2)
+    expect(a.cursorElems).toBe(6)
+    a.align(4)
+    expect(a.cursorElems).toBe(8)
+    expect(a.chunksHeld).toBe(1)
+    a.align(1)
+    expect(a.cursorElems).toBe(8)
+}
+
+test fn align_wraps_to_a_fresh_slab() {
+    var a = arenaOf(4)
+    a.alloc(2)
+    a.align(4)
+    expect(a.chunksHeld).toBe(2)
+    expect(a.cursorElems).toBe(0)
+    expect(a.alloc(1)).toBe(4)
+}
+
+test fn reset_drops_the_whole_chain() {
+    var a = arenaOf(4)
+    a.alloc(2)
+    a.alloc(1)
+    expect(a.alloc(1)).toBe(3)
+    expect(a.chunksHeld).toBe(1)
+    expect(a.capacity()).toBe(4)
+    expect(a.allocElems).toBe(4)
+    a.reset()
+    expect(a.chunksHeld).toBe(0)
+    expect(a.capacity()).toBe(0)
+    expect(a.elementsInUse()).toBe(0)
+    expect(a.unallocated()).toBe(0)
+    expect(a.allocElems).toBe(0)
+    expect(a.alloc(1)).toBe(0)
+    expect(a.chunksHeld).toBe(1)
+}
+
+test fn interior_pointer_math_matches_slab_layout() {
+    var a = arenaOf(4)
+    var x = a.alloc(2)
+    var y = a.alloc(2)
+    var z = a.alloc(1)
+    expect(a.chunkIndexOf(x)).toBe(0)
+    expect(a.inChunkIndex(x)).toBe(0)
+    expect(a.chunkIndexOf(y)).toBe(0)
+    expect(a.inChunkIndex(y)).toBe(2)
+    expect(a.chunkIndexOf(z)).toBe(1)
+    expect(a.inChunkIndex(z)).toBe(0)
+    expect(a.chunkIndexOf(3)).toBe(0)
+    expect(a.inChunkIndex(3)).toBe(3)
+    expect(a.chunkIndexOf(7)).toBe(1)
+    expect(a.inChunkIndex(7)).toBe(3)
+}
+
+test fn zero_size_alloc_returns_next_free_without_consuming() {
+    var a = arenaOf(8)
+    expect(a.alloc(0)).toBe(0)
+    expect(a.elementsInUse()).toBe(0)
+    expect(a.allocElems).toBe(0)
+    expect(a.alloc(1)).toBe(0)
+    expect(a.allocElems).toBe(1)
+}
+
+test fn negative_alloc_is_invalid() {
+    var a = arenaOf(8)
+    expect(a.alloc(-1)).toBe(INVALID_ADDR)
+    expect(a.chunksHeld).toBe(0)
+}
+
+test fn oversized_alloc_is_clamped_to_a_slab() {
+    var a = arenaOf(4)
+    expect(a.alloc(10)).toBe(0)
+    expect(a.allocElems).toBe(4)
+    expect(a.elementsInUse()).toBe(4)
+    expect(a.alloc(1)).toBe(4)
+    expect(a.chunksHeld).toBe(2)
+}
+
+test fn raw_chunk_bumps_writes_and_reads_back() {
+    unsafe {
+        var c = RawChunk(alloc(int, 4), 4)
+        var a = c.bump()
+        var b = c.bump()
+        c.set(a, 7)
+        c.set(b, 8)
+        expect(c.get(a)).toBe(7)
+        expect(c.get(b)).toBe(8)
+        expect(c.remaining()).toBe(2)
+        expect(c.bump()).toBe(2)
+        expect(c.remaining()).toBe(1)
+        c.freeIt()
+    }
+}
+
+test fn raw_chunk_exhausted_bump_is_invalid() {
+    unsafe {
+        var c = RawChunk(alloc(int, 2), 2)
+        c.bump()
+        c.bump()
+        expect(c.bump()).toBe(INVALID_ADDR)
+        expect(c.remaining()).toBe(0)
+        c.freeIt()
+    }
+}
+
+test fn raw_chunk_free_happens_exactly_once() {
+    unsafe {
+        var c = RawChunk(alloc(int, 2), 2)
+        expect(c.freeIt()).toBe(true)
+        expect(c.freeIt()).toBe(false)
+    }
+}

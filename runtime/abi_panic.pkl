@@ -1,0 +1,109 @@
+module runtime.abi_panic
+
+/// Port of `runtime/src/panic.rs`'s fatal `pickle_panic_*` family - the paths
+/// for a `match` with no arm, an unwrapped none, missing interface dispatch,
+/// and a spread arity mismatch - plus the `fatal` writer shared with the cast
+/// failures.
+///
+/// THE BYTE CONTRACT. The reference routes the message through
+/// `pickle_panic_cstr` -> `pickle_panic_bytes` -> `fatal`, which writes
+/// `fatal: pickle: match is not exhaustive\n` to stderr and exits 1. The `nostd`
+/// arm reaches stderr through `nostd::console_error_write` - one `WriteFile` on
+/// the stderr handle - and exits through `nostd::exit`, i.e. `ExitProcess`.
+/// Byte-parity harnesses compare stderr exactly, so this body writes the same
+/// three byte runs through `abi_stdio::writeStderr` (the reference's own route:
+/// `GetStdHandle(STD_ERROR_HANDLE)` plus one `WriteFile`) and terminates with
+/// `win_exit`, the `ExitProcess` builtin. The pattern - string pointer plus
+/// `STR_BYTES_OFF` for inline bytes, length from `len`, discard-style extern
+/// calls - is `abi_exception::writeErr` verbatim, byte-verified against the
+/// native runtime.
+///
+/// WHAT IS NOT PORTED. `pickle_test_capture_*` routes recoverable failures
+/// through the test harness; a non-exhaustive match is not a recoverable
+/// condition, and in test code it is caught by the emitter as a fatal compile-
+/// time path (the call is placed on a fall-through branch `match` lowering
+/// proves unreachable forward). Same shape as `pickle_exit`: a fatality, not a
+/// yield.
+///
+/// VERIFIED. A lock-step AOT probe (`tests/tmp/sl_panic.pkl`) matches the
+/// no-import oracle byte-for-byte: exit code 1, stderr exactly
+/// `fatal: pickle: match is not exhaustive\n`. The body keeps no managed cells
+/// and performs no allocation, so it never coexists with a collector the way
+/// `abi_shadow` must.
+///
+/// NO `println` ANYWHERE IN THIS BODY. `println` lowers through
+/// `pickle_str_concat`, re-entering the very machinery that scans frames; the
+/// stderr write is brokered by `abi_stdio`, which moves raw bytes only.
+import { byteAt } from runtime.abi_string
+import { writeStderr } from runtime.abi_stdio
+import { STR_BYTES_OFF } from runtime.layout
+
+/// One `WriteFile` of `s` to stderr, decoding the string object's inline bytes.
+fn writeErr(s: string) {
+    unsafe {
+        var p = &s
+        let _ = writeStderr((p as int) + STR_BYTES_OFF, len(s))
+    }
+}
+
+/// ABI: a `match` with no matching arm. Fatal: writes the message and exits 1.
+#[symbol("pickle_panic_no_match")]
+fn abiPanicNoMatch() -> int {
+    writeErr("fatal: ")
+    writeErr("pickle: match is not exhaustive")
+    writeErr("\n")
+    win_exit(1)
+    return 0
+}
+
+/// Fatal writer for callers that bring their own literal. Mirrors
+/// `panic.rs::fatal` (FATAL banner + msg + newline, three writes, exit 1) for
+/// the paths whose message is not a `pickle_panic_*` symbol: the two cast
+/// failures in `abi_classpred` reach native `pickle_panic_cstr` with their own
+/// literal, and the port folds that cstr -> bytes -> fatal route into one
+/// call. Exported; like every body here it allocates nothing and keeps no
+/// managed cells.
+fn fatalMsg(msg: string) {
+    writeErr("fatal: ")
+    writeErr(msg)
+    writeErr("\n")
+    win_exit(1)
+}
+
+/// ABI: `x?` unwrapped a none value. Fatal: `pickle: unwrapped none value`.
+/// Reached from emit's `optUnwrap` (a none at runtime, a path the checker
+/// cannot rule out) via `externCallVoid`.
+#[symbol("pickle_panic_none_unwrap")]
+fn abiPanicNoneUnwrap() -> int {
+    writeErr("fatal: ")
+    writeErr("pickle: unwrapped none value")
+    writeErr("\n")
+    win_exit(1)
+    return 0
+}
+
+/// ABI: interface dispatch found no method implementation. Fatal:
+/// `pickle: interface method dispatch found no implementation`. Emit places it
+/// on the fp==0 fallback of `interfaceDispatch` - defensive for typed source
+/// (the checker's compile-time chain covers every registered class), verified
+/// only through a probe driving the symbol directly.
+#[symbol("pickle_panic_no_iface_method")]
+fn abiPanicNoIfaceMethod() -> int {
+    writeErr("fatal: ")
+    writeErr("pickle: interface method dispatch found no implementation")
+    writeErr("\n")
+    win_exit(1)
+    return 0
+}
+
+/// ABI: a spread call's list length did not match the callee's arity. Fatal:
+/// `pickle: spread list does not match the expected number of arguments`.
+/// Reached from emit's spread lowering on the count-mismatch branch.
+#[symbol("pickle_panic_arity_diff")]
+fn abiPanicArityDiff() -> int {
+    writeErr("fatal: ")
+    writeErr("pickle: spread list does not match the expected number of arguments")
+    writeErr("\n")
+    win_exit(1)
+    return 0
+}

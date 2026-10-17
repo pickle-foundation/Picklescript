@@ -1,0 +1,215 @@
+module cli.x64real
+
+import { DiagnosticSink } from compiler.diag
+import { frontend } from compiler.front
+import { emitIr } from compiler.emit
+import { x64LowerModule, hex2 } from compiler.x64
+import { coffObjFor } from compiler.coff
+import { StringBuilder } from std.text.stringbuilder
+
+fn emptyStrs() -> List<string> {
+    var l = [""]
+    l.pop()
+    l
+}
+
+fn trim(p: string) -> string {
+    var out = ""
+    var sb = bytes(p)
+    var i = 0
+    while (i < len(sb)) {
+        if (sb[i] == 13 as int || sb[i] == 10 as int) {
+            i = i + 1
+        } else {
+            out = out + "{sb[i] as char}"
+            i = i + 1
+        }
+    }
+    out
+}
+
+fn baseName(target: string) -> string {
+    var k = len(target) - 1
+    while (k >= 0) {
+        let b = bytes(target)[k] as int
+        if (b == 47 || b == 92) {
+            break
+        }
+        k = k - 1
+    }
+    var out = ""
+    var j = k + 1
+    while (j < len(target)) {
+        let c = bytes(target)[j] as int
+        if (c == 46) {
+            break
+        }
+        out = out + "{bytes(target)[j] as char}"
+        j = j + 1
+    }
+    out
+}
+
+class AsmBuf {
+    var sb: StringBuilder
+
+    constructor() {
+        this.sb = StringBuilder()
+    }
+
+    fn put(s: string) {
+        this.sb.append(s)
+    }
+
+    fn text() -> string {
+        this.sb.toString()
+    }
+}
+
+fn relocAt(relocs: List<Reloc>, i: int) -> string {
+    var r = 0
+    while (r < len(relocs)) {
+        if (relocs[r].off == i) {
+            return relocs[r].sym
+        }
+        r = r + 1
+    }
+    ""
+}
+
+fn byteLine(w: AsmBuf, bs: List<int>, relocs: List<Reloc>, mark: string) {
+    var i = 0
+    var row = 0
+    var first = true
+    while (i < len(bs)) {
+        let sym = relocAt(relocs, i)
+        if (sym != "") {
+            if (row > 0) {
+                w.put("\n")
+                row = 0
+            }
+            w.put(".quad " + sym + "\n")
+            i = i + 8
+        } else {
+            if (row == 0) {
+                var line = ".byte "
+                if (first && mark != "") {
+                    line = line + mark + " "
+                    first = false
+                }
+                w.put(line)
+            } else {
+                w.put(", ")
+            }
+            w.put("0x" + hex2(bs[i]))
+            row = row + 1
+            if (row == 16) {
+                w.put("\n")
+                row = 0
+            }
+            i = i + 1
+        }
+    }
+    if (row > 0) {
+        w.put("\n")
+    }
+}
+
+fn emitFmod(w: AsmBuf) {
+    w.put(".text\n")
+    w.put(".balign 16\n")
+    w.put(".globl pickle_fmod\n")
+    w.put("pickle_fmod:\n")
+    w.put(".byte 0xf2, 0x0f, 0x10, 0xd8\n")
+    w.put(".byte 0xf2, 0x0f, 0x5e, 0xc1\n")
+    w.put(".byte 0x66, 0x0f, 0x3a, 0x0b, 0xd0, 0x03\n")
+    w.put(".byte 0xf2, 0x0f, 0x59, 0xd1\n")
+    w.put(".byte 0xf2, 0x0f, 0x5c, 0xda\n")
+    w.put(".byte 0xf2, 0x0f, 0x10, 0xc3\n")
+    w.put(".byte 0xc3\n")
+}
+
+fn asmFor(out: X64Out, m: IrModule) -> string {
+    let w = AsmBuf()
+    w.put(".text\n")
+    var i = 0
+    while (i < len(out.funcs)) {
+        let f = out.funcs[i]
+        w.put(".balign 16\n")
+        w.put(".globl " + f.symbol + "\n")
+        w.put(f.symbol + ":\n")
+        byteLine(w, f.bytes, f.relocs, "")
+        i = i + 1
+    }
+    emitFmod(w)
+    var s = 0
+    while (s < len(m.strings)) {
+        w.put(".section .rodata\n")
+        w.put(".balign 16\n")
+        w.put("pkl_strdata_" + str(s) + ":\n")
+        byteLine(w, m.strings[s], emptyRelocsS(), "")
+        s = s + 1
+    }
+    w.text()
+}
+
+fn emptyRelocsS() -> List<Reloc> {
+    var l = [Reloc(0, "x")]
+    l.pop()
+    l
+}
+
+fn main() {
+    let argv = args()
+    if (len(argv) < 2) {
+        println("NO ARGS")
+        return
+    }
+    let target = argv[0]
+    let dir = argv[1]
+    var ok = false
+    if (let some(src) = read_file(target)) {
+        let sinks = DiagnosticSink()
+        if (let some(loaded) = frontend(target, src, sinks)) {
+            if (let some(m) = emitIr(loaded.program, loaded.resolved, sinks)) {
+                if (let some(out) = x64LowerModule(m, sinks)) {
+                    var sumCode = 0
+                    var fi = 0
+                    while (fi < len(out.funcs)) {
+                        print("STAT func " + str(fi) + " " + out.funcs[fi].symbol + " " + str(len(out.funcs[fi].bytes)) + "\n")
+                        sumCode = sumCode + len(out.funcs[fi].bytes)
+                        fi = fi + 1
+                    }
+                    var sumStr = 0
+                    var si = 0
+                    while (si < len(m.strings)) {
+                        print("STAT str " + str(si) + " " + str(len(m.strings[si])) + "\n")
+                        sumStr = sumStr + len(m.strings[si])
+                        si = si + 1
+                    }
+                    print("STAT totalcode=" + str(sumCode) + " totalstr=" + str(sumStr) + "\n")
+                    var asm = asmFor(out, m)
+                    if (write_file(dir + "/funcs.s", asm)) {
+                        ok = true
+                    }
+                    let blob = coffObjFor(m, out)
+                    var sb = StringBuilder()
+                    var bi = 0
+                    while (bi < len(blob)) {
+                        sb.appendByte(blob[bi] as byte)
+                        bi = bi + 1
+                    }
+                    if (write_file(dir + "/funcs.obj", sb.toString())) {
+                        ok = true
+                    }
+                    print("wrote funcs.s funcs=" + str(len(out.funcs)) + " strings=" + str(len(m.strings)) + " obj=" + str(len(blob)) + "b\n")
+                }
+            }
+        }
+    }
+    if (ok) {
+        println("X64REAL OK")
+    } else {
+        println("X64REAL FAIL")
+    }
+}

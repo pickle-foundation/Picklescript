@@ -1,0 +1,63 @@
+// Lowers one module to PickleIR on stdout, using the same pipeline the shipped
+// compiler uses: `frontendChecked` loads the module *and its imports*, then
+// `emitIr` lowers it.
+//
+// The distinction from `main.pkl` matters. `main.pkl`'s `irSource` works from
+// `lex`/`parse`/`Resolver` directly, so it never loads an import and reports
+// `irfail` for any module that has one. That is fine for a single-file sweep
+// and wrong for anything with imports, which is why the parity gate uses this
+// driver instead.
+//
+// Exactly one file per run, so stdout is the IR and nothing else. A module that
+// fails to load or lower prints `IRFAIL <file>` to stderr and exits 1, which
+// keeps "the two compilers disagree" distinct from "the module is broken".
+
+module cli.irone
+
+import { DiagnosticSink } from compiler.diag
+import { frontendChecked } from compiler.front
+import { emitIr } from compiler.emit
+import { irModuleStr } from compiler.ir
+
+fn main() {
+    let argv = args()
+    if (len(argv) != 1) {
+        let se = stderr_stream()
+        let _ = se.write(bytes("usage: ir_one <file.pkl>\n"))
+        exit(2)
+    }
+    let target = argv[0]
+    match (read_file(target)) {
+        case none -> {
+            let se = stderr_stream()
+            let _ = se.write(bytes("IRFAIL " + target + ": cannot read\n"))
+            exit(1)
+        }
+        case some(src) -> {
+            let diags = DiagnosticSink()
+            match (frontendChecked(target, src, diags)) {
+                case none -> {
+                    let se = stderr_stream()
+                    let _ = se.write(bytes("IRFAIL " + target + ": did not check\n"))
+                    for (d in diags.diagnostics) {
+                        let _ = se.write(bytes("  " + d.message + "\n"))
+                    }
+                    exit(1)
+                }
+                case some(out) -> {
+                    match (emitIr(out.program, out.resolved, diags)) {
+                        case none -> {
+                            let se = stderr_stream()
+                            let _ = se.write(bytes("IRFAIL " + target + ": did not lower\n"))
+                            for (d in diags.diagnostics) {
+                                let _ = se.write(bytes("  " + d.message + "\n"))
+                            }
+                            exit(1)
+                        }
+                        case some(m) -> print(irModuleStr(m))
+                    }
+                }
+            }
+        }
+    }
+}

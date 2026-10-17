@@ -1,0 +1,162 @@
+module compiler.parser_test
+
+import { isWildcardIdent, contextualIdent, isSomeStr, optTokIs, startsItemToken, isFieldSyntax, memberFieldName, isOperatorSymbol, isIdentTok, hookKind, binopInfo, assignOpTok, describeTok, strChar, punctTok, isContAfter, isContBefore } from compiler.parser
+import { Tok } from compiler.token
+import { BinOp, AssignOp } from compiler.ast
+import { keywordTok } from compiler.token
+
+test fn wildcard_ident_check() {
+    expect(isWildcardIdent("_")).toBe(true)
+    expect(isWildcardIdent("x")).toBe(false)
+}
+
+test fn contextual_idents() {
+    match (contextualIdent(Tok.Get)) {
+        case some(s) -> expect(s).toBe("get")
+        case none -> expect(true).toBe(false)
+    }
+    match (contextualIdent(Tok.Constructor)) {
+        case some(s) -> expect(s).toBe("constructor")
+        case none -> expect(true).toBe(false)
+    }
+    match (contextualIdent(Tok.Fn)) {
+        case some(s) -> expect(true).toBe(false)
+        case none -> expect(true).toBe(true)
+    }
+}
+
+test fn optional_helpers() {
+    expect(isSomeStr("a")).toBe(true)
+    expect(isSomeStr(none)).toBe(false)
+    let fnTok = keywordTok("fn")
+    expect(optTokIs(fnTok, Tok.Fn)).toBe(true)
+    expect(optTokIs(fnTok, Tok.Class)).toBe(false)
+    expect(optTokIs(none, Tok.Fn)).toBe(false)
+}
+
+test fn starts_item_tokens() {
+    expect(startsItemToken(Tok.Fn)).toBe(true)
+    expect(startsItemToken(Tok.Class)).toBe(true)
+    expect(startsItemToken(Tok.Const)).toBe(true)
+    expect(startsItemToken(Tok.Public)).toBe(true)
+    expect(startsItemToken(Tok.Plus)).toBe(false)
+    expect(startsItemToken(Tok.Let)).toBe(false)
+}
+
+test fn field_syntax_gate() {
+    expect(isFieldSyntax(true, Tok.Let)).toBe(true)
+    expect(isFieldSyntax(true, Tok.Var)).toBe(true)
+    expect(isFieldSyntax(true, Tok.Ident("x"))).toBe(true)
+    expect(isFieldSyntax(true, Tok.Fn)).toBe(false)
+    expect(isFieldSyntax(false, Tok.Let)).toBe(false)
+}
+
+test fn member_field_names() {
+    expect(memberFieldName(Tok.Ident("x"))).toBe(true)
+    expect(memberFieldName(Tok.Get)).toBe(true)
+    expect(memberFieldName(Tok.Deinit)).toBe(true)
+    expect(memberFieldName(Tok.Fn)).toBe(false)
+}
+
+test fn operator_symbols() {
+    expect(isOperatorSymbol(Tok.Plus)).toBe(true)
+    expect(isOperatorSymbol(Tok.StarStar)).toBe(true)
+    expect(isOperatorSymbol(Tok.Shl)).toBe(true)
+    expect(isOperatorSymbol(Tok.LBracket)).toBe(true)
+    expect(isOperatorSymbol(Tok.Colon)).toBe(false)
+    expect(isOperatorSymbol(Tok.Assign)).toBe(false)
+}
+
+test fn ident_checks() {
+    expect(isIdentTok(Tok.Ident("x"))).toBe(true)
+    expect(isIdentTok(Tok.Fn)).toBe(false)
+}
+
+test fn hook_kinds() {
+    match (hookKind("beforeEach")) {
+        case some(s) -> expect(s).toBe("be")
+        case none -> expect(true).toBe(false)
+    }
+    match (hookKind("afterAll")) {
+        case some(s) -> expect(s).toBe("aa")
+        case none -> expect(true).toBe(false)
+    }
+    match (hookKind("setup")) {
+        case some(s) -> expect(true).toBe(false)
+        case none -> expect(true).toBe(true)
+    }
+}
+
+test fn binop_precedences() {
+    match (binopInfo(Tok.Plus)) {
+        case some(b) -> {
+            expect(b.prec).toBe(8)
+            match (b.op) {
+                case BinOp.Add -> expect(true).toBe(true)
+                case _ -> expect(true).toBe(false)
+            }
+        }
+        case none -> expect(true).toBe(false)
+    }
+    match (binopInfo(Tok.StarStar)) {
+        case some(b) -> {
+            expect(b.prec).toBe(10)
+            match (b.op) {
+                case BinOp.Pow -> expect(true).toBe(true)
+                case _ -> expect(true).toBe(false)
+            }
+        }
+        case none -> expect(true).toBe(false)
+    }
+    match (binopInfo(Tok.EqEq)) {
+        case some(b) -> {
+            expect(b.prec).toBe(6)
+            match (b.op) {
+                case BinOp.Eq -> expect(true).toBe(true)
+                case _ -> expect(true).toBe(false)
+            }
+        }
+        case none -> expect(true).toBe(false)
+    }
+    match (binopInfo(Tok.Colon)) {
+        case some(b) -> expect(true).toBe(false)
+        case none -> expect(true).toBe(true)
+    }
+}
+
+test fn assign_op_tokens() {
+    match (assignOpTok(AssignOp.Add)) {
+        case Tok.PlusEq -> expect(true).toBe(true)
+        case _ -> expect(true).toBe(false)
+    }
+    match (assignOpTok(AssignOp.Shl)) {
+        case Tok.ShlEq -> expect(true).toBe(true)
+        case _ -> expect(true).toBe(false)
+    }
+    match (assignOpTok(AssignOp.Assign)) {
+        case Tok.Assign -> expect(true).toBe(true)
+        case _ -> expect(true).toBe(false)
+    }
+}
+
+test fn describe_and_punct() {
+    expect(describeTok(Tok.Newline)).toBe("end of line")
+    expect(describeTok(Tok.Eof)).toBe("end of file")
+    expect(describeTok(Tok.Number)).toBe("number")
+    expect(describeTok(Tok.LParen)).toBe("`(`")
+    expect(punctTok(Tok.RParen)).toBe(")")
+    expect(punctTok(Tok.ColonColon)).toBe("::")
+    expect(punctTok(Tok.AndAnd)).toBe("&&")
+    expect(punctTok(Tok.RangeIncl)).toBe("..=")
+    expect(punctTok(Tok.SendOp)).toBe("<-")
+    expect(strChar('a')).toBe("a")
+}
+
+test fn continuation_helpers() {
+    expect(isContAfter(Tok.Plus)).toBe(true)
+    expect(isContAfter(Tok.Comma)).toBe(true)
+    expect(isContAfter(Tok.Eof)).toBe(false)
+    expect(isContBefore(Tok.In)).toBe(false)
+    expect(isContBefore(Tok.Colon)).toBe(false)
+    expect(isContBefore(Tok.Dot)).toBe(true)
+}

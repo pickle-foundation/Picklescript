@@ -1,0 +1,86 @@
+module runtime.statics
+
+/// Port of `runtime/src/statics.rs`: class static-field storage.
+///
+/// The ABI stays native: `pickle_static_get(class_id, slot)` /
+/// `pickle_static_set(class_id, slot, value)` address one raw GC-rooted cell
+/// per `(class_id, slot)`, allocated lazily on first access; values follow the
+/// same representation as instance slots (managed pointers).
+///
+/// What a self-hosted runtime owns is the CONTRACT: cells key on
+/// `(class_id, slot)`, an unset cell reads as `none`, and `pickle test`
+/// resets the store between files so one module's baked class ids never alias
+/// the next module's cells.
+
+/// Cells key on `class_id * STATIC_CELL_STRIDE + slot`, a flat index. The
+/// stride must exceed the largest per-class static slot count.
+const STATIC_CELL_STRIDE: int = 1024
+
+class StaticCell {
+    var isSet: bool
+    var value: int
+
+    constructor(initIsSet: bool, initValue: int) {
+        this.isSet = initIsSet
+        this.value = initValue
+    }
+
+    fn read() -> int? {
+        if (this.isSet) {
+            this.value
+        } else {
+            none
+        }
+    }
+}
+
+class StaticCells {
+    var slots: List<StaticCell>
+
+    constructor() {
+        this.slots = [StaticCell(false, 0)]
+        this.slots.pop()
+    }
+
+    /// Mirror of `pickle_static_get`: `none` when the cell was never assigned.
+    fn getValue(classId: int, slot: int) -> int? {
+        var cell = this.cell(classId, slot)
+        if (let some(c) = cell) {
+            return c.read()
+        }
+        none
+    }
+
+    /// Mirror of `pickle_static_set`.
+    fn setValue(classId: int, slot: int, value: int) {
+        var idx = classId * STATIC_CELL_STRIDE + slot
+        if (idx < 0) {
+            return
+        }
+        while (len(this.slots) <= idx) {
+            this.slots.push(StaticCell(false, 0))
+        }
+        this.slots[idx].value = value
+        this.slots[idx].isSet = true
+    }
+
+    fn cell(classId: int, slot: int) -> StaticCell? {
+        var idx = classId * STATIC_CELL_STRIDE + slot
+        if (idx < 0) {
+            return none
+        }
+        if (idx >= len(this.slots)) {
+            return none
+        }
+        this.slots[idx]
+    }
+
+    /// Mirror of `statics::reset`: drop every static cell. Between modules the
+    /// class ids restart at PICKLE_CLASS_USER_BASE, so the old cells must not
+    /// be reused. After `clear()` every read is `none` again.
+    fn clear() {
+        while (len(this.slots) > 0) {
+            this.slots.pop()
+        }
+    }
+}

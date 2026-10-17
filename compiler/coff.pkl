@@ -1,0 +1,366 @@
+module compiler.coff
+
+import { X64Out, Reloc, X64Func } from compiler.x64
+
+fn pad16(bs: List<int>) {
+   while ((len(bs) & 0xF) != 0) {
+           bs.push(0)
+       }
+   }
+
+   /// Storage for a global with no static initializer. The only global slot the
+   /// emitter produces today is a zeroed `int64`, so this is eight bytes rather
+   /// than a real `.bss` section: a `.bss` needs virtual-size > raw-size section
+   /// bookkeeping, and materializing zeros keeps one code path for both cases.
+   fn zeroGlobalBytes() -> List<int> {
+       var b = [0, 0, 0, 0, 0, 0, 0, 0]
+       b
+   }
+
+fn fmodBytes() -> List<int> {
+    var b = [0]
+    b.pop()
+    b.push(0xF2)
+    b.push(0x0F)
+    b.push(0x10)
+    b.push(0xD8)
+    b.push(0xF2)
+    b.push(0x0F)
+    b.push(0x5E)
+    b.push(0xC1)
+    b.push(0x66)
+    b.push(0x0F)
+    b.push(0x3A)
+    b.push(0x0B)
+    b.push(0xD0)
+    b.push(0x03)
+    b.push(0xF2)
+    b.push(0x0F)
+    b.push(0x59)
+    b.push(0xD1)
+    b.push(0xF2)
+    b.push(0x0F)
+    b.push(0x5C)
+    b.push(0xDA)
+    b.push(0xF2)
+    b.push(0x0F)
+    b.push(0x10)
+    b.push(0xC3)
+    b.push(0xC3)
+    b
+}
+
+class SymRec {
+    var name: string
+    var section: int
+    var value: int
+    var cls: int
+
+    constructor(name: string, section: int, value: int, cls: int) {
+        this.name = name
+        this.section = section
+        this.value = value
+        this.cls = cls
+    }
+}
+
+fn emptySymRecs() -> List<SymRec> {
+    var l = [SymRec("x", 0, 0, 0)]
+    l.pop()
+    l
+}
+
+fn pushSym(recs: List<SymRec>, name: string, section: int, value: int, cls: int) {
+    recs.push(SymRec(name, section, value, cls))
+}
+
+fn symIndex(recs: List<SymRec>, name: string) -> int {
+    var i = 0
+    while (i < len(recs)) {
+        if (recs[i].name == name) {
+            return i
+        }
+        i = i + 1
+    }
+    -1
+}
+
+fn hasSym(recs: List<SymRec>, name: string) -> bool {
+    symIndex(recs, name) >= 0
+}
+
+fn buildStrTbl(recs: List<SymRec>, longOffs: List<int>) -> List<int> {
+    var strTbl = [0]
+    strTbl.pop()
+    strTbl.push(0)
+    strTbl.push(0)
+    strTbl.push(0)
+    strTbl.push(0)
+    var i = 0
+    while (i < len(recs)) {
+        let name = recs[i].name
+        if (len(name) <= 8) {
+            longOffs.push(-1)
+        } else {
+            longOffs.push(len(strTbl))
+            var j = 0
+            while (j < len(name)) {
+                strTbl.push(bytes(name)[j] as int)
+                j = j + 1
+            }
+            strTbl.push(0)
+        }
+        i = i + 1
+    }
+    strTbl[0] = len(strTbl) & 0xFF
+    strTbl[1] = (len(strTbl) >> 8) & 0xFF
+    strTbl[2] = (len(strTbl) >> 16) & 0xFF
+    strTbl[3] = (len(strTbl) >> 24) & 0xFF
+    strTbl
+}
+
+fn u16Blob(blob: List<int>, at: int, v: int) {
+    blob[at    ] = v & 0xFF
+    blob[at + 1] = (v >> 8) & 0xFF
+}
+
+fn u32wBlob(blob: List<int>, at: int, v: int) {
+    blob[at    ] = v & 0xFF
+    blob[at + 1] = (v >> 8) & 0xFF
+    blob[at + 2] = (v >> 16) & 0xFF
+    blob[at + 3] = (v >> 24) & 0xFF
+}
+
+fn writeSection(blob: List<int>, at: int, name: string, size: int, rawOff: int, relocOff: int, relocCount: int, chars: int) {
+    var i = 0
+    while (i < 8) {
+        if (i < len(name)) {
+            blob[at + i] = bytes(name)[i] as int
+        } else {
+            blob[at + i] = 0
+        }
+        i = i + 1
+    }
+    u32wBlob(blob, at + 8, 0)
+    u32wBlob(blob, at + 12, 0)
+    u32wBlob(blob, at + 16, size)
+    u32wBlob(blob, at + 20, rawOff)
+    u32wBlob(blob, at + 24, relocOff)
+    u32wBlob(blob, at + 28, 0)
+    u16Blob(blob, at + 32, relocCount)
+    u16Blob(blob, at + 34, 0)
+    u32wBlob(blob, at + 36, chars)
+}
+
+fn writeSymBlob(blob: List<int>, at: int, longOff: int, rec: SymRec) {
+    if (longOff < 0) {
+        var i = 0
+        while (i < 8) {
+            if (i < len(rec.name)) {
+                blob[at + i] = bytes(rec.name)[i] as int
+            } else {
+                blob[at + i] = 0
+            }
+            i = i + 1
+        }
+    } else {
+        blob[at    ] = 0
+        blob[at + 1] = 0
+        blob[at + 2] = 0
+        blob[at + 3] = 0
+        u32wBlob(blob, at + 4, longOff)
+    }
+    u32wBlob(blob, at + 8, rec.value)
+    u16Blob(blob, at + 12, rec.section)
+    u16Blob(blob, at + 14, 0)
+    blob[at + 16] = rec.cls
+    blob[at + 17] = 0
+}
+
+fn coffObjFor(m: IrModule, out: X64Out) -> List<int> {
+    var text = [0]
+    text.pop()
+    var funcStart = [0]
+    funcStart.pop()
+    var relocs = [Reloc(0, "x")]
+    relocs.pop()
+var rdata = [0]
+       rdata.pop()
+       var strStart = [0]
+       strStart.pop()
+       var data = [0]
+       data.pop()
+       var globStart = [0]
+       globStart.pop()
+
+    var i = 0
+    while (i < len(out.funcs)) {
+        let f = out.funcs[i]
+        funcStart.push(len(text))
+        var j = 0
+        while (j < len(f.bytes)) {
+            text.push(f.bytes[j])
+            j = j + 1
+        }
+        pad16(text)
+        var r = 0
+        while (r < len(f.relocs)) {
+            relocs.push(Reloc(funcStart[len(funcStart) - 1] + f.relocs[r].off, f.relocs[r].sym))
+            r = r + 1
+        }
+        i = i + 1
+    }
+    funcStart.push(len(text))
+    let fm = fmodBytes()
+    var k = 0
+    while (k < len(fm)) {
+        text.push(fm[k])
+        k = k + 1
+    }
+    pad16(text)
+
+    var s = 0
+    while (s < len(m.strings)) {
+        strStart.push(len(rdata))
+        var h = 0
+        while (h < len(m.strings[s])) {
+            rdata.push(m.strings[s][h])
+            h = h + 1
+        }
+        pad16(rdata)
+        s = s + 1
+    }
+
+var recs = emptySymRecs()
+       pushSym(recs, ".text", 1, 0, 3)
+       if (len(m.strings) > 0) {
+           pushSym(recs, ".rdata", 2, 0, 3)
+       }
+       if (len(m.globals) > 0) {
+           pushSym(recs, ".data", 3, 0, 3)
+       }
+    var fi = 0
+    while (fi < len(out.funcs)) {
+        if (!hasSym(recs, out.funcs[fi].symbol)) {
+            pushSym(recs, out.funcs[fi].symbol, 1, funcStart[fi], 2)
+        }
+        fi = fi + 1
+    }
+    pushSym(recs, "pickle_fmod", 1, funcStart[len(out.funcs)], 2)
+       var gi = 0
+       while (gi < len(m.globals)) {
+           let g = m.globals[gi]
+           globStart.push(len(data))
+           var bytes = zeroGlobalBytes()
+           if (let some(bs) = g.init) {
+               bytes = bs
+           }
+           var q = 0
+           while (q < len(bytes)) {
+               data.push(bytes[q])
+               q = q + 1
+           }
+           pushSym(recs, g.symbol, 3, globStart[gi], 2)
+           gi = gi + 1
+       }
+    var si = 0
+    while (si < len(m.strings)) {
+        pushSym(recs, "pkl_strdata_" + str(si), 2, strStart[si], 2)
+        si = si + 1
+    }
+    var ri = 0
+    while (ri < len(relocs)) {
+        if (!hasSym(recs, relocs[ri].sym)) {
+            pushSym(recs, relocs[ri].sym, 0, 0, 2)
+        }
+        ri = ri + 1
+    }
+
+    var longOffs = [0]
+    longOffs.pop()
+    let strTbl = buildStrTbl(recs, longOffs)
+
+var hasRdata = len(m.strings) > 0
+       var hasData = len(m.globals) > 0
+       var numSec = 1
+       if (hasRdata) {
+           numSec = 2
+       }
+       if (hasData) {
+           numSec = 3
+       }
+
+       var textRawOff = 20 + 40 * numSec
+       var rdataRawOff = textRawOff + len(text)
+       var dataRawOff = rdataRawOff + len(rdata)
+       var textRelocOff = dataRawOff + len(data)
+    var symOff = textRelocOff + 10 * len(relocs)
+    var strOff = symOff + 18 * len(recs)
+    var outLen = strOff + len(strTbl)
+
+    var blob = [0]
+    blob.pop()
+    var pad = 0
+    while (pad < outLen) {
+        blob.push(0)
+        pad = pad + 1
+    }
+
+    var c1 = 0x60500020
+    var c2 = 0x40500040
+
+    u16Blob(blob, 0, 0x8664)
+    u16Blob(blob, 2, numSec)
+    u32wBlob(blob, 4, 0)
+    u32wBlob(blob, 8, symOff)
+    u32wBlob(blob, 12, len(recs))
+    u16Blob(blob, 16, 0)
+    u16Blob(blob, 18, 0)
+
+writeSection(blob, 20, ".text", len(text), textRawOff, textRelocOff, len(relocs), c1)
+       if (hasRdata) {
+           writeSection(blob, 60, ".rdata", len(rdata), rdataRawOff, 0, 0, c2)
+       }
+       if (hasData) {
+           // Read/write initialized data. `MEM_WRITE` is load-bearing: these
+           // slots are targets of `storeglobal`, so a read-only mapping faults
+           // on the first write even though `loadglobal` reads back fine.
+           writeSection(blob, 100, ".data", len(data), dataRawOff, 0, 0, 0xC0000040)
+       }
+
+       var t = 0
+       while (t < len(text)) {
+           blob[textRawOff + t] = text[t]
+           t = t + 1
+       }
+       t = 0
+       while (t < len(rdata)) {
+           blob[rdataRawOff + t] = rdata[t]
+           t = t + 1
+       }
+       t = 0
+       while (t < len(data)) {
+           blob[dataRawOff + t] = data[t]
+           t = t + 1
+       }
+    var rl = 0
+    while (rl < len(relocs)) {
+        let base = textRelocOff + 10 * rl
+        u32wBlob(blob, base, relocs[rl].off)
+        let si = symIndex(recs, relocs[rl].sym)
+        u32wBlob(blob, base + 4, si)
+        u16Blob(blob, base + 8, 0x0001)
+        rl = rl + 1
+    }
+    var ys = 0
+    while (ys < len(recs)) {
+        writeSymBlob(blob, symOff + 18 * ys, longOffs[ys], recs[ys])
+        ys = ys + 1
+    }
+    var st = 0
+    while (st < len(strTbl)) {
+        blob[strOff + st] = strTbl[st]
+        st = st + 1
+    }
+    blob
+}

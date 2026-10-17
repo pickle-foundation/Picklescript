@@ -1,0 +1,165 @@
+module runtime.exception
+
+/// Port of `runtime/src/exception.rs`: the in-flight throw channel.
+///
+/// The native side keeps the flag and payload in thread-local cells, and roots
+/// the payload through the collector's temp-root set while it is in flight. A
+/// self-hosted runtime keeps the same CONTRACT in a single owner that the rest
+/// of the runtime holds:
+///
+/// - `publish` stores a payload and raises the pending flag, then returns
+///   normally. Nothing branches inside it; the emitted code checks `isPending`
+///   after each call and returns early, so every frame between the throw and its
+///   handler leaves in order and pops its own shadow frame.
+/// - `isPending` is the propagation check the emitter calls.
+/// - `take` consumes the in-flight throw, returning the payload and clearing
+///   the flag. The payload is reported as an int, where `NO_PAYLOAD` stands for
+///   "the throw carried nothing", because a self-hosted runtime cannot
+///   construct an option value: `some` is a binding pattern, not a
+///   constructor.
+/// - `clear` drops a throw that no handler matched, so the flag cannot leak
+///   into a later, unrelated call.
+///
+/// The difference from the native implementation is where the state lives.
+/// There is no thread-local storage here: the owner object *is* the storage,
+/// threaded explicitly, so a self-hosted runtime cannot depend on a TLS slot it
+/// has no way to port. Rooting an in-flight payload through the collector stays
+/// the native runtime's job, because only it owns the shadow stack and the temp
+/// roots; here the payload stays reachable from `payload` for as long as it is
+/// in flight, which is what keeps it alive.
+
+/// Marks a throw whose payload is absent. Distinct from any real payload.
+const NO_PAYLOAD: int = -9223372036854775807
+
+/// The exception state, threaded by reference wherever a throw can cross a call.
+class ExceptionState {
+    /// Whether a throw is in flight. Checked after every call, so it is a plain
+    /// field read on the propagation path.
+    var pending: bool
+    /// The in-flight payload, `NO_PAYLOAD` when the throw carried nothing.
+    var payload: int
+
+    constructor() {
+        this.pending = false
+        this.payload = NO_PAYLOAD
+    }
+}
+
+/// ABI: `throw v`. Publishes `v` as the in-flight payload and raises the
+/// pending flag. Returns normally: the emitter places it on a path that
+/// branches away, and a caller checks `isPending` after each call, so the
+/// function that threw is already on its way out by the time this returns.
+///
+/// A second throw while one is in flight replaces the payload, matching the
+/// native ABI: the newer exception is the one that reaches the handler.
+fn publish(st: ExceptionState, value: int) {
+    st.payload = value
+    st.pending = true
+}
+
+/// ABI: is a throw in flight?
+fn isPending(st: ExceptionState) -> bool {
+    st.pending
+}
+
+/// ABI: consume the in-flight throw, returning its payload (`NO_PAYLOAD` if
+/// there was none) and clearing the flag. Emitted by `catch`, which has
+/// already stored the payload where the handler can read it.
+fn take(st: ExceptionState) -> int {
+    var got = st.payload
+    st.payload = NO_PAYLOAD
+    st.pending = false
+    got
+}
+
+/// ABI: drop an in-flight throw without handling it, returning whether one was
+/// there. The emitter uses this on the path out of a `try` that has no `catch`
+/// and did not match, so the flag does not leak into an unrelated later call.
+fn clear(st: ExceptionState) -> bool {
+    if (!st.pending) {
+        return false
+    }
+    let _ = take(st)
+    true
+}
+
+/// Mirror of `take_escaped`: consume whatever escaped to the top and describe
+/// it, or `NO_PAYLOAD` when nothing escaped. The program entry points call this
+/// to turn a payload nobody caught into a report rather than a flag to clear.
+fn takeEscaped(st: ExceptionState) -> int {
+    if (!st.pending) {
+        return NO_PAYLOAD
+    }
+    take(st)
+}
+
+/// Render a payload as text for an uncaught-exception report. The self-hosted
+/// runtime has no string decoder, so the payload is reported numerically; the
+/// native runtime renders the actual message. The contract being ported is the
+/// state machine above, not the formatting.
+fn describe(value: int) -> string {
+    if (value == NO_PAYLOAD) {
+        return "uncaught exception"
+    }
+    "uncaught exception " + intToString(value)
+}
+
+/// Decimal rendering, so a report is readable without a string decoder.
+fn intToString(v: int) -> string {
+    if (v == 0) {
+        return "0"
+    }
+    var neg = v < 0
+    var n = v
+    if (neg) {
+        n = 0 - n
+    }
+    var digits = ""
+    while (n > 0) {
+        digits = charDigit(n % 10) + digits
+        n = n / 10
+    }
+    if (neg) {
+        return "-" + digits
+    }
+    digits
+}
+
+/// One decimal digit as text.
+fn charDigit(d: int) -> string {
+    if (d == 0) {
+        return "0"
+    }
+    if (d == 1) {
+        return "1"
+    }
+    if (d == 2) {
+        return "2"
+    }
+    if (d == 3) {
+        return "3"
+    }
+    if (d == 4) {
+        return "4"
+    }
+    if (d == 5) {
+        return "5"
+    }
+    if (d == 6) {
+        return "6"
+    }
+    if (d == 7) {
+        return "7"
+    }
+    if (d == 8) {
+        return "8"
+    }
+    "9"
+}
+
+/// Mirror of `exception::reset`: forget any in-flight throw, so a previous
+/// module's leftover cannot be mistaken for this module's.
+fn reset(st: ExceptionState) {
+    st.payload = NO_PAYLOAD
+    st.pending = false
+}

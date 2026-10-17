@@ -1,0 +1,67 @@
+module runtime.list
+
+/// Port of `runtime/src/list.rs`: the portable `List<T>` semantics.
+///
+/// The storage layer stays native: a `{header, len, cap, data}` object whose
+/// `data` is a raw `cap * 8` slot array; `pickle_list_new/len/get/set/push/
+/// pop/remove/insert/sort` operate on it directly. Capacity grows by doubling
+/// from `INITIAL_CAP`, capped at `MAX_CAP` (`isize::MAX / 8`), panicking with
+/// "pickle: list capacity overflow" past the cap.
+///
+/// What a self-hosted runtime owns is the CONTRACT: the arithmetic sequence
+/// builder, the stable ascending sort, and the exact bounds messages.
+///
+/// `pickle_range(start, end, step)` builds `[start, end)` stepping by `step`;
+/// a zero step yields an empty list. Bounds are inclusive of `start`,
+/// exclusive of `end`.
+fn rangeSeq(start: int, end: int, step: int) -> List<int> {
+    var out = [0]
+    out.pop()
+    if (step == 0) {
+        return out
+    }
+    var v = start
+    if (step > 0) {
+        while (v < end) {
+            out.push(v)
+            v = v + step
+        }
+    } else {
+        while (v > end) {
+            out.push(v)
+            v = v + step
+        }
+    }
+    out
+}
+
+/// In-place stable ascending insertion sort (the `list_sort` algorithm; O(n^2)
+/// worst case — fine for symbol tables). The element comparison is the caller's
+/// `less` seam: `list_sort` dispatches kinds `0` int/byte/char/bool payloads,
+/// `1` float bits, `2` strings on boxed elements.
+fn insertionSort(xs: List<int>, less: fn (int, int) -> bool) {
+    var n = len(xs)
+    var i = 1
+    while (i < n) {
+        var key = xs[i]
+        var j = i
+        while (j > 0 && less(key, xs[j - 1])) {
+            xs[j] = xs[j - 1]
+            j = j - 1
+        }
+        xs[j] = key
+        i = i + 1
+    }
+}
+
+/// Panic raised by `list_remove_at` for an out-of-bounds index.
+const MSG_REMOVE_OOB: string = "pickle: remove index out of bounds"
+
+/// Panic raised by `list_insert` for an index past `len`.
+const MSG_INSERT_OOB: string = "pickle: insert index out of bounds"
+
+/// Panic raised by `require_capacity` past `MAX_CAP` / on growth overflow.
+const MSG_CAP_OVERFLOW: string = "pickle: list capacity overflow"
+
+/// Initial capacity doubling base for a fresh list.
+const INITIAL_CAP: int = 8

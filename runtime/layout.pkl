@@ -1,0 +1,134 @@
+module runtime.layout
+
+/// Port slice 2 of the memory core (decision 2026-09-25): object and class
+/// descriptor layout math. Mirrors `runtime/src/layout.rs` and the descriptor
+/// math in `runtime/src/class.rs` (`docs/05-memory.md`). Pure deterministic
+/// math — no raw memory — the exact contract a real-heap layout pass must
+/// satisfy.
+///
+/// Everything is 8-byte aligned: every object starts with the 24-byte header,
+/// payload slots are 8-byte units at `HEADER + 8*i`, and the builtin payload
+/// layouts are fixed.
+
+/// Every object starts with the 24-byte header.
+const HEADER: int = 24
+
+/// `PString { header, len: usize, bytes: [u8] }` — inline UTF-8 bytes.
+const STR_LEN_OFF: int = HEADER
+const STR_BYTES_OFF: int = HEADER + 8
+
+/// `PList { header, len: usize, cap: usize, data }`.
+const LIST_LEN_OFF: int = HEADER
+const LIST_CAP_OFF: int = HEADER + 8
+const LIST_DATA_OFF: int = HEADER + 16
+
+/// `PMap { header, len: usize, cap: usize, entries }`.
+const MAP_LEN_OFF: int = HEADER
+const MAP_CAP_OFF: int = HEADER + 8
+const MAP_ENTRIES_OFF: int = HEADER + 16
+
+/// Boxed scalar `{ header, bits: i64 }`.
+const BOX_PAYLOAD_OFF: int = HEADER
+const BOX_PAYLOAD: int = 8
+const BOX_OBJECT_SIZE: int = HEADER + BOX_PAYLOAD
+
+/// `PEnum { header, tag: i64, fields }` — the tag in payload slot 0 is NOT a
+/// managed pointer; the collector never chases it.
+const ENUM_TAG_OFF: int = HEADER
+const ENUM_FIELDS_OFF: int = HEADER + 8
+const ENUM_HEADER_SLOTS: int = 1
+
+/// `PTuple { header, len: usize, fields }` — explicit count because the 32-byte
+/// allocator minimum makes a size-derived count ambiguous for empty tuples.
+const TUPLE_LEN_OFF: int = HEADER
+const TUPLE_FIELDS_OFF: int = HEADER + 8
+
+/// `PStream { header, inner }` — payload slot 0 holds an unmanaged raw pointer
+/// to the Rust-heap inner state, never traced, dropped by the finalizer.
+const STREAM_INNER_OFF: int = HEADER
+const STREAM_OBJECT_SIZE: int = HEADER + 8
+
+/// Fixed payload sizes of the builtin objects.
+const STRING_PAYLOAD: int = 8
+const LIST_PAYLOAD: int = 24
+const MAP_PAYLOAD: int = 24
+const ENUM_BASE_PAYLOAD: int = 16
+
+/// Fixed *object* sizes (24-byte payload past the 24-byte header).
+const LIST_OBJECT_SIZE: int = HEADER + LIST_PAYLOAD
+const MAP_OBJECT_SIZE: int = HEADER + MAP_PAYLOAD
+
+/// Round `n` up to the next multiple of 8 (`heap::align8`).
+fn align8(n: int) -> int {
+    ((n + 7) / 8) * 8
+}
+
+/// User-class instance: header + `field_count` 8-byte managed slots
+/// (`class.rs::class_object_size`).
+fn classObjectSize(fieldCount: int) -> int {
+    HEADER + 8 * fieldCount
+}
+
+/// Byte offset of class field slot `i` — every slot is one 8-byte unit and
+/// holds a managed pointer (user classes mark all slots managed).
+fn classSlotOffset(i: int) -> int {
+    HEADER + 8 * i
+}
+
+/// Payload slots an object of the given size holds for a plain slot-array
+/// format: `size = HEADER + 8*f`.
+fn classFieldCountFromSize(size: int) -> int {
+    (size - HEADER) / 8
+}
+
+/// Enum object size holding `field_count` payload fields (tag + slots).
+fn enumObjectSize(fieldCount: int) -> int {
+    HEADER + 8 + fieldCount * 8
+}
+
+/// Payload fields of an enum object derived from its stored size (floored at
+/// 0 — `enum.rs` uses a saturating subtract: `(size - HEADER - 8) / 8`).
+fn enumFieldCountFromSize(size: int) -> int {
+    if (size <= HEADER + 8) { return 0 }
+    (size - HEADER - 8) / 8
+}
+
+/// Tuple object size holding `field_count` payload fields (like an enum, but
+/// with no tag slot).
+fn tupleObjectSize(fieldCount: int) -> int {
+    HEADER + 8 + fieldCount * 8
+}
+
+/// Total byte size of a string object holding `n` inline bytes
+/// (`layout::builtin_string_total`): bytes live at `STR_BYTES_OFF` and the
+/// whole object is 8-aligned.
+fn stringObjectSize(n: int) -> int {
+    align8(STR_BYTES_OFF + n)
+}
+
+/// Managed-mask words for a class descriptor broadcast (`class.rs`):
+/// `ceil(slot_count/32)` u32 words; slot `i` is bit `i%32` of word `i/32`.
+fn managedMaskWordCount(slotCount: int) -> int {
+    (slotCount + 31) / 32
+}
+
+/// All-managed mask words for a user class (every slot is a managed pointer).
+/// Returns one word per 32 slots (word `k` covers slots `32k .. 32(k+1)`).
+fn userClassMaskWords(slotCount: int) -> List<int> {
+    var words = [0]
+    words.remove(0)
+    var k = 0
+    while (k < managedMaskWordCount(slotCount)) {
+        var count = slotCount - 32 * k
+        if (count > 32) { count = 32 }
+        var word = 0
+        var b = 0
+        while (b < count) {
+            word = word | (1 << b)
+            b = b + 1
+        }
+        words.push(word)
+        k = k + 1
+    }
+    words
+}

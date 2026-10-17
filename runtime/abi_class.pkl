@@ -1,0 +1,214 @@
+module runtime.abi_class
+
+/// Sovereign class-instance ABI bodies, ported from `runtime/src/class.rs`.
+///
+/// Companion to `runtime.abi_enum`: same shape of work (allocate an object,
+/// write a header, address payload slots) and the same central trap, which is
+/// documented in detail on `abiSizeWords` below.
+///
+/// SCOPE, STATED PLAINLY. This module makes *instance layout* sovereign. It does
+/// NOT make user classes work, because `pickle_class_register` — the symbol that
+/// hands out class ids and installs descriptors — is still native and still
+/// blocked on the private collector registry (`Gc::register_class`,
+/// `class_parent`, `class_iface_has` are `pub fn` with no `#[no_mangle]`). So
+/// after this tranche a program can allocate and address an instance, but cannot
+/// define one. That is a deliberate order: the layout is the part with the
+/// arithmetic trap in it, the registry is the part with no seam at all.
+///
+/// WHAT IS PORTED HERE: `pickle_class_new`, `pickle_obj_slot_get`,
+/// `pickle_obj_slot_set`. NOT PORTED: `pickle_class_register`,
+/// `pickle_class_name`, `pickle_class_is`, `pickle_class_cast`,
+/// `pickle_class_add_interface`, `pickle_class_add_iface_method`,
+/// `pickle_class_implements`, `pickle_iface_method`, `pickle_iface_cast` — all
+/// of which read the descriptor/parent/interface tables.
+///
+/// THE ALLOCATION IS NOT GC TRACKED, same as everywhere else in the port.
+/// `class_new` natively calls `gc.alloc`, which registers the object with the
+/// collector so its slots are traced. This port calls `alloc`, which hands back
+/// untracked raw memory. An instance therefore leaks, and — more importantly —
+/// the collector will never trace the managed pointers stored in its slots, so a
+/// payload object referenced only from a field could be swept. This is the
+/// standing limitation shared with `runtime.abi_list` / `runtime.abi_map`, not
+/// something introduced here, and it is why the GC registry is the next tranche
+/// rather than an optional extra.
+///
+/// Payload slots must still be zeroed explicitly: `alloc` does not zero memory
+/// (see the `zeroed` helper in `runtime.abi_map` and `enumNew` in
+/// `runtime.abi_enum`), and native `class_new` zeroes them so an uninitialised
+/// field is never traced.
+
+import { PICKLE_CLASS_USER_BASE } from runtime.object
+import { HEADER } from runtime.layout
+// `abiClassNew` allocates with `alloc(int, n)`, so the raw-allocation slots
+// belong in the object next to it. See `abi_raw.pkl` for what they replace.
+// `abiRegisterObject` records the instance in the port's sweepability
+// registry; without it `abi_class`'s "the allocation is not GC tracked"
+// limitation would be unobservable metadata instead of a fixable gap.
+import { abiRawAlloc, abiRegisterObject } from runtime.abi_raw
+
+/// `class_id` is header word 1, `size` is word 2 (see the header layout in
+/// `runtime/src/object.rs`: `next`, then `class_id`/`flags` packed in word 1,
+/// then `size`/`_pad` packed in word 2).
+const CLASS_ID_WORD: int = 1
+const SIZE_WORD: int = 2
+
+/// Word index of payload slot 0. The header is 24 bytes = 3 words, so the
+/// payload starts at word 3.
+const SLOT_WORD: int = HEADER / 8
+
+/// `heap::MIN_OBJECT`. `Gc::alloc` clamps every allocation up to this, so a
+/// tiny object is still 32 bytes. See `abiSizeWords` for why that matters.
+const MIN_OBJECT: int = 32
+
+/// THE TRAP: the size header word is the CLAMPED size, not `HEADER + 8*n`.
+///
+/// `class_object_size(n)` is `24 + 8n`, but the object does not store that — it
+/// stores whatever `Gc::alloc` settled on, and `Gc::alloc` computes
+/// `align8(24 + 8n).max(MIN_OBJECT).min(u32::MAX)`. For every small `n` the two
+/// differ:
+///
+///     n=0  ->  class_object_size = 24,  size word = 32
+///     n=1  ->  class_object_size = 32,  size word = 32
+///     n=2  ->  class_object_size = 40,  size word = 40
+///
+/// Writing `24 + 8n` into word 2 is therefore wrong for a zero-field class: the
+/// object would claim 24 bytes, `class_slot`'s guard
+/// `size < HEADER + 8` would reject every index, and `obj_slot_get` would return
+/// null for a slot that native reads successfully. The clamp is observable
+/// through the accessor, not just through the allocator's internals.
+///
+/// For `n = 0` the clamp has a second, stranger consequence. The stored size is
+/// 32, so `class_slot` computes `slots = (32 - 24 - 8) / 8 = 0` and admits
+/// index 0 -- so `obj_slot_get(obj, 0)` reads word 3, which is past the object's
+/// *logical* extent but inside its 32-byte allocation. The guard admits the
+/// index; it does not promise anything about the value.
+///
+/// Note the reference zeroes `8 * field_count` bytes and nothing more
+/// (`if field_count > 0 { write_bytes(payload, 0, 8 * field_count) }`), so for
+/// `n = 0` that word is whatever the allocator handed back -- indeterminate.
+/// This port reproduces the *guard*, and deliberately does not assert anything
+/// about that word's value. Do not add an expectation on it: the Rust bump
+/// allocator and the ported heap return different garbage, so such a test
+/// fails for reasons that have nothing to do with the ABI. Write to the slot and
+/// read it back if you want to prove index 0 is addressable.
+fn abiSizeWords(fieldCount: int) -> int {
+    var raw = HEADER + 8 * fieldCount
+    var aligned = ((raw + 7) / 8) * 8
+    if (aligned < MIN_OBJECT) {
+        aligned = MIN_OBJECT
+    }
+    return aligned
+}
+
+/// Number of payload slots a stored size admits, using the reference's guard
+/// arithmetic verbatim: `if size < HEADER + 8 { null }` then
+/// `slots = (size - HEADER - 8) / 8`, and the bound is `idx > slots`.
+fn slotCountFromSize(size: int) -> int {
+    if (size < HEADER + 8) {
+        return 0 - 1
+    }
+    return (size - HEADER - 8) / 8
+}
+
+/// Create an instance of user `classId` holding `slotCount` null field slots.
+///
+/// Port of `class.rs::pickle_class_new` -> `class_new`. The two clamps in the
+/// reference are load-bearing and both are kept:
+///
+///   * `slot_count < 0` becomes 0, so a negative count yields a zero-field
+///     object rather than an under-sized allocation.
+///   * `class_id < PICKLE_CLASS_USER_BASE` is raised to `PICKLE_CLASS_USER_BASE`,
+///     because the builtin ids (string..stream) are not instantiable as user
+///     classes and a low id would alias them.
+///
+/// The reference then allocates `class_object_size(n)` and zeroes the payload.
+/// Here the allocation is `alloc` and the *stored size* is `abiSizeWords(n)`,
+/// which is what the collector would have stored.
+fn classNew(classId: int, slotCount: int) -> *int {
+    unsafe {
+        var n = slotCount
+        if (n < 0) {
+            n = 0
+        }
+        var id = classId
+        if (id < PICKLE_CLASS_USER_BASE) {
+            id = PICKLE_CLASS_USER_BASE
+        }
+        var size = abiSizeWords(n)
+        var words = (size + 7) / 8
+        var obj = alloc(int, words)
+        obj[0] = 0
+        obj[CLASS_ID_WORD] = id
+        obj[SIZE_WORD] = size
+        // Zero the payload so an uninitialised field is never traced, exactly
+        // as `ptr::write_bytes(payload_mut(), 0, 8 * field_count)` does. Note
+        // this zeroes exactly `n` slots, not `size/8 - 3`: the reference writes
+        // `8 * field_count` words, so the extra bytes the clamp added stay
+        // whatever the allocator returned.
+        var i = 0
+        while (i < n) {
+            obj[SLOT_WORD + i] = 0
+            i = i + 1
+        }
+        abiRegisterObject(obj)
+        return obj
+    }
+}
+
+/// Allocate an instance of user class `class_id` with `slot_count` null field
+/// slots. Ported from `pickle_class_new`.
+#[symbol("pickle_class_new")]
+fn abiClassNew(classId: int, slotCount: int) -> *int {
+    return classNew(classId, slotCount)
+}
+
+/// Read field slot `slot`; null when out of bounds.
+///
+/// Port of `class.rs::pickle_obj_slot_get` -> `class_slot`. The bound is derived
+/// from the object's own stored size rather than from a stored field count,
+/// which is why the `MIN_OBJECT` clamp in `abiSizeWords` is load-bearing.
+///
+/// The guard is `idx > slots`, strictly greater, so the last admitted index is
+/// `slots` itself. Reproduced as written.
+#[symbol("pickle_obj_slot_get")]
+fn abiObjSlotGet(obj: *int, slot: int) -> *int {
+    if (obj == 0 as *int) {
+        return 0 as *int
+    }
+    if (slot < 0) {
+        return 0 as *int
+    }
+    unsafe {
+        var slots = slotCountFromSize(obj[SIZE_WORD])
+        if (slot > slots) {
+            return 0 as *int
+        }
+        return obj[SLOT_WORD + slot] as *int
+    }
+}
+
+/// Write field slot `slot`; silently ignored when out of bounds.
+///
+/// Port of `class.rs::pickle_obj_slot_set` -> `class_set_slot`. Same guard
+/// arithmetic as the getter, and like the reference a write outside the object
+/// is a no-op rather than a fault. The comment on `class_set_slot` notes the
+/// compiler only emits statically-known in-range indices, so the silent path is
+/// belt-and-braces — but it is reproduced rather than tightened, because a
+/// tighter version would diverge on any input a future emitter change could
+/// produce.
+#[symbol("pickle_obj_slot_set")]
+fn abiObjSlotSet(obj: *int, slot: int, value: *int) {
+    if (obj == 0 as *int) {
+        return
+    }
+    if (slot < 0) {
+        return
+    }
+    unsafe {
+        var slots = slotCountFromSize(obj[SIZE_WORD])
+        if (slot > slots) {
+            return
+        }
+        obj[SLOT_WORD + slot] = value as int
+    }
+}

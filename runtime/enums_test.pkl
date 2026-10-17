@@ -1,0 +1,89 @@
+module runtime.enum_test
+
+import { PICKLE_CLASS_STRING, PICKLE_CLASS_LIST, PICKLE_CLASS_MAP, PICKLE_CLASS_ENUM, PICKLE_CLASS_BOX_INT, PICKLE_CLASS_BOX_FLOAT } from runtime.object
+import { EnumPayload, EnumValue, enumEqValue, payloadEq, payloadKindOf, KIND_STRING, KIND_INT, KIND_FLOAT, KIND_BOOL, KIND_CHAR, KIND_NONE, KIND_OTHER, KIND_ENUM } from runtime.enums
+
+fn intPayload(v: int) -> EnumPayload {
+    EnumPayload(KIND_INT, v, 0.0, "", none, 0)
+}
+
+fn strPayload(s: string) -> EnumPayload {
+    EnumPayload(KIND_STRING, 0, 0.0, s, none, 0)
+}
+
+fn kindDispatch() {
+    expect(payloadKindOf(PICKLE_CLASS_STRING)).toBe(KIND_STRING)
+    expect(payloadKindOf(PICKLE_CLASS_BOX_INT)).toBe(KIND_INT)
+    expect(payloadKindOf(PICKLE_CLASS_BOX_FLOAT)).toBe(KIND_FLOAT)
+    expect(payloadKindOf(PICKLE_CLASS_ENUM)).toBe(KIND_ENUM)
+    expect(payloadKindOf(PICKLE_CLASS_LIST)).toBe(KIND_OTHER)
+    expect(payloadKindOf(PICKLE_CLASS_MAP)).toBe(KIND_OTHER)
+}
+
+test fn equal_values_compare_true() {
+    kindDispatch()
+    var a = EnumValue(3, [intPayload(7), strPayload("hi")])
+    var b = EnumValue(3, [intPayload(7), strPayload("hi")])
+    expect(enumEqValue(a, b)).toBe(true)
+}
+
+test fn tags_must_match() {
+    var a = EnumValue(3, [intPayload(7)])
+    var b = EnumValue(4, [intPayload(7)])
+    expect(enumEqValue(a, b)).toBe(false)
+}
+
+test fn arity_must_match() {
+    var a = EnumValue(3, [intPayload(7)])
+    var b = EnumValue(3, [intPayload(7), intPayload(1)])
+    expect(enumEqValue(a, b)).toBe(false)
+}
+
+test fn payload_content_must_match() {
+    var a = EnumValue(3, [intPayload(7), strPayload("x")])
+    expect(enumEqValue(a, EnumValue(3, [intPayload(8), strPayload("x")]))).toBe(false)
+    expect(enumEqValue(a, EnumValue(3, [intPayload(7), strPayload("y")]))).toBe(false)
+    expect(enumEqValue(a, EnumValue(3, [intPayload(7), strPayload("x")]))).toBe(true)
+}
+
+test fn float_payload_is_ieee() {
+    var a = EnumPayload(KIND_FLOAT, 0, 1.5, "", none, 0)
+    expect(payloadEq(a, EnumPayload(KIND_FLOAT, 0, 1.5, "", none, 0))).toBe(true)
+    expect(payloadEq(a, EnumPayload(KIND_FLOAT, 0, 2.5, "", none, 0))).toBe(false)
+    expect(payloadEq(EnumPayload(KIND_FLOAT, 0, -0.0, "", none, 0), EnumPayload(KIND_FLOAT, 0, 0.0, "", none, 0))).toBe(true)
+}
+
+test fn none_kind_matches_itself_and_nothing_else() {
+    var n = EnumPayload(KIND_NONE, 0, 0.0, "", none, 0)
+    expect(payloadEq(n, n)).toBe(true)
+    expect(payloadEq(n, intPayload(0))).toBe(false)
+    expect(payloadEq(intPayload(0), n)).toBe(false)
+}
+
+test fn other_kind_is_identity() {
+    var a = EnumPayload(KIND_OTHER, 0, 0.0, "", none, 7)
+    var b = EnumPayload(KIND_OTHER, 0, 0.0, "", none, 7)
+    expect(payloadEq(a, b)).toBe(true)
+    expect(payloadEq(a, EnumPayload(KIND_OTHER, 0, 0.0, "", none, 8))).toBe(false)
+}
+
+test fn nested_enums_compare_by_value() {
+    var inner = EnumValue(1, [strPayload("deep")])
+    var outerA = EnumValue(2, [EnumPayload(KIND_ENUM, 0, 0.0, "", inner, 0)])
+    var outerB = EnumValue(2, [EnumPayload(KIND_ENUM, 0, 0.0, "", EnumValue(1, [strPayload("deep")]), 0)])
+    var outerC = EnumValue(2, [EnumPayload(KIND_ENUM, 0, 0.0, "", EnumValue(5, [strPayload("deep")]), 0)])
+    expect(enumEqValue(outerA, outerB)).toBe(true)
+    expect(enumEqValue(outerA, outerC)).toBe(false)
+}
+
+test fn mixed_kinds_never_match() {
+    expect(payloadEq(intPayload(4), strPayload("4"))).toBe(false)
+    expect(payloadEq(EnumPayload(KIND_BOOL, 1, 0.0, "", none, 0), intPayload(1))).toBe(false)
+    expect(payloadEq(EnumPayload(KIND_CHAR, 65, 0.0, "", none, 0), EnumPayload(KIND_BOOL, 65, 0.0, "", none, 0))).toBe(false)
+}
+
+test fn scalar_kinds_compare_numeric_slots() {
+    expect(payloadEq(EnumPayload(KIND_BOOL, 1, 0.0, "", none, 0), EnumPayload(KIND_BOOL, 1, 0.0, "", none, 0))).toBe(true)
+    expect(payloadEq(EnumPayload(KIND_BOOL, 1, 0.0, "", none, 0), EnumPayload(KIND_BOOL, 0, 0.0, "", none, 0))).toBe(false)
+    expect(payloadEq(EnumPayload(KIND_CHAR, 65, 0.0, "", none, 0), EnumPayload(KIND_CHAR, 65, 0.0, "", none, 0))).toBe(true)
+}

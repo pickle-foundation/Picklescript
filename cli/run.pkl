@@ -1,0 +1,106 @@
+module cli.run
+
+import { DiagnosticSink } from compiler.diag
+import { CoffObj } from compiler.objread
+import { newObjs, lowerProgram, loadArchive, linkExe } from cli.buildlib
+
+fn newArgs() -> List<string> {
+    var argv = [""]
+    argv.pop()
+    argv
+}
+
+fn pathBase(p: string) -> string {
+    let bs = bytes(p)
+    var last = -1
+    var i = 0
+    while (i < len(bs)) {
+        let b = bs[i] as int
+        if (b == 47 || b == 92) {
+            last = i
+        }
+        i = i + 1
+    }
+    var out = ""
+    var k = last + 1
+    while (k < len(bs)) {
+        out += "{bs[k] as char}"
+        k = k + 1
+    }
+    out
+}
+
+fn stripPkl(base: string) -> string {
+    let bs = bytes(base)
+    let n = len(bs)
+    if (n > 4 && bs[n - 4] == 46 && bs[n - 3] == 112 && bs[n - 2] == 107 && bs[n - 1] == 108) {
+        var out = ""
+        var k = 0
+        while (k < n - 4) {
+            out += "{bs[k] as char}"
+            k = k + 1
+        }
+        return out
+    }
+    base
+}
+
+fn main() {
+    let argv = args()
+    if (len(argv) < 2) {
+        println("RUN NO ARGS")
+        return
+    }
+    let target = argv[0]
+    let runtimeLib = argv[1]
+    var programArgs = newArgs()
+    var i = 2
+    while (i < len(argv)) {
+        programArgs.push(argv[i])
+        i = i + 1
+    }
+    let exePath = "tools/diff/g12run/" + stripPkl(pathBase(target)) + ".exe"
+    if (let some(src) = read_file(target)) {
+        let sinks = DiagnosticSink()
+        if (let some(program) = lowerProgram(target, src, sinks)) {
+            let programObj = program.obj
+            if (let some(libObjects) = loadArchive(runtimeLib)) {
+                var objects = newObjs()
+                objects.push(programObj)
+                var objIndex = 0
+                while (objIndex < len(libObjects)) {
+                    objects.push(libObjects[objIndex])
+                    objIndex = objIndex + 1
+                }
+                if (let some(errorText) = linkExe(objects, exePath, program.overrides)) {
+                    println("RUN BUILD FAIL: " + errorText)
+                    return
+                }
+                var childArgv = newArgs()
+                childArgv.push(exePath)
+                var a = 0
+                while (a < len(programArgs)) {
+                    childArgv.push(programArgs[a])
+                    a = a + 1
+                }
+                let exitOut = run_cmd(childArgv, none, none, none, none, none, none, true)
+                if (let some(outcome) = exitOut) {
+                    match (outcome) {
+                        case (code, out, err, timed) -> {
+                            if (let some(c) = code) {
+                                exit(c)
+                            }
+                        }
+                        case _ -> {}
+                    }
+                }
+                exit(1)
+            }
+            println("RUN FAIL: cannot read runtime lib " + runtimeLib)
+            return
+        }
+        println("RUN FAIL: source " + target + " did not lower to COFF")
+        return
+    }
+    println("RUN FAIL: cannot read source " + target)
+}

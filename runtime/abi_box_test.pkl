@@ -1,0 +1,219 @@
+module runtime.abi_box_test
+
+import { abiBoxI64, abiUnboxI64, abiBoxBool, abiUnboxBool, abiBoxChar, abiUnboxChar, abiBoxF64, abiUnboxF64, newBox, boxBits } from runtime.abi_box
+import { PICKLE_CLASS_BOX_INT, PICKLE_CLASS_BOX_FLOAT, PICKLE_CLASS_BOX_BOOL, PICKLE_CLASS_BOX_CHAR } from runtime.object
+import { abiRegisteredCount, abiRegisteredBytes } from runtime.abi_raw
+
+/// A float box, built by hand. `pickle_box_f64` IS ported now, so the tests
+/// below use `abiBoxF64` where they are checking the box half and this helper
+/// only where they need to inject a payload the value path could not produce -
+/// that is, the NaN rows, whose original bit pattern is deliberately
+/// canonicalised on the way in (see `abi_box.pkl`).
+fn floatBox(bits: int) -> *int {
+    return newBox(PICKLE_CLASS_BOX_FLOAT, bits)
+}
+
+test fn box_i64_round_trips_negative() {
+    var b = abiBoxI64(-1234567890123)
+    expect(abiUnboxI64(b)).toBe(-1234567890123)
+}
+
+test fn box_i64_round_trips_zero_and_max() {
+    expect(abiUnboxI64(abiBoxI64(0))).toBe(0)
+    expect(abiUnboxI64(abiBoxI64(9223372036854775807))).toBe(9223372036854775807)
+}
+
+test fn box_bool_round_trips() {
+    expect(abiUnboxBool(abiBoxBool(true))).toBe(true)
+    expect(abiUnboxBool(abiBoxBool(false))).toBe(false)
+}
+
+test fn box_bool_treats_any_nonzero_payload_as_true() {
+    // Mirrors boxscalar.rs: unbox_bool is `unbox_bits(obj, "bool") != 0`, so a box
+    // built with a raw 2 must still read back `true`.
+    expect(abiUnboxBool(newBox(PICKLE_CLASS_BOX_BOOL, 2))).toBe(true)
+}
+
+test fn box_char_round_trips() {
+    expect(abiUnboxChar(abiBoxChar(65))).toBe(65)
+    expect(abiUnboxChar(abiBoxChar(0))).toBe(0)
+}
+
+test fn new_box_writes_the_header_the_runtime_reads() {
+    // p[1] is class_id/flags and p[2] is the object's byte size; the GC and
+    // pickle_print_obj both key off them, so a box that skips them is not a box.
+    var b = newBox(PICKLE_CLASS_BOX_INT, 7)
+    unsafe {
+        expect(b[1]).toBe(PICKLE_CLASS_BOX_INT)
+        expect(b[2]).toBe(32)
+    }
+    expect(boxBits(b)).toBe(7)
+}
+
+test fn unbox_f64_reads_the_payload_as_a_bit_pattern_not_a_number() {
+    // The payload of a float box is `v.to_bits()`. If this body used a numeric
+    // conversion instead of `f64FromBits`, 4609434218613702656 would answer
+    // 4609434218613702656.0 rather than 1.5 - so these values are the whole point.
+    expect(abiUnboxF64(floatBox(4609434218613702656))).toBe(1.5)
+    expect(abiUnboxF64(floatBox(4607182418800017408))).toBe(1.0)
+    expect(abiUnboxF64(floatBox(4602678819172646912))).toBe(0.5)
+}
+
+test fn unbox_f64_round_trips_negative_and_zero() {
+    expect(abiUnboxF64(floatBox(-4611686018427387904))).toBe(-2.0)
+    expect(abiUnboxF64(floatBox(0))).toBe(0.0)
+    // -0.0 is bits 0x8000000000000000, which is i64::MIN and so has no literal
+    // spelling; negation of 9223372036854775808 overflows the literal parser.
+    expect(abiUnboxF64(floatBox(0 - 9223372036854775807 - 1))).toBe(-0.0)
+}
+
+test fn unbox_f64_round_trips_infinities_and_extremes() {
+    expect(abiUnboxF64(floatBox(9218868437227405312))).toBe(1.0 / 0.0)
+    expect(abiUnboxF64(floatBox(-4503599627370496))).toBe(-1.0 / 0.0)
+    expect(abiUnboxF64(floatBox(9218868437227405311))).toBe(1.7976931348623157e308)
+    expect(abiUnboxF64(floatBox(-4503599627370497))).toBe(-1.7976931348623157e308)
+}
+
+test fn unbox_f64_preserves_the_smallest_subnormal() {
+    // Bits 1 is the smallest positive subnormal. A numeric conversion would
+    // answer 1.0 here, so this pins that nothing rounds the payload.
+    expect(abiUnboxF64(floatBox(1))).toBe(5e-324)
+}
+
+test fn unbox_f64_propagates_nan_rather_than_panicking() {
+    var f = abiUnboxF64(floatBox(9221120237041090560))
+    expect(f == f).toBe(false)
+}
+
+test fn f64_from_bits_reconstructs_the_four_shape_boundaries() {
+    // Each of these is a corner the ported `abiF64FromBits` has to get exactly
+    // right, and each fails loudly if it does not: the smallest normal is the
+    // first value the `exp != 0` arm handles, the largest subnormal is the last
+    // the `exp == 0` arm handles, and their negatives pin that the sign is
+    // applied by negation rather than folded into the significand.
+    expect(abiUnboxF64(floatBox(4503599627370496))).toBe(2.2250738585072014e-308)
+    expect(abiUnboxF64(floatBox(4503599627370495))).toBe(2.2250738585072009e-308)
+    expect(abiUnboxF64(floatBox(-9218868437227405313))).toBe(-2.2250738585072009e-308)
+    expect(abiUnboxF64(floatBox(-9223372036854775807))).toBe(-5e-324)
+}
+
+test fn f64_from_bits_reconstructs_a_full_precision_normal() {
+    // 0x400921FB54442D18 - all 52 significand bits set to a non-trivial
+    // pattern, so `1 + frac / 2^52` has to stay inside 53 significant bits.
+    // A reconstruction that rounds anywhere along the way answers a different
+    // pi, and `toBe` compares the value rather than the printed form.
+    expect(abiUnboxF64(floatBox(4614256656552045848))).toBe(3.141592653589793)
+    // The sign bit is not an integer negation of the pattern - it is the top bit
+    // ORed in - so `-pi` is a different word, not `-4614256656552045848`.
+    expect(abiUnboxF64(floatBox(0 - 4609115380302729960))).toBe(-3.141592653589793)
+}
+
+test fn box_f64_stores_the_exact_word_not_a_neighbour() {
+    // `pickle_box_f64` is `new_box(BOX_FLOAT, v.to_bits() as i64)`, so what is
+    // under test is the payload word itself, not the value round-tripped through
+    // it - `toBe` on a float would happily accept a nearby double that the value
+    // comparison could not separate. Reading `boxBits` directly closes that hole.
+    //
+    // The selection is the same corner set `unbox_f64` is pinned against, so the
+    // two halves of the pair are now checked against one another from both
+    // directions: every word here also has to survive `abiUnboxF64` above.
+    expect(boxBits(abiBoxF64(1.5))).toBe(4609434218613702656)
+    expect(boxBits(abiBoxF64(1.0))).toBe(4607182418800017408)
+    expect(boxBits(abiBoxF64(0.5))).toBe(4602678819172646912)
+    // All 52 significand bits in a non-trivial pattern; `f64Bits` has to derive
+    // them back out of `a - 1` without rounding once.
+    expect(boxBits(abiBoxF64(3.141592653589793))).toBe(4614256656552045848)
+    expect(boxBits(abiBoxF64(0.0 - 3.141592653589793))).toBe(0 - 4609115380302729960)
+    // Zero keeps its sign bit: `-0.0` is detected by `1.0 / v < 0.0`, because
+    // `-0.0 < 0.0` is false and `v < 0.0` would lose it.
+    expect(boxBits(abiBoxF64(0.0))).toBe(0)
+    expect(boxBits(abiBoxF64(-0.0))).toBe(0 - 9223372036854775807 - 1)
+    // Infinities are returned before the normalisation loop, which would
+    // otherwise spin forever on `inf * 0.5`.
+    expect(boxBits(abiBoxF64(1.0 / 0.0))).toBe(9218868437227405312)
+    expect(boxBits(abiBoxF64(-1.0 / 0.0))).toBe(0 - 4503599627370496)
+    expect(boxBits(abiBoxF64(1.7976931348623157e308))).toBe(9218868437227405311)
+    expect(boxBits(abiBoxF64(-1.7976931348623157e308))).toBe(0 - 4503599627370497)
+    // The subnormal branch: the smallest positive subnormal is word 1, and the
+    // smallest normal is word 4503599627370496, which is the first exponent the
+    // `e >= -1022` arm handles. One apart on the word, many orders apart in
+    // value - so a body that confuses the two branches fails both.
+    expect(boxBits(abiBoxF64(5e-324))).toBe(1)
+    expect(boxBits(abiBoxF64(-5e-324))).toBe(0 - 9223372036854775807)
+    expect(boxBits(abiBoxF64(2.2250738585072014e-308))).toBe(4503599627370496)
+    expect(boxBits(abiBoxF64(-2.2250738585072014e-308))).toBe(0 - 9218868437227405312)
+}
+
+test fn box_f64_recovers_the_exact_word_over_the_whole_shape_space() {
+    // The differential sweep the module header claims: build a word, recover the
+    // value it names with `f64FromBits`, hand that value to `abiBoxF64`, and
+    // require the original word back out of the payload. Both directions are
+    // Pickle bodies, so this fails if either one drifts.
+    //
+    // Every exponent is crossed with both signs and eight significands chosen to
+    // stress each branch - 0, the lowest bit, values either side of a power-of-2
+    // boundary, and the top of the field. NaN rows are skipped: their payload is
+    // not recoverable from the value and `abi_box.pkl` documents the
+    // canonicalisation instead of faking it.
+    var bad = 0
+    var checked = 0
+    var sign = 0
+    while (sign < 2) {
+        var signBit = 0
+        if (sign == 1) {
+            signBit = 0 - 9223372036854775807 - 1
+        }
+        var exp = 0
+        while (exp < 2048) {
+            var fracIdx = 0
+            while (fracIdx < 8) {
+                var frac = 0
+                if (fracIdx == 1) { frac = 1 }
+                if (fracIdx == 2) { frac = 2 }
+                if (fracIdx == 3) { frac = 3 }
+                if (fracIdx == 4) { frac = 8192 }
+                if (fracIdx == 5) { frac = 2199023255551 }
+                if (fracIdx == 6) { frac = 4503599627370494 }
+                if (fracIdx == 7) { frac = 4503599627370495 }
+                var isNan = false
+                if (exp == 2047) {
+                    if (frac != 0) {
+                        isNan = true
+                    }
+                }
+                if (isNan == false) {
+                    var bits = signBit | (exp * 4503599627370496) | frac
+                    var got = boxBits(abiBoxF64(f64FromBits(bits)))
+                    if (got != bits) {
+                        bad = bad + 1
+                    }
+                    checked = checked + 1
+                }
+                fracIdx = fracIdx + 1
+            }
+            exp = exp + 1
+        }
+        sign = sign + 1
+    }
+    // 2 * 2048 * 8 less the two-sign NaN rows (exp 2047, seven non-zero
+    // significands each): 32768 - 14.
+    expect(checked).toBe(32754)
+    expect(bad).toBe(0)
+}
+
+test fn boxes_register_in_the_sweepability_registry() {
+    // Hook verification for the reclamation-gate registry: every box the maker
+    // creates is a registered managed object. Clean image (this file carries no
+    // `abi_string`), so `expect`'s formatting stays native and the deltas are
+    // exact. Boxes are 32 bytes regardless of payload (BOX_WORDS * 8).
+    var beforeC = abiRegisteredCount()
+    var beforeB = abiRegisteredBytes()
+    var b = abiBoxI64(123)
+    expect((b as int) != 0).toBe(true)
+    expect(abiRegisteredCount()).toBe(beforeC + 1)
+    expect(abiRegisteredBytes()).toBe(beforeB + 32)
+    var f = abiBoxF64(f64FromBits(0))
+    expect((f as int) != 0).toBe(true)
+    expect(abiRegisteredCount()).toBe(beforeC + 2)
+    expect(abiRegisteredBytes()).toBe(beforeB + 64)
+}

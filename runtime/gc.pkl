@@ -1,0 +1,193 @@
+module runtime.gc
+
+/// Port of `runtime/src/gc.rs`: the collector's observable contract.
+///
+/// The memory core stays native — mark-and-sweep over arena blocks, shadow
+/// stack protocol, static-root cells, finalizers, manual objects
+/// (`pickle_manual_adopt` / `pickle_manual_free`), and the
+/// `pickle_gc_alloc` / `pickle_gc_collect` / `pickle_gc_root_add` /
+/// `pickle_gc_root_drop` ABI.
+///
+/// What a self-hosted runtime owns is the OBSERVABLE CONTRACT:
+///   - default auto-collect threshold is 8 MiB (DEFAULT_AUTO_COLLECT_THRESHOLD);
+///   - collections run on demand and automatically once bytes allocated since
+///     the last collection reach the threshold, but the allocation that
+///     crosses the threshold survives its own collect (it is pinned);
+///   - `pickle_gc_allocations_since_gc` / `pickle_gc_collection_count`
+///     expose the counters; `pickle_gc_set_threshold` adjusts the trigger;
+///   - the per-module reset between `pickle test` files zeroes the counters,
+///     restores the default threshold, drops every static root, and rebuilds
+///     the heap so a new module's class ids restart from the same base.
+
+/// `DEFAULT_AUTO_COLLECT_THRESHOLD` in object bytes.
+const GC_DEFAULT_THRESHOLD: int = 8388608
+
+class GcStats {
+    var allocationsSinceGc: int
+    var collections: int
+    var autoCollectThreshold: int
+
+    constructor() {
+        this.allocationsSinceGc = 0
+        this.collections = 0
+        this.autoCollectThreshold = GC_DEFAULT_THRESHOLD
+    }
+
+    /// One object allocation (mirror of the `ALLOC_SINCE_GC` counter).
+    fn allocation() {
+        this.allocationsSinceGc = this.allocationsSinceGc + 1
+    }
+
+    /// Mirror of `pickle_gc_collect`: a completed collection cycle resets the
+    /// allocation counter.
+    fn collect() {
+        this.collections = this.collections + 1
+        this.allocationsSinceGc = 0
+    }
+
+    /// Mirror of `pickle_gc_set_threshold(bytes)`.
+    fn setThreshold(bytes: int) {
+        this.autoCollectThreshold = bytes
+    }
+
+    /// Mirror of `gc::reset`: counters zeroed, default threshold restored,
+    /// static roots dropped (here: the store is reconstructed by the caller).
+    fn reset() {
+        this.allocationsSinceGc = 0
+        this.collections = 0
+        this.autoCollectThreshold = GC_DEFAULT_THRESHOLD
+    }
+}
+
+/// The auto-collect trigger: a collection fires once bytes allocated since the
+/// last collection are at/above the threshold. The crossing object itself is
+/// pinned across the collection it triggers.
+fn shouldAutoCollect(bytesSinceLastCollection: int, threshold: int) -> bool {
+    bytesSinceLastCollection >= threshold
+}
+
+/// Threshold state shared by the Pickle-side collector.
+///
+/// `bytesSinceGc` is read from the LIVE collector (`gcBytesSinceGc`), not
+/// mirrored locally: `maybe_collect` in `runtime/src/gc.rs` compares
+/// `BYTES_SINCE_GC` against `AUTO_THRESHOLD`, so those bytes — not the
+/// allocation *count* — are the quantity that drives the real trigger. The
+/// modeled `GcStats` above keeps its own counters for tests that want a hermetic
+/// contract, and the two are deliberately not interchangeable.
+class HeapWatch {
+    var threshold: int
+    var collections: int
+
+    constructor() {
+        this.threshold = GC_DEFAULT_THRESHOLD
+        this.collections = 0
+    }
+
+    /// Bytes allocated since the last collection, straight from the live heap.
+    fn bytesSinceGc() -> int {
+        gcBytesSinceGc()
+    }
+
+    /// Object allocations since the last collection (a COUNT, distinct from
+    /// `bytesSinceGc`; kept for parity with `pickle_gc_allocations_since_gc`).
+    fn allocationsSinceGc() -> int {
+        gcAllocationsSinceGc()
+    }
+
+    /// Completed collection cycles, from the live collector.
+    fn collectionCount() -> int {
+        gcCollectionCount()
+    }
+
+    /// Pin the auto-collect threshold on the live collector. An explicit set
+    /// also disables the adaptive post-collect adjustment until the next reset
+    /// (`AUTO_THRESHOLD_MANUAL`), matching `pickle_gc_set_threshold`.
+    fn setThreshold(bytes: int) {
+        gcSetThreshold(bytes)
+        this.threshold = bytes
+    }
+
+    /// Ask the live collector whether a collection is due, without forcing one.
+    /// This is the decision the native `maybe_collect` makes internally; here
+    /// the same predicate is evaluated in Pickle against real heap bytes.
+    fn isDue() -> bool {
+        shouldAutoCollect(this.bytesSinceGc(), this.threshold)
+    }
+
+    /// Collect if due. Returns true when a collection actually ran, so a caller
+    /// can log or assert on it. The crossing allocation survives its own
+    /// collection because the native collector pins it, not this code.
+    fn collectIfDue() -> bool {
+        if (this.isDue()) {
+            gcCollect(false)
+            this.collections = this.collections + 1
+            return true
+        }
+        return false
+    }
+
+    /// Restore the default threshold on the live collector.
+    fn reset() {
+        gcSetThreshold(GC_DEFAULT_THRESHOLD)
+        this.threshold = GC_DEFAULT_THRESHOLD
+        this.collections = 0
+    }
+}
+
+/// The collector's delegation seam, mirroring `interface Fs` in `runtime.fs`:
+/// the one place a caller says "reclaim now" without knowing whether the
+/// collector behind it is modeled or native.
+///
+/// This is the `collect()` delegation point. It does NOT expose heap internals
+/// — `runtime.collector` still walks a modeled graph, because a raw managed
+/// object view is not reachable from pickle yet. What the seam buys is a
+/// uniform call site: inject `NativeGc` in a real program and the request lands
+/// in the live collector through the compiler-exposed `gcCollect` builtin;
+/// inject `ModeledGc` in a test and it lands in the modeled contract above.
+interface Gc {
+    /// Run a collection cycle. `force` is forwarded to the native collector
+    /// unchanged; the modeled implementation only records it.
+    fn collect(force: bool)
+}
+
+/// The modeled implementation, for tests: records the request against the
+/// observable contract (`GcStats`) instead of touching a real heap.
+class ModeledGc implements Gc {
+    var stats: GcStats
+    var forced: int
+
+    constructor() {
+        this.stats = GcStats()
+        this.forced = 0
+    }
+
+    fn collect(force: bool) {
+        this.stats.collect()
+        if (force) {
+            this.forced = this.forced + 1
+        }
+    }
+}
+
+/// The native implementation: delegates straight into the live collector via
+/// the `gcCollect(force)` builtin, which lowers to `pickle_gc_collect`. This
+/// is the real heap being driven from pickle, not a model of it.
+class NativeGc implements Gc {
+    var collections: int
+
+    constructor() {
+        this.collections = 0
+    }
+
+    fn collect(force: bool) {
+        gcCollect(force)
+        this.collections = this.collections + 1
+    }
+}
+
+/// The single `collect()` call site every caller should use. The
+/// implementation is chosen by injection, so program code and test code call
+/// the same thing.
+fn collectNow(gc: Gc, force: bool) {
+    gc.collect(force)
+}

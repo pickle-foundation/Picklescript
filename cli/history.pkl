@@ -1,0 +1,797 @@
+module cli.history
+
+//! `pickle history`, `pickle builds`, and `pickle explain --history`,
+//! ported into pickle.
+//!
+//! Versions are the git history of `*.pkl` files. For every commit that
+//! touches a `.pkl` file we compile the file as it existed then and store a
+//! `Snapshot` (public surface, dependency lines, build status, and error
+//! codes) in the cache at `.pickle/history/snapshots.db`, keyed by a content
+//! hash. Later runs reuse cached snapshots, so history stays fast.
+
+import { frontendChecked, FrontOutput } from compiler.front
+import { stringTrim, strLt, subStr, sortStrs, dedupStrs, eqStrs } from compiler.front
+import { DiagnosticSink } from compiler.diag
+import { Snapshot, PublicItem, SurfaceChange, extractSurface, depsOf, diffSurfaces, transitLabel, fnv1a64, emptyPublicItems, cps } from compiler.history
+import { emitIr } from compiler.emit
+import { git, Result, currentDir, splitLines } from std.process
+import { writeStderr } from runtime.abi_stdio
+import { STR_BYTES_OFF } from runtime.layout
+import { StringBuilder } from std.text.stringbuilder
+
+/// A commit together with the `*.pkl` files it touched, in commit order.
+class CommitEntry {
+    var commit: string
+    var short: string
+    var date: string
+    var message: string
+    var files: List<string>
+    var shas: List<string>
+
+    constructor(commit: string, short: string, date: string, message: string, files: List<string>, shas: List<string>) {
+        this.commit = commit
+        this.short = short
+        this.date = date
+        this.message = message
+        this.files = files
+        this.shas = shas
+    }
+}
+
+class BuildRow {
+    var date: string
+    var short: string
+    var file: string
+    var ok: bool
+    var codes: List<string>
+
+    constructor(date: string, short: string, file: string, ok: bool, codes: List<string>) {
+        this.date = date
+        this.short = short
+        this.file = file
+        this.ok = ok
+        this.codes = codes
+    }
+}
+
+/// `git <args>` in `root`; stdout on success, `none` (with a diagnostic on
+/// stderr) when git failed.
+fn runGit(root: string, args: List<string>) -> string? {
+    let r = git(root, args)
+    if (r.ok()) {
+        return r.stdout()
+    }
+    stderrLine("error: git " + joinArgs(args) + " failed: " + trimEnd(r.stderr()) + "\n")
+    none
+}
+
+/// Absolute path to the git work tree root, found by walking up from `cwd`.
+fn gitRoot(cwd: string) -> string? {
+    let r = git(cwd, ["rev-parse", "--show-toplevel"] as List<string>)
+    if (r.ok()) {
+        return stringTrim(r.stdout())
+    }
+    stderrLine("error: `" + cwd + "` is not inside a git repository; compiler history is derived from git commits\n")
+    none
+}
+
+/// Every commit that touched a `*.pkl` file, oldest first, with the touched
+/// files and their blob SHAs at that commit. `--raw` (with `--abbrev=40`)
+/// yields, in ONE spawn, the commit headers plus a per-file line of the form
+/// `:mode mode oldsha newsha STAT\tpath`, so `newsha` fingerprints the file
+/// content without fetching it. Files deleted in a commit are skipped, which
+/// matches `git show` failing for them in the cache-miss path.
+fn pklHistory(root: string) -> List<CommitEntry>? {
+    match (runGit(root, ["log", "--format=%x1e%x1f%H%x1f%ci%x1f%s", "--abbrev=40", "--raw", "--", "*.pkl"] as List<string>)) {
+        case none -> { return none }
+        case some(out) -> { return parseHistory(out) }
+    }
+}
+
+fn parseHistory(out: string) -> List<CommitEntry> {
+    let recSep = cps(30)
+    let hdrSep = cps(31)
+    var entries = emptyEntries()
+    let parts = splitBy(out, recSep)
+    var i = 0
+    while (i < len(parts)) {
+        let part = parts[i]
+        if (len(part) > 0 && hasPrefix(part, hdrSep)) {
+            let fields = splitBy(part, hdrSep)
+            if (len(fields) >= 4) {
+                let lines = splitLines(fields[3])
+                var message = ""
+                if (len(lines) > 0) {
+                    message = lines[0]
+                }
+                var files = emptyStrs()
+                var shas = emptyStrs()
+                var j = 1
+                while (j < len(lines)) {
+                    let t = trimEnd(lines[j])
+                    if (hasPrefix(t, ":")) {
+                        match (parseRawLine(t)) {
+                            case some(r) -> {
+                                match (r) {
+                                    case (sha, path) -> {
+                                        files.push(path)
+                                        shas.push(sha)
+                                    }
+                                    case _ -> {}
+                                }
+                            }
+                            case none -> {}
+                        }
+                    }
+                    j = j + 1
+                }
+                entries.push(CommitEntry(fields[1], subStr(fields[1], 0, 7), fields[2], message, files, shas))
+            }
+        }
+        i = i + 1
+    }
+    let out = emptyEntries()
+    var m = len(entries) - 1
+    while (m >= 0) {
+        out.push(entries[m])
+        m = m - 1
+    }
+    out
+}
+
+/// Extract `(newsha, path)` from a `--raw` diff line like
+/// `:100644 100644 <old> <new> M\tpath`; `none` for deletions (zero `new`).
+fn parseRawLine(line: string) -> (string, string)? {
+    if (len(line) < 2) {
+        return none
+    }
+    let body = subStr(line, 1, len(line) - 1)
+    let parts = splitBy(body, " ")
+    if (len(parts) < 5) {
+        return none
+    }
+    let last = parts[len(parts) - 1]
+    let ts = splitBy(last, "\t")
+    if (len(ts) < 2) {
+        return none
+    }
+    let status = ts[0]
+    // Rust parity: `git log --name-only` reports the destination path for a
+    // rename, so a `R<score>` raw line must resolve to `ts[2]`, not `ts[1]`.
+    let path = if (len(ts) >= 3 && hasPrefix(status, "R")) { ts[2] } else { ts[1] }
+    if (status == "D" || status == "U" || status == "X") {
+        return none
+    }
+    let sha = parts[3]
+    if (len(sha) == 0) {
+        return none
+    }
+    (sha, path)
+}
+
+/// `git show <commit>:<file>`, or `none` when the pathspec does not resolve.
+fn gitShow(root: string, commit: string, file: string) -> string? {
+    let r = git(root, ["show", commit + ":" + file] as List<string>)
+    if (r.ok()) {
+        return r.stdout()
+    }
+    none
+}
+
+fn cachePath(root: string) -> string {
+    root + "/.pickle/history/snapshots.db"
+}
+
+fn readCache(root: string) -> List<Snapshot> {
+    var out = emptySnaps()
+    match (read_file(cachePath(root))) {
+        case none -> { return out }
+        case some(text) -> {
+            let lines = fastSplitLines(text)
+            var i = 0
+            while (i < len(lines)) {
+                match (Snapshot.fromJson(lines[i])) {
+                    case some(s) -> out.push(s)
+                    case none -> {}
+                }
+                i = i + 1
+            }
+        }
+    }
+    out
+}
+
+/// Line-split in ONE byte pass. The runtime boxes every byte of a string on
+/// each `bytes(...)` call, so re-deriving the full byte list per line (as
+/// `std.splitLines`/`sliceRange` do) is O(n) per line — quadratic on large
+/// caches. Instead we scan once and copy each line's byte pointers into a
+/// fresh list before `str`, keeping the whole split O(n).
+fn fastSplitLines(s: string) -> List<string> {
+    let bs = bytes(s)
+    var out = emptyStrs()
+    var start = 0
+    var i = 0
+    let n = len(bs)
+    while (i <= n) {
+        if (i == n || bs[i] as int == 10) {
+            var end = i
+            if (end > start && bs[end - 1] as int == 13) {
+                end = end - 1
+            }
+            if (end > start) {
+                var lb = bytes("")
+                var p = start
+                while (p < end) {
+                    lb.push(bs[p])
+                    p = p + 1
+                }
+                out.push(str(lb))
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    out
+}
+
+fn writeCache(root: string, snapshots: List<Snapshot>) {
+    let _ = mkdir(root + "/.pickle")
+    let _ = mkdir(root + "/.pickle/history")
+    var body = snapshots
+    var i = 1
+    while (i < len(body)) {
+        var j = i
+        while (j > 0 && snapBefore(body[j], body[j - 1])) {
+            let tmp = body[j - 1]
+            body[j - 1] = body[j]
+            body[j] = tmp
+            j = j - 1
+        }
+        i = i + 1
+    }
+    var text = StringBuilder()
+    i = 0
+    while (i < len(body)) {
+        text.append(body[i].toJson())
+        text.append("\n")
+        i = i + 1
+    }
+    let _ = write_file(cachePath(root), text.toString())
+}
+
+fn snapBefore(a: Snapshot, b: Snapshot) -> bool {
+    if (a.commit != b.commit) {
+        return strLt(a.commit, b.commit)
+    }
+    strLt(a.file, b.file)
+}
+
+/// Compile a file as it existed at a commit into a `Snapshot`. The frontend
+/// covers lex/parse/resolve/check; codegen diagnostics (e.g. "not lowered
+/// yet") come from `emitIr`.
+fn buildSnapshot(e: CommitEntry, file: string, content: string) -> Snapshot {
+    let diags = DiagnosticSink()
+    let out = frontendChecked(file, content, diags)
+    if (let some(o) = out) {
+        let _ = emitIr(o.program, o.resolved, diags)
+    }
+    var codes = emptyStrs()
+    var i = 0
+    while (i < len(diags.diagnostics)) {
+        match (diags.diagnostics[i].code) {
+            case some(c) -> codes.push(c)
+            case none -> {}
+        }
+        i = i + 1
+    }
+    sortStrs(codes)
+    dedupStrs(codes)
+    var items = emptyPublicItems()
+    var deps = emptyStrs()
+    match (out) {
+        case some(o) -> {
+            items = extractSurface(o.program)
+            deps = depsOf(o.program)
+        }
+        case none -> {}
+    }
+    Snapshot(e.commit, e.short, e.date, e.message, file, fnv1a64(bytes(content)), !diags.anyError(), codes, deps, items)
+}
+
+/// Walk the pkl history, ensuring a cached snapshot exists for every touched
+/// file, and return everything we know, oldest first.
+///
+/// The blob SHA from `--raw` is the content fingerprint: when a cached
+/// snapshot for `(commit, file)` already carries the same `sha`, its content
+/// is unchanged and no `git show` is needed. Snapshots cached by the Rust CLI
+/// have no `sha`; those are trusted once (git content is immutable) and
+/// back-filled, so even the first pickle run over a Rust-written cache avoids
+/// the per-file spawns.
+fn collectSnapshots(root: string) -> List<Snapshot>? {
+    match (pklHistory(root)) {
+        case none -> { return none }
+        case some(history) -> {
+            var cached = readCache(root)
+            var fresh = emptySnaps()
+            var i = 0
+            while (i < len(history)) {
+                let e = history[i]
+                var j = 0
+                while (j < len(e.files)) {
+                    let file = e.files[j]
+                    let sha = e.shas[j]
+                    var found = -1
+                    var k = 0
+                    while (k < len(cached)) {
+                        if (cached[k].commit == e.commit && cached[k].file == file) {
+                            found = k
+                        }
+                        k = k + 1
+                    }
+                    var sn: Snapshot? = none
+                    if (found >= 0 && cached[found].sha == sha) {
+                        sn = cached[found]
+                    } else if (found >= 0 && len(cached[found].sha) == 0) {
+                        cached[found].sha = sha
+                        sn = cached[found]
+                    } else if (found >= 0) {
+                        match (gitShow(root, e.commit, file)) {
+                            case some(content) -> {
+                                let hash = fnv1a64(bytes(content))
+                                if (cached[found].hash == hash) {
+                                    cached[found].sha = sha
+                                    sn = cached[found]
+                                } else {
+                                    let rebuilt = buildSnapshot(e, file, content)
+                                    rebuilt.sha = sha
+                                    cached[found] = rebuilt
+                                    sn = rebuilt
+                                }
+                            }
+                            case none -> {}
+                        }
+                    } else {
+                        match (gitShow(root, e.commit, file)) {
+                            case some(content) -> {
+                                let built = buildSnapshot(e, file, content)
+                                built.sha = sha
+                                cached.push(built)
+                                sn = built
+                            }
+                            case none -> {}
+                        }
+                    }
+                    match (sn) {
+                        case some(x) -> fresh.push(x)
+                        case none -> {}
+                    }
+                    j = j + 1
+                }
+                i = i + 1
+            }
+            if (len(fresh) > 0) {
+                writeCache(root, cached)
+            }
+            return fresh
+        }
+    }
+}
+
+/// Compile-and-cache the whole pkl history, then return the snapshots.
+fn historyFor(root: string) -> List<Snapshot>? {
+    collectSnapshots(root)
+}
+
+fn fmtCommit(short: string, date: string, message: string) -> string {
+    short + "  " + date + "  " + firstLine(message)
+}
+
+/// `pickle history [--file F] [--limit N]`: per file, the last `limit`
+/// versions with the surface evolution between consecutive ones.
+fn renderHistory(snapshots: List<Snapshot>, fileFilter: string?, limit: int) {
+    var files = emptyStrs()
+    var i = 0
+    while (i < len(snapshots)) {
+        if (!listHasStr(files, snapshots[i].file)) {
+            files.push(snapshots[i].file)
+        }
+        i = i + 1
+    }
+    match (fileFilter) {
+        case some(f) -> {
+            var kept = emptyStrs()
+            var k = 0
+            while (k < len(files)) {
+                if (files[k] == f) {
+                    kept.push(f)
+                }
+                k = k + 1
+            }
+            files = kept
+        }
+        case none -> {}
+    }
+    sortStrs(files)
+    let lim = intMax(limit, 1)
+    var fi = 0
+    while (fi < len(files)) {
+        let file = files[fi]
+        var seq = emptySnaps()
+        var s0 = 0
+        while (s0 < len(snapshots)) {
+            if (snapshots[s0].file == file) {
+                seq.push(snapshots[s0])
+            }
+            s0 = s0 + 1
+        }
+        var shown = emptySnaps()
+        var m = len(seq) - 1
+        while (m >= 0 && len(shown) < lim) {
+            shown.push(seq[m])
+            m = m - 1
+        }
+        reverseSnaps(shown)
+        println("history of " + file + " (" + "{len(shown)}" + " version(s))")
+        var last: Snapshot? = none
+        var s1 = 0
+        while (s1 < len(shown)) {
+            let s = shown[s1]
+            println("  " + fmtCommit(s.short, s.date, s.message))
+            match (last) {
+                case some(prev) -> {
+                    if (!eqStrs(prev.deps, s.deps)) {
+                        println("  deps  " + joinComma(prev.deps) + " -> " + joinComma(s.deps))
+                    }
+                    var c0 = 0
+                    while (c0 < len(diffSurfaces(prev.items, s.items))) {
+                        println(pushChangeText(diffSurfaces(prev.items, s.items)[c0]))
+                        c0 = c0 + 1
+                    }
+                }
+                case none -> {}
+            }
+            last = s
+            s1 = s1 + 1
+        }
+        println("")
+        fi = fi + 1
+    }
+}
+
+/// One change row for a file's history:
+/// `changed-type  User.name    name: string -> name: string?  (made nullable)`.
+fn pushChangeText(change: SurfaceChange) -> string {
+    var sig = ""
+    match (change.before) {
+        case some(b) -> {
+            match (change.after) {
+                case some(a) -> sig = b + " -> " + a
+                case none -> sig = b
+            }
+        }
+        case none -> {
+            match (change.after) {
+                case some(b) -> sig = b
+                case none -> {}
+            }
+        }
+    }
+    var label = ""
+    match (transitLabel(optOrEmpty(change.before), optOrEmpty(change.after))) {
+        case some(l) -> label = "  (" + l + ")"
+        case none -> {}
+    }
+    var status = "changed-type"
+    if (change.status == "+") {
+        status = "added-type"
+    } else if (change.status == "-") {
+        status = "removed-type"
+    }
+    "  " + padRight(status, 13) + " " + change.name + "  " + sig + label
+}
+
+fn optOrEmpty(o: string?) -> string {
+    match (o) {
+        case some(s) -> s
+        case none -> ""
+    }
+}
+
+/// `pickle builds [--limit N]`: the most recent `limit` build rows (newest
+/// first) with their status and error codes.
+fn renderBuilds(snapshots: List<Snapshot>, limit: int) {
+    let lim = intMax(limit, 1)
+    var rows = emptyRows()
+    var i = 0
+    while (i < len(snapshots)) {
+        let s = snapshots[i]
+        rows.push(BuildRow(s.date, s.short, s.file, s.ok, s.codes))
+        i = i + 1
+    }
+    var j = 1
+    while (j < len(rows)) {
+        var k = j
+        while (k > 0 && rowBefore(rows[k], rows[k - 1])) {
+            let tmp = rows[k - 1]
+            rows[k - 1] = rows[k]
+            rows[k] = tmp
+            k = k - 1
+        }
+        j = j + 1
+    }
+    var shown = emptyRows()
+    var m = 0
+    while (m < len(rows) && m < lim) {
+        shown.push(rows[m])
+        m = m + 1
+    }
+    println("      commit  file                       ok    codes")
+    var lastCommit: string? = none
+    var r0 = 0
+    while (r0 < len(shown)) {
+        let row = shown[r0]
+        var mark = "ok"
+        if (!row.ok) {
+            mark = "ERR"
+        }
+        let codes = joinSpaces(row.codes)
+        match (lastCommit) {
+            case some(prev) -> {
+                if (row.short != "" && prev == row.short) {
+                    println("      " + padRight("", 28) + " " + padLeft(mark, 4) + "  " + codes)
+                } else {
+                    println("  " + row.short + "  " + padRight(row.file, 28) + " " + padLeft(mark, 4) + "  " + codes)
+                }
+            }
+            case none -> {
+                println("  " + row.short + "  " + padRight(row.file, 28) + " " + padLeft(mark, 4) + "  " + codes)
+            }
+        }
+        lastCommit = row.short
+        r0 = r0 + 1
+    }
+}
+
+/// Newest date first, then most files on the wrong side of the tiebreak.
+fn rowBefore(a: BuildRow, b: BuildRow) -> bool {
+    if (a.date != b.date) {
+        return strLt(b.date, a.date)
+    }
+    if (a.file != b.file) {
+        return strLt(b.file, a.file)
+    }
+    false
+}
+
+/// `pickle explain <CODE> --history`: every version (oldest first) where the
+/// code fired.
+fn renderExplainHistory(snapshots: List<Snapshot>, code: string) {
+    var hits = emptySnaps()
+    var i = 0
+    while (i < len(snapshots)) {
+        if (listHasStr(snapshots[i].codes, code)) {
+            hits.push(snapshots[i])
+        }
+        i = i + 1
+    }
+    if (len(hits) == 0) {
+        println("error[" + code + "] has never been produced by any committed version of a `*.pkl` file")
+        return
+    }
+    println("error[" + code + "] -- produced by committed versions (oldest first):")
+    var h0 = 0
+    while (h0 < len(hits)) {
+        let s = hits[h0]
+        println("  " + s.short + "  " + s.date + "  " + firstLine(s.message))
+        h0 = h0 + 1
+    }
+    println("first seen: " + hits[0].short + " (" + hits[0].file + ")")
+}
+
+// ---- string helpers ----
+
+fn stderrLine(s: string) {
+    // Straight to the stderr handle - `writeStderr` writes to `STD_ERROR_HANDLE`,
+    // the handle `nostd::console_error_write` writes to, through the
+    // `runtime.abi_stdio` seam. Writing through `stderr_stream()` would work but
+    // would pull `pickle_stderr_stream` and `pickle_stream_write` into every
+    // program that imports `cli.history`, including the self-hosted CLI, for a
+    // diagnostic line.
+    unsafe {
+        var p = &s
+        let _ = writeStderr((p as int) + STR_BYTES_OFF, len(s))
+    }
+}
+
+fn joinArgs(args: List<string>) -> string {
+    var s = ""
+    var i = 0
+    while (i < len(args)) {
+        if (i > 0) {
+            s += " "
+        }
+        s += args[i]
+        i = i + 1
+    }
+    s
+}
+
+fn joinComma(l: List<string>) -> string {
+    var s = ""
+    var i = 0
+    while (i < len(l)) {
+        if (i > 0) {
+            s += ", "
+        }
+        s += l[i]
+        i = i + 1
+    }
+    s
+}
+
+fn joinSpaces(l: List<string>) -> string {
+    var s = ""
+    var i = 0
+    while (i < len(l)) {
+        if (i > 0) {
+            s += " "
+        }
+        s += l[i]
+        i = i + 1
+    }
+    s
+}
+
+fn listHasStr(l: List<string>, s: string) -> bool {
+    var i = 0
+    while (i < len(l)) {
+        if (l[i] == s) {
+            return true
+        }
+        i = i + 1
+    }
+    false
+}
+
+fn hasPrefix(s: string, p: string) -> bool {
+    let sb = bytes(p)
+    let bs = bytes(s)
+    if (len(sb) > len(bs)) {
+        return false
+    }
+    var i = 0
+    while (i < len(sb)) {
+        if (bs[i] != sb[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+fn hasSuffix(s: string, suf: string) -> bool {
+    let sb = bytes(suf)
+    let bs = bytes(s)
+    if (len(sb) > len(bs)) {
+        return false
+    }
+    var i = 0
+    var diff = len(bs) - len(sb)
+    while (i < len(sb)) {
+        if (bs[diff + i] != sb[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+fn splitBy(s: string, d: string) -> List<string> {
+    let bs = bytes(s)
+    let db = bytes(d)
+    var out = emptyStrs()
+    var cur = ""
+    var i = 0
+    while (i < len(bs)) {
+        if (db[0] == bs[i]) {
+            out.push(cur)
+            cur = ""
+        } else {
+            cur += cps(bs[i] as int)
+        }
+        i = i + 1
+    }
+    out.push(cur)
+    out
+}
+
+fn trimEnd(s: string) -> string {
+    let bs = bytes(s)
+    var end = len(bs)
+    while (end > 0) {
+        let c = bs[end - 1] as int
+        if (c == 32 || c == 9 || c == 13 || c == 10 || c == 11 || c == 12) {
+            end = end - 1
+        } else {
+            break
+        }
+    }
+    var out = ""
+    var i = 0
+    while (i < end) {
+        out += cps(bs[i] as int)
+        i = i + 1
+    }
+    out
+}
+
+fn firstLine(s: string) -> string {
+    let lines = splitLines(s)
+    if (len(lines) > 0) {
+        return lines[0]
+    }
+    ""
+}
+
+fn padRight(s: string, w: int) -> string {
+    var out = s
+    var n = len(bytes(s))
+    while (n < w) {
+        out += cps(32)
+        n = n + 1
+    }
+    out
+}
+
+fn padLeft(s: string, w: int) -> string {
+    var out = ""
+    var n = len(bytes(s))
+    while (n < w) {
+        out += cps(32)
+        n = n + 1
+    }
+    out + s
+}
+
+fn intMax(a: int, b: int) -> int {
+    if (a > b) {
+        return a
+    }
+    b
+}
+
+fn reverseSnaps(l: List<Snapshot>) {
+    var i = 0
+    var j = len(l) - 1
+    while (i < j) {
+        let tmp = l[i]
+        l[i] = l[j]
+        l[j] = tmp
+        i = i + 1
+        j = j - 1
+    }
+}
+
+fn emptyStrs() -> List<string> {
+    var l = [""]
+    l.pop()
+    l
+}
+
+fn emptySnaps() -> List<Snapshot> {
+    var l = [Snapshot("", "", "", "", "", "", false, emptyStrs(), emptyStrs(), emptyPublicItems())]
+    l.pop()
+    l
+}
+
+fn emptyEntries() -> List<CommitEntry> {
+    var l = [CommitEntry("", "", "", "", emptyStrs(), emptyStrs())]
+    l.pop()
+    l
+}
+
+fn emptyRows() -> List<BuildRow> {
+    var l = [BuildRow("", "", "", false, emptyStrs())]
+    l.pop()
+    l
+}

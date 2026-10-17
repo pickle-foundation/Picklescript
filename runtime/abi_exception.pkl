@@ -1,0 +1,241 @@
+module runtime.abi_exception
+
+/// **DO NOT IMPORT THIS INTO A PROGRAM YOU WILL RUN UNDER `pickle-cli run`
+/// (the JIT).** On the AOT path (`pklc_build` / `pickle build`) it is safe and is
+/// now the activation path. The warning this header used to carry was written
+/// without distinguishing the two, so it was half right: correct for the JIT,
+/// wrong for AOT. Details below; the JIT reason is the LAST section.
+///
+/// RE-MEASURED 2026-10-06, **on the AOT path**, four ways, all green:
+///  1. Link gap vs an empty archive (`tools\diff\port\pklc_build.exe`): a probe
+///     with `import { abiExcPending } from runtime.abi_exception` and NO call to
+///     it resolves `pickle_exc_uncaught` — the symbol is absent from the
+///     unresolved set entirely. The same probe with the import stripped reports
+///     it unresolved. Baseline 4 unresolved vs 15 with the import (the import
+///     also pulls `abi_string`, which surfaces `pickle_class_*`, `pickle_static_*`,
+///     `pickle_stream_*`, `pickle_shadow_*`, `pickle_exit`).
+///  2. Marker build against `combined.lib`: with a distinctive prefix inside
+///     `abiExcUncaught`, the prefix PRINTS when the module is imported and does
+///     NOT print when it is not. So the ported body both links and *beats* the
+///     archive's Rust definition.
+///  3. All 8 `tests/uncaught/*.pkl` fixtures, built with and without the import,
+///     byte-compare stderr + exit: **8/8 IDENTICAL**, including
+///     `uncaught_unicode_message.pkl` at 52 bytes (not the 76 of mojibake this
+///     header used to warn about).
+///  4. `tools\uncaught_parity.ps1` still reports **8/8** after the header rewrite.
+///
+///  5. **THE JIT IS DIFFERENT, AND THIS IS STILL BROKEN.** Same fixture,
+///     `tests/uncaught/uncaught_basic.pkl` with one line added
+///     (`import { abiExcPending } from runtime.abi_exception`), run under
+///     `pickle-cli run`:
+///       - no import: exit 1, 34 bytes of stderr = `uncaught exception: uncaught boom`
+///       - + import:  **exit 0, no report at all**, stderr = 94 bytes of
+///         `UNROOTED-ARG fn=abiExcThrow extern=pickle_obj_slot_set ...`
+///     The warning *names `abiExcThrow`*, which proves the JIT executed the Pickle
+///     body. The mechanism (recorded earlier, corroborated by this symptom): the
+///     JIT rebinds `pickle_exc_throw` to the Pickle body, which writes the Pickle
+///     class static `ExcChannel.inst.pending`, but the emitter's own
+///     `pickle_exc_pending` check still resolves to the Rust function reading the
+///     Rust `thread_local! PENDING`. The flag is written where nobody reads it, so
+///     `take_escaped()` returns None and nothing is reported. AOT does not split,
+///     because all three symbols are overridden together by `progOverrides` and
+///     the entry point then calls Pickle end to end.
+///     **A JIT cannot rebind an extern reference to a Pickle function for the
+///     emitter's own check**, so as long as this module keeps its own channel while
+///     Rust keeps `thread_local`, the two halves necessarily disagree under the
+///     JIT. That — not DCE — is the real reason this file must stay *unimported*
+///     for JIT-run programs, and the reason activation for the whole channel
+///     belongs to an archive replacement rather than to an import.
+///
+/// WHY THE OLD CONCLUSION WAS TRUE WHEN WRITTEN (2026-10-03), AND WHY IT WAS
+/// ALSO THE WRONG EXPLANATION. The activation mechanism is
+/// `Emitter.overrides` (`pickle/compiler/emit.pkl`), the set of names the
+/// emitter actually resolved from a `#[symbol("...")]` attribute on a
+/// top-level callable; `finishLower` hands it to `linkExe` as
+/// `progOverrides`; `linklib.pkl:307` then lets a program definition of an
+/// overridden name win the duplicate against the archive. That
+/// list was introduced 2026-10-04 (PORT-CHECKLIST "Duplicate-symbol resolution"),
+/// one day AFTER the marker experiment — before it there was no way for a
+/// program `#[symbol]` definition to displace an archive member, so the marker
+/// could not print no matter what. The old text "a `#[symbol]` fn is only linked
+/// if Pickle code actually calls it" was an inference from that marker result
+/// under the pre-`progOverrides` linker. Calling is irrelevant.
+///
+/// The real rule, now measured on two independent clusters (`abi_fs`,
+/// `abi_exception`) **on the AOT path**: a `#[symbol]` body is linked, and wins
+/// over the archive, iff **(a) its module is imported and (b) codegen emits an
+/// extern reference to that name**. Condition (b) is what `overrideSymbols` keys
+/// on, so an import with no corresponding extern reference cannot activate
+/// anything. Note what this rule is silent about: it says nothing about the two
+/// sides of a channel agreeing once activated, which is the JIT failure in (5).
+///
+/// The second lesson stands: channels that share a payload representation must be
+/// activated as a unit, and a half-activated channel fails *silently*. The
+/// specific failure it was written for (Latin-1 mojibake on the unicode fixture
+/// from a one-line `abi_string` import) no longer reproduces on AOT — see (3)
+/// above — but it did happen, and (5) is a second, different half-activation that
+/// does still reproduce.
+///
+/// Activation of the *whole* runtime still belongs to the port-runtime-objects
+/// archive that replaces `combined.lib` — see PORT-CHECKLIST "ACTIVATION GAP".
+/// Importing this module into a program means that program's exception channel is
+/// the ported one **when that program is linked AOT**; when it is run under the
+/// JIT, it means the channel splits and the program silently stops reporting
+/// escaped throws.
+import { byteAt } from runtime.abi_string
+import { writeStderr } from runtime.abi_stdio
+import { STR_BYTES_OFF } from runtime.layout
+
+/// Word holding a string object's byte length. The header is
+/// [class_id, size, len, bytes...], so the length sits at word 3 and the
+/// inline payload starts at word 4 (`runtime/src/strings.rs`).
+const LEN_WORD: int = 3
+
+/// One `WriteFile` of a literal to stderr.
+///
+/// THE ROUTE IS THE REFERENCE'S. `exception.rs::report_escaped` writes through
+/// `nostd::console_error_write`: `GetStdHandle(STD_ERROR_HANDLE)` plus one
+/// `WriteFile`, no stream object and no flush - which is exactly what
+/// `abi_console.pkl::emitCstr` does on the stdout handle. Going through
+/// `stderr_stream()` here bought nothing and cost three extern references
+/// (`stderr_stream`, `stream_write`, `stream_flush`), none of which the
+/// reference itself uses on this path.
+///
+/// The write itself lives in `runtime.abi_stdio`, the architecture seam for
+/// standard streams - see that file's header for why every stderr write is
+/// routed through it.
+fn writeErr(s: string) {
+    unsafe {
+        var p = &s
+        let _ = writeStderr((p as int) + STR_BYTES_OFF, len(s))
+    }
+}
+
+/// The same write for a string OBJECT - the throw payload is one. Word 3 of the
+/// header is the byte length.
+fn writeErrObj(obj: *int) {
+    unsafe {
+        let n = obj[LEN_WORD]
+        if (n > 0) {
+            let _ = writeStderr((obj as int) + STR_BYTES_OFF, n)
+        }
+    }
+}
+
+/// The in-flight throw channel, as two scalar globals.
+///
+/// WHY SCALARS, NOT A CLASS STATIC. This module's `pkl_setup_*` is injected
+/// into the top of the compiled `main`, so a `class`-static singleton here
+/// materialises through the emitter's normal static-initialiser lowering:
+/// `pickle_class_new` (a 2-slot instance for `pending` + `payload`) plus
+/// `pickle_box_bool(false)` to store `pending`. Native has no such object at
+/// bring-up — its channel is `thread_local PENDING`/`PAYLOAD`, which allocates
+/// nothing — so the reported GC counters (which count exactly
+/// `Gc::alloc`/`abiRegisterObject` calls) would differ from the native
+/// baseline by 2. Plain module-level `var` globals are image data with zero
+/// defaults: the channel keeps the same single-process-wide ownership, costs
+/// no allocations, and the counters match.
+///
+/// The shadow-stack ABI is the one that genuinely cannot make this trade,
+/// because it must read the *previous* top-of-stack, which is per-thread by
+/// definition; the exception channel has no such constraint (see the FILE
+/// header's WHY THIS REPLACES TLS notes).
+///
+/// `excPayload` is deliberately never cleared to null: this language has no
+/// null pointer literal (`0 as *int` is `E0363`), and the residual value is
+/// unobservable (see the note on `abiExcTake`). Start at 0, which IS the null
+/// pointer.
+var excPending: int = 0
+var excPayload: int = 0
+
+/// ABI: publish `payload` and raise the pending flag.
+///
+/// Returns normally rather than branching away: the emitter places this on a
+/// path that transfers control immediately afterwards, and a caller observes the
+/// flag after the call.
+///
+/// A second throw while one is in flight replaces the payload, matching the
+/// native ABI - the newer exception is the one that reaches the handler.
+#[symbol("pickle_exc_throw")]
+fn abiExcThrow(payload: *int) {
+    excPayload = payload as int
+    excPending = 1
+}
+
+/// ABI: is a throw in flight?
+#[symbol("pickle_exc_pending")]
+fn abiExcPending() -> bool {
+    excPending == 1
+}
+
+/// ABI: consume the in-flight throw, returning its payload and clearing the flag.
+///
+/// The payload pointer is NOT reset to null afterwards, and that is a deliberate
+/// divergence rather than an oversight. Native returns null here; this cannot,
+/// because clearing the field would need the null pointer literal this language
+/// does not have (a fresh null is only available from an unassigned field, not
+/// an expression). It is also unobservable: `emit.pkl:12600` branches to a
+/// handler on `pickle_exc_pending` and only then calls `pickle_exc_take` at
+/// `:12618`, with no null test on the result, so `pending` alone is the validity
+/// gate. The cost is that the last payload stays reachable from the channel
+/// instead of being unrooted, which over-retains one real GC object rather than
+/// leaking one.
+#[symbol("pickle_exc_take")]
+fn abiExcTake() -> *int {
+    let payload = excPayload
+    excPending = 0
+    payload as *int
+}
+
+/// ABI: report a throw that escaped the program and exit 1, or return normally
+/// when nothing escaped.
+///
+/// The backend emits `call pickle_exc_uncaught` on every return out of the
+/// linked entry point (`x64.pkl:852-860`), placed before the frame teardown and
+/// before the return value is loaded, so this runs on the way out of every
+/// ported program. A program that threw nothing pays one field read.
+///
+/// The three writes mirror `exception.rs::report_escaped` exactly, and they must:
+/// `tools/uncaught_parity.ps1:215` compares stderr BYTE-FOR-BYTE against the
+/// native run. `uncaught exception: `, the message, `\n`.
+///
+/// Nothing here may `println`: that lowers to `pickle_str_concat` and re-enters
+/// the body, which is the recursion trap documented in `abi_console.pkl`. The
+/// `writeErr` helpers keep every extern off `pickle_print_obj` - and off the
+/// stream symbols too, which is how this file stops referencing
+/// `stderr_stream`/`stream_write`/`stream_flush`.
+#[symbol("pickle_exc_uncaught")]
+fn abiExcUncaught() {
+    if (excPending == 0) {
+        return
+    }
+    let payload = abiExcTake()
+    writeErr("uncaught exception: ")
+    writeErrObj(payload)
+    writeErr("\n")
+    exit(1)
+}
+
+/// The payload's message bytes, copied out of the string object's inline payload.
+///
+/// Reading the payload needs no null test, and that is measured rather than
+/// assumed. `throw EXPR` only ever publishes a `string`: the checker has
+/// established `Ty::Str`, and the option-wrap at `emit.pkl:12519` is a no-op for
+/// strings - `option_wrap` lifts *scalars* into a boxed pointer
+/// (`pickle_box_i64`/`f64`/`bool`/`char`) and returns every other type unchanged
+/// (`_ => Ok(v)`). So the value handed to `pickle_exc_throw` is always a real
+/// string object, and the native `if !payload.is_null()` guard in
+/// `pickle_exc_throw` is defensive rather than load-bearing - the same finding
+/// as the unreproduced `obj.is_null()` arm in `abi_console.pkl`.
+fn payloadBytes(payload: *int) -> List<byte> {
+    unsafe {
+        let n = payload[LEN_WORD]
+        var buf: List<byte> = bytes("")
+        var i = 0
+        while (i < n) {
+            buf.push(byteAt(payload, i) as byte)
+            i = i + 1
+        }
+        buf
+    }
+}

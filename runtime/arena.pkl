@@ -1,0 +1,200 @@
+module runtime.arena
+
+/// Port slice 1 of the memory core (decision 2026-09-25): the arena.
+///
+/// Mirrors the `Arena<T>` design committed in `docs/05-memory.md`
+/// ("Managed-pointee buffers and arenas — plan"): an arena is a bump region
+/// over a chain of fixed-capacity slabs. `arena.alloc(v)` bump-writes at the
+/// next slot and grows by chaining a new slab; `arena.free()` drops the whole
+/// chain at once; LIFO/region lifetime is an optimization (one drop vs N
+/// frees, contiguous slots).
+///
+/// Two halves:
+///
+/// 1. `Arena` — the semantic bump model. Contiguous element address space
+///    across the chain (`addr = chunkIndex * chunkElems + inChunkAddr`), bump
+///    allocation that never straddles a slab, stride alignment (LIFO),
+///    chain-grow on overflow, `reset()` = drop the whole chain, capacity and
+///    allocation-balance accounting. Deterministic, raw-memory-free, and the
+///    exact contract a real-heap arena must satisfy later.
+/// 2. `RawChunk` — the RAW composition: a single `alloc(int, n)` block held in
+///    a class field, bumped through, and `free`d exactly once (the runtime
+///    rejects double-free loudly; the guard here keeps us from ever reaching
+///    the native panic). Raw blocks are scalar-only and 8-byte aligned
+///    (`runtime/src/raw.rs`), so one int element = 8 bytes and every element
+///    is naturally aligned.
+///
+/// Remaining native wall for the full arena: chain bookkeeping needs to hold
+/// N chunk pointers, which today means `*T` → `int` casts or a typed
+/// `List<*T>` (neither lowered yet). Until then the chain is modeled, and a
+/// `RawChunk` demonstrates the real-buffer bump mechanics the collector will
+/// compose from.
+
+/// Default slab capacity in elements (8-byte int elements).
+const DEFAULT_CHUNK_ELEMS: int = 64
+
+/// Address returned by a negative-size allocation (mirror of an "invalid
+/// size" error in the native allocator).
+const INVALID_ADDR: int = -1
+
+/// Fresh arena at the default slab size.
+fn arena() -> Arena {
+    Arena(DEFAULT_CHUNK_ELEMS)
+}
+
+/// Fresh arena with an explicit per-slab element capacity.
+fn arenaOf(chunkElems: int) -> Arena {
+    Arena(chunkElems)
+}
+
+class Arena {
+    var chunkElems: int
+    var chunksHeld: int
+    var cursorElems: int
+    var allocElems: int
+
+    constructor(chunkElems: int) {
+        this.chunkElems = chunkElems
+        this.chunksHeld = 0
+        this.cursorElems = 0
+        this.allocElems = 0
+    }
+
+    /// Total element capacity of the chain (mirror of `Arena::capacity`).
+    fn capacity() -> int {
+        this.chunksHeld * this.chunkElems
+    }
+
+    /// Elements of the live region currently handed out.
+    fn elementsInUse() -> int {
+        if (this.chunksHeld == 0) { return 0 }
+        (this.chunksHeld - 1) * this.chunkElems + this.cursorElems
+    }
+
+    /// Elements still available across the whole chain.
+    fn unallocated() -> int {
+        this.capacity() - this.elementsInUse()
+    }
+
+    /// Bump allocation must fit the current slab; it never straddles.
+    fn hasRoom(n: int) -> bool {
+        this.cursorElems + n <= this.chunkElems
+    }
+
+    /// `var a = arena.align(n)` — mirror of bump alignment. Pads the cursor up
+    /// to the next multiple of `n` element counts within the current slab;
+    /// padding that would exhaust the slab chains a fresh one (alignment is
+    /// then relative to the fresh slab's start). `n <= 1` is a no-op.
+    fn align(n: int) {
+        if (n <= 1) { return }
+        if (this.chunksHeld == 0) { return }
+        var rem = this.cursorElems % n
+        if (rem == 0) { return }
+        var padded = this.cursorElems - rem + n
+        if (padded >= this.chunkElems) {
+            this.chunksHeld = this.chunksHeld + 1
+            this.cursorElems = 0
+        } else {
+            this.cursorElems = padded
+        }
+    }
+
+    /// Bump-allocate `n` elements and return their flat start address (0-based
+    /// across the chain). Grows by chaining a new slab when the current one
+    /// lacks room. `n == 0` returns the next free address, consuming nothing.
+    /// `n < 0` returns `INVALID_ADDR`. An oversized `n` is clamped to a whole
+    /// slab (`chunkElems`).
+    fn alloc(n: int) -> int {
+        if (n < 0) { return INVALID_ADDR }
+        var want = n
+        if (want > this.chunkElems) { want = this.chunkElems }
+        if (this.chunksHeld == 0) {
+            this.chunksHeld = 1
+            this.cursorElems = 0
+        }
+        if (this.cursorElems + want > this.chunkElems) {
+            this.chunksHeld = this.chunksHeld + 1
+            this.cursorElems = 0
+        }
+        var addr = (this.chunksHeld - 1) * this.chunkElems + this.cursorElems
+        this.cursorElems = this.cursorElems + want
+        this.allocElems = this.allocElems + want
+        addr
+    }
+
+    /// The slab an interior address points into (mirror of the `slab.data`
+    /// interior-pointer split — the data region of slab `k` starts at flat
+    /// address `k * chunkElems`, stable across collections because slabs never
+    /// move).
+    fn chunkIndexOf(addr: int) -> int {
+        addr / this.chunkElems
+    }
+
+    /// Element offset of an interior address within its slab.
+    fn inChunkIndex(addr: int) -> int {
+        addr % this.chunkElems
+    }
+
+    /// Mirror of `arena.free()`: drop the whole region at once. The chain is
+    /// released (chunksHeld -> 0) and every counter zeroed; the next `alloc`
+    /// starts a fresh region at address 0.
+    fn reset() {
+        this.chunksHeld = 0
+        this.cursorElems = 0
+        this.allocElems = 0
+    }
+}
+
+/// A real `alloc(int, n)` block bumped through, then freed exactly once.
+/// Single slab — the only raw composition expressible today (see the module
+/// doc for why the chain stays modeled).
+class RawChunk {
+    var p: *int
+    var elems: int
+    var cursor: int
+    var owner: bool
+
+    constructor(p: *int, elems: int) {
+        this.p = p
+        this.elems = elems
+        this.cursor = 0
+        this.owner = true
+    }
+
+    /// Elements left in the block.
+    fn remaining() -> int {
+        this.elems - this.cursor
+    }
+
+    /// Bump-reserve one element slot; `-1` when the block is exhausted.
+    fn bump() -> int {
+        if (this.cursor >= this.elems) { return INVALID_ADDR }
+        var a = this.cursor
+        this.cursor = a + 1
+        a
+    }
+
+    fn get(i: int) -> int {
+        unsafe {
+            this.p[i]
+        }
+    }
+
+    fn set(i: int, v: int) {
+        unsafe {
+            this.p[i] = v
+        }
+    }
+
+    /// Release the block — idempotent (the runtime rejects a second `free` of
+    /// the same pointer loudly; the owner flag means we never reach that
+    /// panic). Returns whether the block was actually released.
+    fn freeIt() -> bool {
+        if (!this.owner) { return false }
+        unsafe {
+            free(this.p)
+            this.owner = false
+        }
+        true
+    }
+}

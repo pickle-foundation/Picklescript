@@ -1,0 +1,340 @@
+module runtime.abi_enum_test
+
+/// Behavioral tests for the ported enum ABI bodies, mirroring the cases in
+/// `runtime/src/enum.rs`'s own `mod tests` plus the equality cases from
+/// `enum_field_eq`, so the port is checked against the same expectations the
+/// native implementation is.
+
+import { enumNew, enumFieldCount, enumFieldEq, f64ValueEq, isNanBits, tagOf, FIELDS_WORD } from runtime.abi_enum
+import { abiEnumNew, abiEnumTag, abiEnumField, abiEnumSetField, abiEnumEq } from runtime.abi_enum
+import { abiBoxI64, abiBoxBool, abiBoxChar, abiUnboxI64, boxBits } from runtime.abi_box
+import { abiStrFromBytes, abiStrCmp } from runtime.abi_string
+import { tupleNew } from runtime.abi_tuple
+import { PICKLE_CLASS_ENUM, PICKLE_CLASS_BOX_FLOAT, PICKLE_CLASS_STRING } from runtime.object
+
+/// A float box, built by hand: the float half of the box ABI is not ported, so the
+/// raw payload has to be written directly for the value-equality cases.
+fn floatBox(bits: int) -> *int {
+    unsafe {
+        var p = alloc(int, 4)
+        p[0] = 0
+        p[1] = PICKLE_CLASS_BOX_FLOAT
+        p[2] = 32
+        p[3] = bits
+        return p
+    }
+}
+
+/// A tuple object: a payload kind the enum equality deliberately does *not* compare
+/// by content, standing in for every list/map/tuple/class payload.
+fn tupleLike() -> *int {
+    return tupleNew(1)
+}
+
+/// One raw byte in its own word. `abiStrFromBytes` reads through its pointer, so
+/// the byte has to live in real memory rather than be passed as the address.
+fn byteAt(b: int) -> *int {
+    unsafe {
+        var p = alloc(int, 1)
+        p[0] = b
+        return p
+    }
+}
+
+/// IEEE-754 binary64 bit patterns used by the value-equality tests. The sign bit
+/// alone overflows `i64`, so the negative patterns are written as two's-complement
+/// negations.
+const BITS_PZERO: int = 0x0000000000000000
+const BITS_NZERO: int = 0 - 0x7FFFFFFFFFFFFFFF - 1
+const BITS_ONE: int = 0x3FF0000000000000
+const BITS_TWO: int = 0x4000000000000000
+const BITS_MONE: int = 0 - 0x4010000000000000
+const BITS_INF: int = 0x7FF0000000000000
+const BITS_NINF: int = 0 - 0x7FF0000000000000 - 1
+const BITS_NAN: int = 0x7FF8000000000000
+const BITS_NAN_SELF: int = 0x7FF8000000000001
+
+test fn new_zeroes_payload_and_stores_tag() {
+    // runtime/src/enum.rs: new_zeroes_payload_and_stores_tag
+    var e = enumNew(2, 3)
+    expect(abiEnumTag(e)).toBe(2)
+    expect(enumFieldCount(e)).toBe(3)
+    var i = 0
+    while (i < 3) {
+        expect(abiEnumField(e, i) as int).toBe(0)
+        i = i + 1
+    }
+}
+
+test fn new_writes_header_and_derived_count() {
+    // The field count is derived from the stored byte size, not kept separately, so the
+    // header is what makes `enum_field_count` work at all.
+    var e = enumNew(0, 2)
+    unsafe {
+        expect(e[0]).toBe(0)
+        expect(e[1]).toBe(PICKLE_CLASS_ENUM)
+        expect(e[2]).toBe(48)
+    }
+    expect(enumFieldCount(e)).toBe(2)
+}
+
+test fn empty_enum_has_zero_fields() {
+    // An enum's smallest size is exactly 32 bytes, so the derived count stays
+    // unambiguous at zero - unlike a tuple, which needed an explicit count word.
+    var e = enumNew(7, 0)
+    expect(abiEnumTag(e)).toBe(7)
+    expect(enumFieldCount(e)).toBe(0)
+    unsafe {
+        expect(e[2]).toBe(32)
+        expect(abiEnumField(e, 0) as int).toBe(0)
+    }
+}
+
+test fn new_reinitialises_reused_memory() {
+    // runtime/src/enum.rs: new_zeroes_reused_dirty_memory. The native body dirties
+    // the payload region with 0xAB first; the observable half to pin here is that
+    // every field still reads null after init.
+    var e = enumNew(1, 2)
+    abiEnumSetField(e, 0, abiBoxI64(99))
+    abiEnumSetField(e, 1, abiBoxI64(77))
+    var fresh = enumNew(1, 2)
+    expect(enumFieldCount(fresh)).toBe(2)
+    expect(abiEnumField(fresh, 0) as int).toBe(0)
+    expect(abiEnumField(fresh, 1) as int).toBe(0)
+}
+
+test fn field_set_and_get_roundtrip() {
+    // runtime/src/enum.rs: set_get_roundtrip
+    var e = enumNew(3, 2)
+    var a = abiBoxI64(10)
+    var b = abiBoxI64(20)
+    abiEnumSetField(e, 0, a)
+    abiEnumSetField(e, 1, b)
+    expect((abiEnumField(e, 0) as int) == (a as int)).toBe(true)
+    expect((abiEnumField(e, 1) as int) == (b as int)).toBe(true)
+    expect(abiUnboxI64(abiEnumField(e, 0))).toBe(10)
+    expect(abiUnboxI64(abiEnumField(e, 1))).toBe(20)
+}
+
+test fn out_of_range_field_reads_null() {
+    // runtime/src/enum.rs: out_of_range_field_reads_null
+    var e = enumNew(0, 2)
+    expect(abiEnumField(e, 2) as int).toBe(0)
+    expect(abiEnumField(e, 99) as int).toBe(0)
+    // `index` is `usize` natively and cannot be negative; the port guards anyway.
+    expect(abiEnumField(e, -1) as int).toBe(0)
+}
+
+test fn out_of_range_field_write_is_ignored() {
+    // The native body asserts; the port returns instead (documented GAP). What is
+    // observable is that the in-bounds slot is untouched by a rejected store.
+    var e = enumNew(0, 2)
+    abiEnumSetField(e, 0, abiBoxI64(5))
+    abiEnumSetField(e, 7, abiBoxI64(123))
+    abiEnumSetField(e, -1, abiBoxI64(456))
+    expect(abiUnboxI64(abiEnumField(e, 0))).toBe(5)
+    expect(abiEnumField(e, 1) as int).toBe(0)
+}
+
+test fn tag_survives_field_stores() {
+    // The tag occupies payload word 0 in the native description but is not a
+    // managed pointer, so writing field 0 must not disturb it.
+    var e = enumNew(42, 1)
+    abiEnumSetField(e, 0, abiBoxI64(9))
+    expect(abiEnumTag(e)).toBe(42)
+}
+
+test fn eq_identical_pointer_is_true() {
+    // runtime/src/enum.rs: eq_same_pointer
+    var e = enumNew(1, 2)
+    expect(abiEnumEq(e, e)).toBe(true)
+}
+
+test fn eq_null_handling() {
+    // runtime/src/enum.rs: eq_null_handling
+    var e = enumNew(1, 0)
+    var nul = 0 as *int
+    expect(abiEnumEq(nul, nul)).toBe(true)
+    expect(abiEnumEq(e, nul)).toBe(false)
+    expect(abiEnumEq(nul, e)).toBe(false)
+}
+
+test fn eq_requires_matching_tag() {
+    var a = enumNew(1, 1)
+    var b = enumNew(2, 1)
+    abiEnumSetField(a, 0, abiBoxI64(7))
+    abiEnumSetField(b, 0, abiBoxI64(7))
+    expect(abiEnumEq(a, b)).toBe(false)
+}
+
+test fn eq_requires_matching_field_count() {
+    var a = enumNew(1, 1)
+    var b = enumNew(1, 2)
+    expect(abiEnumEq(a, b)).toBe(false)
+}
+
+test fn eq_compares_boxed_scalars_by_value() {
+    // runtime/src/enum.rs: eq_boxed_scalars
+    var a = enumNew(0, 3)
+    var b = enumNew(0, 3)
+    abiEnumSetField(a, 0, abiBoxI64(11))
+    abiEnumSetField(b, 0, abiBoxI64(11))
+    abiEnumSetField(a, 1, abiBoxBool(true))
+    abiEnumSetField(b, 1, abiBoxBool(true))
+    abiEnumSetField(a, 2, abiBoxChar(65))
+    abiEnumSetField(b, 2, abiBoxChar(65))
+    expect(abiEnumEq(a, b)).toBe(true)
+    var c = enumNew(0, 1)
+    abiEnumSetField(c, 0, abiBoxI64(12))
+    expect(abiEnumEq(a, c)).toBe(false)
+}
+
+test fn eq_compares_int_and_bool_as_distinct_classes() {
+    // Same payload bits, different class: the native match requires equal classes
+    // before it looks at the payload.
+    var a = enumNew(0, 1)
+    var b = enumNew(0, 1)
+    abiEnumSetField(a, 0, abiBoxI64(1))
+    abiEnumSetField(b, 0, abiBoxBool(true))
+    expect(boxBits(abiEnumField(a, 0))).toBe(boxBits(abiEnumField(b, 0)))
+    expect(abiEnumEq(a, b)).toBe(false)
+}
+
+test fn eq_compares_strings_by_content() {
+    var a = enumNew(0, 1)
+    var b = enumNew(0, 1)
+    var c = enumNew(0, 1)
+    abiEnumSetField(a, 0, abiStrFromBytes(byteAt(65), 1))
+    abiEnumSetField(b, 0, abiStrFromBytes(byteAt(65), 1))
+    abiEnumSetField(c, 0, abiStrFromBytes(byteAt(66), 1))
+    expect(abiEnumEq(a, b)).toBe(true)
+    expect(abiEnumEq(a, c)).toBe(false)
+}
+
+test fn eq_recurses_through_nested_enums() {
+    var outerA = enumNew(9, 1)
+    var outerB = enumNew(9, 1)
+    var innerA = enumNew(4, 1)
+    var innerB = enumNew(4, 1)
+    var innerC = enumNew(5, 1)
+    abiEnumSetField(innerA, 0, abiBoxI64(3))
+    abiEnumSetField(innerB, 0, abiBoxI64(3))
+    abiEnumSetField(innerC, 0, abiBoxI64(3))
+    abiEnumSetField(outerA, 0, innerA)
+    abiEnumSetField(outerB, 0, innerB)
+    expect(abiEnumEq(outerA, outerB)).toBe(true)
+    abiEnumSetField(outerB, 0, innerC)
+    expect(abiEnumEq(outerA, outerB)).toBe(false)
+}
+
+test fn eq_treats_other_payload_kinds_as_pointer_identity() {
+    // runtime/src/enum.rs: eq_other_payload_is_pointer_identity - the native `_ =>`
+    // arm answers false for anything that is not int/bool/char/float/string/enum,
+    // so two distinct lists are unequal even with identical contents.
+    var a = enumNew(0, 1)
+    var b = enumNew(0, 1)
+    var shared = abiBoxI64(1)
+    abiEnumSetField(a, 0, shared)
+    abiEnumSetField(b, 0, shared)
+    expect(abiEnumEq(a, b)).toBe(true)
+    // A second, distinct list is not equal to the first even with equal contents -
+    // that is the whole point of the pointer-identity arm.
+    var otherA = tupleLike()
+    var otherB = tupleLike()
+    abiEnumSetField(a, 0, otherA)
+    abiEnumSetField(b, 0, otherB)
+    expect(abiEnumEq(a, b)).toBe(false)
+    abiEnumSetField(b, 0, otherA)
+    expect(abiEnumEq(a, b)).toBe(true)
+}
+
+test fn eq_rejects_non_enum_operands() {
+    var e = enumNew(0, 0)
+    var s = abiStrFromBytes(byteAt(65), 1)
+    expect(abiEnumEq(e, s)).toBe(false)
+    expect(abiEnumEq(s, e)).toBe(false)
+}
+
+test fn f64_value_eq_matches_ieee_semantics() {
+    // The native comparison is `f64::from_bits(a) == f64::from_bits(b)`. Three facts
+    // decide every pair: NaN is unequal to everything, identical non-NaN patterns
+    // are equal, and +0.0 equals -0.0.
+    expect(f64ValueEq(BITS_ONE, BITS_ONE)).toBe(true)
+    expect(f64ValueEq(BITS_ONE, BITS_TWO)).toBe(false)
+    expect(f64ValueEq(BITS_ONE, BITS_MONE)).toBe(false)
+    expect(f64ValueEq(BITS_INF, BITS_INF)).toBe(true)
+    expect(f64ValueEq(BITS_INF, BITS_NINF)).toBe(false)
+    expect(f64ValueEq(BITS_NINF, BITS_NINF)).toBe(true)
+}
+
+test fn f64_value_eq_treats_zeros_as_equal() {
+    expect(f64ValueEq(BITS_PZERO, BITS_NZERO)).toBe(true)
+    expect(f64ValueEq(BITS_NZERO, BITS_PZERO)).toBe(true)
+}
+
+test fn f64_value_eq_treats_nan_as_unequal() {
+    expect(isNanBits(BITS_NAN)).toBe(true)
+    expect(isNanBits(BITS_NAN_SELF)).toBe(true)
+    expect(isNanBits(BITS_INF)).toBe(false)
+    expect(isNanBits(BITS_ONE)).toBe(false)
+    expect(isNanBits(BITS_PZERO)).toBe(false)
+    expect(f64ValueEq(BITS_NAN, BITS_NAN)).toBe(false)
+    expect(f64ValueEq(BITS_NAN, BITS_NAN_SELF)).toBe(false)
+    expect(f64ValueEq(BITS_NAN, BITS_ONE)).toBe(false)
+    expect(f64ValueEq(BITS_ONE, BITS_NAN)).toBe(false)
+}
+
+test fn eq_compares_float_payloads_by_value() {
+    // The float half of the box ABI is unported, so the boxes are built by hand.
+    var a = enumNew(0, 2)
+    var b = enumNew(0, 2)
+    abiEnumSetField(a, 0, floatBox(BITS_ONE))
+    abiEnumSetField(b, 0, floatBox(BITS_ONE))
+    expect(abiEnumEq(a, b)).toBe(true)
+    // +0.0 and -0.0 are distinct bit patterns but equal values.
+    abiEnumSetField(b, 0, floatBox(BITS_NZERO))
+    expect(abiEnumEq(a, b)).toBe(false)
+    abiEnumSetField(a, 0, floatBox(BITS_PZERO))
+    expect(abiEnumEq(a, b)).toBe(true)
+    // NaN is never equal, even to an identical pattern.
+    abiEnumSetField(a, 0, floatBox(BITS_NAN))
+    abiEnumSetField(b, 0, floatBox(BITS_NAN))
+    expect(abiEnumEq(a, b)).toBe(false)
+    // Two infinities of the same sign are equal.
+    abiEnumSetField(a, 0, floatBox(BITS_INF))
+    abiEnumSetField(b, 0, floatBox(BITS_INF))
+    expect(abiEnumEq(a, b)).toBe(true)
+}
+
+test fn deep_chain_of_enums_compares_recursively() {
+    // Depth 12 walks `enumEq` -> `enumFieldEq` -> `enumEq` six times over.
+    var depth = 12
+    var head = enumNew(1, 1)
+    var other = enumNew(1, 1)
+    var x = head
+    var y = other
+    var i = 0
+    while (i < depth) {
+        var xn = enumNew(2, 1)
+        var yn = enumNew(2, 1)
+        abiEnumSetField(xn, 0, abiBoxI64(i))
+        abiEnumSetField(yn, 0, abiBoxI64(i))
+        abiEnumSetField(x, 0, xn)
+        abiEnumSetField(y, 0, yn)
+        x = xn
+        y = yn
+        i = i + 1
+    }
+    expect(abiEnumEq(head, other)).toBe(true)
+    // Break one link in the middle of the chain: the leaves still match, but the node
+    // one level up no longer does, and that difference has to survive the walk.
+    var node = head
+    i = 0
+    while (i < 6) {
+        node = abiEnumField(node, 0)
+        i = i + 1
+    }
+    expect(node as int != 0).toBe(true)
+    abiEnumSetField(node, 0, abiBoxI64(999))
+    expect(abiEnumEq(head, other)).toBe(false)
+}

@@ -1,0 +1,117 @@
+module runtime.abi_statics
+
+/// Port of `runtime/src/statics.rs`: class static-field storage, as native ABI
+/// bodies this time — `pickle_static_get` / `pickle_static_set` occupy their
+/// exact C slots via `#[symbol]`, so a split link needs no Rust archive for
+/// either half of the channel.
+///
+/// THE CONTRACT (from `runtime/statics.pkl`, the pure model): cells key on
+/// `(class_id, slot)`, a flat index `class_id * STATIC_CELL_STRIDE + slot`; an
+/// unset cell reads as null; `pickle test` semantics that reset between files
+/// are not ported here because nothing in a linked executable resets — the
+/// store lives for the whole process, like a compiler-emitted global.
+///
+/// WHY THE STORE IS TWO SCALAR TOP-LEVEL VARS. A class's static initializer
+/// runs during *that class's module's setup*, and setup order is ascending
+/// member path — `abi_exception`'s `ExcChannel.inst = ExcChannel()` therefore
+/// runs BEFORE this module's own `pkl_globals_init` would, so any storage
+/// initialized by a managed top-level var's initializer would still be null at
+/// first write. Scalar top-level vars are different: their value is written
+/// into the image before `main` runs, so `cellsBase`/`cellsCap` are valid at
+/// every point from process entry. The block itself is allocated lazily on the
+/// first `static_get`/`static_set`, which makes the whole channel
+/// order-independent: no setup has to precede any other.
+///
+/// NOT PORTED, RECORDED RATHER THAN HIDDEN:
+///   - `statics.rs::cell_bits` registers every cell with `pickle_gc_root_add`
+///     so a static's pointee survives a collection. The cell block here is raw
+///     `alloc(int, n)` memory the collector does not scan, so a collection
+///     could free an object whose only reference is a static. That is part of
+///     the open GC work (`class_register`/`shadow_push`/`runtime_init`), not
+///     of the statics channel: reads and writes are correct today, and no
+///     selflinked program collects yet.
+///   - `statics.rs::reset` (the between-tests clear) — see the contract note
+///     above.
+///
+/// The stride mirrors `STATIC_CELL_STRIDE` in `runtime/statics.pkl`: slots per
+/// class stay far below it, and a flat word block beats the reference's nested
+/// `Vec<Vec<usize>>` in a language whose only resizable container costs a
+/// managed object per cell row.
+
+/// Flat cell index stride: `(class_id, slot) -> class_id * STATIC_CELL_STRIDE + slot`.
+const STATIC_CELL_STRIDE: int = 1024
+
+/// First capacity: covers `class_id`s below 4 before the first growth, and the
+/// doubling loop carries any realistic class table past that. Words, not bytes.
+const INITIAL_CELLS: int = 4096
+
+/// The cell block, word-addressed. Image data: readable from process entry.
+var cellsBase: int = 0
+/// Capacity of `cellsBase`, in words. Image data, kept in lockstep (`base == 0`
+/// exactly while `cap == 0`).
+var cellsCap: int = 0
+
+/// Grow the cell block so `idx` is in range: double until it fits, allocate
+/// fresh (unzeroed, like every `alloc`), copy the old words, zero the new tail
+/// so untouched cells keep reading as null, then release the old block. No
+/// external code can hold a pointer into the old block — `pickle_static_get`
+/// returns the stored *value*, never the cell's address — so freeing is safe.
+fn ensureCapacity(idx: int) {
+    if (idx < cellsCap) {
+        return
+    }
+    unsafe {
+        var cap = cellsCap
+        if (cap == 0) {
+            cap = INITIAL_CELLS
+        }
+        while (idx >= cap) {
+            cap = cap * 2
+        }
+        var fresh = alloc(int, cap)
+        var j = 0
+        while (j < cellsCap) {
+            fresh[j] = (cellsBase as *int)[j]
+            j = j + 1
+        }
+        var k = cellsCap
+        while (k < cap) {
+            fresh[k] = 0
+            k = k + 1
+        }
+        if (cellsBase != 0) {
+            free(cellsBase as *int)
+        }
+        cellsBase = fresh as int
+        cellsCap = cap
+    }
+}
+
+/// Read the managed value held in static cell `(class_id, slot)`; null when the
+/// field was never assigned (or the index is negative — the reference indexes
+/// with `u32`, where a negative would ask for an absurd resize; the emitter
+/// only ever passes non-negative constants, so the guard is belt-and-braces).
+#[symbol("pickle_static_get")]
+fn abiStaticGet(classId: int, slot: int) -> *int {
+    if (classId < 0 || slot < 0) {
+        return (0 as int) as *int
+    }
+    let idx = classId * STATIC_CELL_STRIDE + slot
+    ensureCapacity(idx)
+    unsafe {
+        return (cellsBase as *int)[idx] as *int
+    }
+}
+
+/// Store `value` into static cell `(class_id, slot)`.
+#[symbol("pickle_static_set")]
+fn abiStaticSet(classId: int, slot: int, value: *int) {
+    if (classId < 0 || slot < 0) {
+        return
+    }
+    let idx = classId * STATIC_CELL_STRIDE + slot
+    ensureCapacity(idx)
+    unsafe {
+        (cellsBase as *int)[idx] = value as int
+    }
+}

@@ -1,0 +1,639 @@
+module runtime.abi_gc_test
+
+import { abiGcAllocationsSinceGc, abiGcBytesSinceGc, abiGcCollectionCount, abiGcSetThreshold, abiGcCollect, abiGcRootAdd, abiManualAdopt, abiManualFree, abiGcThresholdNow, abiRootCount, abiManualCount, abiLiveBytesNow } from runtime.abi_gc
+import { abiRegisteredCount, abiRegisteredBytes, abiRegisterObject, abiUnregisterObject } from runtime.abi_raw
+import { abiShadowPush, abiShadowPop } from runtime.abi_shadow
+
+/// FRAME-ROBUST SWEEP BUILDERS. The ported codegen emits a shadow frame for every
+/// collect-capable function, so a raw pointer local of a `test fn` is itself a
+/// managed home: an object registered into such a local stays reachable across the
+/// collect and defeats the sweep assertions below. Each helper builds and registers
+/// its object, then returns only the address - a plain `int`, never a managed home -
+/// so by the time the caller collects, the helper's frame has been popped and the
+/// object is unrooted, exactly as the native suite observed. This mirrors the
+/// hand-built headers documented below (no maker module is imported).
+fn make_registered(words: int, klass: int, size: int) -> int {
+    var addr = 0
+    unsafe {
+        var p = alloc(int, words)
+        p[0] = 0
+        p[1] = klass
+        p[2] = size
+        var k = 3
+        while (k < words) {
+            p[k] = 0
+            k = k + 1
+        }
+        abiRegisterObject(p)
+        addr = p as int
+    }
+    return addr
+}
+
+fn make_registered_list() -> int {
+    var addr = 0
+    unsafe {
+        var data = alloc(int, 4)
+        var k = 0
+        while (k < 4) {
+            data[k] = 0
+            k = k + 1
+        }
+        var list = alloc(int, 6)
+        list[0] = 0
+        list[1] = 1
+        list[2] = 48
+        list[3] = 4
+        list[4] = 4
+        list[5] = data as int
+        abiRegisterObject(list)
+        addr = list as int
+    }
+    return addr
+}
+
+fn make_registered_map() -> int {
+    var addr = 0
+    unsafe {
+        var entries = alloc(int, 8)
+        var k = 0
+        while (k < 8) {
+            entries[k] = 0
+            k = k + 1
+        }
+        var map = alloc(int, 6)
+        map[0] = 0
+        map[1] = 2
+        map[2] = 48
+        map[3] = 0
+        map[4] = 8
+        map[5] = entries as int
+        abiRegisterObject(map)
+        addr = map as int
+    }
+    return addr
+}
+
+fn make_registered_stream(childAddr: int) -> int {
+    var addr = 0
+    unsafe {
+        var stream = alloc(int, 4)
+        stream[0] = 0
+        stream[1] = 9
+        stream[2] = 32
+        stream[3] = childAddr
+        abiRegisterObject(stream)
+        addr = stream as int
+    }
+    return addr
+}
+
+/// WHY THE COUNTER TESTS USE DELTAS. The seam counters are process-global
+/// scalar image data (no per-test reset — nothing but `abiGcCollect` re-zeroes
+/// them, the same contract as `abi_statics`), and the runtime suite runs tests
+/// in an unspecified order. Asserting deltas keeps every test order-
+/// independent. The single absolute post-collect read is safe because
+/// `collect` itself zeroes the seam counters first. The one absolute
+/// default-threshold claim is absent for the same reason: a later test pins
+/// the threshold and nothing restores it.
+
+test fn raw_allocations_are_counted_honestly() {
+    // The seam counters mirror native `Gc::alloc`, which counts MANAGED objects
+    // only - it bumps them where an object is adopted into the collector, never
+    // inside the raw allocator. A raw `alloc(int, n)` block is untraced, so it
+    // must leave the counters exactly where they were; the port's `Gc::alloc`
+    // moment is `abiRegisterObject` (see `register_tracks_count_and_the_header_size`),
+    // and that is what moves them.
+    var beforeA = abiGcAllocationsSinceGc()
+    var beforeB = abiGcBytesSinceGc()
+    unsafe {
+        // alloc(int, 16) = 16 * 8 = 128 bytes of raw, untraced memory.
+        var p = alloc(int, 16) as *int
+        expect((p as int) != 0).toBe(true)
+        // Raw allocation is uncounted: the managed-object seam must not move.
+        expect(abiGcAllocationsSinceGc()).toBe(beforeA)
+        expect(abiGcBytesSinceGc()).toBe(beforeB)
+    }
+    // Adopting a 32-byte managed object is the accounted event, exactly where
+    // native `Gc::alloc` would bump.
+    unsafe {
+        var q = alloc(int, 4) as *int
+        q[2] = 32
+        abiRegisterObject(q)
+        expect(abiGcAllocationsSinceGc()).toBe(beforeA + 1)
+        expect(abiGcBytesSinceGc()).toBe(beforeB + 32)
+        abiUnregisterObject(q)
+    }
+}
+
+test fn collect_advances_the_count_and_zeroes_the_counters() {
+    var before = abiGcCollectionCount()
+    abiGcCollect(true)
+    expect(abiGcCollectionCount()).toBe(before + 1)
+    expect(abiGcAllocationsSinceGc()).toBe(0)
+    expect(abiGcBytesSinceGc()).toBe(0)
+    abiGcCollect(false)
+    expect(abiGcCollectionCount()).toBe(before + 2)
+}
+
+test fn set_threshold_pins_and_collect_keeps_the_pinned_value() {
+    abiGcSetThreshold(4096)
+    expect(abiGcThresholdNow()).toBe(4096)
+    abiGcCollect(true)
+    expect(abiGcThresholdNow()).toBe(4096)
+    var before = abiGcCollectionCount()
+    abiGcSetThreshold(1024)
+    abiGcCollect(false)
+    expect(abiGcThresholdNow()).toBe(1024)
+    expect(abiGcCollectionCount()).toBe(before + 1)
+}
+
+test fn root_add_registers_cells_and_survives_growth() {
+    var before = abiRootCount()
+    unsafe {
+        // Cells must be REAL addresses: the mirrored collector dereferences
+        // each registered cell (`cell[0]`) to read its pointee, so a fake
+        // address would fault. 30 distinct cells inside one block force several
+        // doublings (ROOTS_INITIAL = 16); every cell's pointee starts null, so
+        // a later collect skips each one.
+        var cells = alloc(int, 30)
+        var j = 0
+        while (j < 30) {
+            cells[j] = 0
+            j = j + 1
+        }
+        var i = 0
+        while (i < 30) {
+            var cell = (cells as int) + i * 8
+            expect(abiGcRootAdd(cell)).toBe(cell)
+            i = i + 1
+        }
+    }
+    expect(abiRootCount()).toBe(before + 30)
+}
+
+test fn root_add_of_zero_is_registered_without_fault() {
+    var before = abiRootCount()
+    expect(abiGcRootAdd(0)).toBe(0)
+    expect(abiRootCount()).toBe(before + 1)
+}
+
+test fn manual_adopt_is_idempotent_free_releases_and_null_is_ignored() {
+    unsafe {
+        var p = alloc(int, 1) as *int
+        var before = abiManualCount()
+        expect((abiManualAdopt(p) as int)).toBe(p as int)
+        expect(abiManualCount()).toBe(before + 1)
+        expect((abiManualAdopt(p) as int)).toBe(p as int)
+        expect(abiManualCount()).toBe(before + 1)
+        abiManualFree(p)
+        expect(abiManualCount()).toBe(before)
+        abiManualFree(p)
+        expect(abiManualCount()).toBe(before)
+        expect((abiManualAdopt((0 as int) as *int) as int)).toBe(0)
+        expect(abiManualCount()).toBe(before)
+        abiManualFree((0 as int) as *int)
+        expect(abiManualCount()).toBe(before)
+    }
+}
+
+// The portfolio below exercises the sweepability registry and the REAL ported
+// mark-and-sweep collector (reclamation gate, phase 2b). Same delta discipline
+// as the counters: the registry is process-global scalar image data with no
+// per-test reset, so every assertion is a difference against a local snapshot
+// taken inside the test.
+//
+// WHY THE OBJECTS ARE HAND-BUILT HERE. Importing a maker module would
+// activate its ported bodies for this file's whole image, and `expect`'s
+// `.toBe` unconditionally builds its expected/received strings through the
+// active ported path - so a maker import would inflate every counter delta in
+// this file (the seam discipline documented above depends on this image
+// carrying only `abi_gc`, `abi_raw`, and the `abi_shadow` chain). `abi_shadow`
+// owns no object makers - it is pure TLS plumbing with zero managed cells - so
+// importing it (directly here, and transitively via `abi_gc`'s own import)
+// changes nothing about the counter discipline. The collector reads only the
+// size and class header words, so a hand-written header exercises the exact
+// same walk a maker triggers; the makers' own `abiRegisterObject` calls are
+// asserted in `abi_box_test` and, cross-arm, by the `sync_gc_live_main`
+// battery main. Sweep tests that seed a root use the manual registry or a real
+// root cell - the collector DEREFERENCES a registered cell to read its
+// pointee, so cells must be real addresses inside a block this file still
+// owns. The two shadow tests at the end push a synthetic frame (same layout a
+// compiled caller's frame has) so the phase-2c walker can be exercised here
+// without a maker in the image.
+
+test fn register_tracks_count_and_the_header_size() {
+    unsafe {
+        var p = alloc(int, 4)
+        p[0] = 0
+        p[1] = 3
+        p[2] = 32
+        p[3] = 0
+        var beforeC = abiRegisteredCount()
+        var beforeB = abiRegisteredBytes()
+        abiRegisterObject(p)
+        expect(abiRegisteredCount()).toBe(beforeC + 1)
+        expect(abiRegisteredBytes()).toBe(beforeB + 32)
+    }
+}
+
+test fn unregister_releases_count_and_bytes_swap_last() {
+    unsafe {
+        var a = alloc(int, 4)
+        a[0] = 0
+        a[1] = 3
+        a[2] = 32
+        a[3] = 0
+        var b = alloc(int, 5)
+        b[0] = 0
+        b[1] = 4
+        b[2] = 40
+        b[3] = 0
+        b[4] = 0
+        abiRegisterObject(a)
+        abiRegisterObject(b)
+        var beforeC = abiRegisteredCount()
+        var beforeB = abiRegisteredBytes()
+        // Releasing the first entry must pull the last one into its slot
+        // (swap-with-last) and drop a's bytes; the remaining object keeps its
+        // own size.
+        abiUnregisterObject(a)
+        expect(abiRegisteredCount()).toBe(beforeC - 1)
+        expect(abiRegisteredBytes()).toBe(beforeB - 32)
+        // Unregistering b (still present) returns the registry to an empty
+        // delta; a second unregister of a unknown address is a no-op.
+        abiUnregisterObject(b)
+        expect(abiRegisteredCount()).toBe(beforeC - 2)
+        expect(abiRegisteredBytes()).toBe(beforeB - 72)
+        abiUnregisterObject(a)
+        expect(abiRegisteredCount()).toBe(beforeC - 2)
+        expect(abiRegisteredBytes()).toBe(beforeB - 72)
+    }
+}
+
+test fn raw_spans_are_not_registered() {
+    var beforeC = abiRegisteredCount()
+    var beforeB = abiRegisteredBytes()
+    unsafe {
+        // alloc(int, 16) is a raw span - the backing a list or map would hold
+        // - not a managed object, so the registry must not move.
+        var p = alloc(int, 16) as *int
+        expect((p as int) != 0).toBe(true)
+    }
+    expect(abiRegisteredCount()).toBe(beforeC)
+    expect(abiRegisteredBytes()).toBe(beforeB)
+}
+
+test fn manual_free_releases_the_registry_entry() {
+    unsafe {
+        var p = alloc(int, 4)
+        p[0] = 0
+        p[1] = 3
+        p[2] = 32
+        p[3] = 0
+        abiRegisterObject(p)
+        var beforeC = abiRegisteredCount()
+        var beforeB = abiRegisteredBytes()
+        abiManualAdopt(p)
+        abiManualFree(p)
+        expect(abiRegisteredCount()).toBe(beforeC - 1)
+        expect(abiRegisteredBytes()).toBe(beforeB - 32)
+    }
+}
+
+test fn collect_sweeps_unrooted_objects_and_reports_survivors() {
+    // Settle: reclaim any object a previous test registered but never released
+    // (the sweepability registry is image-global with no per-test reset), so
+    // the snapshot below is a clean baseline. A later collect in this file
+    // sweeps those leftovers too - the tests must not depend on them.
+    abiGcCollect(false)
+    var beforeC = abiRegisteredCount()
+    var beforeB = abiRegisteredBytes()
+    // Built+registered in a helper whose frame pops on return, so no managed
+    // local of this test roots it: only the plain int address lives here.
+    var p = make_registered(6, 2, 48)
+    expect(p != 0).toBe(true)
+    abiGcCollect(true)
+    // The object is unrooted (no static-root cell, no manual adopt), so the
+    // ported mark-and-sweep reclaims it: the registry drops back to the
+    // pre-test snapshot, and the live figure the collect reports is the true
+    // survivor byte total.
+    expect(abiRegisteredCount()).toBe(beforeC)
+    expect(abiRegisteredBytes()).toBe(beforeB)
+    expect(abiLiveBytesNow()).toBe(beforeB)
+}
+
+test fn root_cell_retained_object_survives_collect() {
+    abiGcCollect(false)
+    var beforeC = abiRegisteredCount()
+    var beforeB = abiRegisteredBytes()
+    unsafe {
+        var p = alloc(int, 4)
+        p[0] = 0
+        p[1] = 3
+        p[2] = 32
+        p[3] = 0
+        abiRegisterObject(p)
+        var cells = alloc(int, 1)
+        cells[0] = p as int
+        abiGcRootAdd(cells as int)
+    }
+    abiGcCollect(true)
+    expect(abiRegisteredCount()).toBe(beforeC + 1)
+    expect(abiRegisteredBytes()).toBe(beforeB + 32)
+    expect(abiLiveBytesNow()).toBe(beforeB + 32)
+}
+
+test fn manual_object_survives_collect() {
+    abiGcCollect(false)
+    var beforeC = abiRegisteredCount()
+    var beforeB = abiRegisteredBytes()
+    unsafe {
+        var p = alloc(int, 4)
+        p[0] = 0
+        p[1] = 3
+        p[2] = 32
+        p[3] = 0
+        abiRegisterObject(p)
+        abiManualAdopt(p)
+    }
+    abiGcCollect(true)
+    expect(abiRegisteredCount()).toBe(beforeC + 1)
+    expect(abiRegisteredBytes()).toBe(beforeB + 32)
+    expect(abiLiveBytesNow()).toBe(beforeB + 32)
+}
+
+test fn reachable_through_list_data_span_is_kept() {
+    abiGcCollect(false)
+    var beforeC = abiRegisteredCount()
+    var beforeB = abiRegisteredBytes()
+    unsafe {
+        var child = alloc(int, 4)
+        child[0] = 0
+        child[1] = 3
+        child[2] = 32
+        child[3] = 0
+        abiRegisterObject(child)
+        var data = alloc(int, 4)
+        data[0] = child as int
+        data[1] = 0
+        data[2] = 0
+        data[3] = 0
+        // A list (class 1): len 1, cap 4, data span holding the child.
+        var list = alloc(int, 6)
+        list[0] = 0
+        list[1] = 1
+        list[2] = 48
+        list[3] = 1
+        list[4] = 4
+        list[5] = data as int
+        abiRegisterObject(list)
+        abiManualAdopt(list)
+    }
+    abiGcCollect(true)
+    // The list is rooted (manual) and its element span is traced, so both the
+    // list and the child survive the cycle.
+    expect(abiRegisteredCount()).toBe(beforeC + 2)
+    expect(abiRegisteredBytes()).toBe(beforeB + 80)
+}
+
+test fn unreachable_list_and_map_are_swept_with_their_spans() {
+    abiGcCollect(false)
+    var beforeC = abiRegisteredCount()
+    var beforeB = abiRegisteredBytes()
+    // A list with a real element span and a map with a real entry table, both
+    // unrooted: the sweep must reclaim the object blocks and their out-of-line
+    // spans (observable only through the registry - the freed memory is the OS
+    // heap's, not the port's). Each is built+registered in a helper so no managed
+    // local of this test roots it.
+    var list = make_registered_list()
+    var map = make_registered_map()
+    expect(list != 0).toBe(true)
+    expect(map != 0).toBe(true)
+    abiGcCollect(true)
+    expect(abiRegisteredCount()).toBe(beforeC)
+    expect(abiRegisteredBytes()).toBe(beforeB)
+    expect(abiLiveBytesNow()).toBe(beforeB)
+}
+
+test fn conservative_user_class_walk_keeps_reachable_field() {
+    abiGcCollect(false)
+    var beforeC = abiRegisteredCount()
+    var beforeB = abiRegisteredBytes()
+    unsafe {
+        var child = alloc(int, 4)
+        child[0] = 0
+        child[1] = 3
+        child[2] = 32
+        child[3] = 0
+        abiRegisterObject(child)
+        // A user class (id 10): size 48 -> three payload words, walked
+        // conservatively; the reachable field lives in the first one.
+        var user = alloc(int, 6)
+        user[0] = 0
+        user[1] = 10
+        user[2] = 48
+        user[3] = child as int
+        user[4] = 0
+        user[5] = 0
+        abiRegisterObject(user)
+        abiManualAdopt(user)
+    }
+    abiGcCollect(true)
+    expect(abiRegisteredCount()).toBe(beforeC + 2)
+    expect(abiRegisteredBytes()).toBe(beforeB + 80)
+}
+
+test fn tuple_and_enum_payloads_are_traced() {
+    abiGcCollect(false)
+    var beforeC = abiRegisteredCount()
+    var beforeB = abiRegisteredBytes()
+    unsafe {
+        var child = alloc(int, 4)
+        child[0] = 0
+        child[1] = 3
+        child[2] = 32
+        child[3] = 0
+        abiRegisterObject(child)
+        // A tuple (class 8): len 1, one field holding the child.
+        var tuple = alloc(int, 6)
+        tuple[0] = 0
+        tuple[1] = 8
+        tuple[2] = 48
+        tuple[3] = 1
+        tuple[4] = child as int
+        tuple[5] = 0
+        abiRegisterObject(tuple)
+        // An enum (class 7): tag 0, size 48 -> two payload words, first field
+        // (tag + 1) holding the child.
+        var enumObj = alloc(int, 6)
+        enumObj[0] = 0
+        enumObj[1] = 7
+        enumObj[2] = 48
+        enumObj[3] = 0
+        enumObj[4] = child as int
+        enumObj[5] = 0
+        abiRegisterObject(enumObj)
+        abiManualAdopt(tuple)
+        abiManualAdopt(enumObj)
+    }
+    abiGcCollect(true)
+    expect(abiRegisteredCount()).toBe(beforeC + 3)
+    expect(abiRegisteredBytes()).toBe(beforeB + 128)
+}
+
+test fn map_entries_are_traced_and_markers_skipped() {
+    abiGcCollect(false)
+    var beforeC = abiRegisteredCount()
+    var beforeB = abiRegisteredBytes()
+    unsafe {
+        var child = alloc(int, 4)
+        child[0] = 0
+        child[1] = 3
+        child[2] = 32
+        child[3] = 0
+        abiRegisterObject(child)
+        // Entry table with a tombstone marker in a key slot (1): the marker is
+        // a trivial integer, never an object address - the walk must skip it
+        // rather than dereference it, while still tracing the live child keys
+        // and values.
+        var entries = alloc(int, 8)
+        entries[0] = 1
+        entries[1] = child as int
+        entries[2] = child as int
+        entries[3] = 0
+        entries[4] = 0
+        entries[5] = 0
+        entries[6] = 0
+        entries[7] = 0
+        var map = alloc(int, 6)
+        map[0] = 0
+        map[1] = 2
+        map[2] = 48
+        map[3] = 2
+        map[4] = 4
+        map[5] = entries as int
+        abiRegisterObject(map)
+        abiManualAdopt(map)
+    }
+    abiGcCollect(true)
+    expect(abiRegisteredCount()).toBe(beforeC + 2)
+    expect(abiRegisteredBytes()).toBe(beforeB + 80)
+}
+
+test fn box_payload_is_not_traced() {
+    abiGcCollect(false)
+    var beforeC = abiRegisteredCount()
+    var beforeB = abiRegisteredBytes()
+    // The child is built+registered in a helper (frame popped), so its ONLY
+    // reference is the box payload below. The box (class 4), adopted, survives;
+    // a scalar payload is not an edge, so the child must still be swept even
+    // though its address is written in the box.
+    var child = make_registered(4, 3, 32)
+    unsafe {
+        var box = alloc(int, 4)
+        box[0] = 0
+        box[1] = 4
+        box[2] = 32
+        box[3] = child
+        abiRegisterObject(box)
+        abiManualAdopt(box)
+    }
+    abiGcCollect(true)
+    expect(abiRegisteredCount()).toBe(beforeC + 1)
+    expect(abiRegisteredBytes()).toBe(beforeB + 32)
+    expect(abiLiveBytesNow()).toBe(beforeB + 32)
+}
+
+// The two tests below exercise the phase-2c shadow-stack root directly: the
+// ported collect marks from the same per-thread chain the ported push/pop
+// (`runtime.abi_shadow`) maintain. A synthetic frame in a raw block stands in
+// for a compiled caller's frame - same layout (`prev` at word 0, 32-bit
+// `slot_count` at word 1, slots from word 2) - so a registered object only a
+// frame slot points at must survive the cycle, and must be swept once that
+// frame is popped. Pushing writes word 0 with the real chain head (the
+// harness's own frames, whose cells hold only native objects the registered
+// filter skips), so the walk is the one a running program's collect performs.
+// The frame is popped before this test returns, keeping the real chain intact.
+
+test fn shadow_frame_slot_roots_a_registered_object_until_pop() {
+    abiGcCollect(false)
+    var beforeC = abiRegisteredCount()
+    var beforeB = abiRegisteredBytes()
+    // The child is built+registered by a helper (its frame has popped), so the
+    // synthetic frame's slot word 2 is its ONLY edge.
+    var child = make_registered(4, 3, 32)
+    unsafe {
+        var frame = alloc(int, 8)
+        frame[1] = 1
+        frame[2] = child
+        abiShadowPush(frame)
+        abiGcCollect(true)
+        abiShadowPop(frame)
+        // Rooted through the live frame slot, the child survives the cycle.
+        expect(abiRegisteredCount()).toBe(beforeC + 1)
+        expect(abiRegisteredBytes()).toBe(beforeB + 32)
+        expect(abiLiveBytesNow()).toBe(beforeB + 32)
+    }
+    // Popped, the frame is gone from the chain; a later collect reclaims it.
+    abiGcCollect(false)
+    expect(abiRegisteredCount()).toBe(beforeC)
+    expect(abiRegisteredBytes()).toBe(beforeB)
+}
+
+test fn shadow_walk_masks_the_slot_count_and_skips_unregistered_slots() {
+    abiGcCollect(false)
+    var beforeC = abiRegisteredCount()
+    var beforeB = abiRegisteredBytes()
+    // The child is built+registered by a helper (its frame has popped), so the
+    // synthetic frame's slot word 3 is its ONLY edge.
+    var child = make_registered(4, 3, 32)
+    unsafe {
+        // `frame[1]` is a full 64-bit word whose LOW 32 bits are the emitter's
+        // slot count (2) and whose high bits are stale pad noise: the masked
+        // walker must still read count 2. Slot 0 holds a non-address that must
+        // never be treated as an edge; slot 1 holds the child.
+        var frame = alloc(int, 8)
+        frame[1] = 0x200000000 + 2
+        frame[2] = 0x20000
+        frame[3] = child
+        abiShadowPush(frame)
+        abiGcCollect(true)
+        abiShadowPop(frame)
+        expect(abiRegisteredCount()).toBe(beforeC + 1)
+        expect(abiRegisteredBytes()).toBe(beforeB + 32)
+        expect(abiLiveBytesNow()).toBe(beforeB + 32)
+    }
+    abiGcCollect(false)
+    expect(abiRegisteredCount()).toBe(beforeC)
+    expect(abiRegisteredBytes()).toBe(beforeB)
+}
+
+// The finalizer divergence, made observable. A stream (class id 9) is NOT
+// traced (its payload is an unmanaged raw pointer, `CLA_STREAM` exits before
+// the conservative user-class walk), and a swept stream's block is freed raw -
+// the port never runs the native `stream_finalizer`. Pinned here: a stream-
+// shaped object whose payload points at a SEPARATELY registered child must be
+// swept WITHOUT keeping the child (proving the payload is never traced), and
+// the stream block itself must be reclaimed (proving the sweep frees it like
+// any other registered block, leaking the inner pointer rather than dropping
+// it - the recorded leak-vs-drop divergence, see `abi_stream`'s header).
+test fn swept_stream_object_is_freed_raw_and_its_payload_is_not_traced() {
+    abiGcCollect(false)
+    var beforeC = abiRegisteredCount()
+    var beforeB = abiRegisteredBytes()
+    // Both objects are built+registered by helpers whose frames have popped, so
+    // neither is rooted by a managed local of this test. The stream (class id 9)
+    // carries the child's address in its word 3 - an inner raw pointer, never
+    // dereferenced or traced.
+    var child = make_registered(4, 3, 32)
+    var stream = make_registered_stream(child)
+    expect(stream != 0).toBe(true)
+    abiGcCollect(true)
+    // Nothing roots either block: the stream's payload is never a trace edge
+    // (if the walk touched word 3 as a reference, the child would survive), and
+    // both the stream and the child are swept back to the pre-test baseline.
+    expect(abiRegisteredCount()).toBe(beforeC)
+    expect(abiRegisteredBytes()).toBe(beforeB)
+    expect(abiLiveBytesNow()).toBe(beforeB)
+}

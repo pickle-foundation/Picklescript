@@ -1,0 +1,260 @@
+module runtime.abi_class_test
+
+import { abiClassNew, abiObjSlotGet, abiObjSlotSet, abiSizeWords, slotCountFromSize, CLASS_ID_WORD, SIZE_WORD, SLOT_WORD } from runtime.abi_class
+import { PICKLE_CLASS_USER_BASE, PICKLE_CLASS_STRING } from runtime.object
+import { HEADER } from runtime.layout
+import { abiBoxI64 } from runtime.abi_box
+import { abiStrFromByte } from runtime.abi_string
+
+// Header word indices, spelled as literals rather than imported, so this file
+// independently pins the layout instead of trusting `runtime.abi_class`'s own
+// constants. `test_header_word_indices_match_the_module` compares the two.
+// Named `HDR_*` so they cannot collide with `runtime.abi_class`'s names -- a
+// local top-level name that collides with a name in an imported module resolves
+// to "undeclared" inside a string interpolation under the ported compiler.
+const HDR_ID_WORD: int = 1
+const HDR_SIZE_WORD: int = 2
+const HDR_SLOT_WORD: int = 3
+
+/// Word `w` of `obj`. Reads through a `*int`, which is what every body here
+/// does; kept as a helper so the header assertions read as header assertions.
+fn word(obj: *int, w: int) -> int {
+    unsafe {
+        return obj[w]
+    }
+}
+
+test fn header_word_indices_match_the_module() {
+    expect(HDR_ID_WORD).toBe(CLASS_ID_WORD)
+    expect(HDR_SIZE_WORD).toBe(SIZE_WORD)
+    expect(HDR_SLOT_WORD).toBe(SLOT_WORD)
+    expect(HDR_SLOT_WORD).toBe(HEADER / 8)
+}
+
+test fn size_word_is_the_clamped_size_not_the_raw_size() {
+    // THE TRAP. `class_object_size(0)` is 24, but `Gc::alloc` clamps to
+    // MIN_OBJECT = 32 and the *stored* size is what the collector settled on.
+    // Writing 24 would make every slot read return null.
+    expect(abiSizeWords(0)).toBe(32)
+    expect(abiSizeWords(1)).toBe(32)
+    expect(abiSizeWords(2)).toBe(40)
+    expect(abiSizeWords(3)).toBe(48)
+    expect(abiSizeWords(4)).toBe(56)
+    // Raw 24 + 8n is the *unclamped* value, which differs only for n=0.
+    expect((HEADER + 8 * 0)).toBe(24)
+    expect((HEADER + 8 * 1)).toBe(32)
+}
+
+test fn size_word_is_always_eight_aligned_and_at_least_min_object() {
+    expect(abiSizeWords(0) % 8).toBe(0)
+    expect(abiSizeWords(1) % 8).toBe(0)
+    expect(abiSizeWords(7) % 8).toBe(0)
+    expect(abiSizeWords(0) >= 32).toBe(true)
+    expect(abiSizeWords(5) >= 32).toBe(true)
+}
+
+test fn slot_count_from_size_uses_the_reference_guard() {
+    // `size < HEADER + 8` means no slots are addressable at all; -1 is returned
+    // so the caller's `idx > slots` test rejects even index 0.
+    expect(slotCountFromSize(0)).toBe(0 - 1)
+    expect(slotCountFromSize(24)).toBe(0 - 1)
+    expect(slotCountFromSize(31)).toBe(0 - 1)
+    expect(slotCountFromSize(32)).toBe(0)
+    expect(slotCountFromSize(40)).toBe(1)
+    expect(slotCountFromSize(48)).toBe(2)
+}
+
+test fn class_new_writes_the_header() {
+    let o = abiClassNew(10, 2)
+    expect(word(o, 0)).toBe(0)
+    expect(word(o, HDR_ID_WORD)).toBe(10)
+    expect(word(o, HDR_SIZE_WORD)).toBe(40)
+}
+
+test fn class_new_clamps_a_low_class_id_to_the_user_base() {
+    // Builtin ids are not instantiable as user classes; the reference raises
+    // anything below PICKLE_CLASS_USER_BASE.
+    expect(word(abiClassNew(0, 1), HDR_ID_WORD)).toBe(PICKLE_CLASS_USER_BASE)
+    expect(word(abiClassNew(5, 1), HDR_ID_WORD)).toBe(PICKLE_CLASS_USER_BASE)
+    expect(word(abiClassNew(9, 1), HDR_ID_WORD)).toBe(PICKLE_CLASS_USER_BASE)
+    expect(word(abiClassNew(PICKLE_CLASS_USER_BASE, 1), HDR_ID_WORD)).toBe(PICKLE_CLASS_USER_BASE)
+    expect(word(abiClassNew(PICKLE_CLASS_STRING, 1), HDR_ID_WORD)).toBe(PICKLE_CLASS_USER_BASE)
+    expect(word(abiClassNew(11, 1), HDR_ID_WORD)).toBe(11)
+    expect(word(abiClassNew(300, 1), HDR_ID_WORD)).toBe(300)
+}
+
+test fn class_new_clamps_a_negative_slot_count_to_zero() {
+    let o = abiClassNew(10, 0 - 1)
+    expect(word(o, HDR_SIZE_WORD)).toBe(32)
+    expect(word(o, HDR_ID_WORD)).toBe(10)
+}
+
+test fn class_new_zeroes_every_field_slot() {
+    // `alloc` does not zero, so the explicit loop is load-bearing: an
+    // uninitialised field must never be traced.
+    let o = abiClassNew(10, 4)
+    var i = 0
+    while (i < 4) {
+        expect(word(o, HDR_SLOT_WORD + i)).toBe(0)
+        i = i + 1
+    }
+}
+
+test fn slot_set_then_get_round_trips_a_value() {
+    let o = abiClassNew(10, 3)
+    let v = abiBoxI64(42)
+    abiObjSlotSet(o, 0, v)
+    abiObjSlotSet(o, 2, v)
+    expect((abiObjSlotGet(o, 0) as int) == (v as int)).toBe(true)
+    expect((abiObjSlotGet(o, 2) as int) == (v as int)).toBe(true)
+    // Slot 1 was never written, so it still reads as the zero written at
+    // construction: null.
+    expect((abiObjSlotGet(o, 1) as int) == 0).toBe(true)
+}
+
+test fn slot_get_on_an_unwritten_instance_is_null() {
+    let o = abiClassNew(10, 2)
+    expect((abiObjSlotGet(o, 0) as int) == 0).toBe(true)
+    expect((abiObjSlotGet(o, 1) as int) == 0).toBe(true)
+}
+
+test fn slot_set_preserves_a_stored_pointer_exactly() {
+    // Round-tripping a real object proves the payload is being treated as a
+    // pointer and not copied as an integer width that happens to work.
+    let o = abiClassNew(10, 1)
+    let s = abiStrFromByte(65)
+    abiObjSlotSet(o, 0, s)
+    let back = abiObjSlotGet(o, 0)
+    expect((back as int) == (s as int)).toBe(true)
+    // And the pointed-at object is still usable through the retrieved pointer.
+    expect(word(back, 3)).toBe(1)
+}
+
+test fn slot_get_rejects_a_negative_index() {
+    let o = abiClassNew(10, 2)
+    expect((abiObjSlotGet(o, 0 - 1) as int) == 0).toBe(true)
+    expect((abiObjSlotGet(o, 0 - 100) as int) == 0).toBe(true)
+}
+
+test fn slot_get_rejects_an_index_past_the_last_slot() {
+    // 3 fields -> size 48 -> slots = (48-24-8)/8 = 2, and the guard is
+    // `idx > slots`, so index 3 is the first rejection.
+    let o = abiClassNew(10, 3)
+    let v = abiBoxI64(1)
+    abiObjSlotSet(o, 2, v)
+    expect((abiObjSlotGet(o, 2) as int) == (v as int)).toBe(true)
+    expect((abiObjSlotGet(o, 3) as int) == 0).toBe(true)
+    expect((abiObjSlotGet(o, 100) as int) == 0).toBe(true)
+}
+
+test fn slot_set_out_of_range_is_a_silent_no_op() {
+    let o = abiClassNew(10, 2)
+    let v = abiBoxI64(7)
+    abiObjSlotSet(o, 99, v)
+    // Nothing was written past the end, and slot 0 is untouched.
+    expect((abiObjSlotGet(o, 0) as int) == 0).toBe(true)
+    abiObjSlotSet(o, 0 - 1, v)
+    expect((abiObjSlotGet(o, 0) as int) == 0).toBe(true)
+}
+
+test fn a_zero_field_class_still_answers_slot_zero() {
+    // THE CLAMP MADE VISIBLE. A 0-field class stores size 32 (not 24), so the
+    // guard computes slots = 0 and ADMITS index 0 -- word 3 is past the
+    // object's logical 24-byte extent but inside its 32-byte allocation.
+    //
+    // The guard is what is asserted, not the value in that word. The reference
+    // zeroes only `8 * field_count` bytes, so for field_count == 0 word 3 is
+    // uninitialised allocator memory: the Rust bump allocator and the ported
+    // heap return different garbage there, and a JIT/AOT parity main that
+    // printed it would mismatch for reasons unrelated to this ABI. So prove
+    // addressability by writing the slot and reading it back.
+    let o = abiClassNew(10, 0)
+    expect(word(o, HDR_SIZE_WORD)).toBe(32)
+    expect(slotCountFromSize(32)).toBe(0)
+
+    // Index 0 is addressable: the write is not ignored, and the value survives.
+    let v = abiBoxI64(11)
+    abiObjSlotSet(o, 0, v)
+    expect((abiObjSlotGet(o, 0) as int) == (v as int)).toBe(true)
+
+    // Index 1 is beyond even the clamped allocation's guard, so it stays null
+    // even though index 0 was writable.
+    expect((abiObjSlotGet(o, 1) as int) == 0).toBe(true)
+    abiObjSlotSet(o, 1, v)
+    expect((abiObjSlotGet(o, 1) as int) == 0).toBe(true)
+}
+
+test fn zero_and_one_field_classes_share_a_size_word() {
+    // Both clamp to 32, so they are indistinguishable by size alone. That is
+    // exactly why the port stores the clamped value rather than 24 + 8n.
+    expect(abiSizeWords(0)).toBe(abiSizeWords(1))
+    expect(word(abiClassNew(10, 0), HDR_SIZE_WORD)).toBe(word(abiClassNew(10, 1), HDR_SIZE_WORD))
+}
+
+test fn null_object_reads_and_writes_are_ignored() {
+    // The reference guards `obj.is_null()` on both accessors. A write to null
+    // must not fault; a read of null is null.
+    let nil = 0 as *int
+    abiObjSlotSet(nil, 0, abiBoxI64(1))
+    expect((abiObjSlotGet(nil, 0) as int) == 0).toBe(true)
+    expect((abiObjSlotGet(nil, 5) as int) == 0).toBe(true)
+}
+
+test fn two_instances_do_not_share_slots() {
+    // Guards against a port that accidentally allocated a shared span or wrote
+    // through a stale word index.
+    let a = abiClassNew(10, 2)
+    let b = abiClassNew(10, 2)
+    let v = abiBoxI64(5)
+    abiObjSlotSet(a, 0, v)
+    expect((abiObjSlotGet(b, 0) as int) == 0).toBe(true)
+    expect((abiObjSlotGet(a, 0) as int) == (v as int)).toBe(true)
+}
+
+test fn fields_are_independent_across_indices() {
+    let o = abiClassNew(10, 4)
+    let v1 = abiBoxI64(1)
+    let v2 = abiBoxI64(2)
+    let v3 = abiBoxI64(3)
+    let v4 = abiBoxI64(4)
+    abiObjSlotSet(o, 0, v1)
+    abiObjSlotSet(o, 1, v2)
+    abiObjSlotSet(o, 2, v3)
+    abiObjSlotSet(o, 3, v4)
+    expect((abiObjSlotGet(o, 0) as int) == (v1 as int)).toBe(true)
+    expect((abiObjSlotGet(o, 1) as int) == (v2 as int)).toBe(true)
+    expect((abiObjSlotGet(o, 2) as int) == (v3 as int)).toBe(true)
+    expect((abiObjSlotGet(o, 3) as int) == (v4 as int)).toBe(true)
+}
+
+test fn a_wide_instance_has_the_expected_size_and_slot_count() {
+    // Sanity on the far end of the arithmetic, where the clamp does not apply
+    // and raw == stored.
+    expect(abiSizeWords(8)).toBe(24 + 64)
+    expect(slotCountFromSize(abiSizeWords(8))).toBe(7)
+    let o = abiClassNew(10, 8)
+    expect(word(o, HDR_SIZE_WORD)).toBe(88)
+    let v = abiBoxI64(9)
+    abiObjSlotSet(o, 7, v)
+    expect((abiObjSlotGet(o, 7) as int) == (v as int)).toBe(true)
+    expect((abiObjSlotGet(o, 8) as int) == 0).toBe(true)
+}
+
+test fn overwriting_a_slot_replaces_the_pointer() {
+    // The stored value is a pointer, so a second write must fully replace it
+    // rather than OR into it (the trap that bit `pickle_str_set`).
+    let o = abiClassNew(10, 1)
+    let a = abiBoxI64(0 - 1)
+    let b = abiBoxI64(1)
+    abiObjSlotSet(o, 0, a)
+    abiObjSlotSet(o, 0, b)
+    expect((abiObjSlotGet(o, 0) as int) == (b as int)).toBe(true)
+    expect((abiObjSlotGet(o, 0) as int) == (a as int)).toBe(false)
+}
+
+test fn storing_null_clears_a_slot() {
+    let o = abiClassNew(10, 1)
+    abiObjSlotSet(o, 0, abiBoxI64(3))
+    abiObjSlotSet(o, 0, 0 as *int)
+    expect((abiObjSlotGet(o, 0) as int) == 0).toBe(true)
+}

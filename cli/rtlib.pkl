@@ -1,0 +1,116 @@
+module cli.rtlib
+
+import { DiagnosticSink } from compiler.diag
+import { sortStrings } from compiler.cache
+import { blobFrom, arWriteStrs } from compiler.objread
+import { lowerModuleObjBytes } from cli.buildlib
+import { strFrom } from compiler.linklib
+
+/// Build the pickle runtime archive: every candidate `pickle/runtime/*.pkl`
+/// member lowered once, phase-A form (default class salts, no setup symbols —
+/// the exact objects `cli.selflink` selects over), packed into a `.ar` by
+/// `arWrite`. `cli.build` then links a program against this archive exactly as
+/// it links against the Rust `combined.lib`, with no cargo and no per-target
+/// member lowering.
+///
+/// Usage: pickle-cli run pickle/cli/rtlib.pkl -- <rtDir> <outArchive>
+/// The member filter mirrors `cli.selflink`: `_test.pkl` and `fs.pkl` are
+/// excluded (fs.pkl is a seam; abi_fs.pkl carries the symbol bodies).
+fn main() {
+    let argv = args()
+    if (len(argv) < 2) {
+        println("RTLIB NO ARGS: <rtDir> <outArchive>")
+        return
+    }
+    let rtDir = argv[0]
+    let outArchive = argv[1]
+    var members = [""]
+    members.pop()
+    let dirOpt = list_dir(rtDir)
+    if (let some(files) = dirOpt) {
+        for (f in files) {
+            let fp = slashes(f)
+            if (hasSuffix(fp, ".pkl") && !hasSuffix(fp, "_test.pkl") && !hasSuffix(fp, "/fs.pkl")) {
+                members.push(fp)
+            }
+        }
+    }
+    sortStrings(members)
+    var names: List<string> = [""]
+    names.pop()
+    var datas: List<string> = [""]
+    datas.pop()
+    var lowered = 0
+    var failed = 0
+    for (m in members) {
+        let msrcOpt = read_file(m)
+        if (let some(msrc) = msrcOpt) {
+            let msinks = DiagnosticSink()
+            let mobjOpt = lowerModuleObjBytes(m, msrc, msinks)
+            if (let some(mobj) = mobjOpt) {
+                names.push(m)
+                datas.push(strFrom(mobj.bytes))
+                lowered = lowered + 1
+            } else {
+                failed = failed + 1
+                println("RTLIB LOWER FAIL: " + m)
+                printDiags(msinks)
+            }
+        } else {
+            failed = failed + 1
+            println("RTLIB READ FAIL: " + m)
+        }
+    }
+    println("RTLIB members=" + str(len(members)) + " lowered=" + str(lowered) + " failed=" + str(failed))
+    let archive = arWriteStrs(names, datas)
+    if (write_file(outArchive, archive)) {
+        println("RTLIB WROTE " + outArchive + " bytes=" + str(len(archive)))
+    } else {
+        println("RTLIB WRITE FAIL: " + outArchive)
+    }
+}
+
+fn hasSuffix(s: string, suf: string) -> bool {
+    let sb = blobFrom(s)
+    let fb = blobFrom(suf)
+    if (len(fb) > len(sb)) {
+        return false
+    }
+    var i = 0
+    while (i < len(fb)) {
+        if (sb[len(sb) - len(fb) + i] != fb[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+fn slashes(p: string) -> string {
+    let bs = blobFrom(p)
+    var out = ""
+    var i = 0
+    while (i < len(bs)) {
+        if ((bs[i] as int) == 92) {
+            out = out + "/"
+        } else {
+            out = out + "{bs[i] as char}"
+        }
+        i = i + 1
+    }
+    out
+}
+
+fn printDiags(sinks: DiagnosticSink) {
+    let ds = sinks.diagnostics
+    var i = 0
+    while (i < len(ds)) {
+        let d = ds[i]
+        var sp = "none"
+        if (let some(s0) = d.span) {
+            sp = "(" + str(s0.start) + "," + str(s0.end) + ")"
+        }
+        println("DIAG " + d.message + " span=" + sp)
+        i = i + 1
+    }
+}
