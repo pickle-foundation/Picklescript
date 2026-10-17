@@ -88,16 +88,27 @@ function ByteEq([string]$a, [string]$b) {
 # or not a Rust toolchain is present (a Rust-free checkout with a pickle seed reuses
 # the same stamps). Provider identity is folded in explicitly where it matters.
 function Get-TreeHash([string[]]$dirs) {
-    $files = @()
-    foreach ($d in $dirs) {
-        if (Test-Path -LiteralPath $d) {
-            $files += Get-ChildItem -LiteralPath $d -Recurse -Filter *.pkl -File
+    # Hash only git-tracked *.pkl under $dirs. Untracked scratch (editor dumps, debug
+    # probes) left in a source tree must not perturb the stamp, and the tracked set is
+    # exactly what a clean checkout has. Line endings are normalised too: git stores LF
+    # but a Windows working tree is CRLF, and both must hash the same.
+    $root = (Resolve-Path ".").Path
+    $pairs = @()
+    foreach ($f in (git ls-files -- "*.pkl")) {
+        $norm = $f -replace '/', '\'
+        foreach ($d in $dirs) {
+            $dn = $d.TrimEnd('\')
+            if ($norm.StartsWith($dn + '\')) { $pairs += $norm; break }
         }
     }
     $hasher = [System.Security.Cryptography.SHA256]::Create()
-    foreach ($f in ($files | Sort-Object FullName)) {
-        $bytes = [System.IO.File]::ReadAllBytes($f.FullName)
-        $null = $hasher.TransformBlock($bytes, 0, $bytes.Length, $null, 0)
+    foreach ($rel in ($pairs | Sort-Object -Unique)) {
+        $full = Join-Path $root $rel
+        if (Test-Path -LiteralPath $full) {
+            $text = [System.IO.File]::ReadAllText($full).Replace("`r`n", "`n")
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($text)
+            $null = $hasher.TransformBlock($bytes, 0, $bytes.Length, $null, 0)
+        }
     }
     $null = $hasher.TransformFinalBlock([byte[]]@(), 0, 0)
     [BitConverter]::ToString($hasher.Hash).Replace("-", "").ToLowerInvariant()

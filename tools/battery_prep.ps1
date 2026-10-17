@@ -86,7 +86,7 @@ if ($oraclesFrozen) {
     Write-Output "PREP oracles FROZEN (sources unchanged; Rust cli not used)"
 } else {
     if (-not (Test-Path -LiteralPath $batteryCommonCli)) {
-        Write-Host "PREP SKIPPED: oracle hash mismatch (port-derived); using committed oracles"
+        throw "PREP FAILED: oracle sources changed but no Rust cli at $batteryCommonCli to regenerate them. Restore the committed oracles (tools\diff\oracle.zip) or rebuild the Rust cli."
     }
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     foreach ($t in $Targets) {
