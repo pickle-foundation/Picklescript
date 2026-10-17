@@ -27,10 +27,8 @@ $goldenDir  = "tools\diff\sovereign-golden"
 $outDir     = "tools\diff\sovereign"
 $buildDrv   = "tools\diff\port\pklc_build.exe"
 $runDrv     = "tools\diff\port\pklc_run.exe"
-$combined   = @(
-  "$env:TEMP\opencode\rarc\combined.lib"
-  "C:\Users\vilni\AppData\Local\Temp\opencode\rarc\combined.lib"
-) | Where-Object { Test-Path $_ } | Select-Object -First 1
+$combined   = "$env:TEMP\opencode\rarc\combined.lib"
+if (-not (Test-Path $combined)) { $combined = "" }
 
 function Write-Phase($t) { Write-Output ""; Write-Output "=== $t ===" }
 

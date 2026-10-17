@@ -46,9 +46,10 @@ $ErrorActionPreference = "Continue"
 # automatic collector is safe under heavy compile workloads. (PKL_NO_AUTO_GC
 # remains available for debugging.)
 Remove-Item Env:PKL_NO_AUTO_GC -ErrorAction SilentlyContinue
-$Root = "."
-$Cli  = "$Root\target\debug\pickle-cli.exe"
-$Temp = "C:\Users\vilni\AppData\Local\Temp\opencode\uncaught"
+$Root = (Resolve-Path ".").Path
+$Cli  = Join-Path $Root "target\debug\pickle-cli.exe"
+# Scratch lives under the gitignored tools/diff so a fresh clone needs no setup.
+$Temp = Join-Path $Root "tools\diff\uncaught"
 $Work = Join-Path $Temp "work"
 
 New-Item -ItemType Directory -Force -Path $Work | Out-Null

@@ -36,7 +36,7 @@ param(
 $ErrorActionPreference = "Continue"
 $Root = "."
 $Cli  = "$Root\target\debug\pickle-cli.exe"
-$Temp = "C:\Users\vilni\AppData\Local\Temp\opencode\fatalparity"
+$Temp = Join-Path $Env:TEMP "opencode\fatalparity"
 $Work = Join-Path $Temp "work"
 
 New-Item -ItemType Directory -Force -Path $Work | Out-Null
@@ -82,7 +82,7 @@ function Show([byte[]]$b) {
     return (($b | ForEach-Object { if ($_ -ge 32 -and $_ -lt 127) { [char]$_ } else { "<0x{0:X2}>" -f $_ } }) -join '')
 }
 
-$Combined = @("C:\Users\vilni\AppData\Local\Temp\opencode\x64real\rarc\combined.lib", "$Env:TEMP\opencode\x64real\rarc\combined.lib", "$Env:TEMP\opencode\rarc\combined.lib") |
+$Combined = @("$Env:TEMP\opencode\x64real\rarc\combined.lib", "$Env:TEMP\opencode\rarc\combined.lib") |
     Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $Combined) { Write-Output "COMBINED LIB NOT FOUND (rebuild via tools/build_combined_lib.ps1)"; exit 1 }
 

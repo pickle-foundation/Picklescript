@@ -45,6 +45,11 @@ function Invoke-NativeQuiet([string]$exe, [string[]]$argv) {
 # stalls the entire battery.
 $script:NativeTimeoutExit = 124
 function Invoke-NativeTimeout([string]$exe, [string[]]$argv, [string]$outPath, [int]$timeoutSec) {
+    # The capture file must be absolute: [IO.File]::Create resolves relative paths
+    # against [Environment]::CurrentDirectory, which Set-Location (and any launcher
+    # script) leaves untouched, so a battery started from another tree would silently
+    # write every capture out of repo and ByteEq would fail everywhere.
+    if (-not [System.IO.Path]::IsPathRooted($outPath)) { $outPath = Join-Path (Get-Location).Path $outPath }
     if (Test-Path -LiteralPath $outPath) { Remove-Item -LiteralPath $outPath -Force }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = (Resolve-Path -LiteralPath $exe).Path

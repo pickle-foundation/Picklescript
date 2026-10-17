@@ -6,8 +6,13 @@ param(
 $ErrorActionPreference = "Continue"
 $Root   = "."
 $Cli    = "$Root\target\debug\pickle-cli.exe"
-$Gcc    = "C:\Users\vilni\Tools\w64devkit\w64devkit\bin\gcc.exe"
-$Temp   = "C:\Users\vilni\AppData\Local\Temp\opencode\x64real"
+# External toolchain comes from PATH first, then the conventional w64devkit
+# location under the user's profile; scratch goes to the system temp dir.
+$Gcc    = (Get-Command gcc.exe -ErrorAction SilentlyContinue).Source
+if (-not $Gcc) {
+    $Gcc = Join-Path $env:USERPROFILE "Tools\w64devkit\w64devkit\bin\gcc.exe"
+}
+$Temp   = Join-Path $Env:TEMP "opencode\x64real"
 $Stem   = [System.IO.Path]::GetFileNameWithoutExtension($Target)
 $Probe  = Join-Path $Temp $Stem
 

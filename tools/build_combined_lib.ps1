@@ -7,7 +7,12 @@ param(
 $ErrorActionPreference = "Stop"
 
 $Root = "."
-$Ar   = "C:\Users\vilni\Tools\w64devkit\w64devkit\bin\ar.exe"
+# Archive tool from PATH first, then the conventional w64devkit location in
+# the user's profile.
+$Ar = (Get-Command ar.exe -ErrorAction SilentlyContinue).Source
+if (-not $Ar) {
+    $Ar = Join-Path $env:USERPROFILE "Tools\w64devkit\w64devkit\bin\ar.exe"
+}
 $Work = "$Env:TEMP\opencode\combo\work"
 
 if (-not (Test-Path $Ar)) { throw "ar not found: $Ar" }

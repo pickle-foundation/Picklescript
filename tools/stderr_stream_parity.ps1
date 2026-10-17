@@ -37,10 +37,7 @@ if (-not (Test-Path -LiteralPath $fixture)) {
 }
 
 # One lib path, whichever this machine actually has.
-$lib = @(
-    "$env:TEMP\opencode\rarc\combined.lib",
-    "C:\Users\vilni\AppData\Local\Temp\opencode\rarc\combined.lib"
-) | Where-Object { Test-Path $_ } | Select-Object -First 1
+$lib = "$env:TEMP\opencode\rarc\combined.lib"
 if (-not $lib) {
     Write-Output "STDERR-PARITY: SKIP (no combined.lib; run tools\build_combined_lib.ps1 first)"
     exit 0
