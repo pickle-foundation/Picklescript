@@ -1,7 +1,7 @@
 module runtime.abi_gc_test
 
-import { abiGcAllocationsSinceGc, abiGcBytesSinceGc, abiGcCollectionCount, abiGcSetThreshold, abiGcCollect, abiGcRootAdd, abiManualAdopt, abiManualFree, abiGcThresholdNow, abiRootCount, abiManualCount, abiLiveBytesNow } from runtime.abi_gc
-import { abiRegisteredCount, abiRegisteredBytes, abiRegisterObject, abiUnregisterObject } from runtime.abi_raw
+import { abiGcAllocationsSinceGc, abiGcBytesSinceGc, abiGcCollectionCount, abiGcSetThreshold, abiGcCollect, abiGcRootAdd, abiManualAdopt, abiManualFree, abiGcThresholdNow, abiRootCount, abiManualCount, abiLiveBytesNow, abiGcTempRoot, abiGcTempUnroot, abiGcTempCount } from runtime.abi_gc
+import { abiRegisteredCount, abiRegisteredBytes, abiRegisterObject, abiUnregisterObject, abiRegisteredAt, abiTempRoot, abiTempUnroot, abiTempCount } from runtime.abi_raw
 import { abiShadowPush, abiShadowPop } from runtime.abi_shadow
 
 /// FRAME-ROBUST SWEEP BUILDERS. The ported codegen emits a shadow frame for every
@@ -636,4 +636,125 @@ test fn swept_stream_object_is_freed_raw_and_its_payload_is_not_traced() {
     expect(abiRegisteredCount()).toBe(beforeC)
     expect(abiRegisteredBytes()).toBe(beforeB)
     expect(abiLiveBytesNow()).toBe(beforeB)
+}
+
+// ---- temp roots: the helper liveness lease ---------------------------------
+//
+// Native `gc.rs` keeps a `temp_roots` list (`temp_root`/`temp_unroot`/
+// `temp_lease`): a helper that is mid-build holds a lease so a nested
+// collection cannot sweep an object that is registered but not yet reachable
+// from any root. `trace_from_roots` seeds the marks from that list exactly as
+// the ported engine now seeds `geMarkFromRoots`. These tests mirror the
+// native contract using the collector-side view: a registered leaf object
+// held ONLY by a lease must survive a collect that would otherwise sweep it,
+// releasing the lease must make it sweepable again, and the lease itself must
+// be idempotent with null ignored.
+
+// Frame-robust through the same builders as the sweep tests: build+register
+// inside a helper whose frame has popped; the CALLER holds only the plain int
+// address, so a `*int` local of the test fn can never be the root holding the
+// object alive. The lease is taken INSIDE the builder, directly after the
+// register moment (no allocation can interleave - that is exactly the helper
+// contract the lease exists for, with a pinned 4096 test threshold auto-
+// collecting between every pair of expectations).
+fn make_leased_leaf() -> int {
+    var addr = 0
+    unsafe {
+        var p = alloc(int, 4)
+        p[0] = 0
+        p[1] = 3
+        p[2] = 32
+        p[3] = 0
+        abiRegisterObject(p)
+        abiGcTempRoot(p)
+        addr = p as int
+    }
+    return addr
+}
+
+fn registryContains(address: int) -> bool {
+    var i = 0
+    while (i < abiRegisteredCount()) {
+        if (abiRegisteredAt(i) == address) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// The LEASE-FREE twin of `make_leased_leaf`: same block shape, no lease, so it
+// is registered and rooted by nothing at all - the baseline the kept-alive
+// test is measured against.
+fn make_dying_leaf() -> int {
+    var addr = 0
+    unsafe {
+        var p = alloc(int, 4)
+        p[0] = 0
+        p[1] = 3
+        p[2] = 32
+        p[3] = 0
+        abiRegisterObject(p)
+        addr = p as int
+    }
+    return addr
+}
+
+test fn temp_root_keeps_a_registered_unpublished_object_alive_through_a_collect() {
+    // Delta assertions keep the test order-independent (see the counter note
+    // at the top of the file): the registries are process-global image data
+    // and no per-test reset exists.
+    abiGcCollect(false)
+    var beforeReg = abiRegisteredCount()
+    var beforeTe = abiGcTempCount()
+    var beforeTeRaw = abiTempCount()
+    var leaf = make_leased_leaf()
+    expect(beforeTe).toBe(beforeTeRaw)
+    // The leaf is registered and rooted by nothing except the lease the
+    // builder took (halving the helper contract: no allocation can sneak
+    // between the register moment and the lease).
+    expect(abiGcTempCount()).toBe(beforeTe + 1)
+    expect(abiTempCount()).toBe(beforeTeRaw + 1)
+    // Re-rooting is idempotent and null is ignored: the same registry grows
+    // once for the same address and not at all for 0.
+    abiGcTempRoot(leaf as *int)
+    expect(abiGcTempCount()).toBe(beforeTe + 1)
+    abiGcTempRoot(0 as *int)
+    expect(abiGcTempCount()).toBe(beforeTe + 1)
+    // The collect the helper could not avoid: the lease is the only reason the
+    // object survives this cycle. Without the lease the exact same cycle
+    // sweeps the exact same object (proven by the unrooted test below).
+    abiGcCollect(true)
+    expect(registryContains(leaf)).toBe(true)
+    expect(abiRegisteredCount()).toBe(beforeReg + 1)
+    // Mirror `gc.rs`'s "can answer whether obj currently holds a lease": after
+    // the release the count drops back and a second root can take it again.
+    abiGcTempUnroot(leaf as *int)
+    expect(abiGcTempCount()).toBe(beforeTe)
+    // A lease that is not present releases as a no-op (unroot-of-unrooted):
+    abiGcTempUnroot(leaf as *int)
+    expect(abiGcTempCount()).toBe(beforeTe)
+    // Suite hygiene: re-root, release, and sweep once more so the lease list
+    // and the registry both return to the pre-test baseline (the leaf itself
+    // is reclaimed) - nothing of this test outlives it for the next tests.
+    abiGcTempRoot(leaf as *int)
+    abiGcTempUnroot(leaf as *int)
+    abiGcCollect(true)
+    expect(abiGcTempCount()).toBe(beforeTe)
+    expect(abiRegisteredCount()).toBe(beforeReg)
+    expect(registryContains(leaf)).toBe(false)
+}
+
+test fn unrooted_object_is_swept_by_the_next_collect() {
+    // The regression baseline the test above needs to be meaningful: the same
+    // leaf block taken with NO temp-root lease, via `make_dying_leaf`, is
+    // swept by the very cycle that the leased object survives. If some other
+    // root covered the leaf, both tests would pass regardless of the lease,
+    // which would prove the seed code dead.
+    abiGcCollect(false)
+    var beforeReg = abiRegisteredCount()
+    var leaf = make_dying_leaf()
+    abiGcCollect(true)
+    expect(registryContains(leaf)).toBe(false)
+    expect(abiRegisteredCount()).toBe(beforeReg)
 }

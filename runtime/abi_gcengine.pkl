@@ -165,6 +165,19 @@ var manCap: int = 0
 var manCount: int = 0
 const MAN_INITIAL: int = 16
 
+/// The temp-root registry: flat word block of liveness leases. A runtime
+/// helper that is mid-build - an object that exists, is registered, but has
+/// not yet been published to a frame slot, a root cell, or a parent's slot -
+/// holds a lease here so any collection the helper's OWN next allocation may
+/// trigger (or an explicit `pickle_gc_collect` racing it) cannot sweep the
+/// half-built value. Mirrors `gc.rs`'s `temp_root`/`temp_unroot`, which seed
+/// `trace::trace_from_roots` the same way. Unlike the manual registry the
+/// flag word is untouched: a lease is purely liveness, never an adopt.
+var teBase: int = 0
+var teCap: int = 0
+var teCount: int = 0
+const TE_INITIAL: int = 16
+
 // --------------------------------------------------------- block growth
 /// The capacity a block reaches for `idx` items under doubling growth: the
 /// first power-of-2 multiple of `initial` strictly above `idx` (or the input
@@ -751,7 +764,7 @@ fn geTrace(object: int) {
 }
 
 /// Seed the worklist from the port's root set (static-root cells + manual
-/// registry), the shadow chain, then drain it.
+/// registry + in-flight temp leases), the shadow chain, then drain it.
 fn geMarkFromRoots() {
     markPendingLen = 0
     var root = 0
@@ -770,6 +783,13 @@ fn geMarkFromRoots() {
             geEnqueue((manBase as *int)[manual])
         }
         manual = manual + 1
+    }
+    var temp = 0
+    while (temp < teCount) {
+        unsafe {
+            geEnqueue((teBase as *int)[temp])
+        }
+        temp = temp + 1
     }
     geMarkFromShadow(abiShadowHead())
     while (markPendingLen > 0) {
@@ -909,6 +929,57 @@ fn abiEngineRootAdd(cell: int) -> int {
     }
     rootsCount = rootsCount + 1
     return cell
+}
+
+/// Temporarily root `obj` while a helper is still building it. Unlike
+/// `abiEngineManualAdopt` the flag word is untouched: this is purely a
+/// liveness lease, so a nested collection inside the helper cannot sweep the
+/// not-yet-published value. The helper must call `abiEngineTempUnroot` before
+/// returning a value that has been published to a slot/frame/root. Null is
+/// ignored and re-rooting is idempotent - mirrors `gc.rs::temp_root`, whose
+/// `contains` guard this is.
+fn abiEngineTempRoot(obj: *int) {
+    if ((obj as int) == 0) {
+        return
+    }
+    var i = 0
+    while (i < teCount) {
+        unsafe {
+            if ((teBase as *int)[i] == (obj as int)) {
+                return
+            }
+        }
+        i = i + 1
+    }
+    teBase = geGrow(teBase, teCap, teCount, TE_INITIAL)
+    teCap = geCapGrown(teCap, teCount, TE_INITIAL)
+    unsafe {
+        (teBase as *int)[teCount] = obj as int
+    }
+    teCount = teCount + 1
+}
+
+/// Release the liveness lease on `obj` taken by `abiEngineTempRoot`. An
+/// address that holds no lease is ignored - mirrors `gc.rs::temp_unroot`'s
+/// `retain` becoming a no-op for absent entries.
+fn abiEngineTempUnroot(obj: *int) {
+    var i = 0
+    while (i < teCount) {
+        unsafe {
+            if ((teBase as *int)[i] == (obj as int)) {
+                (teBase as *int)[i] = (teBase as *int)[teCount - 1]
+                (teBase as *int)[teCount - 1] = 0
+                teCount = teCount - 1
+                return
+            }
+        }
+        i = i + 1
+    }
+}
+
+/// Number of registered temp-root leases - exported for tests.
+fn abiEngineTempCount() -> int {
+    return teCount
 }
 
 /// Adopt `obj` as a programmer-owned allocation: register it unless already

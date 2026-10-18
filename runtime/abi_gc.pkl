@@ -30,10 +30,15 @@ module runtime.abi_gc
 ///     moment, adopted by every maker through `abi_raw` - reproduces exactly
 ///     that, including the one-time `PKL_NO_AUTO_GC` / `PKL_GC_THRESHOLD`
 ///     environment read. This closes the former open divergence.
-///   - **Roots are the static-root cells, the manual registry, and the current
-///     thread's shadow stack.** Native's helper temp-roots and the multi-thread
-///     `shadow.rs` registry (+ its wide lock) are still not ported: a qualified
-///     image collects on its own thread with no in-flight native helper.
+///   - **Roots are the static-root cells, the manual registry, the in-flight
+///     temp-root leases, and the current thread's shadow stack.** The
+///     temp-root lease (`abiGcTempRoot`/`abiGcTempUnroot`, the port of
+///     `gc.rs`'s `temp_root`/`temp_unroot`) keeps a helper's half-built,
+///     not-yet-published object alive across a collection the helper's next
+///     allocation may trigger. Native's helper temp-roots ARE ported; the
+///     multi-thread `shadow.rs` registry (+ its wide lock) is still not
+///     ported: a qualified image collects on its own thread with no
+///     in-flight native helper.
 ///   - **The walk is exact for every builtin container and conservative for
 ///     user classes.** Lists trace by `len`, maps by `cap`, tuples/enums by
 ///     their payload fields; boxes and streams are not traced; user classes
@@ -48,7 +53,7 @@ module runtime.abi_gc
 /// `pickle_gc_collect(force)` accepts and ignores its argument - native v1
 /// always collects.
 
-import { abiEngineAllocCount, abiEngineAllocBytes, abiEngineCollectionCount, abiEngineSetThreshold, abiEngineCollect, abiEngineRootAdd, abiEngineManualAdopt, abiEngineManualFree, abiEngineThresholdNow, abiEngineLiveBytesNow, abiEngineRootCount, abiEngineManualCount } from runtime.abi_gcengine
+import { abiEngineAllocCount, abiEngineAllocBytes, abiEngineCollectionCount, abiEngineSetThreshold, abiEngineCollect, abiEngineRootAdd, abiEngineManualAdopt, abiEngineManualFree, abiEngineThresholdNow, abiEngineLiveBytesNow, abiEngineRootCount, abiEngineManualCount, abiEngineTempRoot, abiEngineTempUnroot, abiEngineTempCount } from runtime.abi_gcengine
 
 /// Number of allocations since the last collection - the count, deliberately
 /// distinct from the byte figure. Mirrors `gc.rs::pickle_gc_allocations_since_gc`.
@@ -125,4 +130,23 @@ fn abiRootCount() -> int {
 /// Number of adopted manual objects - exported for tests.
 fn abiManualCount() -> int {
     return abiEngineManualCount()
+}
+
+/// Temporarily root `obj` while its maker is still building it: a pure
+/// liveness lease, no manual-adopt flag. Mirrors `gc.rs::temp_root`. Not a
+/// `#[symbol]` - native's temp_root is internal, so the observable surface
+/// stays, and a maker that reaches this helper through `abi_raw` gets the
+/// same root the reference helpers do.
+fn abiGcTempRoot(obj: *int) {
+    abiEngineTempRoot(obj)
+}
+
+/// Release the lease taken by `abiGcTempRoot`. Mirrors `gc.rs::temp_unroot`.
+fn abiGcTempUnroot(obj: *int) {
+    abiEngineTempUnroot(obj)
+}
+
+/// Number of active temp-root leases - exported for tests.
+fn abiGcTempCount() -> int {
+    return abiEngineTempCount()
 }
