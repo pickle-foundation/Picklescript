@@ -191,7 +191,11 @@ if (-not $rtlibCand) {
 Invoke-BuildDriver "cli\test.pkl" $pklcTest | Out-Null
 $portTests = @(Get-ChildItem "compiler\*_test.pkl")
 foreach ($pt in $portTests) {
-    $code = Invoke-NativeTimeout $pklcTest @($pt.FullName, $rtlibCand) "$g7dir\g7.txt" 300
+# Per-module wall budget is generous on purpose (a hang check, not a perf
+# gate): the heaviest module (emit_test.pkl) takes 5-6 minutes measured on a
+# desktop with heavy background load, so 300s is marginal and kills healthy
+# runs. A real hang (thread/channel blocks) lasts forever and is still caught.
+    $code = Invoke-NativeTimeout $pklcTest @($pt.FullName, $rtlibCand) "$g7dir\g7.txt" 600
     if ($code -eq 0) { $gate7ok++ } else {
         $gate7fail++
         $line = (Get-Content -LiteralPath "$g7dir\g7.txt" | Select-String "test result|FAILED" | Select-Object -First 1)
