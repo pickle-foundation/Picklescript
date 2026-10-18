@@ -3,6 +3,9 @@ module runtime.abi_gc_test
 import { abiGcAllocationsSinceGc, abiGcBytesSinceGc, abiGcCollectionCount, abiGcSetThreshold, abiGcCollect, abiGcRootAdd, abiManualAdopt, abiManualFree, abiGcThresholdNow, abiRootCount, abiManualCount, abiLiveBytesNow, abiGcTempRoot, abiGcTempUnroot, abiGcTempCount } from runtime.abi_gc
 import { abiRegisteredCount, abiRegisteredBytes, abiRegisterObject, abiUnregisterObject, abiRegisteredAt, abiTempRoot, abiTempUnroot, abiTempCount } from runtime.abi_raw
 import { abiShadowPush, abiShadowPop } from runtime.abi_shadow
+import { abiClassRegister } from runtime.abi_class_extra
+import { abiStrFromByte, abiStrConcat } from runtime.abi_string
+import { STR_BYTES_OFF } from runtime.layout
 
 /// FRAME-ROBUST SWEEP BUILDERS. The ported codegen emits a shadow frame for every
 /// collect-capable function, so a raw pointer local of a `test fn` is itself a
@@ -757,4 +760,164 @@ test fn unrooted_object_is_swept_by_the_next_collect() {
     abiGcCollect(true)
     expect(registryContains(leaf)).toBe(false)
     expect(abiRegisteredCount()).toBe(beforeReg)
+}
+
+// ----------------------------------------------------- deinit finalizers
+/// The finalizer counters the three `deinit` tests below read. Module-level
+/// like `abi_once_test`'s `seenOnce`: a Pickle fn body cannot allocate a
+/// closure around locals, and the counters must be writable from a module fn
+/// the engine dereferences through the abi_classwords leaf.
+var finiRuns: int = 0
+var finiLoads: int = 0
+
+/// A `deinit` shaped exactly like the emitter's `pkl_<T>_deinit`:
+/// `fn (*mut PickleObject)`, returning nothing. Reads the dying object's
+/// class word to prove the pointer it received is the dying block itself
+/// (`finiLoads`), and counts one run (`finiRuns`).
+fn countingFin(o: *int) {
+    finiRuns = finiRuns + 1
+    unsafe {
+        finiLoads = o[1]
+    }
+}
+
+/// Register `Widget`, a class whose descriptor carries `countingFin` as its
+/// `deinit` (finalizer word non-zero, no owned slots). Registration returns
+/// the class id the accompanying builder must stamp into the block's header.
+/// The fn-to-int cast is the word move `IrConst::FuncAddr` bakes for
+/// registration calls.
+fn registerFinClass() -> int {
+    // "Widget", built byte-wise like the string tests do (ABI bodies never get
+    // a string literal for the same reason workspaces do not own one).
+    var nm = abiStrConcat(abiStrConcat(abiStrConcat(abiStrConcat(abiStrConcat(abiStrFromByte(87), abiStrFromByte(105)), abiStrConcat(abiStrFromByte(100), abiStrFromByte(103))), abiStrConcat(abiStrFromByte(101), abiStrFromByte(116))), abiStrFromByte(0)), abiStrFromByte(0))
+    return abiClassRegister(((nm as int) + STR_BYTES_OFF) as *int, 6, 0, 0, 0, (countingFin as int), 0)
+}
+
+/// Register `Owner`, a class with one `#[manualAlloc]` slot (owned mask bit 0)
+/// and NO deinit - the second deferral trigger, the non-zero owned mask.
+fn registerOwnedClass() -> int {
+    // "Owner".
+    var nm = abiStrConcat(abiStrConcat(abiStrConcat(abiStrConcat(abiStrFromByte(79), abiStrFromByte(119)), abiStrConcat(abiStrFromByte(110), abiStrFromByte(101))), abiStrFromByte(114)), abiStrFromByte(0))
+    return abiClassRegister(((nm as int) + STR_BYTES_OFF) as *int, 5, 1, 0, (1 << 0), 0, 0)
+}
+
+/// Frame-robust builders for the finalizer tests: same contract as
+/// `make_registered` above - the block is built and registered inside a
+/// helper, and only the raw address (a plain int, never a managed home) comes
+/// back, so the test's collect sees an unrooted candidate.
+fn makeFinObj(cid: int) -> int {
+    var addr = 0
+    unsafe {
+        var p = alloc(int, 5)
+        p[0] = 0
+        p[1] = cid
+        p[2] = 40
+        p[3] = 0
+        p[4] = 0
+        abiRegisterObject(p)
+        addr = p as int
+    }
+    return addr
+}
+
+fn makeOwnedHolder(cid: int, child: int) -> int {
+    var addr = 0
+    unsafe {
+        var p = alloc(int, 5)
+        p[0] = 0
+        p[1] = cid
+        p[2] = 40
+        p[3] = child
+        p[4] = 0
+        abiRegisterObject(p)
+        addr = p as int
+    }
+    return addr
+}
+
+/// The owned child: an int-box (builtin class 4, 32 bytes, one payload word)
+/// that is registered AND adopted as manual - exactly the `#[manualAlloc]`
+/// field shape the owned mask names. Adoption is what keeps it alive across
+/// the collect; the holder's owned-field release is what takes it back down.
+fn makeManualBox() -> int {
+    var addr = 0
+    unsafe {
+        var p = alloc(int, 4)
+        p[0] = 0
+        p[1] = 4
+        p[2] = 32
+        p[3] = 0
+        abiRegisterObject(p)
+        abiManualAdopt(p)
+        addr = p as int
+    }
+    return addr
+}
+
+test fn death_finalizer_runs_at_the_sweep_that_frees_the_object() {
+    // Delta assertions keep the test order-independent (see the counter note
+    // at the top of the file): the registries are process-global image data
+    // and no per-test reset exists.
+    abiGcCollect(false)
+    var beforeReg = abiRegisteredCount()
+    var runs = finiRuns
+    var cid = registerFinClass()
+    var w = makeFinObj(cid)
+    abiGcCollect(true)
+    // The object had no root: the sweep took it, but because its descriptor
+    // carries a `deinit` the block was DEFERRED - the finalizer ran exactly
+    // once on the dying block (proven by the class word the fn read back),
+    // and only then was the block freed (the registry count returned to
+    // baseline; the deferred list empties itself every cycle).
+    expect(finiRuns).toBe(runs + 1)
+    expect(finiLoads).toBe(cid)
+    expect(abiRegisteredCount()).toBe(beforeReg)
+    expect(registryContains(w)).toBe(false)
+}
+
+test fn owned_manual_field_is_released_cascade_without_a_finalizer() {
+    abiGcCollect(false)
+    var beforeReg = abiRegisteredCount()
+    var beforeMan = abiManualCount()
+    var runs = finiRuns
+    var cid = registerOwnedClass()
+    var child = makeManualBox()
+    var holder = makeOwnedHolder(cid, child)
+    expect(abiManualCount()).toBe(beforeMan + 1)
+    abiGcCollect(true)
+    // The holder had no root and no `deinit`, yet its owned slot earned it the
+    // deferral: the sweep kept the block until the owned-field release ran,
+    // which handed the still-adopted manual child to `manual_free` - counts
+    // return to baseline for BOTH registries, and the finalizer counter shows
+    // no finalizer was run for this deferral.
+    expect(abiManualCount()).toBe(beforeMan)
+    expect(abiRegisteredCount()).toBe(beforeReg)
+    expect(finiRuns).toBe(runs)
+    expect(registryContains(holder)).toBe(false)
+    expect(registryContains(child)).toBe(false)
+}
+
+test fn manual_free_runs_the_finalizer_and_releases_the_block() {
+    abiGcCollect(false)
+    var beforeReg = abiRegisteredCount()
+    var beforeMan = abiManualCount()
+    var runs = finiRuns
+    var cid = registerFinClass()
+    var w = makeFinObj(cid)
+    abiManualAdopt(w as *int)
+    expect(abiManualCount()).toBe(beforeMan + 1)
+    // The explicit release path: deregister first, then the `deinit` runs -
+    // the same counter the sweep path bumps - and the block itself goes back
+    // to the heap (native `manual_free`, gc.rs 537-572; the port version also
+    // releases the block, closing the pre-slice leak where manual_free only
+    // dropped the registries and left the memory untracked).
+    abiManualFree(w as *int)
+    expect(finiRuns).toBe(runs + 1)
+    expect(finiLoads).toBe(cid)
+    expect(abiManualCount()).toBe(beforeMan)
+    // Sweep the maker garbage (class-name strings and concat intermediates)
+    // so the population count reads its true pre-test baseline.
+    abiGcCollect(false)
+    expect(abiRegisteredCount()).toBe(beforeReg)
+    expect(registryContains(w)).toBe(false)
 }

@@ -1,0 +1,102 @@
+// runtime/abi_classwords.pkl
+//
+// Per-class numeric descriptor words for the collector's sweep: the
+// `#[manualAlloc]` owned-slot mask and the `deinit` finalizer address.
+//
+// WHY A SEPARATE LEAF. The full descriptor table (names, parent links) lives
+// in `abi_class_extra`, which is not a leaf: it builds managed strings, so it
+// (transitively) sits above the collector. The sweep must read the owned mask
+// and finalizer of every candidate it is about to free, and the engine may
+// not import `abi_class_extra` back. This module stores ONLY the two numeric
+// words, depends on nothing but the raw allocator, and is therefore a legal
+// leaf import of `abi_gcengine`. `abi_class_extra` writes through it at
+// registration time, so the two tables stay index-aligned by class id.
+
+/// Word stride of one record: `[owned_mask, finalizer]`.
+const WORDS_STRIDE: int = 2
+
+/// Initial capacity of the record block in words: 64 classes.
+const INITIAL_WORDS: int = 128
+
+/// Base address of the record block, as a plain int (module globals are
+/// unmanaged statics and must not hold pointers the sweep would need to trace;
+/// the block is raw `alloc` memory like every other registry table).
+var wordsBase: int = 0
+var wordsCap: int = 0
+
+/// Grow the record block so record `id`'s second word is in range: double
+/// until it fits, allocate fresh, copy the old words, zero the new tail so
+/// untouched records read `[0, 0]` (an unregistered id must not pick up
+/// garbage: no owned slots, no finalizer), then release the old block.
+fn ensureWordsCap(id: int) {
+    if (WORDS_STRIDE * id + 1 < wordsCap) {
+        return
+    }
+    unsafe {
+        var cap = wordsCap
+        if (cap == 0) {
+            cap = INITIAL_WORDS
+        }
+        while (WORDS_STRIDE * id + 1 >= cap) {
+            cap = cap * 2
+        }
+        var fresh = alloc(int, cap)
+        var j = 0
+        while (j < wordsCap) {
+            fresh[j] = (wordsBase as *int)[j]
+            j = j + 1
+        }
+        var k = wordsCap
+        while (k < cap) {
+            fresh[k] = 0
+            k = k + 1
+        }
+        if (wordsBase != 0) {
+            free(wordsBase as *int)
+        }
+        wordsBase = fresh as int
+        wordsCap = cap
+    }
+}
+
+/// Store `(ownedMask, finalizer)` for class `id`. Called from
+/// `abi_class_extra` at registration; a class without a `deinit` and without
+/// `#[manualAlloc]` fields passes `(0, 0)`.
+fn abiClassWordsSet(id: int, ownedMask: int, finalizer: int) {
+    ensureWordsCap(id)
+    unsafe {
+        (wordsBase as *int)[WORDS_STRIDE * id] = ownedMask
+        (wordsBase as *int)[WORDS_STRIDE * id + 1] = finalizer
+    }
+}
+
+/// `#[manualAlloc]` slot mask of class `id`; 0 when the id is unregistered or
+/// the class owns nothing. Mirrors native `Gc::class_owned_mask`'s default of
+/// an empty mask.
+fn abiClassOwnedMaskOf(id: int) -> int {
+    if (id < 0) {
+        return 0
+    }
+    if (WORDS_STRIDE * id + 1 >= wordsCap) {
+        return 0
+    }
+    unsafe {
+        return (wordsBase as *int)[WORDS_STRIDE * id]
+    }
+}
+
+/// Raw `deinit` address of class `id`; 0 when the id is unregistered or the
+/// class has no finalizer. The address is the compile-time function value the
+/// emitter passes to `pickle_class_register`, kept as a plain int here - the
+/// engine casts it back to a callable only at invocation time.
+fn abiClassFinalizerOf(id: int) -> int {
+    if (id < 0) {
+        return 0
+    }
+    if (WORDS_STRIDE * id + 1 >= wordsCap) {
+        return 0
+    }
+    unsafe {
+        return (wordsBase as *int)[WORDS_STRIDE * id + 1]
+    }
+}

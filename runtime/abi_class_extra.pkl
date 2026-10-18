@@ -21,15 +21,17 @@ module runtime.abi_class_extra
 /// would-be defensive copy here costs an allocation for a pointer the emitter
 /// guarantees is stable.
 ///
-/// WHAT IS NOT STORED (yet): `slot_count`, the managed mask, the owned mask,
-/// `finalizer`, and the interface buckets (those live in `abi_classpred`).
-/// No ported body reads them in this slice - the collector is a future slice.
-/// Kept out so the table stays `[name_ptr, name_len, parent]` per id rather
-/// than carrying words nothing consumes; the `slotCount` etc. arguments are
-/// therefore accepted and ignored, exactly as `pickle_class_register`'s
-/// native side effects beyond name/parent storage are ignored here. `parent`
-/// IS stored: `classParentOf` feeds the parent chain walks in
-/// `abi_classpred` (and later the collector), mirroring `gc.rs`'s
+/// WHAT IS STORED. `[name_ptr, name_len, parent]` per id, here; the numeric
+/// sweep words (`owned_mask`, `finalizer`) live in the leaf table
+/// `abi_classwords`, written at registration time - the collector reads that
+/// leaf because this module sits above it (gc.rs `class_register`, lines
+/// 133-198). `slot_count` and the managed `mask` stay accepted-and-ignored:
+/// the engine walks user classes conservatively (every payload word,
+/// registered-address edges only), so no ported body reads them. The
+/// `slotCount` etc. arguments are therefore ignored, exactly as
+/// `pickle_class_register`'s native side effects beyond the stored words are.
+/// `parent` IS stored: `classParentOf` feeds the parent-chain walks in
+/// `abi_classpred` and the engine, mirroring `gc.rs`'s
 /// `set_class_parent`/`class_parent`.
 ///
 /// `pickle_class_name` ALWAYS returns a fresh managed `string`: the registered
@@ -40,6 +42,7 @@ module runtime.abi_class_extra
 
 import { abiStrFromBytes, newStr, newStrUnmanaged, byteInto } from runtime.abi_string
 import { STR_BYTES_OFF } from runtime.layout
+import { abiClassWordsSet } from runtime.abi_classwords
 
 /// Word stride of one class record: `[name_ptr, name_len, parent]`.
 const NAME_STRIDE: int = 3
@@ -193,14 +196,15 @@ fn seedBuiltins() {
 
 /// Register one user-class descriptor: assign the next id (10 + registration
 /// count, matching the compile-time id order the emitter bakes into call
-/// sites), store its name AND its parent class id, and return the assigned
-/// id. The other descriptor words are not stored yet (see header). Mirrors
-/// `class.rs::register_class`'s assignment and copy; the copy is the
+/// sites), store its name AND its parent class id here, and store the sweep
+/// words (`ownedMask`, `finalizer`) in the `abi_classwords` leaf. Mirrors
+/// `class.rs::register_class`'s assignment and copy; the name copy is the
 /// documented divergence above.
 #[symbol("pickle_class_register")]
 fn abiClassRegister(namePtr: *int, nameLen: int, slotCount: int, mask: int, ownedMask: int, finalizer: int, parent: int) -> int {
     var id = classNamesCount
     setName(id, namePtr, nameLen, parent)
+    abiClassWordsSet(id, ownedMask, finalizer)
     classNamesCount = classNamesCount + 1
     return id
 }

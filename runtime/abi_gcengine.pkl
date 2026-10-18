@@ -52,6 +52,7 @@ module runtime.abi_gcengine
 /// modules would collide. Public entry points are `abiEngine*`.
 
 import { abiShadowHead } from runtime.abi_shadow
+import { abiClassOwnedMaskOf, abiClassFinalizerOf } from runtime.abi_classwords
 
 /// Managed class ids on object words (mirror of `runtime/object` labels).
 /// Word 1 carries the id; string's id is 0 (see `abi_raw`'s note on word 0's
@@ -177,6 +178,23 @@ var teBase: int = 0
 var teCap: int = 0
 var teCount: int = 0
 const TE_INITIAL: int = 16
+
+/// The sweep's deferred-dead list: flat word block of object addresses whose
+/// death needs post-sweep work before the block is freed. Native sweeps pick
+/// these out with the `should_defer` predicate (gc.rs collect, line 402): a
+/// dead USER class (ids 0-9 are list/map/string and never deferred) whose
+/// descriptor carries a `deinit` finalizer or a non-zero `#[manualAlloc]`
+/// owned-slot mask. The baseline sweep free is skipped for them - a finalizer
+/// must be able to touch its object, and owned fields are released AFTER the
+/// holder's death is fixed - so the blocks ride out the sweep here and are
+/// finalized, field-released, and freed after `regBytes` is fixed up and while
+/// `collecting` is still 1 (a finalizer that allocates cannot re-enter).
+/// Mirrors the `deferred` vector and the post-sweep loops in gc.rs (lines
+/// 440-456).
+var defBase: int = 0
+var defCap: int = 0
+var defCount: int = 0
+const DEF_INITIAL: int = 16
 
 // --------------------------------------------------------- block growth
 /// The capacity a block reaches for `idx` items under doubling growth: the
@@ -820,6 +838,57 @@ fn geReleaseOutOfLine(object: int) {
     }
 }
 
+/// Invoke a registered `deinit` finalizer. The engine stores finalizers as
+/// plain function ADDRESSES (the emitter passes the compiled `pkl_<T>_deinit`
+/// address to `pickle_class_register`, and the abi_classwords leaf keeps it as
+/// an int word so the sweep can compare against 0 without a callable value).
+/// Casting the address back to a callable is the int-to-fn word cast the
+/// compiler allows for exactly this ABI use (native transmutes the same word
+/// in `class_register`, gc.rs lines 175-183). A zero address is the no-desc
+/// case and is skipped - native's `builtin_nop_finalizer` equivalent.
+fn geRunFinalizer(fin: int, object: int) {
+    if (fin == 0) {
+        return
+    }
+    unsafe {
+        var f = fin as fn (*int) -> void
+        f(object as *int)
+    }
+}
+
+/// Release every `#[manualAlloc]` field of a dead (deferred) object, following
+/// the class descriptor's owned-slot mask: child payload slots named by set
+/// bits are handed to `abiEngineManualFree` WHEN they are still registered as
+/// manual - a child that was already released, or never was a manual object,
+/// is skipped. Recursion into `abiEngineManualFree` re-reads the child's own
+/// mask and deregisters it FIRST, so ownership cycles terminate instead of
+/// looping (native `free_owned_fields`, gc.rs lines 274-288, whose manual
+/// registry `contains` check this mirrors). Owned slots join the payload at
+/// `WO_CLASS_PAYLOAD`, like every user-class slot.
+fn geFreeOwnedFields(object: int) {
+    var classId = 0
+    unsafe {
+        classId = (object as *int)[WO_CLASS]
+    }
+    var owned = abiClassOwnedMaskOf(classId)
+    if (owned == 0) {
+        return
+    }
+    var bit = 0
+    while (bit < 64) {
+        if ((owned & (1 << bit)) != 0) {
+            var child = 0
+            unsafe {
+                child = (object as *int)[WO_CLASS_PAYLOAD + bit]
+            }
+            if (child != 0) {
+                abiEngineManualFree(child as *int)
+            }
+        }
+        bit = bit + 1
+    }
+}
+
 /// One collection cycle: mark from the port's roots, sweep the unmarked
 /// registered population back to the OS heap (list/map spans included), refresh
 /// the live figure, zero the seam counters, then adapt the threshold unless a
@@ -852,6 +921,14 @@ fn abiEngineCollect(force: bool) {
     // swap-with-last `abiEngineUnregister`, whose linear registry scan made the
     // sweep quadratic. `write <= read` always, so packing never clobbers a slot
     // that has not been read yet.
+    //
+    // Deferral: a dead USER class whose descriptor carries a `deinit` finalizer
+    // or a non-zero owned-slot mask is NOT freed here - its block is parked on
+    // the deferred list so the post-sweep phase below can run the finalizer and
+    // release owned fields while the block still exists (native's
+    // `should_defer` arm, gc.rs lines 422-436). Builtins are never deferred:
+    // list/map/string spans are released inline below like every other dead
+    // object.
     var write = 0
     var read = 0
     while (read < regCount) {
@@ -865,15 +942,34 @@ fn abiEngineCollect(force: bool) {
             }
             write = write + 1
         } else {
-            geReleaseOutOfLine(address)
-            // Read the size before freeing: `free` may overwrite the header.
-            var size = 0
+            var classId = 0
             unsafe {
-                size = (address as *int)[2]
+                classId = (address as *int)[WO_CLASS]
             }
-            regBytes = regBytes - size
-            unsafe {
-                free(address as *int)
+            var deferIt = 0
+            if (classId >= 10) {
+                if (abiClassOwnedMaskOf(classId) != 0 || abiClassFinalizerOf(classId) != 0) {
+                    deferIt = 1
+                }
+            }
+            if (deferIt == 1) {
+                defBase = geGrow(defBase, defCap, defCount, DEF_INITIAL)
+                defCap = geCapGrown(defCap, defCount, DEF_INITIAL)
+                unsafe {
+                    (defBase as *int)[defCount] = address
+                }
+                defCount = defCount + 1
+            } else {
+                geReleaseOutOfLine(address)
+                // Read the size before freeing: `free` may overwrite the header.
+                var size = 0
+                unsafe {
+                    size = (address as *int)[2]
+                }
+                regBytes = regBytes - size
+                unsafe {
+                    free(address as *int)
+                }
             }
         }
         read = read + 1
@@ -885,6 +981,47 @@ fn abiEngineCollect(force: bool) {
     markPending = 0
     markPendingLen = 0
     liveBytes = regBytes
+    // Post-sweep finalizer phase, with `collecting` still 1 so a finalizer that
+    // allocates cannot start a nested collection (native gc.rs runs its two
+    // passes inside the same guard). Pass one runs finalizers and releases
+    // owned fields recursively; pass two frees the blocks and un-counts their
+    // bytes. Owned-field release deregisters children from the manual registry
+    // before recursing, so ownership cycles terminate.
+    var di = 0
+    while (di < defCount) {
+        var obj = 0
+        unsafe {
+            obj = (defBase as *int)[di]
+        }
+        var classId = 0
+        unsafe {
+            classId = (obj as *int)[WO_CLASS]
+        }
+        var fin = abiClassFinalizerOf(classId)
+        if (fin != 0) {
+            geRunFinalizer(fin, obj)
+        }
+        geFreeOwnedFields(obj)
+        di = di + 1
+    }
+    di = 0
+    while (di < defCount) {
+        var obj = 0
+        unsafe {
+            obj = (defBase as *int)[di]
+        }
+        // Read the size before freeing: `free` may overwrite the header.
+        var size = 0
+        unsafe {
+            size = (obj as *int)[2]
+        }
+        regBytes = regBytes - size
+        unsafe {
+            free(obj as *int)
+        }
+        di = di + 1
+    }
+    defCount = 0
     rawAllocCount = 0
     rawAllocBytes = 0
     if (thresholdManual == 0) {
@@ -1007,23 +1144,49 @@ fn abiEngineManualAdopt(obj: *int) -> *int {
 }
 
 /// Release an object adopted with `abiEngineManualAdopt`: remove it from the
-/// manual registry (swap-with-last) and release its sweepability entry. Null
-/// and an unknown address are ignored.
+/// manual registry (swap-with-last), release its sweepability entry, run its
+/// `deinit` finalizer, release owned fields recursively, free the list-map
+/// span, and return the block itself to the heap. Null and an unknown address
+/// are ignored (the caller-side `manual-registered` assert of native
+/// `manual_free`, gc.rs line 537, stays a silent no-op here - the ABI's free
+/// has no trap path in the port). Deregistering FIRST keeps a finalizer that
+/// allocates from ever seeing a half-freed manual object.
 fn abiEngineManualFree(obj: *int) {
     if ((obj as int) == 0) {
         return
     }
     var i = 0
-    while (i < manCount) {
+    var found = 0
+    while (i < manCount && found == 0) {
         unsafe {
             if ((manBase as *int)[i] == (obj as int)) {
                 (manBase as *int)[i] = (manBase as *int)[manCount - 1]
                 (manBase as *int)[manCount - 1] = 0
                 manCount = manCount - 1
-                abiEngineUnregister(obj)
-                return
+                found = 1
             }
         }
-        i = i + 1
+        if (found == 0) {
+            i = i + 1
+        }
+    }
+    if (found == 0) {
+        return
+    }
+    abiEngineUnregister(obj)
+    var classId = 0
+    unsafe {
+        classId = (obj as int as *int)[WO_CLASS]
+    }
+    var fin = abiClassFinalizerOf(classId)
+    if (fin != 0) {
+        geRunFinalizer(fin, obj as int)
+    }
+    geFreeOwnedFields(obj as int)
+    geReleaseOutOfLine(obj as int)
+    // Registry bookkeeping already happened inside `abiEngineUnregister`
+    // (count + bytes), so this is only the block release.
+    unsafe {
+        free(obj as *int)
     }
 }
