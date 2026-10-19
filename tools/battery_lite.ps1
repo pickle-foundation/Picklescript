@@ -76,8 +76,8 @@ if (-not (Test-Path -LiteralPath $pklcTest)) {
 }
 $rtlibAbs = Abs $rtlibCand
 $pklcTestAbs = Abs $pklcTest
+New-Item -ItemType Directory -Force -Path "tools\diff\ptest" | Out-Null
 $gdir = Abs "tools\diff\ptest"
-New-Item -ItemType Directory -Force -Path $gdir | Out-Null
 
 # LITE GATE7: the compiler corpus.
 $g7items = @()
