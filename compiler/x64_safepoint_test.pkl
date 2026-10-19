@@ -1,0 +1,138 @@
+module compiler.x64_safepoint_test
+
+import { IrTy, IrConst, IrInstr, IrTerm, IrExtern, IrBlock, IrFunc, IrModule, Callee, emptyIrTys, emptyIrParams, emptyIrGlobals } from compiler.ir
+import { X64Func, X64Out, x64LowerModule, emptyRelocs } from compiler.x64
+import { DiagnosticSink } from compiler.diag
+
+fn emptyInstrs() -> List<IrInstr> {
+    var l = [IrInstr.Const(0, IrConst.Int(0))]
+    l.pop()
+    l
+}
+
+fn emptyInts() -> List<int> {
+    var l = [0]
+    l.pop()
+    l
+}
+
+fn emptyBlocks() -> List<IrBlock> {
+    var l = [IrBlock(0, emptyInstrs(), IrTerm.Unreachable)]
+    l.pop()
+    l
+}
+
+fn emptyTags() -> List<string> {
+    var l = [""]
+    l.pop()
+    l
+}
+
+fn mkExtern(sym: string) -> IrExtern {
+    IrExtern(sym, emptyIrTys(), IrTy.Unit)
+}
+
+fn mkFunc(name: string, symbol: string, slots: List<IrTy>, body: List<IrInstr>) -> IrFunc {
+    let blocks = [IrBlock(0, body, IrTerm.Return(none))]
+    IrFunc(name, symbol, emptyIrParams(), IrTy.Unit, slots, 0, blocks, false, false, emptyTags())
+}
+
+fn mkModule(f: IrFunc, sym: string) -> IrModule {
+    var fs = [IrFunc("seed", "", emptyIrParams(), IrTy.Unit, emptyIrTys(), 0, emptyBlocks(), false, false, emptyTags())]
+    fs.pop()
+    fs.push(f)
+    var es = [mkExtern(sym)]
+    var bn = {"s": 0}
+    bn.remove("s")
+    var ss = [[0]]
+    ss.pop()
+    IrModule(fs, es, bn, ss, emptyIrGlobals())
+}
+
+fn lowerOne(f: IrFunc, sym: string) -> X64Func {
+    let out = x64LowerModule(mkModule(f, sym), DiagnosticSink())
+    match (out) {
+        case none -> {
+            expect(false).toBe(true)
+            X64Func("bad", emptyInts(), emptyRelocs(), 0, 0)
+        }
+        case some(o) -> o.funcs[0]
+    }
+}
+
+fn countSym(f: X64Func, sym: string) -> int {
+    var n = 0
+    var i = 0
+    while (i < len(f.relocs)) {
+        if (f.relocs[i].sym == sym) {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    n
+}
+
+fn byteOf(v: int, i: int) -> int {
+    (v >> (8 * i)) & 0xFF
+}
+
+fn countImm(f: X64Func, v: int) -> int {
+    var total = 0
+    var i = 0
+    while (i + 7 < len(f.bytes)) {
+        let b0 = byteOf(v, 0)
+        if (f.bytes[i] == b0) {
+            var hit = true
+            var j = 1
+            while (j < 8 && hit) {
+                if (f.bytes[i + j] != byteOf(v, j)) {
+                    hit = false
+                }
+                j = j + 1
+            }
+            if (hit) {
+                total = total + 1
+            }
+        }
+        i = i + 1
+    }
+    total
+}
+
+fn packedOf(f: X64Func) -> int {
+    (90 << 56) | (f.totalK << 32) | f.ncells
+}
+
+describe("safepoint ABI shape", {
+    test("gc site roots its cells and stamps the frame", {
+        let slots = [IrTy.Str]
+        let body = [IrInstr.Call(none, Callee.Extern(0), emptyInts())]
+        let f = lowerOne(mkFunc("f", "call_ext", slots, body), "pickle_support_tick")
+        expect(f.ncells).toBe(1)
+        expect(countSym(f, "pickle_shadow_push")).toBe(1)
+        expect(countSym(f, "pickle_shadow_pop")).toBe(1)
+        expect(f.relocs[0].sym).toBe("pickle_shadow_push")
+        expect(countImm(f, packedOf(f))).toBe(1)
+    })
+
+    test("non-gc site never pushes shadow", {
+        let slots = [IrTy.Str]
+        let body = [IrInstr.Const(0, IrConst.Int(0))]
+        let f = lowerOne(mkFunc("f", "no_call", slots, body), "pickle_support_tick")
+        expect(f.ncells).toBe(1)
+        expect(countSym(f, "pickle_shadow_push")).toBe(0)
+        expect(countSym(f, "pickle_shadow_pop")).toBe(0)
+        expect(countImm(f, packedOf(f))).toBe(0)
+    })
+
+    test("shadow api exempts itself from framing", {
+        let slots = [IrTy.Str]
+        let body = [IrInstr.Const(1, IrConst.Int(0)), IrInstr.CallInd(none, 1, emptyIrTys(), IrTy.Unit, emptyInts())]
+        let f = lowerOne(mkFunc("abiShadowHead", "call_ish", slots, body), "pickle_shadow_pop")
+        expect(f.ncells).toBe(1)
+        expect(countSym(f, "pickle_shadow_push")).toBe(0)
+        expect(countSym(f, "pickle_shadow_pop")).toBe(0)
+        expect(countImm(f, packedOf(f))).toBe(0)
+    })
+
+})
