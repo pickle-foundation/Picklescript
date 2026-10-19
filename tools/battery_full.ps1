@@ -31,6 +31,48 @@ $threadGoldenKeys = @(
     "tests_pickle_thread_test",
     "stdlib_thread_test"
 )
+
+# ---- Parallel shard plumbing ----------------------------------------------
+# The per-module steps of the heavy gates are independent processes with private
+# capture paths, so they run on K workers (tools\battery_shard.ps1) instead of
+# one serial core. $env:BATTERY_WORKERS overrides the count; the parent passes
+# one JSON spec file and aggregates the per-shard result lines into the same
+# gate summaries the serial loop produced. All paths handed to a shard are
+# absolute; runtime argv spellings stay byte-identical to the serial gate's.
+$script:ShardWorkers = 6
+if ($env:BATTERY_WORKERS -match '^\d+$' -and [int]$env:BATTERY_WORKERS -gt 0) { $script:ShardWorkers = [int]$env:BATTERY_WORKERS }
+
+function Abs([string]$p) { (Resolve-Path -LiteralPath $p).Path }
+
+function Invoke-GateShards([object[]]$items, [string]$specFile, [string]$resultsBase) {
+    $json = @($items | ForEach-Object { $_ | ConvertTo-Json -Compress })
+    [IO.File]::WriteAllLines($specFile, [string[]]$json)
+    $pids = @()
+    for ($i = 0; $i -lt $script:ShardWorkers; $i++) {
+        $args2 = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $PSScriptRoot "battery_shard.ps1"), "-SpecFile", $specFile, "-Results", "$resultsBase.r$i", "-Shard", $i, "-Stride", $script:ShardWorkers)
+        Remove-Item "$resultsBase.r$i", "$resultsBase.o$i", "$resultsBase.e$i" -ErrorAction SilentlyContinue
+        $p = Start-Process -FilePath "powershell.exe" -ArgumentList $args2 -WorkingDirectory (Get-Location).Path -PassThru -WindowStyle Hidden -RedirectStandardOutput "$resultsBase.o$i" -RedirectStandardError "$resultsBase.e$i"
+        if ($null -ne $p) { $pids += $p.Id }
+    }
+    if ($pids.Count -gt 0) { Wait-Process -Id $pids -Timeout 12600 -ErrorAction SilentlyContinue }
+    $ok = 0; $fail = 0
+    for ($i = 0; $i -lt $script:ShardWorkers; $i++) {
+        $res = "$resultsBase.r$i"
+        if (-not (Test-Path -LiteralPath $res)) { continue }
+        foreach ($ln in (Get-Content -LiteralPath $res)) {
+            $parts = $ln -split "`t"
+            if ($parts.Length -lt 4) { continue }
+            if ($parts[0] -eq "OK") { $ok++ } else { $fail++; Write-Output "$($parts[1]) $($parts[2]): $($parts[3])" }
+        }
+    }
+    $total = $ok + $fail
+    if ($total -ne $items.Count) {
+        Write-Output "SHARD WARNING: collected $total results for $($items.Count) items"
+        $fail += ($items.Count - $total)
+    }
+    if ($total -eq $items.Count) { Remove-Item "$resultsBase.r*", "$resultsBase.o*", "$resultsBase.e*", $specFile -ErrorAction SilentlyContinue }
+    [pscustomobject]@{ ok = $ok; fail = $fail }
+}
 $batterySw = [System.Diagnostics.Stopwatch]::StartNew()
 
 # tools/diff/ is gitignored, so a clean checkout has none of these. Only main.pkl mkdirs
@@ -190,18 +232,25 @@ if (-not $rtlibCand) {
 } else {
 Invoke-BuildDriver "cli\test.pkl" $pklcTest | Out-Null
 $portTests = @(Get-ChildItem "compiler\*_test.pkl")
+$rtlibAbs = Abs $rtlibCand
+$pklcTestAbs = Abs $pklcTest
+$g7dirAbs = Abs $g7dir
+$g7items = @()
 foreach ($pt in $portTests) {
 # Per-module wall budget is generous on purpose (a hang check, not a perf
 # gate): the heaviest module (emit_test.pkl) takes 5-6 minutes measured on a
 # desktop with heavy background load, so 300s is marginal and kills healthy
 # runs. A real hang (thread/channel blocks) lasts forever and is still caught.
-    $code = Invoke-NativeTimeout $pklcTest @($pt.FullName, $rtlibCand) "$g7dir\g7.txt" 600
-    if ($code -eq 0) { $gate7ok++ } else {
-        $gate7fail++
-        $line = (Get-Content -LiteralPath "$g7dir\g7.txt" | Select-String "test result|FAILED" | Select-Object -First 1)
-        Write-Output "GATE7 FAIL $($pt.Name) exit=$code [$line]"
+    $g7items += [pscustomobject]@{
+        gate = "GATE7"; tag = $pt.BaseName
+        kind = "result"; exitOnly = $true
+        exe = $pklcTestAbs; argv = @($pt.FullName, $rtlibAbs)
+        capture = (Join-Path $g7dirAbs ("g7_" + $pt.BaseName + ".txt"))
+        budget = 600
     }
 }
+$g7r = Invoke-GateShards $g7items (Join-Path $g7dirAbs "g7.spec") (Join-Path $g7dirAbs "g7res")
+$gate7ok = $g7r.ok; $gate7fail = $g7r.fail
 Write-Output "GATE7 PORT UNIT SUITE (self-test, native): PASS=$gate7ok FAIL=$gate7fail"
 }
 
@@ -239,18 +288,29 @@ if (-not (Test-Path -LiteralPath $pklcTest)) { Invoke-BuildDriver "cli\test.pkl"
 if (-not $rtlibCand) {
     Write-Output "GATE9 TEST BYTE-PARITY: RUNTIME ARCHIVE MISSING"
 } else {
+    $g9dirAbs = Abs $g9dir
+    $goldenAbs = Abs $goldenDir
+    $rtlibAbs = Abs $rtlibCand
+    $pklcTestAbs = Abs $pklcTest
+    $g9items = @()
     foreach ($m in $g9tests) {
         $target = "tests\pickle\$($m.Name)"
         $key = Get-GoldenKey $target
         if ($threadGoldenKeys -contains $key) { $g9skip++; Write-Output "GATE9 SKIP $($m.BaseName) (std-runtime-only OS-thread test; ported runtime is the nostd contract)"; continue }
-        $goldOut = "$goldenDir\test\$key.out"
-        $goldExit = "$goldenDir\test\$key.exit"
+        $goldOut = "$goldenAbs\test\$key.out"
+        $goldExit = "$goldenAbs\test\$key.exit"
         if (-not (Test-Path -LiteralPath $goldOut)) { $g9fail++; Write-Output "GATE9 $($m.BaseName): golden missing ($key)"; continue }
-        $ic = Invoke-NativeTimeout $pklcTest @($target, $rtlibCand) "$g9dir\port.txt" 180
-        $rc = [int](Get-Content -LiteralPath $goldExit -Raw)
-        if ($rc -eq $ic -and (ByteEq "$g9dir\port.txt" $goldOut)) { $g9ok++ }
-        else { $g9fail++; Write-Output "GATE9 $($m.BaseName): exit=$rc/$ic stdout_match=$(ByteEq "$g9dir\port.txt" $goldOut)" }
+        $g9items += [pscustomobject]@{
+            gate = "GATE9"; tag = $m.BaseName
+            kind = "parity"
+            exe = $pklcTestAbs; argv = @($target, $rtlibAbs)
+            capture = (Join-Path $g9dirAbs ("port_" + $m.BaseName + ".txt"))
+            budget = 180
+            goldenOut = $goldOut; goldenExit = $goldExit
+        }
     }
+    $g9r = Invoke-GateShards $g9items (Join-Path $g9dirAbs "g9.spec") (Join-Path $g9dirAbs "g9res")
+    $g9ok = $g9r.ok; $g9fail += $g9r.fail
     Write-Output "GATE9 TEST BYTE-PARITY (stdout+exit, $($g9tests.Count) files, native vs golden, skip=$g9skip): PASS=$g9ok FAIL=$g9fail"
 }
 
@@ -268,10 +328,23 @@ if (-not $rtlibCand) {
     Write-Output "GATE10 PICKLE RUNTIME SUITE: RUNTIME ARCHIVE MISSING"
 } else {
     $g10dir = "tools\diff\ptest"; New-Item -ItemType Directory -Path $g10dir -Force | Out-Null
+    $rtlibAbs = Abs $rtlibCand
+    $pklcTestAbs = Abs $pklcTest
+    $g10dirAbs = Abs $g10dir
+    $g10items = @()
     foreach ($f in @(Get-ChildItem "runtime\*_test.pkl")) {
-        $code = Invoke-NativeTimeout $pklcTest @($f.FullName, $rtlibCand) "$g10dir\g10.txt" 180
-        if ($code -ne 0) { Write-Output "GATE10 $($f.Name): exit=$code" }
-        foreach ($l in (Get-Content -LiteralPath "$g10dir\g10.txt" | Select-String "test result:")) {
+        $g10items += [pscustomobject]@{
+            gate = "GATE10"; tag = $f.BaseName
+            kind = "result"; exitOnly = $false
+            exe = $pklcTestAbs; argv = @($f.FullName, $rtlibAbs)
+            capture = (Join-Path $g10dirAbs ("g10_" + $f.BaseName + ".txt"))
+            budget = 180
+        }
+    }
+    $g10r = Invoke-GateShards $g10items (Join-Path $g10dirAbs "g10.spec") (Join-Path $g10dirAbs "g10res")
+    foreach ($f in @(Get-ChildItem "runtime\*_test.pkl")) {
+        $cap = Join-Path $g10dirAbs ("g10_" + $f.BaseName + ".txt")
+        foreach ($l in (Get-Content -LiteralPath $cap -ErrorAction SilentlyContinue | Select-String "test result:")) {
             if ($l.Line -match "test result: (\d+) passed; (\d+) failed") {
                 $g10pass += [int]$matches[1]
                 $g10fail += [int]$matches[2]
@@ -279,7 +352,8 @@ if (-not $rtlibCand) {
             }
         }
     }
-    Write-Output "GATE10 PICKLE RUNTIME SUITE (native: pass=$g10pass fail=$g10fail of $g10total): PASS=$($g10fail -eq 0)"
+    if ($g10r.fail -ne 0) { Write-Output "GATE10 module-level failures=$($g10r.fail)" }
+    Write-Output "GATE10 PICKLE RUNTIME SUITE (native: pass=$g10pass fail=$g10fail of $g10total): PASS=$($g10r.fail -eq 0)"
 }
 
 # ---- GATE 11: stdlib byte-parity -- the ported test driver must reproduce the
@@ -294,18 +368,29 @@ New-Item -ItemType Directory -Path $g11dir -Force | Out-Null
 if (-not $rtlibCand) {
     Write-Output "GATE11 STDLIB BYTE-PARITY: RUNTIME ARCHIVE MISSING"
 } else {
+    $g11dirAbs = Abs $g11dir
+    $goldenAbs = Abs $goldenDir
+    $rtlibAbs = Abs $rtlibCand
+    $pklcTestAbs = Abs $pklcTest
+    $g11items = @()
     foreach ($m in $g11tests) {
         $target = $m.FullName.Substring((Resolve-Path ".").Path.Length + 1)
         $key = Get-GoldenKey $target
         if ($threadGoldenKeys -contains $key) { $g11skip++; Write-Output "GATE11 SKIP $($m.BaseName) (std-runtime-only OS-thread test; ported runtime is the nostd contract)"; continue }
-        $goldOut = "$goldenDir\test\$key.out"
-        $goldExit = "$goldenDir\test\$key.exit"
+        $goldOut = "$goldenAbs\test\$key.out"
+        $goldExit = "$goldenAbs\test\$key.exit"
         if (-not (Test-Path -LiteralPath $goldOut)) { $g11fail++; Write-Output "GATE11 $($m.BaseName): golden missing ($key)"; continue }
-        $ic = Invoke-NativeTimeout $pklcTest @($target, $rtlibCand) "$g11dir\port.txt" 180
-        $rc = [int](Get-Content -LiteralPath $goldExit -Raw)
-        if ($rc -eq $ic -and (ByteEq "$g11dir\port.txt" $goldOut)) { $g11ok++ }
-        else { $g11fail++; Write-Output "GATE11 $($m.BaseName): exit=$rc/$ic stdout_match=$(ByteEq "$g11dir\port.txt" $goldOut)" }
+        $g11items += [pscustomobject]@{
+            gate = "GATE11"; tag = $m.BaseName
+            kind = "parity"
+            exe = $pklcTestAbs; argv = @($target, $rtlibAbs)
+            capture = (Join-Path $g11dirAbs ("port_" + $m.BaseName + ".txt"))
+            budget = 180
+            goldenOut = $goldOut; goldenExit = $goldExit
+        }
     }
+    $g11r = Invoke-GateShards $g11items (Join-Path $g11dirAbs "g11.spec") (Join-Path $g11dirAbs "g11res")
+    $g11ok = $g11r.ok; $g11fail += $g11r.fail
     Write-Output "GATE11 STDLIB BYTE-PARITY (stdout+exit, $($g11tests.Count) files, native vs golden, skip=$g11skip): PASS=$g11ok FAIL=$g11fail"
 }
 
@@ -329,10 +414,15 @@ if (-not (Invoke-BuildDriver "cli\build.pkl" $pklcBuild)) {
         $g12dir = "tools\diff\g12"
         New-Item -ItemType Directory -Path $g12dir -Force | Out-Null
         $g12ok = 0; $g12fail = 0; $g12skip = 0
+        $rtlibAbs = Abs $rtlibCand
+        $goldenAbs = Abs $goldenDir
+        $pklcBuildAbs = Abs $pklcBuild
+        $g12dirAbs = Abs $g12dir
+        $g12items = @()
         foreach ($m in $mains) {
             if ($m.BaseName -eq "os_args_main") { $g12skip++; continue }
             $target = "tests\pickle\$($m.BaseName).pkl"
-            $exe = Join-Path $g12dir "$($m.BaseName).exe"
+            $exe = Join-Path $g12dirAbs "$($m.BaseName).exe"
             # AOT-built drivers receive argv directly (no `--` — that separator is
             # only consumed by `pickle run <driver> -- <args>` under the JIT).
             # Re-linking is skipped when a stamp shows source/compiler/lib unchanged;
@@ -340,20 +430,21 @@ if (-not (Invoke-BuildDriver "cli\build.pkl" $pklcBuild)) {
             # gc_observable_main is exempt: its output reflects runtime startup
             # allocation plumbing, so an inherited stale artifact could flake the
             # byte compare — it is always freshly re-linked.
-            if ($m.BaseName -eq "gc_observable_main") {
-                Remove-Item $exe, "$exe.hash" -ErrorAction SilentlyContinue
-            }
-            if (-not (Invoke-Artifact $pklcBuild $target $rtlibCand $exe)) {
-                $g12fail++; Write-Output "GATE12 $($m.BaseName): build failed"; continue
-            }
-            $goldOut = "$goldenDir\run\$($m.BaseName).out"
-            $goldExit = "$goldenDir\run\$($m.BaseName).exit"
+            $goldOut = "$goldenAbs\run\$($m.BaseName).out"
+            $goldExit = "$goldenAbs\run\$($m.BaseName).exit"
             if (-not (Test-Path -LiteralPath $goldOut)) { $g12fail++; Write-Output "GATE12 $($m.BaseName): golden missing"; continue }
-            $ic = Invoke-NativeTimeout $exe @() "$g12dir\port.txt" 180
-            $rc = [int](Get-Content -LiteralPath $goldExit -Raw)
-            if ($rc -eq $ic -and (ByteEq "$g12dir\port.txt" $goldOut)) { $g12ok++ }
-            else { $g12fail++; Write-Output "GATE12 $($m.BaseName): exit=$rc/$ic stdout_match=$(ByteEq "$g12dir\port.txt" $goldOut)" }
+            $g12items += [pscustomobject]@{
+                gate = "GATE12"; tag = $m.BaseName
+                kind = "buildparity"
+                builder = $pklcBuildAbs; source = $target; lib = $rtlibAbs
+                exe = $exe; fresh = ($m.BaseName -eq "gc_observable_main")
+                capture = (Join-Path $g12dirAbs ("port_" + $m.BaseName + ".txt"))
+                budget = 180
+                goldenOut = $goldOut; goldenExit = $goldExit
+            }
         }
+        $g12r = Invoke-GateShards $g12items (Join-Path $g12dirAbs "g12.spec") (Join-Path $g12dirAbs "g12res")
+        $g12ok = $g12r.ok; $g12fail += $g12r.fail
         Write-Output "GATE12 PORTED BUILD (exe stdout+exit vs golden, $($mains.Count) mains, skip=$g12skip): PASS=$g12ok FAIL=$g12fail"
     }
 }
@@ -378,13 +469,18 @@ if (-not (Invoke-BuildDriver "cli\run.pkl" $pklcRun)) {
         $g12bdir = "tools\diff\g12run"
         New-Item -ItemType Directory -Path $g12bdir -Force | Out-Null
         $g12bok = 0; $g12bfail = 0
+        $rtlibAbs = Abs $rtlibCand
+        $goldenAbs = Abs $goldenDir
+        $pklcRunAbs = Abs $pklcRun
+        $g12bdirAbs = Abs $g12bdir
+        $g12bitems = @()
         foreach ($m in $mains) {
             # os_args_main has no no-arg run golden (capture skips it; its argv lane is
             # the meaningful one) — it is exercised by the dedicated argv case below.
             if ($m.BaseName -eq "os_args_main") { continue }
             $target = "tests\pickle\$($m.BaseName).pkl"
-            $goldOut = "$goldenDir\run\$($m.BaseName).out"
-            $goldExit = "$goldenDir\run\$($m.BaseName).exit"
+            $goldOut = "$goldenAbs\run\$($m.BaseName).out"
+            $goldExit = "$goldenAbs\run\$($m.BaseName).exit"
             if (-not (Test-Path -LiteralPath $goldOut)) { $g12bfail++; Write-Output "GATE12b $($m.BaseName): golden missing"; continue }
             # Port behavior: the run driver compiles->links->spawns internally. That
             # rebuild is skipped when a stamp proves source/compiler/lib unchanged and
@@ -392,21 +488,20 @@ if (-not (Invoke-BuildDriver "cli\run.pkl" $pklcRun)) {
             # still runs freshly against the golden every time (the only difference is
             # the exe was not re-linked this run). os_args_main is excluded: its argv
             # case is what proves the run driver's spawn/argv path, so it stays fresh.
-            $exe = Join-Path $g12bdir "$($m.BaseName).exe"
-            $stamp = "$exe.hash"
-            $want = Get-ArtifactStamp $target $rtlibCand
-            if ($m.BaseName -ne "os_args_main" -and (Test-Path -LiteralPath $exe) -and (Test-Path -LiteralPath $stamp) -and ((Get-Content -LiteralPath $stamp -Raw).Trim() -eq $want)) {
-                $ic = Invoke-NativeTimeout $exe @() "$g12bdir\port.txt" 180
-            } else {
-                $ic = Invoke-NativeTimeout $pklcRun @($target, $rtlibCand) "$g12bdir\port.txt" 180
-                if ($ic -eq 0 -and (Test-Path -LiteralPath $exe)) {
-                    Set-Content -LiteralPath $stamp -Value $want -NoNewline
-                }
+            $g12bitems += [pscustomobject]@{
+                gate = "GATE12b"; tag = $m.BaseName
+                kind = "runparity"
+                builder = $pklcRunAbs; argv = @($target, $rtlibAbs)
+                exe = (Join-Path $g12bdirAbs "$($m.BaseName).exe")
+                stamp = ((Join-Path $g12bdirAbs "$($m.BaseName).exe") + ".hash")
+                want = (Get-ArtifactStamp $target $rtlibCand)
+                capture = (Join-Path $g12bdirAbs ("port_" + $m.BaseName + ".txt"))
+                budget = 180
+                goldenOut = $goldOut; goldenExit = $goldExit
             }
-            $rc = [int](Get-Content -LiteralPath $goldExit -Raw)
-            if ($rc -eq $ic -and (ByteEq "$g12bdir\port.txt" $goldOut)) { $g12bok++ }
-            else { $g12bfail++; Write-Output "GATE12b $($m.BaseName): exit=$rc/$ic stdout_match=$(ByteEq "$g12bdir\port.txt" $goldOut)" }
         }
+        $g12br = Invoke-GateShards $g12bitems (Join-Path $g12bdirAbs "g12b.spec") (Join-Path $g12bdirAbs "g12bres")
+        $g12bok = $g12br.ok; $g12bfail += $g12br.fail
         # os_args_main with real arguments: the ported exe must see "2/foo/bar" and
         # exit 7 on a1=="exit", byte-identical to the frozen `pickle run ... -- exit exit`
         # golden.

@@ -161,18 +161,52 @@ foreach ($d in $drivers) { if (-not (Test-Path -LiteralPath (Join-Path $OutDir $
 if ($allPresent -and (Test-Path -LiteralPath $stamp) -and ((Get-Content -LiteralPath $stamp -Raw).Trim() -eq $want)) {
     Write-Output "SELFHOST: DRIVERS UP TO DATE (stamp matches) - nothing to rebuild"
 } else {
-    $ok = 0; $fail = 0
-    foreach ($d in $drivers) {
-        $out = Join-Path $OutDir $d.out
-        $t0 = Get-Date
-        $rc = Invoke-Quiet $Seed @($d.src, $SeedLib, $out) (Join-Path $WorkDir "$($d.out).log")
-        $dt = [math]::Round(((Get-Date) - $t0).TotalSeconds, 1)
-        $good = ($rc -eq 0) -and (Test-Path -LiteralPath $out)
-        if ($good) { $ok++ } else { $fail++ }
-        Write-Output ("SELFHOST: BUILD {0,-18} rc={1} ok={2} t={3}s" -f $d.out, $rc, $good, $dt)
+    # Parallel shard build: every driver build is an independent process with a
+    # private log, so the 10 builds run on K workers (battery_shard.ps1, kind
+    # "plain": run, capture all traffic, require exit 0). Byte-reproducibility of
+    # each driver is unaffected - same seed, same source spellings, same
+    # working directory as the serial loop had.
+    $seedAbs = (Resolve-Path -LiteralPath $Seed).Path
+    if (-not [System.IO.Path]::IsPathRooted($SeedLib)) { $SeedLibAbs = Join-Path (Get-Location).Path $SeedLib } else { $SeedLibAbs = $SeedLib }
+    $workers = 6
+    if ($env:BATTERY_WORKERS -match '^\d+$' -and [int]$env:BATTERY_WORKERS -gt 0) { $workers = [int]$env:BATTERY_WORKERS }
+    $specAbs = Join-Path $WorkDir "selfhost.spec"
+    $resBase = Join-Path $WorkDir "selfhostres"
+    $items = @($drivers | ForEach-Object {
+        [pscustomobject]@{
+            gate = "SELFHOST"; tag = $_.out
+            kind = "plain"
+            exe = $seedAbs; argv = @($_.src, $SeedLib, (Join-Path $OutDir $_.out))
+            capture = (Join-Path $WorkDir "$($_.out).log")
+            budget = 3600
+        }
+    })
+    [IO.File]::WriteAllLines($specAbs, @($items | ForEach-Object { $_ | ConvertTo-Json -Compress }))
+    $pids = @()
+    for ($i = 0; $i -lt $workers; $i++) {
+        Remove-Item "$resBase.r$i", "$resBase.o$i", "$resBase.e$i" -ErrorAction SilentlyContinue
+        $p = Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $PSScriptRoot "battery_shard.ps1"), "-SpecFile", $specAbs, "-Results", "$resBase.r$i", "-Shard", $i, "-Stride", $workers) -WorkingDirectory $Root -PassThru -WindowStyle Hidden -RedirectStandardOutput "$resBase.o$i" -RedirectStandardError "$resBase.e$i"
+        if ($null -ne $p) { $pids += $p.Id }
     }
-    Write-Output "SELFHOST: DRIVERS BUILT ok=$ok fail=$fail"
-    if ($fail -eq 0) { Set-Content -LiteralPath $stamp -Value $want -NoNewline }
+    Wait-Process -Id $pids -Timeout 7200 -ErrorAction SilentlyContinue
+    $ok = 0; $fail = 0
+    for ($i = 0; $i -lt $workers; $i++) {
+        $res = "$resBase.r$i"
+        if (-not (Test-Path -LiteralPath $res)) { continue }
+        foreach ($ln in (Get-Content -LiteralPath $res)) {
+            $f = $ln -split "`t"
+            if ($f.Length -lt 5) { continue }
+            if ($f[0] -eq "OK") { $ok++; Write-Output ("SELFHOST: BUILD {0,-18} rc=0 ok=True t={1}" -f $f[2], $f[4]) }
+            else { $fail++; Write-Output ("SELFHOST: BUILD {0,-18} FAILED {1}" -f $f[2], $f[3]) }
+        }
+    }
+    $total = $ok + $fail
+    if ($total -ne $drivers.Count) {
+        Write-Output "SELFHOST: SHARD WARNING collected $total results of $($drivers.Count) drivers"
+        $fail += ($drivers.Count - $total)
+    }
+    Write-Output "SELFHOST: DRIVERS BUILT ok=$ok fail=$fail (K=$workers)"
+    if ($fail -eq 0 -and $total -eq $drivers.Count) { Set-Content -LiteralPath $stamp -Value $want -NoNewline; Remove-Item "$resBase.r*", "$resBase.o*", "$resBase.e*", $specAbs -ErrorAction SilentlyContinue }
 }
 
 if ($NoVerify) { Write-Output "SELFHOST: DONE (verification skipped)"; exit 0 }
