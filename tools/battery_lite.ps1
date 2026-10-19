@@ -59,7 +59,10 @@ $failed = $false
 
 Write-Output "===== BATTERY LITE (behavior lane, workers=$script:LiteWorkers) ====="
 
-# PREP: runtime archive + ported test driver.
+# PREP: runtime archive + ported test driver. A fresh checkout has no
+# tools\diff\port directory (git does not track empty dirs) - the seed's
+# linker needs it to exist before it can write a driver exe.
+New-Item -ItemType Directory -Force -Path "tools\diff\port" | Out-Null
 $rtlibCand = Get-RtlibArchive
 if (-not $rtlibCand) {
     Write-Output "LITE PREP RUNTIME ARCHIVE: MISSING"
