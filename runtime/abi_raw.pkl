@@ -70,6 +70,11 @@ import { abiEngineAllocCount, abiEngineAllocBytes, abiEngineResetCounters, abiEn
 /// The block is not traced by the collector and not reclaimed by anyone but
 /// the caller: `free` must run exactly once, which is the same contract
 /// `alloc(int, n)` has always had in front of these bodies.
+///
+/// Native `alloc` panics when `HeapAlloc` answers null; the port takes the
+/// same divergence every unreachable-native-panic path takes here and exits.
+/// Handing the null back would turn a failed commit into writes at address 0
+/// two lowering steps later.
 #[symbol("pickle_raw_alloc")]
 fn abiRawAlloc(size: int) -> int {
     var n = size
@@ -77,7 +82,11 @@ fn abiRawAlloc(size: int) -> int {
         n = 1
     }
     var heap = win_get_process_heap()
-    return win_heap_alloc(heap, 0, n)
+    let addr = win_heap_alloc(heap, 0, n)
+    if (addr == 0) {
+        win_exit(1)
+    }
+    return addr
 }
 
 /// Release a block previously returned by `abiRawAlloc`.

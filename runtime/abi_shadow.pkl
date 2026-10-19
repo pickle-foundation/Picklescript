@@ -143,7 +143,10 @@ fn shadowRegistryLockRelease() {
 /// `ensure_registered_locked`): TLS -1 (unallocated) allocates the slot; TLS
 /// slot 0 (no node) creates the node on the raw heap, links it, remembers the
 /// TLS handle; an existing node is returned untouched. Every referenced node
-/// word is written explicitly - `win_heap_alloc` does NOT zero.
+/// word is written explicitly - `win_heap_alloc` does NOT zero. A failed node
+/// allocation (null under commit pressure) releases the lock and exits, the
+/// same divergence `abiShadowPop` takes for native panics - writes through
+/// address 0 inside the lock would be the worst possible failure shape.
 fn shadowEnsureRegisteredLocked() -> int {
     unsafe {
         if (shadowTlsSlot == -1) {
@@ -153,6 +156,10 @@ fn shadowEnsureRegisteredLocked() -> int {
         if (node == 0) {
             var heap = win_get_process_heap()
             node = win_heap_alloc(heap, 0, 24)
+            if (node == 0) {
+                shadowRegistryLockRelease()
+                win_exit(1)
+            }
             unsafe {
                 (node as *int)[0] = 0
                 (node as *int)[1] = shadowNextId
