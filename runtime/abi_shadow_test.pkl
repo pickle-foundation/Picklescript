@@ -1,0 +1,46 @@
+module runtime.abi_shadow_test
+
+import { abiGcRegisterThread, abiShadowHead, abiShadowRegistryHead, abiShadowRegistryCount } from runtime.abi_shadow
+
+/// The unit suite for the S3 thread registry: raw-heap `GcThread` nodes
+/// `[frames, id, next]`, TLS per-thread handles, the one-owner-word registry
+/// lock, and the `pickle_gc_register_thread` seam - against the `shadow.rs`
+/// contract (ids from 1, ensure-registered idempotent, nodes linked at the
+/// process head the collector walks under the lock).
+///
+/// Registry state is PROCESS-GLOBAL and this suite shares its process with
+/// the test harness, so assertions stay relational: never an absolute id or
+/// count, always relations on values this test observed. The harness's own
+/// compiled test bodies push shadow frames, so the running thread ALWAYS has
+/// a live frame list - which is why this suite never calls
+/// `pickle_gc_unregister_thread`: the single-thread contract forbids freeing
+/// a registry node whose frame list is in use, and only a real spawned
+/// worker (or the process tail) can exercise it. The unregister/id-advance
+/// behaviour is covered by the standalone probes (S3 scratch) and, later,
+/// by a `spawn`-based suite once the port has real worker threads.
+///
+/// NO FATAL PATH: nothing here moves the registry the running thread needs to
+/// survive.
+test fn register_ids_are_positive_and_idempotent() {
+    var a = abiGcRegisterThread()
+    var b = abiGcRegisterThread()
+    expect(a > 0).toBe(true)
+    expect(b).toBe(a)
+}
+
+test fn registry_has_this_thread_frame_head_and_exact_id() {
+    var a = abiGcRegisterThread()
+    expect(abiShadowRegistryCount() > 0).toBe(true)
+    expect(abiShadowHead() > 0).toBe(true)
+    var found = false
+    var node = abiShadowRegistryHead()
+    while (node != 0 && found == false) {
+        unsafe {
+            if ((node as *int)[1] == a) {
+                found = true
+            }
+            node = (node as *int)[2]
+        }
+    }
+    expect(found).toBe(true)
+}

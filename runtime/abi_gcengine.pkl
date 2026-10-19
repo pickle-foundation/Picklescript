@@ -51,7 +51,7 @@ module runtime.abi_gcengine
 /// `regCapGrown` vs `abi_gc`'s `blockCapGrown`), so a helper reused across
 /// modules would collide. Public entry points are `abiEngine*`.
 
-import { abiShadowHead } from runtime.abi_shadow
+import { shadowRegistryLockAcquire, shadowRegistryLockRelease, abiShadowRegistryHead } from runtime.abi_shadow
 import { abiClassOwnedMaskOf, abiClassFinalizerOf } from runtime.abi_classwords
 
 /// Managed class ids on object words (mirror of `runtime/object` labels).
@@ -809,7 +809,19 @@ fn geMarkFromRoots() {
         }
         temp = temp + 1
     }
-    geMarkFromShadow(abiShadowHead())
+    /// Every registered thread's frame chain is a root set, walked under the
+    /// registry lock the way native's trace holds `lock_registry()` over
+    /// `all_threads()` (gc.rs). In the single-thread contract there is exactly
+    /// one node, so this is the same set the per-thread head walk covered.
+    shadowRegistryLockAcquire()
+    var threadNode = abiShadowRegistryHead()
+    while (threadNode != 0) {
+        unsafe {
+            geMarkFromShadow((threadNode as *int)[0])
+            threadNode = (threadNode as *int)[2]
+        }
+    }
+    shadowRegistryLockRelease()
     while (markPendingLen > 0) {
         markPendingLen = markPendingLen - 1
         var object = 0

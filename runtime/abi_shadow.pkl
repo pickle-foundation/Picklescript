@@ -1,28 +1,66 @@
 module runtime.abi_shadow
 
-/// Port of the `runtime/src/shadow.rs` frame-list head, via the Win32 TLS
-/// builtins (`win_tls_alloc` / `win_tls_get` / `win_tls_set`), the per-thread
-/// storage this language does not otherwise have.
+/// Port of the `runtime/src/shadow.rs` thread registry + frame lists, via the
+/// Win32 TLS builtins (`win_tls_alloc` / `win_tls_get` / `win_tls_set`) and the
+/// process-heap builtins (`win_get_process_heap` / `win_heap_alloc` /
+/// `win_heap_free`), the storage and allocator this language does not otherwise
+/// have. Slice S3 of the live-GC qualification (native parities:
+/// `register_thread`/`unregister_thread`/`insert_thread_locked`/
+/// `ensure_registered_locked`, `push_frame`/`pop_frame` under the registry
+/// lock, `pickle_gc_register_thread`/`pickle_gc_unregister_thread` ids from 1).
 ///
-/// WHY TLS AND WHY THIS SHAPE. The reference keeps each OS thread's shadow-list
-/// head in that thread's `GcThread` node, found through a Rust `thread_local!`
-/// handle into a process-wide registry guarded by a mutex. This port keeps only
-/// the one piece of state that is inherently per-thread - the top-of-stack
-/// pointer - in a Win32 TLS slot; the thread registry and the `GcThread` nodes
-/// are NOT ported.
+/// THE SHAPE. A `GcThread` node is a three-word raw-heap block `[frames, id,
+/// next]` (native struct: `*mut ShadowFrame`, `u32`, registry link) linked into
+/// the process registry list `shadowRegHead` (native `THREAD_HEAD`). The
+/// thread's own handle lives in a Win32 TLS slot that holds the NODE POINTER
+/// (native `CURRENT_THREAD`), not the frame head - `node[0]` is the frame
+/// list head. `shadowNextId` is native `THREAD_COUNT` (ids from 1; a fresh
+/// registration after an unregister gets the next value, monotonic forever).
+/// Nodes are raw-heap blocks, so the Pickle collector can never reclaim them
+/// - the exact position of native's `Box::into_raw` - and unregistering
+/// (`pickle_gc_unregister_thread`) releases the block the way native's
+/// `Box::from_raw` does.
 ///
-/// WHEN THE CHAIN MUST BE READ. A collector walks the shadow list from the
-/// head to find an object pointer's frame. The chain is only safe to read by a
-/// reader that uses the SAME head this body writes. Two images are qualified:
-///   - the selflink (`sl_climain.map.txt` ships none of `pickle_gc_*`), where
-///     the native collector is absent, so the chain is written correctly and
-///     consumed by nothing; and
-///   - `runtime.abi_gc`'s ported collect, which reads this head once per cycle
-///     (`abiShadowHead`) and marks every frame walkable from it - the phase-2c
-///     shadow-stack root (see that module's roots divergence). The native
-///     registry and lock are still not ported (recorded below as divergences);
-///     a qualified image collects on its own thread, so the single chain is the
-///     whole root set.
+/// THE LOCK. `shadowLock` serialises every mutation of and walk over
+/// `shadowRegHead` and every thread's frame list, one owner word spin with
+/// `win_sleep(0)` between retries (native holds `REGISTRY`, a real
+/// `Mutex<()>`, for exactly the same scope: `push_frame`, `pop_frame`,
+/// `register_thread`, `unregister_thread`, and the collector's whole shadow
+/// walk). Two divergences are recorded:
+///   - The spin is not a hardware atomic: in every qualified image this
+///     runtime serves ONE OS thread (the nostd contract; `spawn` runs its body
+///     inline), so two acquirers can never interleave and a plain
+///     read/write on the owner word is observably identical to the mutex.
+///     A future multithread image must harden this word first.
+///   - The pop-time LIFO check cannot reach the panic channel from this leaf
+///     (`writeStderr` sits above the collector), so a pop out of order is a
+///     silent `win_exit(1)`, not native's panicked
+///     "shadow stack pop out of order" message. The emitter always pops
+///     exactly the frames it pushed, so the check is a debugger aid, not a
+///     runtime contract.
+///
+/// THE UNREGISTER LAW. Native `pop_frame` also runs `ensure_registered`,
+/// which has a same-thread consequence the plain ABI does not show: after
+/// `pickle_gc_unregister_thread` the next push/pop on the SAME thread
+/// creates a FRESH node (a new id - `shadowNextId` keeps advancing) with an
+/// empty frame list. `win_heap_alloc` may hand back the exact block the
+/// unregister freed, so a pointer-identity probe after such a sequence can
+/// read the new node as if the old one survived; probes and suites must
+/// discriminate through ids and registry walks, never through addresses.
+/// And because each node carries the thread's LIVE frame list, unregistering
+/// a thread whose frames are still in use tears the whole chain away - the
+/// next pop trips the out-of-order check (native: panic; here: silent
+/// `win_exit(1)`). The seam is therefore for END-OF-LIFE threads: either a
+/// spawned worker finishing, or the process tail. No suite may unregister
+/// the running harness thread.
+///
+/// WHEN THE CHAIN MUST BE READ. The collector walks EVERY registered thread's
+/// frame list under the lock (native `gc.rs` trace holds `lock_registry()` and
+/// walks `all_threads()`); the engine seeds its worklist per registry node
+/// through `abiShadowRegistryHead()` between `shadowRegistryLockAcquire()`
+/// and `shadowRegistryLockRelease()`. `abiShadowHead()` keeps the
+/// per-thread head read (native `current_thread()`'s node frames) for the
+/// callers that want only this thread's chain.
 /// The lock-step build against `combined.lib` is NOT qualified: that library
 /// still links the native collector, which walks the Rust `GcThread` registry
 /// (`THREAD_HEAD` -> `GcThread.frames`) and cannot see a head that lives only
@@ -31,18 +69,19 @@ module runtime.abi_shadow
 /// as 0xC0000005 on a depth-30 x 2000-iteration recursion with a live list. In
 /// `abi_gc`-importing images the native collector never runs (the ported
 /// `pickle_gc_collect` owns the cycle), so the split cannot surface there.
-/// `collector.pkl` (the modelled collector) reads the same TLS head and is the
-/// shape the ported collector follows.
+/// `collector.pkl` (the modelled collector) walks a `ShadowRegistry` model and
+/// is the shape the ported collector follows.
 ///
 /// WHY THE BODY STAYS ZERO-CELL. `x64.pkl::pushShadow` emits
 /// `call pickle_shadow_push` only when `plan.ncells > 0` (line 864), and the
 /// `popShadow()` call at the `Return` term is gated the same way (line 1590).
 /// A body with no managed locals therefore cannot instrument itself. This
-/// body's locals are all `int`, the one global it touches is a scalar `var`,
-/// and the TLS builtins return `Int`, so it has zero managed cells. That is the
-/// property the 2026-10-03 attempt lacked - it stored the chain in a managed
-/// list and re-entered itself until the stack died. If this ever regresses, the
-/// failure mode is the same loud stack overflow, not silent corruption.
+/// body's locals are all `int`, the touched globals are scalar `var`s, and the
+/// TLS/heap/exit/sleep builtins deal in `Int` values only, so it has zero
+/// managed cells. That is the property the 2026-10-03 attempt lacked - it
+/// stored the chain in a managed list and re-entered itself until the stack
+/// died. If this ever regresses, the failure mode is the same loud stack
+/// overflow, not silent corruption.
 ///
 /// THE LAYOUT IS THE REFERENCE'S. The emitter's frame pointer is the base of a
 /// `ShadowFrame`: header is 16 bytes with `prev` at word 0 and `slot_count` at
@@ -52,25 +91,13 @@ module runtime.abi_shadow
 /// `pickle_shadow_set` / `pickle_shadow_get`, which stay Rust and are exercised
 /// only by a program whose safepoints spill managed locals.
 ///
-/// TLS INDEX. Allocated lazily on the first push and kept in a scalar top-level
-/// `var`, which is image data valid from process entry - the `abi_statics`
-/// `cellsBase`/`cellsCap` pattern, the only mutable module storage a runtime
-/// body may reach. `-1` is spelled `TLS_OUT_OF_INDEXES`; `TlsAlloc` never
-/// returns it, so it is a safe "not yet allocated" sentinel. A freshly
-/// allocated index may legitimately be 0 and must not be mistaken for unset.
-///
-/// DIVERGENCES (all recorded, none currently observable in a qualified image):
-///   - No registry and no lock: the reference serialises push/pop against
-///     concurrent collection. Nothing collects in a qualified image today, and
-///     a non-qualified image (native collector + TLS head) is a documented
-///     channel split, not a running configuration.
-///   - No LIFO-order check on pop (the reference asserts the popped frame is
-///     the head). The emitter always pops exactly the frames it pushed, so the
-///     assert is a debugger aid, not a runtime contract.
-///   - Pop clears the popped frame's `prev` (matches the reference); the chain
-///     itself cannot be inspected from Pickle, so the proof is behavioural:
-///     a deep-nesting probe runs byte-identical to the native oracle and a
-///     large recursion does not overflow, which a re-entrant body would.
+/// TLS INDEX. Allocated lazily at the first `ensure-registered` and kept in a
+/// scalar top-level `var`, which is image data valid from process entry - the
+/// `abi_statics` `cellsBase`/`cellsCap` pattern, the only mutable module
+/// storage a runtime body may reach. `-1` is spelled `TLS_OUT_OF_INDEXES`;
+/// `TlsAlloc` never returns it, so it is a safe "not yet allocated" sentinel.
+/// A freshly allocated index may legitimately be 0 and must not be mistaken
+/// for unset.
 ///
 /// THE JIT CAVEAT. Like `abi_exception`, this channel can split under
 /// `pickle-cli run`: the JIT may execute the Pickle body while another side
@@ -80,47 +107,185 @@ module runtime.abi_shadow
 /// mechanical correctness at small volumes but must not be pushed past the GC
 /// threshold. Byte-parity probes therefore run against the selflink.
 
-/// The Win32 TLS index holding this thread's shadow-frame list head, or
-/// `-1` (`TLS_OUT_OF_INDEXES`) before the first push.
+/// The Win32 TLS index holding this thread's `GcThread` node pointer, or
+/// `-1` (`TLS_OUT_OF_INDEXES`) before the first push/registration.
 var shadowTlsSlot: int = -1
 
-/// ABI: push `frame` onto the current thread's shadow stack.
+/// Process registry head: the chain of `GcThread` nodes (native
+/// `THREAD_HEAD`), each `[frames, id, next]` on the raw heap.
+var shadowRegHead: int = 0
+
+/// Id handed to the NEXT thread that registers. Native `THREAD_COUNT` starts
+/// at 1 so 0 can mean "no thread"; `fetch_add` returns the old value, so ids
+/// observed in the registry are exactly 1, 2, 3, ... in registration order.
+var shadowNextId: int = 1
+
+/// Registry owner word (native `REGISTRY` Mutex): 1 = an acquirer holds the
+/// exclusive lock, 0 = unlocked.
+var shadowLock: int = 0
+
+/// Take the registry lock. Bounded spin between `win_sleep(0)` retries - the
+/// Sleep(0) yields the time slice, so a future contended image cannot starve;
+/// in the qualified single-thread contract the loop never runs twice.
+fn shadowRegistryLockAcquire() {
+    while (shadowLock == 1) {
+        win_sleep(0)
+    }
+    shadowLock = 1
+}
+
+/// Release the registry lock.
+fn shadowRegistryLockRelease() {
+    shadowLock = 0
+}
+
+/// Ensure this thread is registered, assuming the lock is held (native
+/// `ensure_registered_locked`): TLS -1 (unallocated) allocates the slot; TLS
+/// slot 0 (no node) creates the node on the raw heap, links it, remembers the
+/// TLS handle; an existing node is returned untouched. Every referenced node
+/// word is written explicitly - `win_heap_alloc` does NOT zero.
+fn shadowEnsureRegisteredLocked() -> int {
+    unsafe {
+        if (shadowTlsSlot == -1) {
+            shadowTlsSlot = win_tls_alloc()
+        }
+        var node = win_tls_get(shadowTlsSlot)
+        if (node == 0) {
+            var heap = win_get_process_heap()
+            node = win_heap_alloc(heap, 0, 24)
+            unsafe {
+                (node as *int)[0] = 0
+                (node as *int)[1] = shadowNextId
+                shadowNextId = shadowNextId + 1
+                (node as *int)[2] = shadowRegHead
+                shadowRegHead = node
+                let _ = win_tls_set(shadowTlsSlot, node)
+            }
+        }
+        return node
+    }
+}
+
+/// ABI: push `frame` onto the current thread's shadow stack (native
+/// `push_frame` under the registry lock, with auto-registration).
 #[symbol("pickle_shadow_push")]
 fn abiShadowPush(frame: *int) {
     unsafe {
-        var slot = shadowTlsSlot
-        if (slot == -1) {
-            slot = win_tls_alloc()
-            shadowTlsSlot = slot
-        }
-        frame[0] = win_tls_get(slot)
-        let _ = win_tls_set(slot, (frame as int))
+        shadowRegistryLockAcquire()
+        var node = shadowEnsureRegisteredLocked()
+        frame[0] = (node as *int)[0]
+        (node as *int)[0] = frame as int
+        shadowRegistryLockRelease()
     }
 }
 
 /// ABI: pop `frame`, which the emitter guarantees is the current head of this
-/// thread's stack.
+/// thread's stack (native `pop_frame`: registry lock, frames==frame assert,
+/// then the head unsticks and the popped frame's `prev` clears). Out-of-order
+/// pop takes the silent `win_exit(1)` divergence instead of native's panic
+/// message (the leaf cannot reach `writeStderr`).
 #[symbol("pickle_shadow_pop")]
 fn abiShadowPop(frame: *int) {
     unsafe {
-        var slot = shadowTlsSlot
-        if (slot != -1) {
-            var prev = frame[0]
-            let _ = win_tls_set(slot, prev)
+        if (shadowTlsSlot != -1) {
+            shadowRegistryLockAcquire()
+            var node = shadowEnsureRegisteredLocked()
+            if ((node as *int)[0] != (frame as int)) {
+                shadowRegistryLockRelease()
+                win_exit(1)
+            }
+            (node as *int)[0] = frame[0]
             frame[0] = 0
+            shadowRegistryLockRelease()
         }
     }
 }
 
-/// ABI-read: the current thread's shadow-frame chain head (a `ShadowFrame`
-/// base), or 0 when nothing has been pushed on this thread yet. The ported
-/// collector (`runtime.abi_gc`) reads this once per cycle and walks the chain
-/// through `frame[0]` (`prev`), sharing exactly the head the ported push/pop
-/// write. Zero-cell like the rest of this module (one scalar read).
+/// ABI-read: this thread's shadow-frame chain head (a `ShadowFrame` base), or
+/// 0 when nothing has been pushed on this thread yet (native
+/// `current_thread()` -> `GcThread.frames`).
 fn abiShadowHead() -> int {
-    var slot = shadowTlsSlot
-    if (slot == -1) {
-        return 0
+    unsafe {
+        if (shadowTlsSlot == -1) {
+            return 0
+        }
+        var node = win_tls_get(shadowTlsSlot)
+        if (node == 0) {
+            return 0
+        }
+        return (node as *int)[0]
     }
-    return win_tls_get(slot)
 }
+
+/// Lookup: the process registry head for a collector walk (native
+/// `all_threads()`). Read and walk between the lock calls; the caller holds
+/// the lock exactly as native's trace holds `lock_registry()`.
+fn abiShadowRegistryHead() -> int {
+    return shadowRegHead
+}
+
+/// Lookup: the number of registered thread nodes (counted by walking the
+/// chain the way native's `all_threads()` walk would). Diagnostic/test seam.
+fn abiShadowRegistryCount() -> int {
+    var count = 0
+    var node = shadowRegHead
+    while (node != 0) {
+        count = count + 1
+        unsafe {
+            node = (node as *int)[2]
+        }
+    }
+    return count
+}
+
+/// ABI: register the calling OS thread with the collector and return its id
+/// (native `pickle_gc_register_thread` -> `register_thread().id`, ids from 1).
+/// Idempotent per thread like the reference's `ensure_registered`.
+#[symbol("pickle_gc_register_thread")]
+fn abiGcRegisterThread() -> int {
+    unsafe {
+        shadowRegistryLockAcquire()
+        var node = shadowEnsureRegisteredLocked()
+        shadowRegistryLockRelease()
+        return (node as *int)[1]
+    }
+}
+
+/// ABI: unregister the calling OS thread from the collector (native
+/// `pickle_gc_unregister_thread`): unlink the node from the registry, detach
+/// the TLS handle, then release the raw-heap block - native's
+/// `unregister_thread` takes the registry lock for exactly this sequence and
+/// drops the Box under it. A never-registered thread is a no-op like the
+/// reference (node null check).
+#[symbol("pickle_gc_unregister_thread")]
+fn abiGcUnregisterThread() {
+    unsafe {
+        if (shadowTlsSlot == -1) {
+            return
+        }
+        var node = win_tls_get(shadowTlsSlot)
+        if (node == 0) {
+            return
+        }
+        shadowRegistryLockAcquire()
+        var cur = shadowRegHead
+        var prev = 0
+        while (cur != 0 && cur != node) {
+            prev = cur
+            cur = (cur as *int)[2]
+        }
+        if (cur == node) {
+            if (prev == 0) {
+                shadowRegHead = (node as *int)[2]
+            } else {
+                (prev as *int)[2] = (node as *int)[2]
+            }
+        }
+        let _ = win_tls_set(shadowTlsSlot, 0)
+        var heap = win_get_process_heap()
+        let _ = win_heap_free(heap, 0, node)
+        shadowRegistryLockRelease()
+    }
+}
+
+
