@@ -1,0 +1,118 @@
+﻿module compiler.emitutil_test
+
+import { sanitizeSymbol, isAsciiAlnum, planName, chainDepth, itemTags, flatBuiltin, managedIr, scalarIr, floatVal } from compiler.emitutil
+import { IrTy, emptyIrTys, irTyStr } from compiler.ir
+import { Ty } from compiler.ty
+import { emptyStrs, emptyAttrs } from compiler.ast
+
+test fn symbols_lexed_from_names() {
+    expect(sanitizeSymbol("Counter<int>")).toBe("Counter_int_")
+    expect(sanitizeSymbol("")).toBe("_")
+    expect(sanitizeSymbol("pkl_main")).toBe("pkl_main")
+}
+
+test fn ascii_alnum_boundaries() {
+    expect(isAsciiAlnum(48 as byte)).toBe(true)
+    expect(isAsciiAlnum(47 as byte)).toBe(false)
+    expect(isAsciiAlnum(57 as byte)).toBe(true)
+    expect(isAsciiAlnum(65 as byte)).toBe(true)
+    expect(isAsciiAlnum(122 as byte)).toBe(true)
+    expect(isAsciiAlnum(123 as byte)).toBe(false)
+}
+
+test fn plan_names_strip_generics() {
+    expect(planName("Counter<int>")).toBe("Counter")
+    expect(planName("Counter")).toBe("Counter")
+}
+
+test fn chain_depth_counts_from_leaf() {
+    expect(chainDepth(["A", "B", "C"], "A")).toBe(2)
+    expect(chainDepth(["A", "B", "C"], "C")).toBe(0)
+    expect(chainDepth(["A", "B", "C"], "Z")).toBe(0)
+}
+
+test fn item_tags_collects_tag_attrs() {
+    let tags = itemTags(emptyAttrs())
+    expect(len(tags)).toBe(0)
+}
+
+test fn flat_builtin_extern_table() {
+    let fb = flatBuiltin("win_tls_alloc")
+    var sym = ""
+    var mayGc = false
+    if (let some(t) = fb) {
+        match (t) {
+            case (s, params, returns, ret, pnames) -> {
+                sym = s
+                mayGc = returns
+            }
+            case _ -> {}
+        }
+    } else {
+        expect(false).toBe(true)
+    }
+    expect(sym).toBe("__imp_TlsAlloc")
+    expect(mayGc).toBe(true)
+    let fb2 = flatBuiltin("gcCollect")
+    if (let some(t2) = fb2) {
+        match (t2) {
+            case (s, params, returns, ret, pnames) -> expect(s).toBe("pickle_gc_collect")
+            case _ -> expect(false).toBe(true)
+        }
+    } else {
+        expect(false).toBe(true)
+    }
+    var missing = true
+    if (let some(_) = flatBuiltin("not_a_builtin")) {
+        missing = false
+    }
+    expect(missing).toBe(true)
+}
+
+test fn managed_ir_types() {
+    expect(managedIr(IrTy.Ptr)).toBe(true)
+    expect(managedIr(IrTy.Str)).toBe(true)
+    expect(managedIr(IrTy.Unit)).toBe(true)
+    expect(managedIr(IrTy.Int)).toBe(false)
+    expect(managedIr(IrTy.Float)).toBe(false)
+}
+
+test fn scalar_ir_domain() {
+    if (let some(s) = scalarIr(Ty.Int)) {
+        expect(irTyTagOf(s)).toBe(irTyTagOf(IrTy.Int))
+    } else {
+        expect(false).toBe(true)
+    }
+    var strIsIr = false
+    if (let some(_) = scalarIr(Ty.String)) {
+        strIsIr = true
+    }
+    expect(strIsIr).toBe(false)
+}
+
+test fn float_literal_parsing() {
+    expect(floatVal("2.5")).toBe(2.5)
+    expect(floatVal("nonsense")).toBe(0.0)
+}
+
+test fn thread_count_has_no_params() {
+    let fb = flatBuiltin("thread_count")
+    var noParams = false
+    if (let some(t) = fb) {
+        match (t) {
+            case (s, params, returns, ret, pnames) -> {
+                expect(s).toBe("pickle_thread_count")
+                noParams = len(pnames) == 0
+            }
+            case _ -> {}
+        }
+    }
+    expect(noParams).toBe(true)
+    var probe = emptyStrs()
+    probe.push("x")
+    expect(len(probe)).toBe(1)
+}
+
+fn irTyTagOf(t: IrTy) -> string {
+    irTyStr(t)
+}

@@ -1,0 +1,2125 @@
+﻿module compiler.emitutil
+
+// Support model for the emitter: module constants, pure data classes, and free
+// helper functions over AST/ty/resolve types. Split out of emit.pkl per the
+// one-primary-declaration-per-file rule; emit.pkl keeps `class Emitter` plus
+// the register/lower orchestration and imports this module one-way.
+
+import * from compiler.ast
+import { Span, Diagnostic, DiagnosticSink } from compiler.diag
+import { IrBlock, IrFunc, IrGlobal, IrModule, IrParam, IrTy, emptyIrBlocks, emptyIrGlobals, emptyIrParams, emptyIrTys, emptyModule, irTyStr, irxParseFloat } from compiler.ir
+import { CallableInfo, ClassTable, CtorInfo, EnumTable, FieldInfo, ParamInfo, PropertyInfo, ResolvedProgram, TypeTableEntry, entryGenerics } from compiler.resolve
+import { collectExprTypes, containsStr, isNoneStr, spanKey } from compiler.check
+import * from compiler.ty
+import { f64ToBits } from compiler.x64
+
+/// Runtime class ids for user classes start at this id: the runtime reserves
+/// 0..=6 for the builtin boxed types (string/list/map/int/float/bool/char),
+/// 7 for `PEnum`, 8 for `PTuple`, and 9 for `PStream`, so the first user class
+/// registered at runtime gets id `PICKLE_CLASS_USER_BASE`. The compiler assigns
+/// `base + index` in declaration order, matching the runtime's allocation
+/// order.
+const PICKLE_CLASS_USER_BASE: int = 10
+
+/// Make a function symbol from a type's display name: keep alphanumerics,
+/// replace every other character (commas, spaces, parens, `?`, `&`, ...) with
+/// `_`, so instantiation suffixes stay valid linker symbols.
+fn sanitizeSymbol(s: string) -> string {
+    var out = ""
+    for (c in s) {
+        if (isAsciiAlnum(c)) {
+            out += "{c as char}"
+        } else {
+            out += "_"
+        }
+    }
+    if (out == "") {
+        out = "_"
+    }
+    out
+}
+
+fn isAsciiAlnum(c: byte) -> bool {
+    (c >= 48 && c <= 57) || (c >= 97 && c <= 122) || (c >= 65 && c <= 90)
+}
+
+/// How a function body leaves its current block, once every `finally` owed on
+/// the way has already run.
+enum Exit {
+    /// Leave the function with this value.
+    Return(v: int?)
+    /// Jump to an existing block (a `break`/`continue` target).
+    Branch(target: int)
+    /// Leave the function because a throw is propagating. A function with a
+    /// result must still produce one, so a zero of that type is returned; the
+    /// caller checks the pending flag before it reads the value.
+    Propagate
+}
+
+/// The innermost `catch` in the function being emitted, and enough context to
+/// know which `finally`s are still owed on the way into it.
+class HandlerCtx {
+    var target: int
+    var finBase: int
+    var ownFinally: bool
+
+    constructor(target: int, finBase: int, ownFinally: bool) {
+        this.target = target
+        this.finBase = finBase
+        this.ownFinally = ownFinally
+    }
+}
+
+/// A `break`/`continue` target pair.
+class LoopCtx {
+    var continueTarget: int
+    var breakTarget: int
+
+    constructor(continueTarget: int, breakTarget: int) {
+        this.continueTarget = continueTarget
+        this.breakTarget = breakTarget
+    }
+}
+
+/// Where a registered function's body and signature come from.
+enum FnSource {
+    // Top-level `fn` (or `test`) declaration.
+    TopLevel(f: FnDecl)
+    // The visible wrapper of an `async fn`: a normal module function with the
+    // async fn's real ABI that allocates the future closure and returns it.
+    // Runs no user code; the body runs only when `await` drives the closure.
+    AsyncFn(f: FnDecl, hidden: int)
+    // The hidden future body of an `async fn`: a 0-arg hoisted body with the
+    // lambda ABI (`env` = closure object), whose slots 1..N snapshot each of
+    // the async fn's parameters under its own name.
+    AsyncBody(f: FnDecl, pty: List<Ty>, ret: Ty)
+    // A lambda expression's hoisted body: slot 0 is the closure object, whose
+    // slots 1..N hold the captured values copied in at entry; the lambda's own
+    // parameters come after the closure object.
+    Lambda(lambda: Expr, captures: List<Capture>, pty: List<Ty>, ret: Ty, owner: int?)
+    // The constructor of a class/struct: synthesized from the fields unless an
+    // explicit `constructor(...)` body is present.
+    Ctor(table: ClassTable, inits: List<SlotInit>, initBlocks: List<Block>, ctor: ConstructorDecl?)
+    // A named constructor: a static factory that delegates to the primary
+    // constructor via `this(...)`.
+    NamedCtor(table: ClassTable, ctor: ConstructorDecl)
+    // A `deinit` finalizer: runs at GC sweep on a dead instance, off the
+    // allocation path. Slot 0 is `this`; returns unit.
+    Deinit(table: ClassTable, body: Block)
+    // A class/struct method (instance or static).
+    Method(table: ClassTable, md: MethodDecl)
+    // The visible wrapper of an `async` method (instance or static), with the
+    // method's real ABI (`this` at slot 0 for instance methods, then the
+    // parameters): allocates the future closure and returns it. `methodIds`
+    // maps the method name here, so calls and overrides dispatch exactly like
+    // a regular method.
+    AsyncMethod(table: ClassTable, md: MethodDecl, hidden: int, isStatic: bool, thisTy: Ty?)
+    // The hidden future body of an `async` method: closure slots hold the
+    // receiver (instance methods) then the parameters; the receiver is
+    // re-declared as `this` so the body runs exactly like a regular method.
+    AsyncMethodBody(table: ClassTable, md: MethodDecl, pty: List<Ty>, ret: Ty, isStatic: bool)
+    // A property accessor: slot 0 is `this` (instance only; static
+    // properties are receiver-less), and setters take a `value` parameter,
+    // over the resolved property signature.
+    Property(table: ClassTable, pd: PropertyDecl, info: PropertyInfo, isSet: bool, isStatic: bool)
+    // The synthesized static-field initializer: one assignment per static
+    // field, evaluated once at program start. `None` means the field had no
+    // initializer and is stored as its default (zero/null) value.
+StaticInit(inits: List<StaticInitEntry>)
+    GlobalsInit(inits: List<ManagedGlobalInit>)
+    // A dynamically-callable forwarder for a top-level function used as a
+    // value. Slot 0 is the closure object (ignored; module functions capture
+    // nothing), the real arguments occupy slots 1..N, and the body calls
+    // `target` and returns its result. This gives a module function the same
+    // `(env, ...)` ABI as a hoisted lambda body, so `fn_value_call` can
+    // dispatch to it uniformly through a zero-capture closure object.
+    Trampoline(span: Span, target: int, pty: List<Ty>, ret: Ty)
+    // A dynamically-callable forwarder for an instance method bound to a
+    // receiver. Slot 0 is the closure object, slot 1 holds the bound receiver
+    // (captured like a lambda capture), and the real arguments occupy slots
+    // 2..N; the body loads the receiver and calls `target` with it first, then
+    // returns the result. This gives a bound method the same `(env, ...)` ABI
+    // as a hoisted lambda body, so `fn_value_call` dispatches to it uniformly.
+    // When the method is overridden (`branches` non-empty), the body dispatches
+    // on the runtime class of the loaded receiver exactly like a virtual call.
+MethodTrampoline(span: Span, target: int, pty: List<Ty>, ret: Ty, branches: List<DispatchBranch>)
+    // A dynamically-callable forwarder for spreading a boxed `List<...>` into a
+    // target function's real arguments. Slot 0 is the receiver (instance methods
+    // only), slot 1 is the boxed list; the body unboxes each element by its own
+    // parameter's representation and calls `target` directly, so every call site
+    // that spreads into the same target shares one trampoline ("fn.spread").
+    // Mirrors `build_spread_trampoline` in emit.rs.
+    SpreadTrampoline(span: Span, target: int, pty: List<Ty>, ret: Ty, receiver: bool)
+    // The synthesized `pkl_test_setup` function: registers every user class
+    // and runs `pkl_static_init` before the test runner starts (test modules
+    // have no `main`, so the preamble cannot ride on one).
+    TestSetup
+}
+
+/// `(slot, initializer)` for each instance field with an initializer, in
+/// declaration order.
+class SlotInit {
+    var slot: int
+    var init: Expr
+
+    constructor(slot: int, init: Expr) {
+        this.slot = slot
+        this.init = init
+    }
+}
+
+/// One static-field entry of the synthesized static init: `(class id, static
+/// slot, value expr)`. `value == none` means "no initializer" (store the
+/// default value).
+class StaticInitEntry {
+    var cid: int
+    var slot: int
+    var value: Expr?
+
+    constructor(cid: int, slot: int, value: Expr?) {
+        this.cid = cid
+        this.slot = slot
+        this.value = value
+    }
+}
+
+/// One managed top-level `var`: the global id whose slot must be rooted, and the
+/// initializer expression that builds its value at run time.
+class ManagedGlobalInit {
+var gid: int
+        var ty: IrTy
+        var value: Expr
+
+        constructor(gid: int, ty: IrTy, value: Expr) {
+            this.gid = gid
+            this.ty = ty
+            this.value = value
+        }
+}
+
+/// One virtual-dispatch branch: `(descendant class id, its own
+/// implementation)`.
+class DispatchBranch {
+    var cid: int
+    var fid: int
+
+    constructor(cid: int, fid: int) {
+        this.cid = cid
+        this.fid = fid
+    }
+}
+
+/// A registered, lowerable user class/struct.
+class ClassPlan {
+    var name: string
+    var classId: int
+    /// Superclass id for a class that `extends` another, else `None`.
+    var parent: int?
+    var table: ClassTable
+
+    constructor(name: string, classId: int, parent: int?, table: ClassTable) {
+        this.name = name
+        this.classId = classId
+        this.parent = parent
+        this.table = table
+    }
+}
+
+/// One value a lambda body reads from its creating scope. Captures are copied
+/// (snapshotted) into the closure object at creation time and are read-only
+/// inside the hoisted body.
+class Capture {
+    var name: string
+    var ty: Ty
+    var span: Span
+
+    constructor(name: string, ty: Ty, span: Span) {
+        this.name = name
+        this.ty = ty
+        this.span = span
+    }
+}
+
+/// Closures may capture up to this many values; beyond it the synthetic
+/// `__closure_N` layout (one slot per capture) is rejected loudly.
+const MAX_LAMBDA_CAPTURES: int = 8
+
+/// Publish `payload` and raise this thread's pending flag.
+const EXC_THROW: string = "pickle_exc_throw"
+
+/// Is a throw in flight on this thread?
+const EXC_PENDING: string = "pickle_exc_pending"
+
+/// Consume the in-flight throw, returning its payload.
+const EXC_TAKE: string = "pickle_exc_take"
+
+/// Runtime symbol names used to build and call closure values.
+const CLOSURE_CLASS_PREFIX: string = "__closure_"
+
+/// The slot holding the hoisted body's code address inside a closure object.
+const CLOSURE_FN_SLOT: int = 0
+
+/// The number of parameters on a lambda expression.
+fn paramsLen(lambda: Expr) -> int {
+    match (lambda.kind) {
+        case ExprKind.Lambda(params, _, _, _) -> len(params)
+        case _ -> 0
+    }
+}
+
+/// A lambda parameter list's bound names.
+fn boundParams(params: List<Param>) -> Map<string, bool> {
+    var m = { "::seed::": true }
+    m.remove("::seed::")
+    for (p in params) {
+        m[p.name] = true
+    }
+    m
+}
+
+/// Is `name` bound in one of the open lexical scopes at or above `from`?
+/// Scopes below `from` belong to the enclosing function and are invisible to
+/// a hoisted lambda body, so they are NOT treated as bound here (they must be
+/// captured instead).
+fn scopeContainsFrom(scope: List<Map<string, bool>>, fromLevel: int, name: string) -> bool {
+    var i = len(scope)
+    while (i >= 1) {
+        i = i - 1
+        if (i < fromLevel) {
+            break
+        }
+        if (scope[i].has(name)) {
+            return true
+        }
+    }
+    false
+}
+
+/// Bind `name` in the innermost open scope.
+fn scopeBind(scope: List<Map<string, bool>>, name: string) {
+    if (len(scope) >= 1) {
+        var top = scope[len(scope) - 1]
+        top[name] = true
+    }
+}
+
+/// The names a pattern binds (only `Pattern.Binding` introduces names).
+fn patternBinds(p: Pattern) -> List<string> {
+    var out = emptyStrs()
+    collectBinds(p, out)
+    out
+}
+
+fn collectBinds(p: Pattern, out: List<string>) {
+    match (p) {
+        case Pattern.Binding(name, _) -> out.push(name)
+        case Pattern.Tuple(xs) -> {
+            for (x in xs) {
+                collectBinds(x, out)
+            }
+        }
+        case Pattern.Or(xs) -> {
+            for (x in xs) {
+                collectBinds(x, out)
+            }
+        }
+        case Pattern.Variant(_, payloads) -> {
+            for (x in payloads) {
+                collectBinds(x, out)
+            }
+        }
+        case Pattern.Wildcard | Pattern.Literal(_) -> {}
+    }
+}
+
+/// Is `e` a `this(...)` call expression?
+fn thisCallExpr(e: Expr) -> Expr? {
+    match (e.kind) {
+        case ExprKind.Call(callee, _) -> {
+            match (callee.kind) {
+                case ExprKind.This -> e
+                case _ -> none
+            }
+        }
+        case _ -> none
+    }
+}
+
+/// The single `this(...)` delegation expression of a named-constructor body, or
+/// `None` if the body is not exactly one such expression (as a statement or a
+/// block tail).
+fn namedCtorDelegation(body: Block) -> Expr? {
+    if (len(body.stmts) == 0) {
+        return match (body.expr) {
+            case some(e) -> thisCallExpr(e)
+            case none -> none
+        }
+    }
+    if (len(body.stmts) != 1) {
+        return none
+    }
+    var res: Expr? = none
+    match (body.expr) {
+        case none -> {
+            match (body.stmts[0]) {
+                case Stmt.Expr(e) -> res = thisCallExpr(e)
+                case _ -> {}
+            }
+        }
+        case some(_) -> {}
+    }
+    res
+}
+
+/// The leading `super(...)` delegation expression of a primary-constructor
+/// body, when it is the first statement. The call's arguments are evaluated
+/// in the current function's scope and fed to the parent constructor.
+fn ctorSuperDelegation(body: Block) -> Expr? {
+    if (len(body.stmts) == 0) {
+        return none
+    }
+    match (body.stmts[0]) {
+        case Stmt.Expr(e) -> {
+            match (e.kind) {
+                case ExprKind.Call(callee, _) -> {
+                    match (callee.kind) {
+                        case ExprKind.Super -> e
+                        case _ -> none
+                    }
+                }
+                case _ -> none
+            }
+        }
+        case _ -> none
+    }
+}
+
+/// Static slot number of static field `name` (its position among static
+/// fields).
+fn staticFieldSlot(table: ClassTable, name: string) -> int? {
+    var n = 0
+    for (f in table.fields) {
+        if (f.isStatic) {
+            if (f.name == name) {
+                return n
+            }
+            n = n + 1
+        }
+    }
+    none
+}
+
+/// The declared info of static field `name`, when present.
+fn staticFieldInfo(table: ClassTable, name: string) -> FieldInfo? {
+    for (f in table.fields) {
+        if (f.isStatic && f.name == name) {
+            return f
+        }
+    }
+    none
+}
+
+/// The IR type a `List<T>` element value carries outside the runtime.
+fn elemIr(elem: Ty) -> IrTy {
+    match (elem) {
+        case Ty.Int -> IrTy.Int
+        case Ty.Float -> IrTy.Float
+        case Ty.Bool -> IrTy.Bool
+        case Ty.Byte -> IrTy.Int
+        case Ty.Char -> IrTy.Char
+        case Ty.String -> IrTy.Str
+        case _ -> IrTy.Ptr
+    }
+}
+
+fn emptyFnSources() -> List<FnSource> {
+    var l = [FnSource.TopLevel(FnDecl("x", Span(0, 0), Visibility.Public, false, emptyGenericParams(), emptyParams(), none, none))]
+    l.pop()
+    l
+}
+
+fn emptyCaptures() -> List<Capture> {
+    var l = [Capture("x", Ty.Int, Span(0, 0))]
+    l.pop()
+    l
+}
+
+fn emptyPatterns() -> List<Pattern> {
+    var l = [Pattern.Binding("x", none)]
+    l.pop()
+    l
+}
+
+fn emptyClassPlans() -> List<ClassPlan> {
+    var l = [ClassPlan("x", 0, none, seedClassTable())]
+    l.pop()
+    l
+}
+
+fn emptyLoopCtxs() -> List<LoopCtx> {
+    var l = [LoopCtx(0, 0)]
+    l.pop()
+    l
+}
+
+fn emptyHandlerCtxs() -> List<HandlerCtx> {
+    var l = [HandlerCtx(0, 0, false)]
+    l.pop()
+    l
+}
+
+fn emptySlotInits() -> List<SlotInit> {
+    var l = [SlotInit(0, Expr(Span(0, 0), ExprKind.Ident("x")))]
+    l.pop()
+    l
+}
+
+fn emptyStaticInitEntries() -> List<StaticInitEntry> {
+  var l = [StaticInitEntry(0, 0, none)]
+  l.pop()
+  l
+}
+
+fn emptyManagedGlobalInits() -> List<ManagedGlobalInit> {
+  var l = [ManagedGlobalInit(0, IrTy.Str, Expr(Span(0, 0), ExprKind.Lit(Lit.Int(0))))]
+  l.pop()
+  l
+}
+
+fn emptyCtorArgVals() -> List<CtorArgVal> {
+    var l = [CtorArgVal(0, Ty.Int, Span(0, 0))]
+    l.pop()
+    l
+}
+
+fn emptyCtorParams() -> List<CtorParam> {
+    var l = [CtorParam("x", Ty.Int, Span(0, 0), -1)]
+    l.pop()
+    l
+}
+
+fn emptyRegPlans() -> List<RegPlan> {
+    var l = [RegPlan("x", 0, 0, 0, 0)]
+    l.pop()
+    l
+}
+
+fn emptyDispatchBranches() -> List<DispatchBranch> {
+    var l = [DispatchBranch(0, 0)]
+    l.pop()
+    l
+}
+
+fn emptyScopeMaps() -> List<Map<string, bool>> {
+    var l = [boundParams(emptyParams())]
+    l.pop()
+    l
+}
+
+fn seedClassTable() -> ClassTable {
+    ClassTable("x", Span(0, 0), Visibility.Public, emptyStrs(), none, emptyTys(), emptyFieldInfos(), emptyCallableInfos(), emptyPropertyInfos(), none, emptyNamedCtorInfos(), emptyFieldInfos())
+}
+
+/// A seeded empty primary-constructor declaration.
+fn seedConstructorDecl() -> ConstructorDecl {
+    ConstructorDecl(none, Span(0, 0), Visibility.Public, emptyParams(), emptyBlock())
+}
+
+fn emptyFieldInfos() -> List<FieldInfo> {
+    var l = [FieldInfo("x", Visibility.Public, false, false, false, false, Ty.Int, Span(0, 0))]
+    l.pop()
+    l
+}
+
+fn emptyCallableInfos() -> List<CallableInfo> {
+    var l = [CallableInfo("x", Span(0, 0), Visibility.Public, false, false, false, false, none, emptyStrs(), emptyParamInfos(), Ty.Int)]
+    l.pop()
+    l
+}
+
+fn emptyPropertyInfos() -> List<PropertyInfo> {
+    var l = [PropertyInfo("x", Visibility.Public, false, Ty.Int, false, false, Span(0, 0))]
+    l.pop()
+    l
+}
+
+fn emptyParamInfos() -> List<ParamInfo> {
+    var l = [ParamInfo("x", Ty.Int, false, false, Span(0, 0))]
+    l.pop()
+    l
+}
+
+fn emptyNamedCtorInfos() -> List<NamedCtorInfo> {
+    var l = [NamedCtorInfo("x", CtorInfo(Span(0, 0), Visibility.Public, emptyParamInfos()))]
+    l.pop()
+    l
+}
+
+/// Registered instance-method resolution: a function plus whether it is
+/// static, keyed by (class id, method name).
+class MethodRef {
+    var fid: int
+    var isStatic: bool
+
+    constructor(fid: int, isStatic: bool) {
+        this.fid = fid
+        this.isStatic = isStatic
+    }
+}
+
+/// Declared info and initializer of a class-level `const`, keyed by
+/// (class id, const name) and inlined at use sites.
+class ClassConst {
+    var field: FieldInfo
+    var init: Expr
+
+    constructor(field: FieldInfo, init: Expr) {
+        this.field = field
+        this.init = init
+    }
+}
+
+/// A top-level `var` that could not be lowered to a data symbol. Kept as a
+/// record instead of reporting inline so the rest of the module still emits.
+class GlobalFailure {
+    var name: string
+    var span: Span
+    var msg: string
+
+    constructor(name: string, span: Span, msg: string) {
+        this.name = name
+        this.span = span
+        this.msg = msg
+    }
+}
+
+/// Outcome of reducing a global initializer to bytes: `bytes == none` means
+/// zero-init (`.bss`); a non-empty `err` means the initializer was rejected.
+class GlobalInitResult {
+    var bytes: List<int>?
+    var err: string
+
+    constructor(bytes: List<int>?, err: string) {
+        this.bytes = bytes
+        this.err = err
+    }
+}
+
+/// One interface member in declaration order: `(method name, method index)`.
+class IfaceMember {
+    var name: string
+    var index: int
+
+    constructor(name: string, index: int) {
+        this.name = name
+        this.index = index
+    }
+}
+
+/// One direct `implements` declaration: the interface id plus its
+/// method-index -> implementation map.
+class IfaceBucket {
+    var ifaceId: int
+    var methods: List<DispatchBranch>
+
+    constructor(ifaceId: int, methods: List<DispatchBranch>) {
+        this.ifaceId = ifaceId
+        this.methods = methods
+    }
+}
+
+/// `<a>|<b>|<c>` composite key standing in for Rust's `HashMap<(A, B, C), _>`.
+fn tripleKey(a: string, b: string, c: string) -> string {
+    a + "|" + b + "|" + c
+}
+
+/// One instance method visible at a receiver class: `(name, fid)`.
+class NamedFid {
+    var name: string
+    var fid: int
+
+    constructor(name: string, fid: int) {
+        this.name = name
+        this.fid = fid
+    }
+}
+
+/// One recorded `method_ids` insertion in program order, with the receiver
+/// class id kept alongside the string key so `build_virtual_dispatch` can walk
+/// the method table without decoding `pairKey` keys.
+class MethodEntry {
+    var cid: int
+    var name: string
+    var fid: int
+    var isStatic: bool
+
+    constructor(cid: int, name: string, fid: int, isStatic: bool) {
+        this.cid = cid
+        this.name = name
+        this.fid = fid
+        this.isStatic = isStatic
+    }
+}
+
+/// A virtual-dispatch candidate before sorting: `(cid, depth, fid)`.
+class DispatchBranchDepth {
+    var dcid: int
+    var depth: int
+    var dfid: int
+
+    constructor(dcid: int, depth: int, dfid: int) {
+        this.dcid = dcid
+        this.depth = depth
+        this.dfid = dfid
+    }
+}
+
+/// An interface-dispatch branch before sorting: `(depth, cid, fid)`. Sorted
+/// deepest-derived first with class-id ties ascending, mirroring Rust's
+/// `sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)))`.
+class IfaceDepthBranch {
+    var depth: int
+    var cid: int
+    var fid: int
+
+    constructor(depth: int, cid: int, fid: int) {
+        this.depth = depth
+        this.cid = cid
+        this.fid = fid
+    }
+}
+
+/// One recorded property-accessor insertion in program order, keeping the
+/// receiver class id and `is_set` flag alongside the `tripleKey` key so
+/// superclass slots can be inherited without decoding string keys.
+class PropertyEntry {
+    var cid: int
+    var name: string
+    var isSet: bool
+    var fid: int
+
+    constructor(cid: int, name: string, isSet: bool, fid: int) {
+        this.cid = cid
+        this.name = name
+        this.isSet = isSet
+        this.fid = fid
+    }
+}
+
+/// `(interface name, type arguments)` extracted from an interface type.
+class IfaceRef {
+    var name: string
+    var args: List<Ty>
+
+    constructor(name: string, args: List<Ty>) {
+        this.name = name
+        this.args = args
+    }
+}
+
+/// One static-field slot pending its initializer: `(slot, value expr)`,
+/// waiting for the class id before it becomes a `StaticInitEntry`.
+class StaticSlotInit {
+    var slot: int
+    var value: Expr?
+
+    constructor(slot: int, value: Expr?) {
+        this.slot = slot
+        this.value = value
+    }
+}
+
+/// One value passed to a chained `super(...)`/forwarded constructor:
+/// `(value temp, checked type, span)`.
+class CtorArgVal {
+    var v: int
+    var ty: Ty
+    var span: Span
+
+    constructor(v: int, ty: Ty, span: Span) {
+        this.v = v
+        this.ty = ty
+        this.span = span
+    }
+}
+
+/// One primary-constructor parameter as lowered by `build_ctor_body`:
+/// `(name, type, span)` plus the absolute instance-field slot the value must
+/// be stored into (`-1` for an explicit constructor parameter, which the
+/// body assigns itself).
+class CtorParam {
+    var name: string
+    var ty: Ty
+    var span: Span
+    var fieldSlot: int
+
+    constructor(name: string, ty: Ty, span: Span, fieldSlot: int) {
+        this.name = name
+        this.ty = ty
+        this.span = span
+        this.fieldSlot = fieldSlot
+    }
+}
+
+/// The result of `synthesized_ctor_param_meta`: the absolute instance-field
+/// slot each synthesized parameter must be stored into (`-1` = a leading
+/// explicit-ancestor primary-constructor parameter, forwarded to its
+/// chain), plus the nearest explicit-primary ancestor to chain into
+/// (`chainName == ""` when none) and how many leading parameters its chain
+/// consumes.
+class CtorParamMeta {
+    var slots: List<int>
+    var chainName: string
+    var chainCount: int
+
+    constructor(slots: List<int>, chainName: string, chainCount: int) {
+        this.slots = slots
+        this.chainName = chainName
+        this.chainCount = chainCount
+    }
+}
+
+/// The nearest explicit-primary-constructor ancestor of a class: its name
+/// and the absolute end slot of its own instance fields.
+class AncestorMeta {
+    var name: string
+    var endSlot: int
+
+    constructor(name: string, endSlot: int) {
+        this.name = name
+        this.endSlot = endSlot
+    }
+}
+
+/// One `pickle_class_register` plan: `(name, field count, class id, parent
+/// id, manual-field owned mask)`.
+class RegPlan {
+    var name: string
+    var fieldCount: int
+    var cid: int
+    var parent: int
+    var owned: int
+
+    constructor(name: string, fieldCount: int, cid: int, parent: int, owned: int) {
+        this.name = name
+        this.fieldCount = fieldCount
+        this.cid = cid
+        this.parent = parent
+        this.owned = owned
+    }
+}
+
+/// `<a>|<b>` composite key standing in for Rust's `HashMap<(A, B), _>`.
+fn pairKey(a: string, b: string) -> string {
+    a + "|" + b
+}
+
+/// Generic-instantiation key for a function/class/interface name plus its
+/// concrete type arguments, standing in for Rust's `(String, Vec<Ty>)`. The
+/// arg rendering matches the runtime symbol suffix `name<b1, b2>`.
+fn instKey(name: string, args: List<Ty>) -> string {
+    name + "<" + bareJoin(args, ", ") + ">"
+}
+
+/// `@<fid>|<span>` key for lambda registrations, standing in for Rust's
+/// `(Option<FuncId>, Span)`. `-` marks module scope (no enclosing function).
+fn lambdaKey(owner: int?, span: Span) -> string {
+    var o = "-"
+    match (owner) {
+        case some(f) -> o = "@" + str(f)
+        case none -> {}
+    }
+    o + "|" + spanKey(span)
+}
+
+/// True when `x` is `some` (the checker rejects `x == none` directly).
+fn isSomeInt(x: int?) -> bool {
+    match (x) {
+        case some(_) -> true
+        case none -> false
+    }
+}
+
+/// True when `x` is `none`.
+fn isNoneInt(x: int?) -> bool {
+    match (x) {
+        case some(_) -> false
+        case none -> true
+    }
+}
+
+/// True when `s` is an element of `xs`.
+fn hasStr(xs: List<string>, s: string) -> bool {
+    var i = 0
+    while (i < len(xs)) {
+        if (xs[i] == s) {
+            return true
+        }
+        i = i + 1
+    }
+    false
+}
+
+/// The interface instantiation behind `ty`, or `none`: `Ty::Interface` as-is,
+/// peeling a leading reference.
+fn ifaceOf(ty: Ty) -> IfaceRef? {
+    match (ty) {
+        case Ty.Interface(n, a) -> IfaceRef(n, a)
+        case Ty.Ref(inner) -> ifaceOf(inner)
+        case _ -> none
+    }
+}
+
+/// The literal text of a string-literal part, or `none` when it interpolates.
+fn textOf(p: StrPart) -> string? {
+    match (p) {
+        case StrPart.Text(t) -> t
+        case StrPart.Expr(_) -> none
+    }
+}
+
+/// True when every part of a string-literal template is plain text.
+fn allTextParts(parts: List<StrPart>) -> bool {
+    var ok = true
+    for (p in parts) {
+        if (let none = textOf(p)) {
+            ok = false
+        }
+    }
+    ok
+}
+
+/// Concatenate the literal text of a string-literal template (interpolated
+/// parts contribute nothing).
+fn joinText(parts: List<StrPart>) -> string {
+    var text = ""
+    for (p in parts) {
+        if (let some(t) = textOf(p)) {
+            text = text + t
+        }
+    }
+    text
+}
+
+// ---- seed helpers (empty collections must seed a typed value, then drop
+// it, because `{}`/`[]` are blocks in PickleScript) ----
+
+fn seedExpr() -> Expr {
+    Expr(Span(0, 0), ExprKind.Ident("x"))
+}
+
+fn seedFnDecl() -> FnDecl {
+    FnDecl("x", Span(0, 0), Visibility.Public, false, emptyGenericParams(), emptyParams(), none, none)
+}
+
+fn seedFieldInfo() -> FieldInfo {
+    FieldInfo("x", Visibility.Public, false, false, false, false, Ty.Int, Span(0, 0))
+}
+
+fn seedCallableInfo() -> CallableInfo {
+    CallableInfo("x", Span(0, 0), Visibility.Public, false, false, false, false, none, emptyStrs(), emptyParamInfos(), Ty.Int)
+}
+
+fn seedClassMember() -> ClassMember {
+    ClassMember.Init(emptyBlock())
+}
+
+fn seedClassDecl() -> ClassDecl {
+    ClassDecl("x", Span(0, 0), Visibility.Public, emptyGenericParams(), none, emptyTypeExprs(), emptyProcMembers())
+}
+
+fn seedIntScopeMap() -> Map<string, int> {
+    let m = {"::seed::": 0}
+    m.remove("::seed::")
+    m
+}
+
+fn emptyInts() -> List<int> {
+    var l = [0]
+    l.pop()
+    l
+}
+
+fn emptyExprMap() -> Map<string, Expr> {
+    let m = {"::seed::": seedExpr()}
+    m.remove("::seed::")
+    m
+}
+
+fn emptyClassConstMap() -> Map<string, ClassConst> {
+   let m = {"::seed::": ClassConst(seedFieldInfo(), seedExpr())}
+   m.remove("::seed::")
+   m
+   }
+
+fn seedGlobalDecl() -> GlobalDecl {
+   GlobalDecl("x", Visibility.Default, none, seedExpr(), Span(0, 0))
+   }
+
+fn emptyGlobalDeclMap() -> Map<string, GlobalDecl> {
+   let m = {"::seed::": seedGlobalDecl()}
+   m.remove("::seed::")
+   m
+   }
+
+fn emptyGlobalFailures() -> List<GlobalFailure> {
+   let l = [GlobalFailure("x", Span(0, 0), "")]
+   l.pop()
+   l
+   }
+
+fn globalInitOk(b: List<int>?) -> GlobalInitResult {
+   GlobalInitResult(b, "")
+   }
+
+/// True when a declaration carried an explicit `: Type` annotation.
+fn hasTypeExpr(te: TypeExpr?) -> bool {
+   if (let some(_v) = te) {
+   return true
+   }
+   false
+   }
+
+fn globalInitErr(msg: string) -> GlobalInitResult {
+   GlobalInitResult(none, msg)
+   }
+
+fn emptyBytes8() -> List<int> {
+   var b = [0, 0, 0, 0, 0, 0, 0, 0]
+   b
+   }
+
+   fn emptyBytes4() -> List<int> {
+       var b = [0, 0, 0, 0]
+       b
+   }
+
+   fn emptyBytes1() -> List<int> {
+       var b = [0]
+       b
+   }
+
+   /// Little-endian bytes of a 32-bit slot. Mirrors `u32::to_le_bytes`.
+   fn int32LeBytes(v: int) -> List<int> {
+       var b = emptyBytes4()
+       b[0] = v & 0xFF
+       b[1] = (v >> 8) & 0xFF
+       b[2] = (v >> 16) & 0xFF
+       b[3] = (v >> 24) & 0xFF
+       b
+   }
+
+   /// Little-endian bytes of an `f64`. Mirrors `f64::to_le_bytes`.
+   fn float64LeBytes(v: float) -> List<int> {
+       int64LeBytes(f64ToBits(v))
+   }
+
+/// Little-endian bytes of a 64-bit slot. Mirrors `i64::to_le_bytes`.
+fn int64LeBytes(v: int) -> List<int> {
+   var b = emptyBytes8()
+   b[0] = v & 0xFF
+   b[1] = (v >> 8) & 0xFF
+   b[2] = (v >> 16) & 0xFF
+   b[3] = (v >> 24) & 0xFF
+   b[4] = (v >> 32) & 0xFF
+   b[5] = (v >> 40) & 0xFF
+   b[6] = (v >> 48) & 0xFF
+   b[7] = (v >> 56) & 0xFF
+   b
+   }
+
+/// Linker symbol for a top-level `var`. The `pkl_global_` prefix is reserved:
+/// a function named `global_x` would otherwise collide with a global `x`.
+fn globalSymbol(name: string) -> string {
+   "pkl_global_" + name
+   }
+
+/// Source `Ty` -> IR slot type, or `none` when this slice has no lowering for
+/// it yet.
+fn globalIrTy(ty: Ty) -> IrTy? {
+      if (ty == Ty.Int) {
+          return IrTy.Int
+      }
+      if (ty == Ty.Bool) {
+          return IrTy.Bool
+      }
+      if (ty == Ty.Char) {
+          return IrTy.Char
+      }
+      if (ty == Ty.Float) {
+          return IrTy.Float
+      }
+      if (ty == Ty.String) {
+          return IrTy.Str
+      }
+      // Every remaining reference type is one GC object of a known class, so the
+      // slot holds a raw object pointer that the collector traces through the
+      // registered root. `Fn` is excluded because a closure is not a single
+      // object, and `Option` because it is not one either.
+      match (ty) {
+          case Ty.List(_) -> IrTy.Ptr
+          case Ty.Map(_, _) -> IrTy.Ptr
+          case Ty.Tuple(_) -> IrTy.Ptr
+          case Ty.Class(_, _) -> IrTy.Ptr
+          case Ty.Struct(_, _) -> IrTy.Ptr
+          case Ty.Enum(_, _) -> IrTy.Ptr
+          case _ -> none
+      }
+  }
+
+/// Reduce a global initializer to little-endian image bytes.
+///
+/// Returns `ok(none)` for a managed slot: `Str` and `Ptr` have no static form,
+/// so the COFF writer emits a zeroed 8-byte slot and the value plus its
+/// `pickle_gc_root_add` registration are emitted into `pkl_globals_init`
+/// instead.
+///
+/// The scalars are the POD types, each as a literal (float and int may be
+/// negated): enough to prove the `.data` path end to end without inventing a
+/// general static-evaluator.
+fn globalInitBytes(e: Expr, ty: IrTy, name: string) -> GlobalInitResult {
+    // The article is part of the type phrase: "an integer" but "a bool".
+    var want = match (ty) {
+    case IrTy.Bool -> "a bool"
+    case IrTy.Char -> "a char"
+    case IrTy.Float -> "a float"
+    case _ -> "an integer"
+    }
+    var mismatch = "the initializer of top-level `var " + name + "` must be " + want + " literal; a scalar global's value is written into the image before `main` runs, so its initializer cannot call, load, or allocate"
+    // Negation is the one unary that still yields a static scalar.
+    var inner = match (e.kind) {
+    case ExprKind.Unary(op, operand) -> match (op) {
+    case UnOp.Neg -> operand
+    case _ -> none
+    }
+    case _ -> none
+    }
+    if (ty == IrTy.Bool) {
+        if (let some(b) = matchLitBool(e)) {
+            var one = emptyBytes1()
+            one[0] = if (b) { 1 } else { 0 }
+            return globalInitOk(one)
+        }
+        return globalInitErr(mismatch)
+    }
+    if (ty == IrTy.Char) {
+        if (let some(c) = matchLitChar(e)) {
+            return globalInitOk(int32LeBytes(c))
+        }
+        return globalInitErr(mismatch)
+    }
+    if (ty == IrTy.Float) {
+        if (let some(v) = matchLitFloat(e, inner)) {
+            return globalInitOk(float64LeBytes(v))
+        }
+        return globalInitErr(mismatch)
+    }
+    if (let some(v) = matchLitInt(e, inner)) {
+        return globalInitOk(int64LeBytes(v))
+    }
+    if (ty == IrTy.Unit) {
+        return globalInitOk(none)
+    }
+if (ty == IrTy.Str || ty == IrTy.Ptr) {
+          // Managed: no static bytes. The COFF writer already emits an 8-byte
+          // zero slot for a `none` initializer, and the value plus the
+          // `pickle_gc_root_add` registration are emitted into `pkl_globals_init`.
+          return globalInitOk(none)
+      }
+    return globalInitErr(mismatch)
+  }
+
+  fn matchLitBool(e: Expr) -> bool? {
+    match (e.kind) {
+    case ExprKind.Lit(Lit.Bool(b)) -> b
+    case _ -> none
+    }
+  }
+
+fn matchLitChar(e: Expr) -> int? {
+    match (e.kind) {
+    case ExprKind.Lit(Lit.Char(c)) -> c as int
+    case _ -> none
+    }
+}
+
+  fn matchLitInt(e: Expr, neg: Expr?) -> int? {
+    if (let some(operand) = neg) {
+        if (let some(v) = matchLitInt(operand, none)) {
+            return 0 - v
+        }
+        return none
+    }
+    match (e.kind) {
+    case ExprKind.Lit(Lit.Int(v)) -> v
+    case _ -> none
+    }
+  }
+
+fn matchLitFloat(e: Expr, neg: Expr?) -> float? {
+    if (let some(operand) = neg) {
+        if (let some(v) = matchLitFloat(operand, none)) {
+            return 0.0 - v
+        }
+        return none
+    }
+match (e.kind) {
+    case ExprKind.Lit(Lit.Float(text)) -> floatVal(text)
+    case _ -> none
+    }
+}
+
+fn emptyFnSourceMap() -> Map<int, FnSource> {
+    let m = {0: FnSource.TopLevel(seedFnDecl())}
+    m.remove(0)
+    m
+}
+
+fn emptyCallableInfoMap() -> Map<int, CallableInfo> {
+    let m = {0: seedCallableInfo()}
+    m.remove(0)
+    m
+}
+
+fn emptyIntTyListMap() -> Map<int, List<Ty>> {
+    let m = {0: emptyTys()}
+    m.remove(0)
+    m
+}
+
+fn emptyIntStrListMap() -> Map<int, List<string>> {
+    let m = {0: emptyStrs()}
+    m.remove(0)
+    m
+}
+
+fn emptyFnDeclMap() -> Map<string, FnDecl> {
+    let m = {"::seed::": seedFnDecl()}
+    m.remove("::seed::")
+    m
+}
+
+fn emptyStringIntMap() -> Map<string, int> {
+    let m = {"::seed::": 0}
+    m.remove("::seed::")
+    m
+}
+
+fn emptyIntIntMap() -> Map<int, int> {
+    let m = {0: 0}
+    m.remove(0)
+    m
+}
+
+fn emptyIntBoolMap() -> Map<int, bool> {
+    let m = {0: false}
+    m.remove(0)
+    m
+}
+
+fn emptyIntIntListMap() -> Map<int, List<int>> {
+    let m = {0: emptyInts()}
+    m.remove(0)
+    m
+}
+
+fn emptyDiagnostics() -> List<Diagnostic> {
+    let l = [Diagnostic(Severity.Error, "", none, emptyNotes(), none, emptyStrs())]
+    l.remove(0)
+    l
+}
+
+fn emptyStringTyMap() -> Map<string, Ty> {
+    let m = {"::seed::": Ty.Int}
+    m.remove("::seed::")
+    m
+}
+
+fn emptyIntSubstMap() -> Map<int, Map<string, Ty>> {
+    let m = {0: emptyStringTyMap()}
+    m.remove(0)
+    m
+}
+
+fn emptyStringIntOptMap() -> Map<string, int?> {
+    var v: int? = none
+    let m = {"::seed::": v}
+    m.remove("::seed::")
+    m
+}
+
+fn emptyCaptureListMap() -> Map<string, List<Capture>> {
+    let m = {"::seed::": emptyCaptures()}
+    m.remove("::seed::")
+    m
+}
+
+fn emptyClassTableMap() -> Map<string, ClassTable> {
+    let m = {"::seed::": seedClassTable()}
+    m.remove("::seed::")
+    m
+}
+
+fn emptyClassDeclMap() -> Map<string, ClassDecl> {
+    let m = {"::seed::": seedClassDecl()}
+    m.remove("::seed::")
+    m
+}
+
+fn emptyMemberListMap() -> Map<string, List<ClassMember>> {
+    let m = {"::seed::": emptyProcMembers()}
+    m.remove("::seed::")
+    m
+}
+
+fn emptyMethodRefMap() -> Map<string, MethodRef> {
+    let m = {"::seed::": MethodRef(0, false)}
+    m.remove("::seed::")
+    m
+}
+
+fn emptyDispatchMap() -> Map<string, List<DispatchBranch>> {
+    let m = {"::seed::": emptyDispatchBranches()}
+    m.remove("::seed::")
+    m
+}
+
+fn seedIfaceMemberList() -> List<IfaceMember> {
+    var l = [IfaceMember("x", 0)]
+    l.pop()
+    l
+}
+
+fn emptyIfaceBuckets() -> List<IfaceBucket> {
+    var l = [IfaceBucket(0, emptyDispatchBranches())]
+    l.pop()
+    l
+}
+
+fn emptyIfaceMemberMap() -> Map<int, List<IfaceMember>> {
+    let m = {0: seedIfaceMemberList()}
+    m.remove(0)
+    m
+}
+
+fn emptyIfaceBucketMap() -> Map<int, List<IfaceBucket>> {
+    let m = {0: emptyIfaceBuckets()}
+    m.remove(0)
+    m
+}
+
+fn emptyIntScopeMap() -> List<Map<string, int>> {
+    var l = [seedIntScopeMap()]
+    l.pop()
+    l
+}
+
+fn emptyNamedFids() -> List<NamedFid> {
+    var l = [NamedFid("x", 0)]
+    l.pop()
+    l
+}
+
+fn emptyNamedFidMap() -> Map<int, List<NamedFid>> {
+    let m = {0: emptyNamedFids()}
+    m.remove(0)
+    m
+}
+
+fn emptyMethodEntries() -> List<MethodEntry> {
+    var l = [MethodEntry(0, "x", 0, false)]
+    l.pop()
+    l
+}
+
+fn emptyDispatchDepths() -> List<DispatchBranchDepth> {
+    var l = [DispatchBranchDepth(0, 0, 0)]
+    l.pop()
+    l
+}
+
+fn emptyIfaceDepths() -> List<IfaceDepthBranch> {
+    var l = [IfaceDepthBranch(0, 0, 0)]
+    l.pop()
+    l
+}
+
+fn emptyPropertyEntries() -> List<PropertyEntry> {
+    var l = [PropertyEntry(0, "x", false, 0)]
+    l.pop()
+    l
+}
+
+fn emptyIfaceMemberList() -> List<IfaceMember> {
+    var l = [IfaceMember("x", 0)]
+    l.pop()
+    l
+}
+
+fn emptyStaticSlotInits() -> List<StaticSlotInit> {
+    var l = [StaticSlotInit(0, none)]
+    l.pop()
+    l
+}
+
+fn emptyBlocks() -> List<Block> {
+    var l = [Block(emptyStmts(), none, Span(0, 0))]
+    l.pop()
+    l
+}
+
+/// One free-identifier occurrence a walk records: `(name, span)`.
+class NameRef {
+    var name: string
+    var span: Span
+
+    constructor(name: string, span: Span) {
+        this.name = name
+        this.span = span
+    }
+}
+
+/// `(declaring class id, static slot, declared info)` of a resolved static
+/// field, mirroring the Rust `Option<(u32, usize, FieldInfo)>`.
+class StaticFieldLoc {
+    var dcid: int
+    var slot: int
+    var info: FieldInfo
+
+    constructor(dcid: int, slot: int, info: FieldInfo) {
+        this.dcid = dcid
+        this.slot = slot
+        this.info = info
+    }
+}
+
+fn emptyNameRefs() -> List<NameRef> {
+    var l = [NameRef("x", Span(0, 0))]
+    l.pop()
+    l
+}
+
+fn emptyClassMembers() -> List<ClassMember> {
+    var l = [ClassMember.Field("x", none, none, Visibility.Public, false, false, emptyAttrs(), Span(0, 0))]
+    l.pop()
+    l
+}
+
+fn emptyScopeMap() -> Map<string, bool> {
+    var m = { "::seed::": true }
+    m.remove("::seed::")
+    m
+}
+
+/// Byte-wise lexicographic ordering, matching Rust's `String::cmp` for the
+/// ASCII identifier names capture lists sort by.
+fn strLess(a: string, b: string) -> bool {
+    var ab = bytesOf(a)
+    var bb = bytesOf(b)
+    var i = 0
+    while (i < len(ab) && i < len(bb)) {
+        if (ab[i] != bb[i]) {
+            return ab[i] < bb[i]
+        }
+        i = i + 1
+    }
+    len(ab) < len(bb)
+}
+
+fn bytesOf(s: string) -> List<int> {
+    var out: List<int> = [0]
+    out.pop()
+    for (c in s) {
+        out.push(c as int)
+    }
+    out
+}
+
+/// Split `xs[fromLevel..]` off into a new list, order-preserving on both
+/// sides (the tail is returned; `xs` keeps its prefix). Mirrors Rust's
+/// `Vec::split_off`, which the pickled port cannot call directly.
+fn splitOff(xs: List<NameRef>, fromLevel: int) -> List<NameRef> {
+    var tail = emptyNameRefs()
+    var keep = emptyNameRefs()
+    var i = fromLevel
+    while (i < len(xs)) {
+        tail.push(xs[i])
+        i = i + 1
+    }
+    var j = 0
+    while (j < fromLevel) {
+        keep.push(xs[j])
+        j = j + 1
+    }
+    while (len(xs) > 0) {
+        xs.remove(len(xs) - 1)
+    }
+    for (k in keep) {
+        xs.push(k)
+    }
+    tail
+}
+
+/// A small integer tag per `IrTy`, so option-less IR types can be compared
+/// with plain `==`.
+fn irTyTag(t: IrTy) -> int {
+    match (t) {
+        case IrTy.Bool -> 0
+        case IrTy.Char -> 1
+        case IrTy.Int -> 2
+        case IrTy.Float -> 3
+        case IrTy.Str -> 4
+        case IrTy.Unit -> 5
+        case IrTy.Ptr -> 6
+    }
+}
+
+fn irTysEqual(a: List<IrTy>, b: List<IrTy>) -> bool {
+    if (!(len(a) == len(b))) {
+        return false
+    }
+    var i = 0
+    while (i < len(a)) {
+        if (!(irTyTag(a[i]) == irTyTag(b[i]))) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+/// Byte-wise list-of-ints equality (the string table's entries).
+fn intListsEqual(a: List<int>, b: List<int>) -> bool {
+    if (!(len(a) == len(b))) {
+        return false
+    }
+    var i = 0
+    while (i < len(a)) {
+        if (!(a[i] == b[i])) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+fn seedScopeMap() -> Map<string, bool> {
+    let m = {"::seed::": true}
+    m.remove("::seed::")
+    m
+}
+
+/// How a `List<T>` element (or `Map<K,_>` key) is represented at the runtime
+/// boundary. `Ptr` passes the managed value through as a pointer; `Scalar`
+/// records the box/unbox extern pair and the scalar IR type.
+class ElemRep {
+    isPtr: bool
+    boxSym: string
+    unboxSym: string
+    ir: IrTy
+    static fn ptr() -> ElemRep {
+        ElemRep(true, "pickle_box_i64", "pickle_unbox_i64", IrTy.Int)
+    }
+    static fn scalar(boxSym: string, unboxSym: string, ir: IrTy) -> ElemRep {
+        ElemRep(false, boxSym, unboxSym, ir)
+    }
+}
+
+/// Whether a string list contains `s` (the ported form of
+/// `const_inlining.iter().any(|n| n == ...)`).
+fn strListHas(l: List<string>, s: string) -> bool {
+    for (x in l) {
+        if (x == s) {
+            return true
+        }
+    }
+    false
+}
+
+/// The name of an `Ident` expression, or `none` for any other kind.
+fn exprKindIdentName(e: Expr) -> string? {
+    match (e.kind) {
+        case ExprKind.Ident(n) -> n
+        case _ -> none
+    }
+}
+
+fn kindDbg(e: Expr) -> string {
+    match (e.kind) {
+        case ExprKind.Ident(n) -> "ident:" + n
+        case ExprKind.Member(obj, n) -> "member:." + n
+        case ExprKind.Call(_, _) -> "call"
+        case ExprKind.Binary(_, _, _) -> "binop"
+        case ExprKind.Lit(_) -> "lit"
+        case ExprKind.This -> "this"
+        case ExprKind.Block(_) -> "block"
+        case _ -> "other"
+    }
+}
+
+/// Whether any argument carries a spread (`...list`).
+fn anySpread(a: List<CallArg>) -> bool {
+    for (x in a) {
+        if (x.spread) {
+            return true
+        }
+    }
+    false
+}
+
+/// Whether two element representations round-trip identically at the runtime
+/// boundary. Mirrors `ElemRep::eq`.
+fn elemRepSame(a: ElemRep, b: ElemRep) -> bool {
+    a.isPtr == b.isPtr && a.boxSym == b.boxSym && a.unboxSym == b.unboxSym && irTyTag(a.ir) == irTyTag(b.ir)
+}
+
+/// The IR binary op for an AST binary operator, with a defensive fallback to
+/// `Add` (only the arithmetic/comparison ops reach the generic `BinOp` tail).
+/// Mirrors `binary_opcode` in emit.rs.
+fn binaryOpcode(op: BinOp) -> IrBinOp {
+    match (op) {
+        case BinOp.Add -> IrBinOp.Add
+        case BinOp.Sub -> IrBinOp.Sub
+        case BinOp.Mul -> IrBinOp.Mul
+        case BinOp.Div -> IrBinOp.Div
+        case BinOp.Mod -> IrBinOp.Mod
+        case BinOp.Shl -> IrBinOp.Shl
+        case BinOp.Shr -> IrBinOp.Shr
+        case BinOp.BitAnd -> IrBinOp.BitAnd
+        case BinOp.BitOr -> IrBinOp.BitOr
+        case BinOp.BitXor -> IrBinOp.BitXor
+        case BinOp.Lt -> IrBinOp.Lt
+        case BinOp.Le -> IrBinOp.Le
+        case BinOp.Gt -> IrBinOp.Gt
+        case BinOp.Ge -> IrBinOp.Ge
+        case BinOp.Eq -> IrBinOp.Eq
+        case BinOp.Ne -> IrBinOp.Ne
+        case _ -> IrBinOp.Add
+    }
+}
+
+/// The IR binary op for a compound `op=` assignment (`Assign` never combines;
+/// it falls back to `Add`). Mirrors `assign_opcode` in emit.rs.
+fn assignOpcode(op: AssignOp) -> IrBinOp {
+    match (op) {
+        case AssignOp.Add -> IrBinOp.Add
+        case AssignOp.Sub -> IrBinOp.Sub
+        case AssignOp.Mul -> IrBinOp.Mul
+        case AssignOp.Div -> IrBinOp.Div
+        case AssignOp.Mod -> IrBinOp.Mod
+        case AssignOp.Shl -> IrBinOp.Shl
+        case AssignOp.Shr -> IrBinOp.Shr
+        case AssignOp.BitAnd -> IrBinOp.BitAnd
+        case AssignOp.BitOr -> IrBinOp.BitOr
+        case AssignOp.BitXor -> IrBinOp.BitXor
+        case AssignOp.Assign -> IrBinOp.Add
+    }
+}
+
+/// Can two comparison operands share one `icmp`/`fcmp`? The scalar mix
+/// `int`/`float` is handled by the `Itof` promotion counting as compatible;
+/// everything else must be the same IR type. Unknown/unresolved types count
+/// as compatible so substitution-time programs keep flowing to their concrete
+/// form. `-1` is the "unknown/missing" sentinel. Mirrors
+/// `cmp_types_compatible` in emit.rs.
+fn cmpTypesCompatible(aTag: int, bTag: int) -> bool {
+    if (aTag < 0 || bTag < 0) {
+        return true
+    }
+    if (aTag == irTyTag(IrTy.Float) || bTag == irTyTag(IrTy.Float)) {
+        return true
+    }
+    aTag == bTag
+}
+
+/// Flip a comparison op under a logical `.not()`. Note `!EQ -> NE`, `!GT ->
+/// LE`, `!LT -> GE` (the non-strict inverse), which is what a "not greater"
+/// pass really means. Mirrors `flip_cmp` in emit.rs.
+fn flipCmp(op: IrBinOp, negated: bool) -> IrBinOp {
+    if (!negated) {
+        return op
+    }
+    match (op) {
+        case IrBinOp.Eq -> IrBinOp.Ne
+        case IrBinOp.Ne -> IrBinOp.Eq
+        case IrBinOp.Gt -> IrBinOp.Le
+        case IrBinOp.Ge -> IrBinOp.Lt
+        case IrBinOp.Lt -> IrBinOp.Ge
+        case IrBinOp.Le -> IrBinOp.Gt
+        case _ -> op
+    }
+}
+
+/// The Rust `Debug` name of a binary operator, used in defensive messages.
+fn binOpName(op: BinOp) -> string {
+    match (op) {
+        case BinOp.Add -> "Add"
+        case BinOp.Sub -> "Sub"
+        case BinOp.Mul -> "Mul"
+        case BinOp.Div -> "Div"
+        case BinOp.Mod -> "Mod"
+        case BinOp.Pow -> "Pow"
+        case BinOp.Shl -> "Shl"
+        case BinOp.Shr -> "Shr"
+        case BinOp.BitAnd -> "BitAnd"
+        case BinOp.BitOr -> "BitOr"
+        case BinOp.BitXor -> "BitXor"
+        case BinOp.Lt -> "Lt"
+        case BinOp.Le -> "Le"
+        case BinOp.Gt -> "Gt"
+        case BinOp.Ge -> "Ge"
+        case BinOp.Eq -> "Eq"
+        case BinOp.Ne -> "Ne"
+        case BinOp.And -> "And"
+        case BinOp.Or -> "Or"
+        case BinOp.Range -> "Range"
+        case BinOp.RangeIncl -> "RangeIncl"
+        case BinOp.NullCoalesce -> "NullCoalesce"
+        case BinOp.Send -> "Send"
+        case BinOp.Is -> "Is"
+        case BinOp.In -> "In"
+    }
+}
+
+/// Parse a float literal's text into the `f64` value it denotes. The checker
+/// has already validated the shape, so no error handling is needed. Mirrors
+/// Rust's `str::parse::<f64>()` for the plain decimal literals the test suite
+/// `[-]digits[.digits][e[+-]digits]` (no exponents beyond that shape, `_`
+/// separators already stripped) -> the same `f64` Rust's
+/// `text.parse::<f64>()` produces, bit for bit.
+///
+/// This delegates to `irxParseFloat`, which builds the exact decimal as a
+/// big integer and performs one correctly-rounded conversion. Do not
+/// reintroduce the obvious shortcut of scaling `mant as float` by a power of
+/// ten: that needs three separate roundings (`mant as float`, building `p`,
+/// and the multiply/divide), so it silently loses the value at both ends of
+/// the range. `p = 10.0^|scale|` overflows to `inf` for any `scale < -308`,
+/// which turned every subnormal literal (`1e-320`, `5e-324`) into `0.0`, and
+/// `scale > 0` overflowed to `inf` for large magnitudes
+/// (`1.7976931348623157e308`). Repeated multiplication also accumulated error
+/// well before that, so `1e300` came out as `1.0000000000000002e300`.
+///
+/// The token is lexed as a number before we get here, so a `none` result is
+/// unreachable; `0.0` is only a defensive fallback.
+fn floatVal(text: string) -> float {
+    if (let some(v) = irxParseFloat(text)) {
+        return v
+    }
+    0.0
+}
+
+/// `(class name, registered class id)` closed over by the cast helpers for a
+/// concrete `Ty::Class(n, [])`. Mirrors Rust's `user_class_id` result.
+class UserClassRef {
+    var name: string
+    var id: int
+
+    constructor(name: string, id: int) {
+        this.name = name
+        this.id = id
+    }
+}
+
+/// The declared type and lowered value of an `a?.name` / `a?.prop` read.
+class OptMemberVal {
+    var ty: Ty
+    var v: int
+
+    constructor(ty: Ty, v: int) {
+        this.ty = ty
+        this.v = v
+    }
+}
+
+/// The peeled `expect(value)` argument of an assertion chain, plus whether a
+/// `.not()` flips the expectation. Rust's `Option<(&Expr, bool)>`.
+class ExpectPeel {
+    var value: Expr
+    var negated: bool
+
+    constructor(value: Expr, negated: bool) {
+        this.value = value
+        this.negated = negated
+    }
+}
+
+    /// Collect the `#[tag("???????")]` values from an item's attributes. Arguments
+    /// that are not plain string literals are ignored. Mirrors `item_tags`.
+fn itemTags(attrs: List<Attribute>) -> List<string> {
+        var out = emptyStrs()
+        for (a in attrs) {
+            if (a.name != "tag") {
+                continue
+            }
+            for (arg in a.args) {
+                match (arg.kind) {
+                    case ExprKind.Lit(Lit.String(parts)) -> {
+                        if (allTextParts(parts)) {
+                            var text = joinText(parts)
+                            if (!(text == "")) {
+                                out.push(text)
+                            }
+                        }
+                    }
+                    case _ -> {}
+                }
+            }
+        }
+        out
+    }
+
+    /// True when `name`'s table declares a method `mname`.
+fn hasMethodName(t: ClassTable, mname: string) -> bool {
+        var i = 0
+        while (i < len(t.methods)) {
+            if (t.methods[i].name == mname) {
+                return true
+            }
+            i = i + 1
+        }
+        false
+    }
+
+    /// The depth of `cname` inside an ancestry chain: rootmost is deepest
+    /// distance, the element itself is 0. Mirrors the Rust position math.
+fn chainDepth(chain: List<string>, cname: string) -> int {
+        var i = 0
+        while (i < len(chain)) {
+            if (chain[i] == cname) {
+                return len(chain) - 1 - i
+            }
+            i = i + 1
+        }
+        0
+    }
+
+    /// Sort dispatch candidates deepest-derived first (stable insertion sort).
+fn sortBranches(branches: List<DispatchBranchDepth>) {
+        var i = 1
+        while (i < len(branches)) {
+            var j = i
+            while (j > 0 && branches[j - 1].depth < branches[j].depth) {
+                var tmp = branches[j - 1]
+                branches[j - 1] = branches[j]
+                branches[j] = tmp
+                j = j - 1
+            }
+            i = i + 1
+        }
+    }
+
+    /// The generic-plan name behind `name`: for a materialized instantiation
+    /// like `Counter<int>` the plan name `Counter` (declarations and
+    /// initializers live under the plan key); otherwise `name` unchanged.
+fn planName(name: string) -> string {
+        var out = ""
+        for (c in name) {
+            if (c == 60) {
+                break
+            }
+            out = out + "{c as char}"
+        }
+        out
+    }
+
+    /// Collect an `#[symbol("...")]` override from an item's attributes, giving a
+    /// top-level function an exact C ABI symbol name instead of the `pkl_<name>`
+    /// default. This is what lets the ported runtime define `pickle_*` ABI
+    /// functions directly in Pickle. Returns none when absent.
+    ///
+    /// Mirrors `emit.rs::item_symbol`: only a single string literal made purely
+    /// of text parts counts. Interpolation parts yield the empty string and are
+    /// rejected, matching Rust's `StrPart::Expr(_) => String::new()`.
+    ///
+    /// This attribute was previously *validated* by `check.pkl` and then silently
+    /// ignored at emit time, so the port emitted `pkl_abiExcUncaught` where Rust
+    /// emits `pickle_exc_uncaught`. That made every ported `#[symbol]` fn unable to
+    /// override the Rust runtime archive at all - see the duplicate-resolution note
+    /// in `linklib.pkl::mergeAll`.
+fn itemSymbol(attrs: List<Attribute>) -> string? {
+        for (a in attrs) {
+            if (a.name != "symbol") {
+                continue
+            }
+            for (arg in a.args) {
+                match (arg.kind) {
+                    case ExprKind.Lit(lit) -> {
+                        match (lit) {
+                            case Lit.String(parts) -> {
+                                var plain = true
+                                var text = ""
+                                for (p in parts) {
+                                    if (let StrPart.Text(t) = p) {
+                                        text += t
+                                        true
+                                    } else {
+                                        plain = false
+                                        false
+                                    }
+                                }
+                                if (plain && text != "") {
+                                    return text
+                                }
+                            }
+                            case _ -> { false }
+                        }
+                    }
+                    case _ -> { false }
+                }
+            }
+        }
+        none
+    }
+
+    /// The runtime symbol for a top-level callable.
+fn symbolFor(name: string, isTest: bool) -> string {
+        if (isTest) {
+            return "pickle_test_" + name
+        }
+        if (name == "main") {
+            return "pickle_main"
+        }
+        "pkl_" + name
+    }
+
+    /// The IR scalar type behind a language scalar type, if any.
+fn scalarIr(t: Ty) -> IrTy? {
+        match (t) {
+            case Ty.Int -> IrTy.Int
+            case Ty.Float -> IrTy.Float
+            case Ty.Bool -> IrTy.Bool
+            case Ty.Char -> IrTy.Char
+            case Ty.Byte -> IrTy.Int
+            case _ -> none
+        }
+    }
+
+    /// The IR shape of a `T&`/`&T` referent type.
+    ///
+    /// A scalar referent (`*int`, `*float`, ...) is lowered to a MANAGED `Ptr`,
+    /// not a raw `Int`. The value is still a bare address and the ABI is
+    /// unchanged, but the home that carries it is now a shadow cell the
+    /// collector scans. That is what keeps a scalar pointer alive across a call
+    /// that may collect: `abi_list_push(list, v)` spills `list` and calls
+    /// `require_capacity`, and with a raw `Int` home the collector could not see
+    /// `list` and freed it out from under the callee (the heap write that
+    /// faulted). Lowering it as unmanaged was the port's divergence; the raw
+    /// buffer contract is unaffected because a `raw_alloc` block is outside the
+    /// registry, so scanning its address is a no-op.
+fn refIrTy(inner: Ty) -> IrTy {
+        IrTy.Ptr
+    }
+
+    /// The zero span the port uses where Rust reports `FileId(0)`.
+fn fnameSpanFallback() -> Span {
+        Span(0, 0)
+    }
+
+    /// Managed (pointer-carrying) IR types need no scalar boxing.
+fn managedIr(it: IrTy) -> bool {
+        match (it) {
+            case IrTy.Str -> true
+            case IrTy.Ptr -> true
+            case IrTy.Unit -> true
+            case _ -> false
+        }
+    }
+
+    /// Whether a match/if/if-let result needs a slot at all: only non-unit,
+    /// present result types do. Mirrors `!matches!(res_ty, Some(IrTy::Unit) |
+    /// None)` in emit.rs.
+fn matchResultNeedsSlot(resTy: IrTy?) -> bool {
+        if (let some(rt) = resTy) {
+            if (irTyTag(rt) == irTyTag(IrTy.Unit)) {
+                return false
+            }
+            return true
+        }
+        false
+    }
+
+    /// The raw IR domain a non-enum, non-string matched type lives in.
+    /// Mirrors `scalar_ir_of` in emit.rs.
+fn scalarIrOf(st: Ty) -> IrTy? {
+        match (st) {
+            case Ty.Int -> IrTy.Int
+            case Ty.Byte -> IrTy.Int
+            case Ty.Float -> IrTy.Float
+            case Ty.Bool -> IrTy.Bool
+            case Ty.Char -> IrTy.Char
+            case _ -> none
+        }
+    }
+
+    /// The tasks and synchronisation builtins, as
+    /// `(runtime symbol, argument IR types, returns, result IR type, argument
+    /// names)`. The result IR type is meaningful only when `returns` is true.
+    /// Mirrors `flat_builtin` in emit.rs.
+fn flatBuiltin(name: string) -> (string, List<IrTy>, bool, IrTy, List<string>)? {
+        match (name) {
+            case "thread_spawn" -> ("pickle_thread_spawn", [IrTy.Ptr], true, IrTy.Int, ["body"])
+            case "thread_join" -> ("pickle_thread_join", [IrTy.Int], true, IrTy.Bool, ["task"])
+            case "thread_finished" -> ("pickle_thread_finished", [IrTy.Int], true, IrTy.Bool, ["task"])
+            case "thread_message" -> ("pickle_thread_panic_message", [IrTy.Int], true, IrTy.Ptr, ["task"])
+            case "thread_count" -> ("pickle_thread_count", emptyIrTys(), true, IrTy.Int, emptyStrs())
+            case "thread_current" -> ("pickle_thread_current", emptyIrTys(), true, IrTy.Int, emptyStrs())
+            case "sleep_ms" -> ("pickle_thread_sleep_ms", [IrTy.Int], false, IrTy.Int, ["ms"])
+            case "thread_yield" -> ("pickle_thread_yield", emptyIrTys(), false, IrTy.Int, emptyStrs())
+            // Win32 import: `Sleep` (`VOID Sleep(DWORD)`), so a `#[symbol]`
+            // body can occupy `pickle_thread_sleep_ms` with wall-clock sleep
+            // and no Rust shim.
+            case "win_sleep" -> ("__imp_Sleep", [IrTy.Int], false, IrTy.Int, ["ms"])
+            // Win32 import. `__imp_` is the MSVC import-symbol prefix, and
+            // the backend treats that prefix as "resolve me from a system
+            // DLL" rather than "find me in the runtime archive".
+            case "win_thread_id" -> ("__imp_GetCurrentThreadId", emptyIrTys(), true, IrTy.Int, emptyStrs())
+            case "win_tls_alloc" -> ("__imp_TlsAlloc", emptyIrTys(), true, IrTy.Int, emptyStrs())
+            case "win_tls_get" -> ("__imp_TlsGetValue", [IrTy.Int], true, IrTy.Int, ["slot"])
+            case "win_tls_set" -> ("__imp_TlsSetValue", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["slot", "value"])
+            // Process termination, reachable as an import so a `#[symbol]`
+            // body can own the `pickle_exit` slot. No return: the Win32
+            // prototype is `VOID ExitProcess(UINT)`.
+                case "win_exit" -> ("__imp_ExitProcess", [IrTy.Int], false, IrTy.Int, ["code"])
+                // The process heap, reachable as an import triple so a `#[symbol]`
+                // body can own the `pickle_raw_alloc` / `pickle_raw_free` slots.
+                // All three are KERNEL32 exports, and `HeapAlloc` on
+                // `GetProcessHeap()` with zero flags is what Rust's `System`
+                // allocator lowers to on Windows - so a block handed out by one
+                // side and released by the other stays valid even if only one
+                // half of the pair ends up ported.
+                case "win_get_process_heap" -> ("__imp_GetProcessHeap", emptyIrTys(), true, IrTy.Int, emptyStrs())
+                case "win_heap_alloc" -> ("__imp_HeapAlloc", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["heap", "flags", "size"])
+                // Void rather than the Win32 `BOOL`: the caller has no use for
+                // the answer, and reading a 32-bit `BOOL` back as a 64-bit `Int`
+                // would depend on the upper half happening to be zero.
+                case "win_heap_free" -> ("__imp_HeapFree", [IrTy.Int, IrTy.Int, IrTy.Int], false, IrTy.Int, ["heap", "flags", "ptr"])
+                // The filesystem entry points, so a `#[symbol]` body can own
+                // the whole `fs.rs` surface. All are KERNEL32, which is what
+                // `win_import_addr` and `pelink::isShellImp` already assume for
+                // any `__imp_` other than `CommandLineToArgvW`.
+                case "win_get_file_attributes_w" -> ("__imp_GetFileAttributesW", [IrTy.Int], true, IrTy.Int, ["path"])
+                case "win_delete_file_w" -> ("__imp_DeleteFileW", [IrTy.Int], true, IrTy.Int, ["path"])
+                case "win_remove_directory_w" -> ("__imp_RemoveDirectoryW", [IrTy.Int], true, IrTy.Int, ["path"])
+                case "win_create_directory_w" -> ("__imp_CreateDirectoryW", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["path", "sec"])
+                // `(0, NULL)` is the sizing call: it returns the UTF-16 units a
+                // real call would need, counting the terminator.
+                case "win_get_current_directory_w" -> ("__imp_GetCurrentDirectoryW", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["cap", "buf"])
+                case "win_create_file_w" -> ("__imp_CreateFileW", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["name", "access", "share", "sec", "disp", "flags", "tmpl"])
+                case "win_read_file" -> ("__imp_ReadFile", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["handle", "buf", "n", "pRead", "ov"])
+                case "win_write_file" -> ("__imp_WriteFile", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["handle", "buf", "n", "pWritten", "ov"])
+                case "win_close_handle" -> ("__imp_CloseHandle", [IrTy.Int], true, IrTy.Int, ["handle"])
+                case "win_find_first_file_w" -> ("__imp_FindFirstFileW", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["pattern", "data"])
+                case "win_find_next_file_w" -> ("__imp_FindNextFileW", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["handle", "data"])
+                case "win_find_close" -> ("__imp_FindClose", [IrTy.Int], true, IrTy.Int, ["handle"])
+                case "win_get_std_handle" -> ("__imp_GetStdHandle", [IrTy.Int], true, IrTy.Int, ["which"])
+                // The command line, so a `#[symbol]` body can own the
+                // `pickle_args` slot: `GetCommandLineW` (KERNEL32) hands back
+                // the process's UTF-16 line, `CommandLineToArgvW` (SHELL32 -
+                // the one name `pelink::isShellImp` routes apart from
+                // KERNEL32) splits it into a null-terminated `LPWSTR*`, and
+                // `LocalFree` (KERNEL32) releases that block. The split takes
+                // a second, out argument - a count slot - which it requires
+                // to be a writable address; a program that never reads the
+                // count still has to supply the slot, or the call returns
+                // null as if the parse had failed. Void result so
+                // the answer, which nobody reads, never has to agree with the
+                // upper half of a 64-bit `Int`.
+                case "win_get_command_line_w" -> ("__imp_GetCommandLineW", emptyIrTys(), true, IrTy.Int, emptyStrs())
+                case "win_command_line_to_argv_w" -> ("__imp_CommandLineToArgvW", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["cmdline", "pargs"])
+                case "win_local_free" -> ("__imp_LocalFree", [IrTy.Int], false, IrTy.Int, ["mem"])
+                // Process spawning for `run_cmd`. Every parameter is a raw
+                // `Int`: pointers, counts, and Win32 `BOOL`s all arrive as
+                // machine words at the `CreateProcessW` boundary, and the
+                // body is the only caller, so it passes 0/1 integers for the
+                // inherit flag. See the comment in `resolve.pkl`.
+                case "win_create_process_w" -> ("__imp_CreateProcessW", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["app", "cmdline", "procAttr", "threadAttr", "inherit", "flags", "env", "cwd", "si", "pi"])
+                case "win_create_pipe" -> ("__imp_CreatePipe", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["pRead", "pWrite", "sec", "size"])
+                case "win_set_handle_information" -> ("__imp_SetHandleInformation", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["handle", "mask", "flags"])
+                case "win_wait_single" -> ("__imp_WaitForSingleObject", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["handle", "ms"])
+                case "win_get_exit_code_process" -> ("__imp_GetExitCodeProcess", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["handle", "pCode"])
+                case "win_terminate_process" -> ("__imp_TerminateProcess", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["handle", "code"])
+                case "win_peek_pipe" -> ("__imp_PeekNamedPipe", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["handle", "buf", "n", "pRead", "pAvail"])
+                case "win_get_environment_strings_w" -> ("__imp_GetEnvironmentStringsW", emptyIrTys(), true, IrTy.Int, emptyStrs())
+                case "win_free_environment_strings_w" -> ("__imp_FreeEnvironmentStringsW", [IrTy.Int], true, IrTy.Int, ["block"])
+                case "win_get_module_file_name_w" -> ("__imp_GetModuleFileNameW", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["module", "buf", "size"])
+                case "win_get_system_directory_w" -> ("__imp_GetSystemDirectoryW", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["buf", "size"])
+                case "win_get_windows_directory_w" -> ("__imp_GetWindowsDirectoryW", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["buf", "size"])
+                case "win_tick_ms64" -> ("__imp_GetTickCount64", emptyIrTys(), true, IrTy.Int, emptyStrs())
+            case "mutex_new" -> ("pickle_mutex_new", emptyIrTys(), true, IrTy.Int, emptyStrs())
+            case "mutex_lock" -> ("pickle_mutex_lock", [IrTy.Int], false, IrTy.Int, ["m"])
+            case "mutex_trylock" -> ("pickle_mutex_trylock", [IrTy.Int], true, IrTy.Bool, ["m"])
+            case "mutex_unlock" -> ("pickle_mutex_unlock", [IrTy.Int], false, IrTy.Int, ["m"])
+            case "cond_new" -> ("pickle_cond_new", emptyIrTys(), true, IrTy.Int, emptyStrs())
+            case "cond_signal" -> ("pickle_cond_signal", [IrTy.Int], false, IrTy.Int, ["c"])
+            case "cond_broadcast" -> ("pickle_cond_broadcast", [IrTy.Int], false, IrTy.Int, ["c"])
+            case "cond_wait" -> ("pickle_cond_wait", [IrTy.Int, IrTy.Int], false, IrTy.Int, ["c", "m"])
+            case "sem_new" -> ("pickle_sem_new", [IrTy.Int], true, IrTy.Int, ["permits"])
+            case "sem_acquire" -> ("pickle_sem_acquire", [IrTy.Int, IrTy.Int], false, IrTy.Int, ["s", "n"])
+            case "sem_try_acquire" -> ("pickle_sem_try_acquire", [IrTy.Int, IrTy.Int], true, IrTy.Bool, ["s", "n"])
+            case "sem_release" -> ("pickle_sem_release", [IrTy.Int, IrTy.Int], false, IrTy.Int, ["s", "n"])
+            case "atomic_new" -> ("pickle_atomic_new", [IrTy.Int], true, IrTy.Int, ["value"])
+            case "atomic_load" -> ("pickle_atomic_load", [IrTy.Int], true, IrTy.Int, ["a"])
+            case "atomic_store" -> ("pickle_atomic_store", [IrTy.Int, IrTy.Int], false, IrTy.Int, ["a", "value"])
+            case "atomic_add" -> ("pickle_atomic_add", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["a", "delta"])
+            case "atomic_cas" -> ("pickle_atomic_cas", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Bool, ["a", "expected", "value"])
+case "once_new" -> ("pickle_once_new", emptyIrTys(), true, IrTy.Int, emptyStrs())
+        case "once_done" -> ("pickle_once_done", [IrTy.Int], true, IrTy.Bool, ["o"])
+        case "once_run" -> ("pickle_once_run", [IrTy.Int, IrTy.Ptr], true, IrTy.Bool, ["o", "body"])
+        case "channel_new" -> ("pickle_channel_new", [IrTy.Int], true, IrTy.Int, ["cap"])
+        case "channel_cap" -> ("pickle_channel_cap", [IrTy.Int], true, IrTy.Int, ["ch"])
+        case "channel_len" -> ("pickle_channel_len", [IrTy.Int], true, IrTy.Int, ["ch"])
+        case "channel_send" -> ("pickle_channel_send", [IrTy.Int, IrTy.Int], false, IrTy.Int, ["ch", "value"])
+        case "channel_try_send" -> ("pickle_channel_try_send", [IrTy.Int, IrTy.Int], true, IrTy.Bool, ["ch", "value"])
+        case "channel_recv" -> ("pickle_channel_recv", [IrTy.Int], true, IrTy.Int, ["ch"])
+        case "channel_try_recv" -> ("pickle_channel_try_recv", [IrTy.Int], true, IrTy.Ptr, ["ch"])
+        case "channel_close" -> ("pickle_channel_close", [IrTy.Int], false, IrTy.Int, ["ch"])
+        case "channel_closed" -> ("pickle_channel_closed", [IrTy.Int], true, IrTy.Bool, ["ch"])
+          // Bit-reinterpret and class-name primitives. Both exist for the
+          // `pickle_print_obj` port in `runtime/abi_console.pkl`.
+          //
+          // `f64FromBits` has no source-level spelling: `x as float` is a
+          // *numeric* conversion, not a bitcast (verified - `1072693248 as
+          // float` yields `1072693248`, not `0.5`). It is the exact inverse of
+          // the boxing side, which stores `v.to_bits()`.
+          //
+          // `className` is the user-class fallback arm's lookup: the collector
+          // holds the descriptor name table, and without a symbol the arm had
+          // nothing to call. Returns a `string` object or `none`.
+          case "f64FromBits" -> ("pickle_f64_from_bits", [IrTy.Int], true, IrTy.Float, ["bits"])
+          case "className" -> ("pickle_class_name", [IrTy.Int], true, IrTy.Ptr, ["classId"])
+        // Garbage collection. `bool` crosses the ABI as the C `bool` the
+        // runtime extern takes, so it needs no boxing.
+        case "gcCollect" -> ("pickle_gc_collect", [IrTy.Bool], false, IrTy.Int, ["force"])
+        // Observable GC contract: the counters/threshold that make the
+        // auto-collect decision drivable from Pickle (gc.rs:714/720/727).
+        // All three return/take `u32` across the ABI, so `Int` unboxed.
+        case "gcAllocationsSinceGc" -> ("pickle_gc_allocations_since_gc", emptyIrTys(), true, IrTy.Int, emptyStrs())
+        case "gcBytesSinceGc" -> ("pickle_gc_bytes_since_gc", emptyIrTys(), true, IrTy.Int, emptyStrs())
+        case "gcCollectionCount" -> ("pickle_gc_collection_count", emptyIrTys(), true, IrTy.Int, emptyStrs())
+        case "gcSetThreshold" -> ("pickle_gc_set_threshold", [IrTy.Int], false, IrTy.Int, ["bytes"])
+            case _ -> none
+        }
+    }
+
+    /// Sort interface-dispatch candidates deepest-derived first, then by
+    /// ascending class id (stable insertion sort). Mirrors Rust's
+    /// `sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)))`.
+fn sortIfaceBranches(branches: List<IfaceDepthBranch>) {
+        var i = 1
+        while (i < len(branches)) {
+            var j = i
+            while (j > 0) {
+                var prev = branches[j - 1]
+                var b = branches[j]
+                var swap = prev.depth < b.depth || (prev.depth == b.depth && prev.cid > b.cid)
+                if (!swap) {
+                    break
+                }
+                branches[j - 1] = b
+                branches[j] = prev
+                j = j - 1
+            }
+            i = i + 1
+        }
+    }
+
