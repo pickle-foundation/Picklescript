@@ -1,0 +1,254 @@
+// PickleScript compiler: the Emitter state object.
+// ALL emitter mutable state (fields + ctor), NO methods: lowering lives
+// in emitcore.pkl as free fns over `em: Emitter` (family modules import
+// this type one-way; emit imports emitcore + emittypes).
+module compiler.emittypes
+
+import * from compiler.ast
+import { Span, Diagnostic, DiagnosticSink } from compiler.diag
+import { IrBlock, IrFunc, IrGlobal, IrModule, IrParam, IrTy, emptyIrBlocks, emptyIrGlobals, emptyIrParams, emptyIrTys, emptyModule, irTyStr, irxParseFloat } from compiler.ir
+import { CallableInfo, ClassTable, CtorInfo, EnumTable, FieldInfo, ParamInfo, PropertyInfo, ResolvedProgram, TypeTableEntry, entryGenerics } from compiler.resolve
+import { collectExprTypes, containsStr, isNoneStr, spanKey } from compiler.check
+import * from compiler.ty
+import { f64ToBits } from compiler.x64
+import * from compiler.emitutil
+
+// ---- the emitter ---------------------------------------------------------
+
+/// The compiler's IR emitter: walks the checked AST, lowers every expression
+/// and statement to flat block/slot/temp IR, and assembles the `IrModule`.
+/// Mirrors `struct Emitter` in emit.rs (the compound-key maps Rust models as
+/// `HashMap<(A, B), _>` become single-string-key maps via `pairKey` etc.).
+class Emitter {
+    var prog: Program
+    var resolved: ResolvedProgram
+    var diags: DiagnosticSink
+var types: Map<string, Ty>
+    var irModule: IrModule
+    var strIds: Map<string, int>
+    var constsInits: Map<string, Expr>
+    /// Top-level `var` name -> global id. Kept separate from `constsInits`
+    /// because a global is *not* inlined: it becomes a data symbol.
+    var globalIds: Map<string, int>
+    var globalDecls: Map<string, GlobalDecl>
+    /// Globals whose init could not be reduced to bytes, for diagnostics.
+    var globalFailures: List<GlobalFailure>
+    var classConsts: Map<string, ClassConst>
+    var constInlining: List<string>
+    var fidList: List<int>
+    var fsource: Map<int, FnSource>
+    var finfo: Map<int, CallableInfo>
+    var srcParamTys: Map<int, List<Ty>>
+    var fnDecls: Map<string, FnDecl>
+    var instantiations: Map<string, int>
+    var instantonSubst: Map<int, Map<string, Ty>>
+    var classes: List<ClassPlan>
+    var classByName: Map<string, int>
+    var classDecls: Map<string, ClassDecl>
+    var genericTypeMembers: Map<string, List<ClassMember>>
+    var structMembers: Map<string, List<ClassMember>>
+    var classInstByArgs: Map<string, int>
+    var classInstSubst: Map<int, Map<string, Ty>>
+    var fidOwner: Map<int, int>
+    var fidGenerics: Map<int, List<string>>
+    var genericCtxName: string?
+    var genericFnCtx: string?
+    var classAttempted: List<string>
+    var ctorIds: Map<int, int>
+    var namedCtorIds: Map<string, int>
+    var deinitIds: Map<int, int>
+    var methodIds: Map<string, MethodRef>
+    var methodSeq: List<MethodEntry>
+    var virtualDispatch: Map<string, List<DispatchBranch>>
+    var nextIfaceId: int
+    var ifaceInstIds: Map<string, int>
+    var ifaceMembers: Map<int, List<IfaceMember>>
+    var classIfaceBuckets: Map<int, List<IfaceBucket>>
+    var propertyIds: Map<string, int>
+    var staticPropertyIds: Map<string, int>
+    var propertySeq: List<PropertyEntry>
+    var staticPropSeq: List<PropertyEntry>
+    var staticInits: List<StaticInitEntry>
+    var staticInitId: int?
+    var globalsInitId: int?
+    var managedGlobalInits: List<ManagedGlobalInit>
+    var testSetupId: int?
+    /// Â§17.1 split-link options. `cidSalt` offsets this object's user class
+    /// ids so that when several objects link into one exe, each object's
+    /// compile-time class table matches the order `pickle_class_register`
+    /// actually assigns at run time (program first, then members in link
+    /// order). `moduleSetupSymbol`, when non-empty, synthesizes a callable
+    /// function carrying this object's registration/globals/static preamble â€”
+    /// a module with no `main` has nowhere else to hang it. `extraSetups`
+    /// names peer objects' setup functions; they are called from this
+    /// object's preamble after globals are rooted and before static
+    /// initializers run.
+    var cidSalt: int
+    var moduleSetupSymbol: string
+    var extraSetups: List<string>
+    var owner: int?
+    var closureTables: Map<string, ClassTable>
+    var lambdaFids: Map<string, int>
+    var lambdaCaps: Map<string, List<Capture>>
+    var lambdaOwners: Map<string, int?>
+    var lambdaExprs: Map<string, Expr>
+    var collectWrites: bool
+    var nextClosure: int
+    /// ABI symbols this module declared with `#[symbol("...")]`, recorded as
+    /// each top-level callable is registered (the only place the attribute is
+    /// still in hand). This is the set the linker hands to `linkExe` as
+    /// `progOverrides` so a program definition displaces the archive body of
+    /// the same name. It deliberately excludes every compiler-synthesized
+    /// symbol (closures `pkl_closure_N`, methods, ctors, trampolines, ...):
+    /// those are derived from the emitter's own naming, not from an attribute,
+    /// and a symbol like `pkl_closure_0` legitimately exists in both a program
+    /// and a runtime member. Reading symbols back off the IR cannot tell the
+    /// two apart, which is why the set is captured here instead.
+    var overrides: List<string>
+var trampFids: Map<int, int>
+    var methodTrampFids: Map<string, int>
+    var spreadTramps: Map<int, int>
+    var fnTramp: Map<string, int>
+    var fname: string
+    var symbol: string
+    var currentSubst: Map<string, Ty>
+    var currentFid: int?
+    var fnGenerics: List<string>
+    var fparams: List<IrParam>
+    var fret: IrTy
+    var fslots: List<IrTy>
+    var env: List<Map<string, int>>
+    var manualEnv: List<Map<string, bool>>
+    var blocks: List<IrBlock>
+    var cur: int
+    var nextBlock: int
+    var nextTemp: int
+    var loops: List<LoopCtx>
+var failed: bool
+    var iceDepth: int
+    var icePath: List<string>
+    // ---- exception lowering ---------------------------------------------
+    // `finally` bodies owed on the way out of the current block, outermost
+    // first. A `return`/`break`/`continue`/`throw` runs them all, innermost
+    // last, before it actually leaves.
+    var finallys: List<Block>
+    // The `catch`es in scope for the code being emitted, innermost last. A
+    // `throw` here branches straight to the last one.
+    var handlers: List<HandlerCtx>
+    // Set while emitting a `finally` on a path that a throw is already
+    // travelling down. The pending flag is still set there, so a propagation
+    // check would see the throw we are transferring on and divert straight to
+    // the handler, skipping the `finally`s that are still owed.
+    var inThrowTransfer: bool
+    // Pass 1 of two: lower every body with the propagation checks suppressed,
+    // purely to record call edges and which bodies contain a `throw`.
+    var analyzing: bool
+    // `Map<int, bool>` rather than a set: the self-hosted language has no
+    // `Set`, and membership is all this needs.
+    var directThrow: Map<int, bool>
+    var callEdges: Map<int, List<int>>
+    var mayThrow: Map<int, bool>
+    var progMayThrow: bool
+    var currentBuildFid: int?
+    // Diagnostics found during pass 1, replayed if pass 2 never runs.
+    var suppressed: List<Diagnostic>
+    var iceSeq: List<string>
+
+    constructor(prog: Program, resolved: ResolvedProgram, diags: DiagnosticSink, types: Map<string, Ty>) {
+        this.prog = prog
+        this.resolved = resolved
+        this.diags = diags
+        this.types = types
+        this.irModule = emptyModule()
+        this.strIds = emptyStringIntMap()
+        this.constsInits = emptyExprMap()
+        this.globalIds = emptyStringIntMap()
+        this.globalDecls = emptyGlobalDeclMap()
+        this.globalFailures = emptyGlobalFailures()
+        this.classConsts = emptyClassConstMap()
+        this.constInlining = emptyStrs()
+        this.fidList = emptyInts()
+        this.fsource = emptyFnSourceMap()
+        this.finfo = emptyCallableInfoMap()
+        this.srcParamTys = emptyIntTyListMap()
+        this.fnDecls = emptyFnDeclMap()
+        this.instantiations = emptyStringIntMap()
+        this.instantonSubst = emptyIntSubstMap()
+        this.classes = emptyClassPlans()
+        this.classByName = emptyStringIntMap()
+        this.classDecls = emptyClassDeclMap()
+        this.genericTypeMembers = emptyMemberListMap()
+        this.structMembers = emptyMemberListMap()
+        this.classInstByArgs = emptyStringIntMap()
+        this.classInstSubst = emptyIntSubstMap()
+        this.fidOwner = emptyIntIntMap()
+        this.fidGenerics = emptyIntStrListMap()
+        this.genericCtxName = none
+        this.genericFnCtx = none
+        this.classAttempted = emptyStrs()
+        this.ctorIds = emptyIntIntMap()
+        this.namedCtorIds = emptyStringIntMap()
+        this.deinitIds = emptyIntIntMap()
+        this.methodIds = emptyMethodRefMap()
+        this.methodSeq = emptyMethodEntries()
+        this.virtualDispatch = emptyDispatchMap()
+        this.nextIfaceId = 1
+        this.ifaceInstIds = emptyStringIntMap()
+        this.ifaceMembers = emptyIfaceMemberMap()
+        this.classIfaceBuckets = emptyIfaceBucketMap()
+        this.propertyIds = emptyStringIntMap()
+        this.staticPropertyIds = emptyStringIntMap()
+        this.propertySeq = emptyPropertyEntries()
+        this.staticPropSeq = emptyPropertyEntries()
+        this.staticInits = emptyStaticInitEntries()
+        this.staticInitId = none
+        this.globalsInitId = none
+        this.managedGlobalInits = emptyManagedGlobalInits()
+        this.testSetupId = none
+        this.cidSalt = 0
+        this.moduleSetupSymbol = ""
+        this.extraSetups = emptyStrs()
+        this.owner = none
+        this.closureTables = emptyClassTableMap()
+        this.lambdaFids = emptyStringIntMap()
+        this.lambdaCaps = emptyCaptureListMap()
+        this.lambdaOwners = emptyStringIntOptMap()
+        this.lambdaExprs = emptyExprMap()
+        this.collectWrites = false
+        this.nextClosure = 0
+        this.overrides = emptyStrs()
+this.trampFids = emptyIntIntMap()
+        this.methodTrampFids = emptyStringIntMap()
+        this.spreadTramps = emptyIntIntMap()
+        this.fnTramp = emptyStringIntMap()
+        this.fname = ""
+        this.symbol = ""
+        this.currentSubst = emptyStringTyMap()
+        this.currentFid = none
+        this.fnGenerics = emptyStrs()
+        this.fparams = emptyIrParams()
+        this.fret = IrTy.Unit
+        this.fslots = emptyIrTys()
+        this.env = emptyIntScopeMap()
+        this.manualEnv = emptyScopeMaps()
+        this.blocks = emptyIrBlocks()
+        this.cur = 0
+        this.nextBlock = 0
+        this.nextTemp = 0
+        this.loops = emptyLoopCtxs()
+this.failed = false
+        this.iceDepth = 0
+        this.icePath = emptyStrs()
+        this.iceSeq = emptyStrs()
+        this.finallys = emptyBlocks()
+        this.handlers = emptyHandlerCtxs()
+        this.inThrowTransfer = false
+        this.analyzing = false
+        this.directThrow = emptyIntBoolMap()
+        this.callEdges = emptyIntIntListMap()
+        this.mayThrow = emptyIntBoolMap()
+        this.progMayThrow = false
+        this.currentBuildFid = none
+        this.suppressed = emptyDiagnostics()
+    }
+}
