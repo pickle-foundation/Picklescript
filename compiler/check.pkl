@@ -251,6 +251,8 @@ fn classifyMessage(msg: string) -> string? {
         ["`free(p)` takes one argument", "E0440"],
         ["`free` expects a pointer argument", "E0440"],
         ["`free()` takes no arguments", "E0440"],
+        ["`view(obj)` takes one argument", "E0440"],
+        ["`view` needs a managed value", "E0440"],
         ["may only be used inside an `unsafe` block", "E0520"],
         ["type mismatch in ", "E0308"],
         ["cannot return a value from a function with no return type", "E0310"],
@@ -2897,6 +2899,9 @@ class Checker {
             if (bn == "alloc" || bn == "free") {
                 return this.checkRawBuiltin(e, bn, args)
             }
+            if (bn == "view") {
+                return this.checkView(e, args)
+            }
             if (bn == "assert") {
                 return this.checkAssert(e, args)
             }
@@ -3265,6 +3270,43 @@ class Checker {
                 Ty.Unknown
             }
         }
+    }
+
+    /// The `view(obj)` byte-view form: a managed object's machine address,
+    /// typed as a raw `*int`. Unsafe-gated like `alloc`/`free`; the argument
+    /// must be an allocated value (another managed slot stays the owner - a
+    /// view does not root anything by itself).
+    fn checkView( e: Expr, args: List<CallArg>) -> Ty {
+        if (this.unsafeDepth == 0) {
+            this.err(e.span, "view may only be used inside an `unsafe` block")
+        }
+        if (len(args) != 1) {
+            this.err(e.span, "`view(obj)` takes one argument")
+            for (a in args) {
+                let _ = this.checkExpr(a.value)
+            }
+            return Ty.Ptr(Ty.Int)
+        }
+        let ot = this.checkExpr(args[0].value)
+        let supported = match (ot) {
+            case Ty.String -> true
+            case Ty.List(_) -> true
+            case Ty.Map(_, _) -> true
+            case Ty.Tuple(_) -> true
+            case Ty.Class(_, _) -> true
+            case Ty.Struct(_, _) -> true
+            case Ty.Enum(_, _) -> true
+            case Ty.Interface(_, _) -> true
+            case Ty.Option(_) -> true
+            case Ty.Range(_) -> true
+            case Ty.Stream -> true
+            case _ -> false
+        }
+        if (!supported) {
+            this.err(args[0].value.span, "`view` needs a managed value; `{bareName(ot)}` has no object bytes")
+            return Ty.Ptr(Ty.Int)
+        }
+        return Ty.Ptr(Ty.Int)
     }
 
     fn checkRawBuiltin( e: Expr, name: string, args: List<CallArg>) -> Ty {

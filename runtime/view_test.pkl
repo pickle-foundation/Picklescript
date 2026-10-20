@@ -1,0 +1,78 @@
+module runtime.view_test
+
+import { PICKLE_CLASS_LIST } from runtime.object
+import { abiGcCollect } from runtime.abi_gc
+
+/// `view(obj)` hands back a managed object's machine address as a raw `*int`.
+/// These tests observe it through the documented object layout: header words
+/// `[0]=0, [1]=class_id, [2]=byte_size`, payload starts at word 3 (`HEADER` =
+/// 24 bytes); a string's byte length sits in word 3 and its inline UTF-8
+/// bytes from word 4 (byte 32). The owner value stays reachable and the
+/// collector is non-moving, so an address observed through `view` remains
+/// valid for the whole owning scope - that is what the last test below pins.
+
+test fn view_of_a_string_reads_its_object_header_and_payload() {
+    // A string value is a PString object sized `align8(32 + n)`: for "ab" that
+    // is 40 bytes, byte length 2 in word 3, and bytes packed little-endian
+    // into words from word 4 ('a' = 97, 'b' = 98).
+    let s = "ab"
+    unsafe {
+        expect(view(s)[2]).toBe(40)
+        expect(view(s)[3]).toBe(2)
+        expect((view(s)[4] & 255)).toBe(97)
+        expect(((view(s)[4] >> 8) & 255)).toBe(98)
+        // The form is evaluated at emit time and has no runtime call: two
+        // views of the same value name the same address, never a copy.
+        let a = view(s) as int
+        let b = view(s) as int
+        expect(a).toBe(b)
+    }
+}
+
+test fn view_is_the_object_itself_not_a_copy() {
+    // A list literal built by `pickle_list_new` has class id
+    // `PICKLE_CLASS_LIST`, byte size 48 (`LIST_BYTES`), and its length word
+    // tracks pushes. A push through the owner value must be visible through
+    // an address taken before it.
+    unsafe {
+        let l = [1]
+        let p = view(l)
+        expect(p[1]).toBe(PICKLE_CLASS_LIST)
+        expect(p[2]).toBe(48)
+        expect(p[3]).toBe(1)
+        l.push(2)
+        expect(p[3]).toBe(2)
+        // The element-span pointer survived the read: `view(l)` named the
+        // same object `l` names, and dispatching through the raw address is
+        // just an alias of the managed value's own header.
+        let data = ((view(l)[5]) as int) != 0
+        expect(data).toBe(true)
+    }
+}
+
+test fn separate_objects_have_separate_views() {
+    // Two separately built lists are distinct allocations; if `view` showed
+    // anything other than each object's own address, they would collide.
+    unsafe {
+        let a = [1]
+        let b = [2]
+        let pa = view(a) as int
+        let pb = view(b) as int
+        expect(pa != pb).toBe(true)
+    }
+}
+
+test fn a_view_stays_valid_across_a_collect() {
+    // The owner keeps the object reachable and the collector does not move
+    // objects, so a full collect between the view and every use must neither
+    // free nor move the address - including pushes the owner makes later.
+    unsafe {
+        let l = [1]
+        l.push(2)
+        let p = view(l)
+        abiGcCollect(true)
+        expect(p[3]).toBe(2)
+        l.push(3)
+        expect(p[3]).toBe(3)
+    }
+}

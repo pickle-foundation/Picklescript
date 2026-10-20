@@ -400,3 +400,37 @@ test fn logical_chains_are_checked_once_per_operand() {
     let msgs = checkSource(src)
     expect(len(msgs)).toBe(0)
 }
+
+// ---- `view(obj)` byte-view form -----------------------------------------------
+//
+// `view(obj)` re-types a managed value as a raw `*int` (its machine address).
+// Unsafe-gated exactly like alloc/free; the operand must have object bytes, so
+// scalar payloads error; and the happy path checks clean. Statements are
+// newline-separated: the parser does not chain statements on one line.
+
+test fn view_gates_arity_and_operand_type() {
+    let ob = obrace()
+    let cb = cbrace()
+    let q = quote()
+
+    // Outside `unsafe`, the gate errors exactly once, with nothing else.
+    let msgs = checkSource("fn main() " + ob + "\n let l = [1] \n let x = view(l) \n " + cb)
+    expect(len(msgs)).toBe(1)
+    expect(countContaining(msgs, "unsafe")).toBe(1)
+
+    // One argument, or the arity error (and nothing else).
+    let msgs = checkSource("fn main() " + ob + " unsafe " + ob + "\n let l = [1] \n let x = view(l, l) \n " + cb + cb)
+    expect(len(msgs)).toBe(1)
+    expect(countContaining(msgs, "takes one argument")).toBe(1)
+    expect(classifyMessage("`view(obj)` takes one argument")).toBe("E0440")
+
+    // The operand must have object bytes: scalars do not.
+    let msgs = checkSource("fn main() " + ob + " unsafe " + ob + "\n let x = view(5) \n " + cb + cb)
+    expect(len(msgs)).toBe(1)
+    expect(countContaining(msgs, "`view` needs a managed value")).toBe(1)
+    expect(classifyMessage("`view` needs a managed value; `int` has no object bytes")).toBe("E0440")
+
+    // Managed operands check clean - a list and a string alike.
+    let msgs = checkSource("fn main() " + ob + " unsafe " + ob + "\n let l = [1] \n let s = " + q + "hi" + q + " \n let a = view(l) \n let b = view(s) \n " + cb + cb)
+    expect(len(msgs)).toBe(0)
+}
