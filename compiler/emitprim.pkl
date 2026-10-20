@@ -1,0 +1,401 @@
+// PickleScript compiler: the emitter's pervasive primitive layer.
+// The 36 smallest, highest-fan-in lowering helpers (IR temps/consts, block
+// scope plumbing, extern-call shims, diagnostics) that every other emit
+// module builds on. Depends only on emitutil/emittypes and the leaf phase
+// modules, so family modules carved out of emitcore may import this one-way.
+module compiler.emitprim
+
+import * from compiler.ast
+import { Span, Diagnostic, DiagnosticSink } from compiler.diag
+import { IrBinOp, IrBlock, IrConst, IrExtern, IrInstr, IrTerm, IrTy, emptyIrInstrs } from compiler.ir
+import * from compiler.ty
+import { f64ToBits } from compiler.x64
+import * from compiler.emitutil
+import { Emitter } from compiler.emittypes
+
+    /// A symbol unique among the already-pushed module functions.
+fn uniqSymbol(em: Emitter, base: string) -> string {
+        var symbol = base
+        var n = 0
+        var taken = true
+        while (taken) {
+            taken = false
+            for (f in em.irModule.funcs) {
+                if (f.symbol == symbol) {
+                    taken = true
+                    break
+                }
+            }
+            if (taken) {
+                n = n + 1
+                symbol = base + "_v" + str(n)
+            }
+        }
+        symbol
+    }
+
+fn bad(em: Emitter, span: Span, msg: string) -> bool {
+        em.failed = true
+        var d = Diagnostic.errorAt(span, "codegen: " + msg)
+        if (containsStr(msg, "not lowered yet")) {
+            d = d.withCode("E0900")
+        }
+        report(em, d)
+        false
+    }
+
+fn badSpanNote(em: Emitter, msg: string) -> bool {
+        em.failed = true
+        var d = Diagnostic.errorAt(Span(0, 0), "codegen: " + msg)
+        if (containsStr(msg, "not lowered yet")) {
+            d = d.withCode("E0900")
+        }
+        report(em, d)
+        false
+    }
+
+    /// Hand a diagnostic to the sink, unless pass 1 is still running.
+    ///
+    /// Pass 1 exists only to measure call edges, so anything it has to say is
+    /// either going to be said again by pass 2 or never true. Buffering keeps a
+    /// diagnostic from being emitted twice in the case where pass 1 both reports
+    /// it and fails: `emit` replays the buffer and returns without running pass 2.
+    /// A pass 1 that reports nothing still clears the buffer, since a clean
+    /// pass 1 means there was nothing to hold on to.
+fn report(em: Emitter, d: Diagnostic) {
+        if (em.analyzing) {
+            em.suppressed.push(d)
+        } else {
+            em.diags.emit(d)
+        }
+    }
+
+    /// The inferred type of an expression span, substituted through the active
+    /// generic instantiation.
+fn tyOf(em: Emitter, span: Span) -> Ty? {
+        if (let some(t) = em.types.get(spanKey(span))) {
+            return substTy(em, t)
+        }
+        none
+    }
+
+    /// Apply the active generic-parameter substitution to an inferred type.
+    /// No-op outside instantiated generic bodies.
+fn substTy(em: Emitter, ty: Ty) -> Ty {
+        if (len(em.currentSubst) == 0) {
+            return ty
+        }
+        subst(ty, em.currentSubst)
+    }
+
+/// Lower a checked type to its IR type.
+fn mapTy(em: Emitter, t: Ty, span: Span) -> IrTy? {
+        match (t) {
+            case Ty.Bool -> IrTy.Bool
+            case Ty.Char -> IrTy.Char
+            case Ty.Byte -> IrTy.Int
+            case Ty.Int -> IrTy.Int
+            case Ty.Float -> IrTy.Float
+            case Ty.String -> IrTy.Str
+            case Ty.None | Ty.Empty -> IrTy.Unit
+            case Ty.Ptr(inner) -> refIrTy(inner)
+            case Ty.Ref(inner) -> refIrTy(inner)
+            case Ty.Fn(_, _) -> IrTy.Ptr
+            case Ty.Option(_) | Ty.Class(_, _) | Ty.Struct(_, _) | Ty.Enum(_, _) | Ty.Interface(_, _) | Ty.List(_) | Ty.Map(_, _) | Ty.Tuple(_) | Ty.Range(_) | Ty.Stream -> IrTy.Ptr
+            case Ty.Unknown -> {
+                bad(em, span, "untyped expression cannot be lowered")
+                none
+            }
+            case Ty.Var(_) -> {
+                bad(em, span, "generic functions are not lowered yet")
+                none
+            }
+        }
+    }
+
+    /// Lower the inferred type of an expression span.
+fn irty(em: Emitter, span: Span) -> IrTy? {
+        if (let some(t) = tyOf(em, span)) {
+            return mapTy(em, t, span)
+        }
+        bad(em, span, "no inferred type available for this expression")
+        none
+    }
+
+fn ensureInt(em: Emitter, e: Expr) -> bool {
+        match (tyOf(em, e.span)) {
+            case some(Ty.Int) -> true
+            case _ -> {
+                bad(em, e.span, "range bounds must be `int`")
+                false
+            }
+        }
+    }
+
+    /// A fresh virtual register id for a value produced one instruction at a
+    /// time (the IR's `Temp`).
+fn temp(em: Emitter) -> int {
+        var t = em.nextTemp
+        em.nextTemp = em.nextTemp + 1
+        t
+    }
+
+    /// A register holding the value-typed `0` (Pk's unit representation). Lets
+    /// `Temp` and `Slot` helpers avoid an `Option` round-trip.
+fn unitTemp(em: Emitter) -> int {
+        var t = temp(em)
+        instr(em, IrInstr.Const(t, IrConst.Int(0)))
+        t
+    }
+
+    /// Append a slot and return its index (`Slot`).
+fn newSlot(em: Emitter, ty: IrTy) -> int {
+        var s = len(em.fslots)
+        em.fslots.push(ty)
+        s
+    }
+
+    /// Load an already-declared slot into a fresh temp.
+fn load(em: Emitter, slot: int) -> int {
+        var d = temp(em)
+        instr(em, IrInstr.LoadSlot(d, slot))
+        d
+    }
+
+    /// A fresh block id appended to `blocks` with an `Unreachable` terminator.
+fn newBlock(em: Emitter) -> int {
+        var id = em.nextBlock
+        em.nextBlock = em.nextBlock + 1
+        em.blocks.push(IrBlock(id, emptyIrInstrs(), IrTerm.Unreachable))
+        id
+    }
+
+    /// Append an instruction to the current block.
+fn instr(em: Emitter, i: IrInstr) {
+        em.blocks[em.cur].instrs.push(i)
+    }
+
+    /// Set the current block's terminator.
+fn term(em: Emitter, t: IrTerm) {
+        em.blocks[em.cur].term = t
+    }
+
+    /// Enter a new lexical scope for the build environment.
+fn pushScope(em: Emitter) {
+        em.env.push(seedIntScopeMap())
+        em.manualEnv.push(seedScopeMap())
+    }
+
+    /// Leave the current build-environment scope.
+fn popScope(em: Emitter) {
+        em.env.pop()
+        em.manualEnv.pop()
+    }
+
+    /// Bind a name to a slot in the innermost scope.
+fn declare(em: Emitter, name: string, slot: int) {
+        var scope = em.env[len(em.env) - 1]
+        scope[name] = slot
+    }
+
+    /// Declare an extern's id, deduplicating by `(symbol, params, ret)`.
+fn externId(em: Emitter, symbol: string, params: List<IrTy>, ret: IrTy) -> int {
+        var i = 0
+        while (i < len(em.irModule.externs)) {
+            var ex = em.irModule.externs[i]
+            if (ex.symbol == symbol && irTysEqual(ex.params, params) && irTyTag(ex.ret) == irTyTag(ret)) {
+                return i
+            }
+            i = i + 1
+        }
+        em.irModule.externs.push(IrExtern(symbol, params, ret))
+        len(em.irModule.externs) - 1
+    }
+
+    /// Emit a call to an extern taking one value, producing one value.
+fn externCallT1(em: Emitter, symbol: string, params: List<IrTy>, ret: IrTy, args: List<int>) -> int {
+        var ex = externId(em, symbol, params, ret)
+        var dst = temp(em)
+        instr(em, IrInstr.Call(dst, Callee.Extern(ex), args))
+        dst
+    }
+
+    /// Lift a scalar value to the managed-pointer representation used for
+    /// `Option<T>` (and pointer-typed boundaries). `none`/already-managed
+    /// values pass through untouched; scalars are boxed. Mirrors `option_wrap`.
+fn optionWrap(em: Emitter, v: int, ty: Ty, span: Span) -> int? {
+        match (ty) {
+            case Ty.Int -> externCallT1(em, "pickle_box_i64", [IrTy.Int], IrTy.Ptr, [v])
+            case Ty.Float -> externCallT1(em, "pickle_box_f64", [IrTy.Float], IrTy.Ptr, [v])
+            case Ty.Bool -> externCallT1(em, "pickle_box_bool", [IrTy.Bool], IrTy.Ptr, [v])
+            case Ty.Byte -> externCallT1(em, "pickle_box_i64", [IrTy.Int], IrTy.Ptr, [v])
+            case Ty.Char -> externCallT1(em, "pickle_box_char", [IrTy.Char], IrTy.Ptr, [v])
+            case _ -> {
+                let _ = span
+                v
+            }
+        }
+    }
+
+    /// The zero value of a scalar type, as an IR temp.
+fn zeroScalar(em: Emitter, ir: IrTy, span: Span) -> int? {
+        var dst = temp(em)
+        var c = IrConst.Int(0)
+        var ok = true
+        match (ir) {
+            case IrTy.Int -> {
+                c = IrConst.Int(0)
+                ok = true
+            }
+            case IrTy.Float -> {
+                c = IrConst.Float(0.0)
+                ok = true
+            }
+            case IrTy.Bool -> {
+                c = IrConst.Bool(false)
+                ok = true
+            }
+            case IrTy.Char -> {
+                c = IrConst.Char(0 as char)
+                ok = true
+            }
+            case _ -> ok = false
+        }
+        if (!ok) {
+            bad(em, span, "no zero value for this IR type")
+            return none
+        }
+        instr(em, IrInstr.Const(dst, c))
+        dst
+    }
+
+    /// A null pointer constant (`IrConst::Null`).
+fn nullTemp(em: Emitter) -> int? {
+        var dst = temp(em)
+        instr(em, IrInstr.Const(dst, IrConst.Null))
+        dst
+    }
+
+    /// How a `List<T>` element is represented at the runtime boundary.
+fn elemRep(em: Emitter, elem: Ty, span: Span) -> ElemRep? {
+        match (elem) {
+            case Ty.Int -> ElemRep.scalar("pickle_box_i64", "pickle_unbox_i64", IrTy.Int)
+            case Ty.Float -> ElemRep.scalar("pickle_box_f64", "pickle_unbox_f64", IrTy.Float)
+            case Ty.Bool -> ElemRep.scalar("pickle_box_bool", "pickle_unbox_bool", IrTy.Bool)
+            case Ty.Byte -> ElemRep.scalar("pickle_box_i64", "pickle_unbox_i64", IrTy.Int)
+            case Ty.Char -> ElemRep.scalar("pickle_box_char", "pickle_unbox_char", IrTy.Char)
+case Ty.String | Ty.Option(_) | Ty.Class(_, _) | Ty.Struct(_, _) | Ty.Enum(_, _) | Ty.Interface(_, _) | Ty.List(_) | Ty.Map(_, _) | Ty.Tuple(_) | Ty.Range(_) | Ty.Stream | Ty.Ptr(_) | Ty.Fn(_, _) -> ElemRep.ptr()
+            case Ty.Ref(inner) -> {
+                if (let some(_) = scalarIr(inner)) {
+                    ElemRep.scalar("pickle_box_i64", "pickle_unbox_i64", IrTy.Int)
+                } else {
+                    ElemRep.ptr()
+                }
+            }
+            case Ty.None | Ty.Empty -> {
+                bad(em, span, "a list of `none` has no element representation")
+                none
+            }
+            case Ty.Unknown -> {
+                bad(em, span, "list element type is not statically known")
+                none
+            }
+            case Ty.Var(_) -> {
+                bad(em, span, "generic element types are not lowered yet")
+                none
+            }
+        }
+    }
+
+/// Intern a string into the module's string table, returning its id.
+fn internString(em: Emitter, s: string) -> int {
+        if (let some(id) = em.strIds.get(s)) {
+            id
+        } else {
+            var bs = bytesOf(s)
+            em.irModule.strings.push(bs)
+            var id = len(em.irModule.strings) - 1
+            em.strIds[s] = id
+            id
+        }
+    }
+
+    /// Emit a `Const Str` temp for `text`.
+fn strConst(em: Emitter, text: string) -> int {
+        var t = temp(em)
+        instr(em, IrInstr.Const(t, IrConst.Str(internString(em, text))))
+        t
+    }
+
+    /// Emit a `Const Int` temp for `v`.
+fn intConst(em: Emitter, v: int) -> int {
+        var t = temp(em)
+        instr(em, IrInstr.Const(t, IrConst.Int(v)))
+        t
+    }
+
+    /// Emit a `Const Bool` temp for `b`.
+fn boolConst(em: Emitter, b: bool) -> int {
+        var t = temp(em)
+        instr(em, IrInstr.Const(t, IrConst.Bool(b)))
+        t
+    }
+
+    /// Emit a `Const Char` temp for code point `v`.
+fn charConst(em: Emitter, v: int) -> int {
+        var t = temp(em)
+        instr(em, IrInstr.Const(t, IrConst.Char(v as char)))
+        t
+    }
+
+    /// Emit a `Const Float` temp for `v`.
+fn floatConst(em: Emitter, v: float) -> int {
+        var t = temp(em)
+        instr(em, IrInstr.Const(t, IrConst.Float(v)))
+        t
+    }
+
+    /// Emit any `IrConst` as a fresh temp.
+fn constTemp(em: Emitter, c: IrConst) -> int {
+        var t = temp(em)
+        instr(em, IrInstr.Const(t, c))
+        t
+    }
+
+    /// `extern_call_void`: a call whose result is discarded (returns unit).
+fn externCallVoid(em: Emitter, symbol: string, params: List<IrTy>, args: List<int>) {
+        var ex = externId(em, symbol, params, IrTy.Unit)
+        instr(em, IrInstr.Call(none, Callee.Extern(ex), args))
+    }
+
+    /// Declare `name` to a fresh slot already holding `v`. Mirrors
+    /// `declare_binding` in emit.rs.
+fn declareBinding(em: Emitter, name: string, ir: IrTy, v: int) {
+        var slot = newSlot(em, ir)
+        instr(em, IrInstr.StoreSlot(slot, v))
+        declare(em, name, slot)
+    }
+
+    /// `(res OP 0)` with OP flipped by `.not()`. Mirrors `cmp_zero`.
+fn cmpZero(em: Emitter, res: int, op: IrBinOp, negated: bool) -> int? {
+        var dst = temp(em)
+        var zero = intConst(em, 0)
+        instr(em, IrInstr.BinOp(dst, flipCmp(op, negated), res, zero))
+        dst
+    }
+
+    /// A zero constant of the function's return type, for a propagating exit.
+    /// Infallible, unlike `zeroScalar`: an unhandled type falls back to `Int(0)`
+    /// rather than reporting, because a propagate that could not build its zero
+    /// would fail the whole function.
+fn exitZero(em: Emitter) -> int? {
+        var c = IrConst.Int(0)
+        match (em.fret) {
+            case IrTy.Bool -> c = IrConst.Bool(false)
+            case IrTy.Char -> c = IrConst.Char(0 as char)
+            case IrTy.Float -> c = IrConst.Float(0.0)
+            case _ -> c = IrConst.Int(0)
+        }
+        constTemp(em, c)
+    }
+
