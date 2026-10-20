@@ -1,0 +1,241 @@
+// PickleScript compiler: global-read purity analysis over lowered function IR.
+// Answers "does this body read a top-level global" for block bodies, call
+// argument lists, if conditions, for-init/cond headers and global
+// initializers, so the emitter can sequence globals and loop hoisting
+// without a background mutation check. Walks the IR/AST directly (no
+// dispatch through the general stmt/expr walkers), which is what keeps
+// this family leaf-carvable.
+module compiler.emitreadsglobal
+
+import * from compiler.ast
+import { Span, Diagnostic, DiagnosticSink } from compiler.diag
+import { IrBlock, IrFunc, IrGlobal, IrInstr, IrTerm, IrTy } from compiler.ir
+import { ResolvedProgram } from compiler.resolve
+import * from compiler.ty
+import * from compiler.emitutil
+import { Emitter } from compiler.emittypes
+import * from compiler.emitprim
+
+    /// Name of the first top-level global this initializer reads, if any.
+    ///
+    /// `pkl_globals_init` roots every managed slot before it evaluates any
+    /// initializer, because an initializer is the first code that can allocate and
+    /// therefore the first point at which the collector could run. That ordering
+    /// also means every slot is still null while initializers run, so an
+    /// initializer that reads another global would dereference null. Catching it
+    /// here is the only way to keep it out of the generated program.
+    ///
+    /// A bare `Ident` counts only when it names a top-level `var`. Anything the
+    /// resolver cannot resolve is already reported as an undefined name, and a
+    /// local cannot appear in a global initializer.
+    ///
+    /// Mirrors `Emitter::global_init_reads_global` in emit.rs.
+fn globalInitReadsGlobal(em: Emitter, e: Expr): string? {
+        var found: string? = none
+        match (e.kind) {
+            case ExprKind.Ident(name) -> {
+                if (em.globalDecls.has(name)) {
+                    found = name
+                }
+            }
+            case ExprKind.Lit(_) -> {}
+            case ExprKind.This -> {}
+            case ExprKind.Super -> {}
+            case ExprKind.Call(callee, args) -> {
+                found = globalInitReadsGlobal(em, callee)
+                if (isNoneStr(found)) {
+                    found = callArgsReadGlobal(em, args)
+                }
+            }
+            case ExprKind.Member(object, _) -> found = globalInitReadsGlobal(em, object)
+            case ExprKind.OptAccess(object, _) -> found = globalInitReadsGlobal(em, object)
+            case ExprKind.Index(object, index) -> {
+                found = globalInitReadsGlobal(em, object)
+                if (isNoneStr(found)) {
+                    found = globalInitReadsGlobal(em, index)
+                }
+            }
+            case ExprKind.Unary(_, operand) -> found = globalInitReadsGlobal(em, operand)
+            case ExprKind.Await(inner) -> found = globalInitReadsGlobal(em, inner)
+            case ExprKind.Cast(expr, _, _) -> found = globalInitReadsGlobal(em, expr)
+            case ExprKind.OptUnwrap(inner) -> found = globalInitReadsGlobal(em, inner)
+            case ExprKind.Binary(_, lhs, rhs) -> {
+                found = globalInitReadsGlobal(em, lhs)
+                if (isNoneStr(found)) {
+                    found = globalInitReadsGlobal(em, rhs)
+                }
+            }
+            case ExprKind.Range(start, end, _) -> {
+                found = globalInitReadsGlobal(em, start)
+                if (isNoneStr(found)) {
+                    found = globalInitReadsGlobal(em, end)
+                }
+            }
+            case ExprKind.Assign(target, _, value) -> {
+                found = globalInitReadsGlobal(em, target)
+                if (isNoneStr(found)) {
+                    found = globalInitReadsGlobal(em, value)
+                }
+            }
+            case ExprKind.If(cond, then, elseElse) -> {
+                found = ifCondReadsGlobal(em, cond)
+                if (isNoneStr(found)) {
+                    found = blockReadsGlobal(em, then)
+                }
+                if (isNoneStr(found)) {
+                    found = globalInitReadsGlobalOpt(em, elseElse)
+                }
+            }
+            case ExprKind.Match(scrutinee, arms) -> {
+                found = globalInitReadsGlobal(em, scrutinee)
+                if (isNoneStr(found)) {
+                    for (arm in arms) {
+                        found = globalInitReadsGlobalOpt(em, arm.guard)
+                        if (isNoneStr(found)) {
+                            found = globalInitReadsGlobal(em, arm.body)
+                        }
+                        if (!isNoneStr(found)) {
+                            break
+                        }
+                    }
+                }
+            }
+            case ExprKind.Block(b) -> found = blockReadsGlobal(em, b)
+            case ExprKind.Unsafe(b) -> found = blockReadsGlobal(em, b)
+            case ExprKind.Array(parts) -> {
+                for (p in parts) {
+                    found = globalInitReadsGlobal(em, p)
+                    if (!isNoneStr(found)) {
+                        break
+                    }
+                }
+            }
+            case ExprKind.Tuple(parts) -> {
+                for (p in parts) {
+                    found = globalInitReadsGlobal(em, p)
+                    if (!isNoneStr(found)) {
+                        break
+                    }
+                }
+            }
+            case ExprKind.Map(entries) -> {
+                for (en in entries) {
+                    found = globalInitReadsGlobal(em, en.key)
+                    if (isNoneStr(found)) {
+                        found = globalInitReadsGlobal(em, en.value)
+                    }
+                    if (!isNoneStr(found)) {
+                        break
+                    }
+                }
+            }
+            // A lambda body is a separate function: it cannot run during global
+            // initialization, so nothing in it can observe an unfilled slot. A
+            // module-scope lambda cannot capture a global either -- `decideCaptures`
+            // rejects that -- so no global read can hide in here. The `GenericCall`
+            // name is a top-level `fn`, not a `var`.
+            case ExprKind.Lambda(_, _, _, _) -> {}
+            case ExprKind.GenericCall(_, _) -> {}
+        }
+        return found
+    }
+
+fn globalInitReadsGlobalOpt(em: Emitter, e: Expr?): string? {
+        if (let some(inner) = e) {
+            return globalInitReadsGlobal(em, inner)
+        }
+        return none
+    }
+
+fn ifCondReadsGlobal(em: Emitter, cond: IfCond): string? {
+        match (cond) {
+            case IfCond.Cond(e) -> globalInitReadsGlobal(em, e)
+            case IfCond.Binding(_, value) -> globalInitReadsGlobal(em, value)
+        }
+    }
+
+fn callArgsReadGlobal(em: Emitter, args: List<CallArg>): string? {
+        var found: string? = none
+        for (a in args) {
+            found = globalInitReadsGlobal(em, a.value)
+            if (!isNoneStr(found)) {
+                break
+            }
+        }
+        return found
+    }
+
+fn blockReadsGlobal(em: Emitter, b: Block): string? {
+        var found: string? = none
+        for (st in b.stmts) {
+            found = stmtReadsGlobal(em, st)
+            if (!isNoneStr(found)) {
+                break
+            }
+        }
+        if (isNoneStr(found)) {
+            found = globalInitReadsGlobalOpt(em, b.expr)
+        }
+        return found
+    }
+
+fn blockReadsGlobalOpt(em: Emitter, b: Block?): string? {
+        if (let some(inner) = b) {
+            return blockReadsGlobal(em, inner)
+        }
+        return none
+    }
+
+fn stmtReadsGlobal(em: Emitter, st: Stmt): string? {
+        match (st) {
+            case Stmt.Let(_, _, init, _, _) -> globalInitReadsGlobalOpt(em, init)
+            case Stmt.Const(_, _, value, _) -> globalInitReadsGlobal(em, value)
+            case Stmt.Expr(e) -> globalInitReadsGlobal(em, e)
+            case Stmt.Return(value, _) -> globalInitReadsGlobalOpt(em, value)
+            case Stmt.Throw(value, _) -> globalInitReadsGlobal(em, value)
+            case Stmt.While(cond, body, _) -> {
+                var found = globalInitReadsGlobal(em, cond)
+                if (isNoneStr(found)) {
+                    found = blockReadsGlobal(em, body)
+                }
+                found
+            }
+            case Stmt.For(header, body, _) -> {
+                var found = forHeaderReadsGlobal(em, header)
+                if (isNoneStr(found)) {
+                    found = blockReadsGlobal(em, body)
+                }
+                found
+            }
+            case Stmt.Try(body, _, handler, fin, _) -> {
+                var found = blockReadsGlobal(em, body)
+                if (isNoneStr(found)) {
+                    found = blockReadsGlobalOpt(em, handler)
+                }
+                if (isNoneStr(found)) {
+                    found = blockReadsGlobalOpt(em, fin)
+                }
+                found
+            }
+            case Stmt.Break(_) -> none
+            case Stmt.Continue(_) -> none
+            case Stmt.Empty(_) -> none
+        }
+    }
+
+fn forHeaderReadsGlobal(em: Emitter, header: ForHeader): string? {
+        match (header) {
+            case ForHeader.In(_, sequence) -> globalInitReadsGlobal(em, sequence)
+            case ForHeader.Range(init, cond, step) -> {
+                var found = stmtReadsGlobal(em, init)
+                if (isNoneStr(found)) {
+                    found = globalInitReadsGlobal(em, cond)
+                }
+                if (isNoneStr(found)) {
+                    found = globalInitReadsGlobal(em, step)
+                }
+                found
+            }
+        }
+    }
+
