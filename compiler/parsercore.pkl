@@ -1,0 +1,4124 @@
+module compiler.parsercore
+
+import * from compiler.ast
+import { Span, Diagnostic, DiagnosticSink } from compiler.diag
+import { LexedToken, StrLit, StrSeg, Tok, plainTok } from compiler.token
+import * from compiler.parserbag
+
+// ==== parser core (free fns + Parser methods as free fns, receiver = pa) ====
+
+fn parse(tokens: List<LexedToken>, diags: DiagnosticSink) -> Program? {
+    let p = Parser(tokens, diags)
+    let prog = parseProgram(p)
+    if (p.failed || diags.anyError()) {
+        none
+    } else {
+        prog
+    }
+}
+
+fn isWildcardIdent(s: string) -> bool {
+    s == "_"
+}
+
+fn minOf(a: int, b: int) -> int {
+    if (a < b) {
+        a
+    } else {
+        b
+    }
+}
+
+fn listCopy(l: List<string>) -> List<string> {
+    var out = emptyStrs()
+    for (x in l) {
+        out.push(x)
+    }
+    out
+}
+
+fn joinStrs(path: List<string>, sep: string) -> string {
+    var out = ""
+    var i = 0
+    while (i < len(path)) {
+        if (i > 0) {
+            out += sep
+        }
+        out += path[i]
+        i = i + 1
+    }
+    out
+}
+
+fn flattenBlockTail(block: Block) {
+    match (block.expr) {
+        case some(tail) -> {
+            block.stmts.push(Stmt.Expr(tail))
+            block.expr = none
+        }
+        case none -> {}
+    }
+}
+
+fn argBlockAt(e: Expr, args: List<CallArg>, i: int) -> Block? {
+    if (i < len(args)) {
+        return blockOf(args[i].value)
+    }
+    none
+}
+
+fn argAt(args: List<CallArg>, i: int) -> CallArg? {
+    if (i < len(args)) {
+        args[i]
+    } else {
+        none
+    }
+}
+
+fn lastArgAt(args: List<CallArg>) -> CallArg? {
+    if (len(args) > 0) {
+        args[len(args) - 1]
+    } else {
+        none
+    }
+}
+
+fn setFnVis(f: FnDecl, v: Visibility) {
+    f.visibility = v
+}
+
+fn callCalleeName(e: Expr) -> string {
+    match (e.kind) {
+        case ExprKind.Call(callee, _) -> match (callee.kind) {
+            case ExprKind.Ident(n) -> n
+            case _ -> ""
+        }
+        case _ -> ""
+    }
+}
+
+fn callParts(e: Expr) -> CallParts? {
+    match (e.kind) {
+        case ExprKind.Call(callee, args) -> match (callee.kind) {
+            case ExprKind.Ident(n) -> CallParts(n, args)
+            case _ -> none
+        }
+        case _ -> none
+    }
+}
+
+fn strLiteralOf(e: Expr) -> List<StrPart>? {
+    match (e.kind) {
+        case ExprKind.Lit(l) -> match (l) {
+            case Lit.String(parts) -> parts
+            case _ -> none
+        }
+        case _ -> none
+    }
+}
+
+fn blockOf(e: Expr) -> Block? {
+    match (e.kind) {
+        case ExprKind.Block(b) -> b
+        case _ -> none
+    }
+}
+
+fn stmtSpan(s: Stmt) -> Span {
+    match (s) {
+        case Stmt.Let(_, _, _, _, _, span) -> span
+        case Stmt.Const(_, _, _, span) -> span
+        case Stmt.Return(_, span) -> span
+        case Stmt.Break(span) -> span
+        case Stmt.Continue(span) -> span
+        case Stmt.While(_, _, span) -> span
+        case Stmt.For(_, _, span) -> span
+        case Stmt.Expr(e) -> e.span
+        case Stmt.Empty(span) -> span
+    }
+}
+
+fn contextualIdent(t: Tok) -> string? {
+    match (t) {
+        case Tok.Get -> "get"
+        case Tok.Set -> "set"
+        case Tok.Init -> "init"
+        case Tok.Deinit -> "deinit"
+        case Tok.Task -> "task"
+        case Tok.Channel -> "channel"
+        case Tok.Async -> "async"
+        case Tok.Constructor -> "constructor"
+        case Tok.Operator -> "operator"
+        case Tok.Property -> "property"
+        case Tok.Static -> "static"
+        case Tok.Override -> "override"
+        case Tok.Public -> "public"
+        case Tok.Private -> "private"
+        case Tok.Protected -> "protected"
+        case Tok.Extends -> "extends"
+        case Tok.Implements -> "implements"
+        case _ -> none
+    }
+}
+
+fn isSomeStr(o: string?) -> bool {
+    match (o) {
+        case some(_) -> true
+        case none -> false
+    }
+}
+
+fn optTokIs(o: Tok?, k: Tok) -> bool {
+    match (o) {
+        case some(t) -> t == k
+        case none -> false
+    }
+}
+
+fn startsItemToken(k: Tok) -> bool {
+    k == Tok.Fn || k == Tok.Class || k == Tok.Struct || k == Tok.Enum || k == Tok.Interface || k == Tok.Const || k == Tok.Public || k == Tok.Private || k == Tok.Protected || k == Tok.Hash
+}
+
+fn isFieldSyntax(hasMods: bool, k: Tok) -> bool {
+    if (!hasMods) {
+        return false
+    }
+    match (k) {
+        case Tok.Let -> true
+        case Tok.Var -> true
+        case Tok.Ident(_) -> true
+        case _ -> false
+    }
+}
+
+fn memberFieldName(t: Tok) -> bool {
+    match (t) {
+        case Tok.Ident(_) -> true
+        case Tok.Get -> true
+        case Tok.Set -> true
+        case Tok.Init -> true
+        case Tok.Deinit -> true
+        case Tok.Task -> true
+        case Tok.Channel -> true
+        case Tok.Async -> true
+        case _ -> false
+    }
+}
+
+fn isOperatorSymbol(t: Tok) -> bool {
+    match (t) {
+        case Tok.Plus -> true
+        case Tok.Minus -> true
+        case Tok.Star -> true
+        case Tok.Slash -> true
+        case Tok.Percent -> true
+        case Tok.StarStar -> true
+        case Tok.EqEq -> true
+        case Tok.NotEq -> true
+        case Tok.Lt -> true
+        case Tok.Le -> true
+        case Tok.Gt -> true
+        case Tok.Ge -> true
+        case Tok.Shl -> true
+        case Tok.Shr -> true
+        case Tok.Amp -> true
+        case Tok.Pipe -> true
+        case Tok.Caret -> true
+        case Tok.LBracket -> true
+        case _ -> false
+    }
+}
+
+fn isIdentTok(k: Tok) -> bool {
+    match (k) {
+        case Tok.Ident(_) -> true
+        case _ -> false
+    }
+}
+
+fn hookKind(name: string) -> string? {
+    if (name == "beforeAll") {
+        "ba"
+    } else if (name == "beforeEach") {
+        "be"
+    } else if (name == "afterEach") {
+        "ae"
+    } else if (name == "afterAll") {
+        "aa"
+    } else {
+        none
+    }
+}
+
+fn isContAfter(prev: Tok) -> bool {
+    match (prev) {
+        case Tok.Plus -> true
+        case Tok.Minus -> true
+        case Tok.Star -> true
+        case Tok.Slash -> true
+        case Tok.Percent -> true
+        case Tok.StarStar -> true
+        case Tok.Shl -> true
+        case Tok.Shr -> true
+        case Tok.Amp -> true
+        case Tok.Pipe -> true
+        case Tok.Caret -> true
+        case Tok.AndAnd -> true
+        case Tok.OrOr -> true
+        case Tok.EqEq -> true
+        case Tok.NotEq -> true
+        case Tok.Lt -> true
+        case Tok.Le -> true
+        case Tok.Gt -> true
+        case Tok.Ge -> true
+        case Tok.Comma -> true
+        case Tok.Dot -> true
+        case Tok.QuestionDot -> true
+        case Tok.Arrow -> true
+        case Tok.FatArrow -> true
+        case Tok.Range -> true
+        case Tok.RangeIncl -> true
+        case Tok.QuestionQuestion -> true
+        case Tok.Question -> true
+        case Tok.QuestionColon -> true
+        case Tok.SendOp -> true
+        case Tok.LParen -> true
+        case Tok.LBracket -> true
+        case Tok.Assign -> true
+        case Tok.PlusEq -> true
+        case Tok.MinusEq -> true
+        case Tok.StarEq -> true
+        case Tok.SlashEq -> true
+        case Tok.PercentEq -> true
+        case Tok.ShlEq -> true
+        case Tok.ShrEq -> true
+        case Tok.AndEq -> true
+        case Tok.OrEq -> true
+        case Tok.XorEq -> true
+        case _ -> false
+    }
+}
+
+fn isContBefore(t: Tok) -> bool {
+    match (t) {
+        case Tok.Dot -> true
+        case Tok.QuestionDot -> true
+        case Tok.Plus -> true
+        case Tok.Minus -> true
+        case Tok.Star -> true
+        case Tok.Slash -> true
+        case Tok.Percent -> true
+        case Tok.StarStar -> true
+        case Tok.AndAnd -> true
+        case Tok.OrOr -> true
+        case Tok.EqEq -> true
+        case Tok.NotEq -> true
+        case Tok.Lt -> true
+        case Tok.Le -> true
+        case Tok.Gt -> true
+        case Tok.Ge -> true
+        case Tok.Shl -> true
+        case Tok.Shr -> true
+        case Tok.Amp -> true
+        case Tok.Pipe -> true
+        case Tok.Caret -> true
+        case Tok.Range -> true
+        case Tok.RangeIncl -> true
+        case Tok.Question -> true
+        case Tok.QuestionQuestion -> true
+        case Tok.QuestionColon -> true
+        case Tok.SendOp -> true
+        case _ -> false
+    }
+}
+
+fn suffStartsF(s: string?) -> bool {
+    match (s) {
+        case some(v) -> if (len(v) > 0) {
+            v[0] == ('f' as int)
+        } else {
+            false
+        }
+        case none -> false
+    }
+}
+
+fn binopInfo(t: Tok) -> BinopInfo? {
+    match (t) {
+        case Tok.OrOr -> BinopInfo(1, BinOp.Or)
+        case Tok.QuestionQuestion -> BinopInfo(1, BinOp.NullCoalesce)
+        case Tok.AndAnd -> BinopInfo(2, BinOp.And)
+        case Tok.Pipe -> BinopInfo(3, BinOp.BitOr)
+        case Tok.Caret -> BinopInfo(4, BinOp.BitXor)
+        case Tok.Amp -> BinopInfo(5, BinOp.BitAnd)
+        case Tok.EqEq -> BinopInfo(6, BinOp.Eq)
+        case Tok.NotEq -> BinopInfo(6, BinOp.Ne)
+        case Tok.Lt -> BinopInfo(6, BinOp.Lt)
+        case Tok.Le -> BinopInfo(6, BinOp.Le)
+        case Tok.Gt -> BinopInfo(6, BinOp.Gt)
+        case Tok.Ge -> BinopInfo(6, BinOp.Ge)
+        case Tok.In -> BinopInfo(6, BinOp.In)
+        case Tok.Shl -> BinopInfo(7, BinOp.Shl)
+        case Tok.Shr -> BinopInfo(7, BinOp.Shr)
+        case Tok.Plus -> BinopInfo(8, BinOp.Add)
+        case Tok.Minus -> BinopInfo(8, BinOp.Sub)
+        case Tok.Star -> BinopInfo(9, BinOp.Mul)
+        case Tok.Slash -> BinopInfo(9, BinOp.Div)
+        case Tok.Percent -> BinopInfo(9, BinOp.Mod)
+        case Tok.StarStar -> BinopInfo(10, BinOp.Pow)
+        case Tok.Range -> BinopInfo(0, BinOp.Range)
+        case Tok.RangeIncl -> BinopInfo(0, BinOp.RangeIncl)
+        case Tok.SendOp -> BinopInfo(0, BinOp.Send)
+        case _ -> none
+    }
+}
+
+fn assignOpTok(op: AssignOp) -> Tok {
+    match (op) {
+        case AssignOp.Assign -> Tok.Assign
+        case AssignOp.Add -> Tok.PlusEq
+        case AssignOp.Sub -> Tok.MinusEq
+        case AssignOp.Mul -> Tok.StarEq
+        case AssignOp.Div -> Tok.SlashEq
+        case AssignOp.Mod -> Tok.PercentEq
+        case AssignOp.Shl -> Tok.ShlEq
+        case AssignOp.Shr -> Tok.ShrEq
+        case AssignOp.BitAnd -> Tok.AndEq
+        case AssignOp.BitOr -> Tok.OrEq
+        case AssignOp.BitXor -> Tok.XorEq
+    }
+}
+
+fn describeTok(k: Tok) -> string {
+    match (k) {
+        case Tok.Ident(s) -> "identifier `" + s + "`"
+        case Tok.Number -> "number"
+        case Tok.Char(c) -> "character literal `" + strChar(c) + "`"
+        case Tok.Str(_) -> "string literal"
+        case Tok.Newline -> "end of line"
+        case Tok.Eof -> "end of file"
+        case _ -> "`" + punctTok(k) + "`"
+    }
+}
+
+fn strChar(c: char) -> string {
+    "{c}"
+}
+
+fn punctTok(k: Tok) -> string {
+    match (k) {
+        case Tok.LParen -> "("
+        case Tok.RParen -> ")"
+        case Tok.LBrace -> "\{"
+        case Tok.RBrace -> "}"
+        case Tok.LBracket -> "["
+        case Tok.RBracket -> "]"
+        case Tok.Comma -> ","
+        case Tok.Dot -> "."
+        case Tok.Colon -> ":"
+        case Tok.ColonColon -> "::"
+        case Tok.Semicolon -> ";"
+        case Tok.Arrow -> "->"
+        case Tok.FatArrow -> "=>"
+        case Tok.Assign -> "="
+        case Tok.PlusEq -> "+="
+        case Tok.MinusEq -> "-="
+        case Tok.StarEq -> "*="
+        case Tok.SlashEq -> "/="
+        case Tok.PercentEq -> "%="
+        case Tok.ShlEq -> "<<="
+        case Tok.ShrEq -> ">>="
+        case Tok.AndEq -> "&="
+        case Tok.OrEq -> "|="
+        case Tok.XorEq -> "^="
+        case Tok.Plus -> "+"
+        case Tok.Minus -> "-"
+        case Tok.Star -> "*"
+        case Tok.Slash -> "/"
+        case Tok.Percent -> "%"
+        case Tok.StarStar -> "**"
+        case Tok.Bang -> "!"
+        case Tok.Tilde -> "~"
+        case Tok.Amp -> "&"
+        case Tok.Pipe -> "|"
+        case Tok.Caret -> "^"
+        case Tok.Shl -> "<<"
+        case Tok.Shr -> ">>"
+        case Tok.EqEq -> "=="
+        case Tok.NotEq -> "!="
+        case Tok.Lt -> "<"
+        case Tok.Le -> "<="
+        case Tok.Gt -> ">"
+        case Tok.Ge -> ">="
+        case Tok.AndAnd -> "&&"
+        case Tok.OrOr -> "||"
+        case Tok.Question -> "?"
+        case Tok.QuestionDot -> "?."
+        case Tok.QuestionQuestion -> "??"
+        case Tok.QuestionColon -> "?:"
+        case Tok.Range -> ".."
+        case Tok.RangeIncl -> "..="
+        case Tok.SendOp -> "<-"
+        case Tok.Ellipsis -> "..."
+        case Tok.At -> "@"
+        case Tok.Hash -> "#"
+        case Tok.StarStar -> "**"
+        case _ -> "?"
+    }
+}
+
+fn dummySpan() -> Span {
+    Span(0, 0)
+}
+
+fn dummyExpr() -> Expr {
+    Expr(Span(0, 0), ExprKind.Ident("x"))
+}
+
+fn dummyStmt() -> Stmt {
+    Stmt.Empty(Span(0, 0))
+}
+
+fn dummyType() -> TypeExpr {
+    TypeExpr(Span(0, 0), TypeExprKind.Infer)
+}
+
+fn dummyPattern() -> Pattern {
+    Pattern.Wildcard
+}
+
+fn dummyFnBody() -> FnBody {
+    FnBody.Block(emptyBlock())
+}
+
+fn dummyFnDecl() -> FnDecl {
+    FnDecl("x", Span(0, 0), Visibility.Default, false, emptyGenericParams(), emptyParams(), none, none)
+}
+
+fn dummyMethodDecl() -> MethodDecl {
+    MethodDecl("x", Span(0, 0), Visibility.Default, false, false, false, false, none, emptyGenericParams(), emptyParams(), none, none)
+}
+
+fn dummyConstDecl() -> ConstDecl {
+   ConstDecl("x", Visibility.Default, none, dummyExpr(), Span(0, 0))
+   }
+
+fn dummyGlobalDecl() -> GlobalDecl {
+   GlobalDecl("x", Visibility.Default, none, dummyExpr(), Span(0, 0))
+   }
+
+fn dummyClassDecl() -> ClassDecl {
+    ClassDecl("x", Span(0, 0), Visibility.Default, emptyGenericParams(), none, emptyTypeExprs(), emptyProcMembers())
+}
+
+fn dummyEnumDecl() -> EnumDecl {
+    EnumDecl("x", Span(0, 0), Visibility.Default, emptyGenericParams(), emptyEnumVariants(), emptyTypeExprs())
+}
+
+fn dummyInterfaceDecl() -> InterfaceDecl {
+    InterfaceDecl("x", Span(0, 0), Visibility.Default, emptyGenericParams(), emptyTypeExprs(), emptyIfaceMembers())
+}
+
+fn dummyModuleDecl() -> ModuleDecl {
+    ModuleDecl(emptyStrs(), Span(0, 0))
+}
+
+fn dummyImportDecl() -> ImportDecl {
+    ImportDecl(false, emptyStrs(), ImportKind.Wildcard, Span(0, 0))
+}
+
+fn dummyItemKind() -> ItemKind {
+    ItemKind.Fn(dummyFnDecl())
+}
+
+fn dummyClassMember() -> ClassMember {
+    ClassMember.Init(emptyBlock())
+}
+
+fn dummyPropertyDecl() -> PropertyDecl {
+    PropertyDecl("x", Span(0, 0), Visibility.Default, none, none, none, false)
+}
+
+fn dummyProgram() -> Program {
+    Program(none, emptyImportDecls(), emptyItems(), false)
+}
+
+fn emptyMapEntries() -> List<MapEntry> {
+    var l = [MapEntry(dummyExpr(), dummyExpr())]
+    l.pop()
+    l
+}
+
+fn emptyPatterns() -> List<Pattern> {
+    var l = [Pattern.Wildcard]
+    l.pop()
+    l
+}
+
+fn peek(pa: Parser) -> LexedToken {
+        pa.tokens[minOf(pa.pos, len(pa.tokens) - 1)]
+}
+
+fn peekKind(pa: Parser) -> Tok {
+        peek(pa).token.kind
+}
+
+fn peekAt(pa: Parser, ahead: int) -> Tok {
+        pa.tokens[minOf(pa.pos + ahead, len(pa.tokens) - 1)].token.kind
+}
+
+fn span(pa: Parser) -> Span {
+        peek(pa).token.span
+}
+
+fn prevSpan(pa: Parser) -> Span {
+        if (pa.pos == 0) {
+            span(pa)
+        } else {
+            pa.tokens[pa.pos - 1].token.span
+        }
+}
+
+fn advance(pa: Parser) -> LexedToken {
+        let t = peek(pa)
+        if (!(t.token.kind == Tok.Eof)) {
+            pa.pos = pa.pos + 1
+        }
+        t
+}
+
+fn kind(pa: Parser) -> Tok {
+        peekKind(pa)
+}
+
+fn bump(pa: Parser) -> Tok {
+        advance(pa).token.kind
+}
+
+fn at(pa: Parser, k: Tok) -> bool {
+        peekKind(pa) == k
+}
+
+fn eat(pa: Parser, k: Tok) -> bool {
+        if (at(pa, k)) {
+            bump(pa)
+            true
+        } else {
+            false
+        }
+}
+
+fn expect(pa: Parser, k: Tok) {
+        if (at(pa, k)) {
+            bump(pa)
+        } else {
+            errExpected(pa, k)
+            pa.failed = true
+            let _ = Tok.Eof
+        }
+}
+
+fn errExpected(pa: Parser, k: Tok) {
+        let sp = span(pa)
+        var expected = ""
+        if (k == Tok.Newline) {
+            expected = "end of line"
+        } else {
+            expected = "`" + punctTok(k) + "`"
+        }
+        errAt(pa, sp, "expected " + expected + ", found " + describeTok(kind(pa)))
+}
+
+fn errAt(pa: Parser, span: Span, msg: string) {
+        pa.diags.emit(Diagnostic.errorAt(span, msg).withCode("E0111"))
+}
+
+fn errHere(pa: Parser, msg: string) {
+        let sp = span(pa)
+        errAt(pa, sp, msg)
+        pa.failed = true
+}
+
+fn intLitValue(pa: Parser, ival: int?, text: string, span: Span) -> int {
+        if (let some(v) = ival) {
+            v
+        } else {
+            if (intLiteralOverflows(text)) {
+                pa.intLiteralOverflow = true
+            }
+            0
+        }
+}
+
+fn newlines(pa: Parser) {
+        while (at(pa, Tok.Newline)) {
+            bump(pa)
+        }
+}
+
+fn continuationAfter(pa: Parser, prev: Tok) {
+        if (isContAfter(prev)) {
+            newlines(pa)
+        }
+}
+
+fn nextBeginsContinuation(pa: Parser) -> bool {
+        if (lastSigWasRbrace(pa)) {
+            return false
+        }
+        match (peekNonNl(pa, 1)) {
+            case some(t) -> isContBefore(t)
+            case none -> false
+        }
+}
+
+fn lastSigWasRbrace(pa: Parser) -> bool {
+        var i = pa.pos
+        while (i > 0) {
+            i = i - 1
+            let k = pa.tokens[i].token.kind
+            if (k == Tok.Newline) {
+                continue
+            }
+            return k == Tok.RBrace
+        }
+        false
+}
+
+fn peekNonNl(pa: Parser, ahead: int) -> Tok? {
+        while (true) {
+            let t = peekAt(pa, ahead)
+            if (t == Tok.Newline) {
+                ahead = ahead + 1
+            } else if (t == Tok.Eof) {
+                return none
+            } else {
+                return t
+            }
+        }
+}
+
+fn expectStmtEnd(pa: Parser) {
+        // Optional `;` is tolerated as a statement separator.
+        while (at(pa, Tok.Semicolon)) {
+            bump(pa)
+        }
+        if (at(pa, Tok.Newline)) {
+            newlines(pa)
+        } else if (at(pa, Tok.RBrace) || at(pa, Tok.Eof)) {
+            // ok
+        } else {
+            let found = kind(pa)
+            errHere(pa, "expected end of line, found " + describeTok(found))
+            pa.failed = true
+        }
+}
+
+fn expectIdent(pa: Parser, what: string) -> string {
+        let k = kind(pa)
+        match (k) {
+            case Tok.Ident(s) -> {
+                bump(pa)
+                return s
+            }
+            case _ -> {
+                if (let some(ci) = contextualIdent(k)) {
+                    bump(pa)
+                    return ci
+                }
+                errAt(pa, span(pa), "expected identifier for " + what + ", found " + describeTok(k))
+                pa.failed = true
+                return ""
+            }
+        }
+}
+
+fn parseProgram(pa: Parser) -> Program {
+        var modDecl: ModuleDecl? = none
+        let imports = emptyImportDecls()
+        let items = emptyItems()
+        newlines(pa)
+        while (true) {
+            if (at(pa, Tok.Eof)) {
+                break
+            }
+            let k = kind(pa)
+            if (k == Tok.Module) {
+                let m = parseModuleDecl(pa)
+                if (pa.failed) {
+                    return dummyProgram()
+                }
+                modDecl = m
+                newlines(pa)
+            } else if (k == Tok.Import) {
+                let imp = parseImport(pa)
+                if (pa.failed) {
+                    return dummyProgram()
+                }
+                imports.push(imp)
+                newlines(pa)
+            } else {
+                if (at(pa, Tok.Public) && peekAt(pa, 1) == Tok.Import) {
+                    let imp = parseImport(pa)
+                    if (pa.failed) {
+                        return dummyProgram()
+                    }
+                    imports.push(imp)
+                    newlines(pa)
+                    continue
+                }
+                let more = parseItem(pa)
+                if (pa.failed) {
+                    pa.failed = false
+                    recoverToItem(pa)
+                } else {
+                    for (x in more) {
+                        items.push(x)
+                    }
+                }
+                newlines(pa)
+            }
+        }
+        Program(modDecl, imports, items, pa.intLiteralOverflow)
+}
+
+fn parseModuleDecl(pa: Parser) -> ModuleDecl {
+        let start = span(pa)
+        expect(pa, Tok.Module)
+        if (pa.failed) {
+            return dummyModuleDecl()
+        }
+        let path = emptyStrs()
+        while (true) {
+            path.push(expectIdent(pa, "module path"))
+            if (pa.failed) {
+                return dummyModuleDecl()
+            }
+            if (at(pa, Tok.Dot)) {
+                bump(pa)
+            } else {
+                break
+            }
+        }
+        let span = start.to(prevSpan(pa))
+        expectStmtEnd(pa)
+        if (pa.failed) {
+            return dummyModuleDecl()
+        }
+        ModuleDecl(path, span)
+}
+
+fn parseImport(pa: Parser) -> ImportDecl {
+        let start = span(pa)
+        let isPublic = eat(pa, Tok.Public)
+        expect(pa, Tok.Import)
+        if (pa.failed) {
+            return dummyImportDecl()
+        }
+
+        var source = emptyStrs()
+        var kind: ImportKind
+        if (at(pa, Tok.LBrace)) {
+            bump(pa)
+            let items = emptyImports()
+            if (at(pa, Tok.RBrace)) {
+                errHere(pa, "import list must not be empty")
+                pa.failed = true
+                return dummyImportDecl()
+            }
+            while (true) {
+                let istart = span(pa)
+                let itmPath = parseDottedPath(pa, "import path")
+                if (pa.failed) {
+                    return dummyImportDecl()
+                }
+                var alias: string? = none
+                if (eat(pa, Tok.As)) {
+                    alias = expectIdent(pa, "import alias")
+                    if (pa.failed) {
+                        return dummyImportDecl()
+                    }
+                }
+                items.push(ImportItem(itmPath, alias, istart.to(prevSpan(pa))))
+                if (eat(pa, Tok.Comma)) {
+                    newlines(pa)
+                    continue
+                }
+                break
+            }
+            expect(pa, Tok.RBrace)
+            if (pa.failed) {
+                return dummyImportDecl()
+            }
+            expect(pa, Tok.From)
+            if (pa.failed) {
+                return dummyImportDecl()
+            }
+            source = parseDottedPath(pa, "import source")
+            if (pa.failed) {
+                return dummyImportDecl()
+            }
+            kind = ImportKind.Items(items)
+        } else if (at(pa, Tok.Star)) {
+            bump(pa)
+            expect(pa, Tok.From)
+            if (pa.failed) {
+                return dummyImportDecl()
+            }
+            source = parseDottedPath(pa, "import source")
+            if (pa.failed) {
+                return dummyImportDecl()
+            }
+            kind = ImportKind.Wildcard
+        } else {
+            let first = parseDottedPath(pa, "import path")
+            if (pa.failed) {
+                return dummyImportDecl()
+            }
+            if (eat(pa, Tok.From)) {
+                source = parseDottedPath(pa, "import source")
+                if (pa.failed) {
+                    return dummyImportDecl()
+                }
+                var alias: string? = none
+                if (eat(pa, Tok.As)) {
+                    alias = expectIdent(pa, "import alias")
+                    if (pa.failed) {
+                        return dummyImportDecl()
+                    }
+                }
+                let span = start.to(prevSpan(pa))
+                let items = emptyImports()
+                items.push(ImportItem(first, alias, span))
+                kind = ImportKind.Items(items)
+            } else {
+                var alias2: string? = none
+                if (eat(pa, Tok.As)) {
+                    alias2 = expectIdent(pa, "import alias")
+                    if (pa.failed) {
+                        return dummyImportDecl()
+                    }
+                }
+                source = first
+                kind = ImportKind.Module(alias2)
+            }
+        }
+
+        let span = start.to(prevSpan(pa))
+        expectStmtEnd(pa)
+        if (pa.failed) {
+            return dummyImportDecl()
+        }
+        ImportDecl(isPublic, source, kind, span)
+}
+
+fn parseDottedPath(pa: Parser, what: string) -> List<string> {
+        let segs = emptyStrs()
+        while (true) {
+            segs.push(expectIdent(pa, what))
+            if (pa.failed) {
+                return emptyStrs()
+            }
+            if (at(pa, Tok.Dot)) {
+                bump(pa)
+            } else {
+                break
+            }
+        }
+        segs
+}
+
+fn recoverToItem(pa: Parser) {
+        var depth = 0
+        while (true) {
+            let k = kind(pa)
+            if (k == Tok.Eof) {
+                break
+            } else if (k == Tok.LBrace) {
+                depth = depth + 1
+                bump(pa)
+            } else if (k == Tok.RBrace) {
+                if (depth == 0) {
+                    bump(pa)
+                    break
+                }
+                depth = depth - 1
+                bump(pa)
+            } else if (k == Tok.Newline) {
+                if (depth == 0) {
+                    bump(pa)
+                    while (at(pa, Tok.Newline)) {
+                        bump(pa)
+                    }
+                    if (startsItem(pa)) {
+                        break
+                    }
+                } else {
+                    bump(pa)
+                }
+            } else if (depth == 0 && startsItemToken(k)) {
+                break
+            } else {
+                bump(pa)
+            }
+        }
+}
+
+fn startsItem(pa: Parser) -> bool {
+        startsItemToken(kind(pa)) || isTestFnAhead(pa)
+}
+
+fn isTestFnAhead(pa: Parser) -> bool {
+        match (kind(pa)) {
+            case Tok.Ident(n) -> n == "test" && optTokIs(peekNonNl(pa, 1), Tok.Fn)
+            case _ -> false
+        }
+}
+
+fn isTestCallAhead(pa: Parser) -> bool {
+        match (kind(pa)) {
+            case Tok.Ident(n) -> (n == "test" || n == "it") && optTokIs(peekNonNl(pa, 1), Tok.LParen)
+            case _ -> false
+        }
+}
+
+fn isDescribeCallAhead(pa: Parser) -> bool {
+        match (kind(pa)) {
+            case Tok.Ident(n) -> n == "describe" && optTokIs(peekNonNl(pa, 1), Tok.LParen)
+            case _ -> false
+        }
+}
+
+fn isHookCallAhead(pa: Parser) -> bool {
+        match (kind(pa)) {
+            case Tok.Ident(n) -> (n == "beforeAll" || n == "afterAll" || n == "beforeEach" || n == "afterEach") && optTokIs(peekNonNl(pa, 1), Tok.LParen)
+            case _ -> false
+        }
+}
+
+fn parseTestCallItem(pa: Parser) -> ItemKind {
+        let start = span(pa)
+        bump(pa) // `test` / `it`
+        expect(pa, Tok.LParen)
+        if (pa.failed) {
+            return dummyItemKind()
+        }
+        let desc = parseTestDescription(pa)
+        if (pa.failed) {
+            return dummyItemKind()
+        }
+        expect(pa, Tok.Comma)
+        if (pa.failed) {
+            return dummyItemKind()
+        }
+        newlines(pa)
+        var block = parseBlock(pa)
+        if (pa.failed) {
+            return dummyItemKind()
+        }
+        newlines(pa)
+        expect(pa, Tok.RParen)
+        if (pa.failed) {
+            return dummyItemKind()
+        }
+        flattenBlockTail(block)
+        let span = start.to(prevSpan(pa))
+        ItemKind.Test(FnDecl(desc, span, Visibility.Default, false, emptyGenericParams(), emptyParams(), none, FnBody.Block(block)))
+}
+
+fn parseTestDescription(pa: Parser) -> string {
+        let start = span(pa)
+        let lit = match (kind(pa)) {
+            case Tok.Str(l) -> {
+                bump(pa)
+                l
+            }
+            case _ -> none
+        }
+        match (lit) {
+            case some(l) -> {
+                var out = ""
+                var interpolated = false
+                for (seg in l.segments) {
+                    match (seg) {
+                        case StrSeg.Text(text) -> {
+                            out += text
+                            let _ = true
+                        }
+                        case StrSeg.Expr(_) -> { interpolated = true }
+                    }
+                }
+                if (interpolated) {
+                    errAt(pa, start, "interpolation is not allowed in a test description")
+                    pa.failed = true
+                }
+                return out
+            }
+            case none -> {
+                errAt(pa, start, "test description must be a string literal, found " + describeTok(kind(pa)))
+                pa.failed = true
+                return ""
+            }
+        }
+}
+
+fn parseAttributes(pa: Parser) -> List<Attribute> {
+        let out = emptyAttrs()
+        while (at(pa, Tok.Hash)) {
+            let start = span(pa)
+            bump(pa)
+            expect(pa, Tok.LBracket)
+            if (pa.failed) {
+                return emptyAttrs()
+            }
+            let name = expectIdent(pa, "attribute name")
+            if (pa.failed) {
+                return emptyAttrs()
+            }
+            let args = emptyExprs()
+            if (eat(pa, Tok.LParen)) {
+                if (!at(pa, Tok.RParen)) {
+                    while (true) {
+                        args.push(parseExpr(pa))
+                        if (pa.failed) {
+                            return emptyAttrs()
+                        }
+                        if (eat(pa, Tok.Comma)) {
+                            if (at(pa, Tok.RParen)) {
+                                break
+                            }
+                        } else {
+                            break
+                        }
+                    }
+                }
+                expect(pa, Tok.RParen)
+                if (pa.failed) {
+                    return emptyAttrs()
+                }
+            }
+            expect(pa, Tok.RBracket)
+            if (pa.failed) {
+                return emptyAttrs()
+            }
+            out.push(Attribute(name, args, start.to(prevSpan(pa))))
+            newlines(pa)
+        }
+        out
+}
+
+fn parseItem(pa: Parser) -> List<Item> {
+        let doc = emptyStrs()
+        let start = span(pa)
+        let attrs = parseAttributes(pa)
+        if (pa.failed) {
+            return emptyItems()
+        }
+
+        if (isTestCallAhead(pa)) {
+            let kind = parseTestCallItem(pa)
+            if (pa.failed) {
+                return emptyItems()
+            }
+            let span = start.to(prevSpan(pa))
+            let items = emptyItems()
+            items.push(Item(doc, attrs, span, kind))
+            return items
+        }
+
+        if (isDescribeCallAhead(pa)) {
+            let items = parseDescribeItem(pa)
+            if (pa.failed) {
+                return emptyItems()
+            }
+            return items
+        }
+
+        if (isHookCallAhead(pa)) {
+            let kind = parseHookItem(pa)
+            if (pa.failed) {
+                return emptyItems()
+            }
+            let span = start.to(prevSpan(pa))
+            let items = emptyItems()
+            items.push(Item(doc, attrs, span, kind))
+            return items
+        }
+
+        var visibility = Visibility.Default
+        var isTest = false
+
+        while (true) {
+            let k = kind(pa)
+            if (k == Tok.Public) {
+                bump(pa)
+                visibility = Visibility.Public
+            } else if (k == Tok.Private) {
+                bump(pa)
+                visibility = Visibility.Private
+            } else if (k == Tok.Protected) {
+                bump(pa)
+                visibility = Visibility.Protected
+            } else {
+                break
+            }
+        }
+
+        if (isTestFnAhead(pa)) {
+            bump(pa) // `test`
+            isTest = true
+        }
+
+        let k = kind(pa)
+        var kind: ItemKind
+        if (k == Tok.Async) {
+            // `async fn name(...) -> R { body }` -- a future-producing
+            // function. Calling it evaluates nothing: it returns a captured
+            // 0-arg closure (the future) that `await` drives.
+            bump(pa)
+            if (kind(pa) != Tok.Fn) {
+                errHere(pa, "expected `fn` after `async`")
+                return emptyItems()
+            }
+            let f = parseFn(pa)
+            if (pa.failed) {
+                return emptyItems()
+            }
+            setFnVis(f, visibility)
+            f.isAsync = true
+            kind = ItemKind.Fn(f)
+        } else if (k == Tok.Fn) {
+            let f = parseFn(pa)
+            if (pa.failed) {
+                return emptyItems()
+            }
+            setFnVis(f, visibility)
+            if (isTest) {
+                kind = ItemKind.Test(f)
+            } else {
+                kind = ItemKind.Fn(f)
+            }
+        } else if (k == Tok.Class) {
+            let c = parseTypeDecl(pa, true)
+            if (pa.failed) {
+                return emptyItems()
+            }
+            c.visibility = visibility
+            kind = ItemKind.Class(c)
+        } else if (k == Tok.Struct) {
+            let c = parseTypeDecl(pa, false)
+            if (pa.failed) {
+                return emptyItems()
+            }
+            c.visibility = visibility
+            let ext = c.extends
+            let impls = c.implements
+            if (len(impls) == 0) {
+                if (let some(e) = ext) {
+                    errAt(pa, e.span, "structs cannot inherit from other types; use composition")
+                }
+            }
+            kind = ItemKind.Struct(StructDecl(c.name, c.span, c.visibility, c.generics, impls, c.members))
+        } else if (k == Tok.Enum) {
+            let e = parseEnum(pa)
+            if (pa.failed) {
+                return emptyItems()
+            }
+            e.visibility = visibility
+            kind = ItemKind.Enum(e)
+        } else if (k == Tok.Interface) {
+            let i = parseInterface(pa)
+            if (pa.failed) {
+                return emptyItems()
+            }
+            i.visibility = visibility
+            kind = ItemKind.Interface(i)
+        } else if (k == Tok.Const) {
+            let c = parseConst(pa)
+            if (pa.failed) {
+                return emptyItems()
+            }
+            kind = ItemKind.Const(c)
+        } else if (k == Tok.Var) {
+            let g = parseGlobal(pa)
+            if (pa.failed) {
+                return emptyItems()
+            }
+            kind = ItemKind.Global(g)
+        } else {
+            errHere(pa, "expected a declaration (class, fn, struct, enum, interface, const, var), found " + describeTok(kind(pa)))
+            return emptyItems()
+        }
+        let span = start.to(prevSpan(pa))
+        let items = emptyItems()
+        items.push(Item(doc, attrs, span, kind))
+        items
+}
+
+fn parseDescribeItem(pa: Parser) -> List<Item> {
+        let start = span(pa)
+        bump(pa) // `describe`
+        expect(pa, Tok.LParen)
+        if (pa.failed) {
+            return emptyItems()
+        }
+        let desc = parseTestDescription(pa)
+        if (pa.failed) {
+            return emptyItems()
+        }
+        expect(pa, Tok.Comma)
+        if (pa.failed) {
+            return emptyItems()
+        }
+        newlines(pa)
+        var block = parseBlock(pa)
+        if (pa.failed) {
+            return emptyItems()
+        }
+        newlines(pa)
+        expect(pa, Tok.RParen)
+        if (pa.failed) {
+            return emptyItems()
+        }
+        flattenBlockTail(block)
+        let span = start.to(prevSpan(pa))
+        let out = emptyItems()
+        desugarDescribeBlock(pa, 0, [desc], block, out)
+        let _ = span
+        if (pa.failed) {
+            return emptyItems()
+        }
+        out
+}
+
+fn parseHookItem(pa: Parser) -> ItemKind {
+        let start = span(pa)
+        var hook = expectIdent(pa, "hook name")
+        if (pa.failed) {
+            return dummyItemKind()
+        }
+        expect(pa, Tok.LParen)
+        if (pa.failed) {
+            return dummyItemKind()
+        }
+        newlines(pa)
+        var block = parseBlock(pa)
+        if (pa.failed) {
+            return dummyItemKind()
+        }
+        newlines(pa)
+        expect(pa, Tok.RParen)
+        if (pa.failed) {
+            return dummyItemKind()
+        }
+        flattenBlockTail(block)
+        let span = start.to(prevSpan(pa))
+        var kindPart = "?"
+        if (let some(h) = hookKind(hook)) {
+            kindPart = h
+        }
+        let name = "__pkl_hook_" + kindPart + "_"
+        ItemKind.Fn(FnDecl(name, span, Visibility.Default, false, emptyGenericParams(), emptyParams(), none, FnBody.Block(block)))
+}
+
+fn desugarDescribeBlock(pa: Parser, depth: int, path: List<string>, block: Block, out: List<Item>) {
+        for (stmt in block.stmts) {
+            let isExpr = match (stmt) {
+                case Stmt.Expr(e) -> e
+                case _ -> none
+            }
+            match (isExpr) {
+                case some(e) -> {
+                    let parts = callParts(e)
+                    match (parts) {
+                        case some(cc) -> {
+                            let callee = cc.callee
+                            let args = cc.args
+                            if (callee == "test" || callee == "it") {
+                                let desc = describeCallStr(pa, e, args, 0)
+                                if (pa.failed) {
+                                    return
+                                }
+                                let b = argBlockAt(e, args, 1)
+                                match (b) {
+                                    case some(bblk) -> {
+                                        var prefix = ""
+                                        if (len(path) > 0) {
+                                            prefix = joinStrs(path, " > ") + " > "
+                                        }
+                                        let full = prefix + desc
+                                        out.push(Item(emptyStrs(), emptyAttrs(), e.span, ItemKind.Test(FnDecl(full, e.span, Visibility.Default, false, emptyGenericParams(), emptyParams(), none, FnBody.Block(bblk)))))
+                                    }
+                                    case none -> {
+                                        errAt(pa, e.span, "`" + callee + "()` needs a `(\"description\", \{ ... \})` body")
+                                        pa.failed = true
+                                        return
+                                    }
+                                }
+                            } else if (callee == "describe") {
+                                let desc = describeCallStr(pa, e, args, 0)
+                                if (pa.failed) {
+                                    return
+                                }
+                                let b = argBlockAt(e, args, 1)
+                                match (b) {
+                                    case some(bblk) -> {
+                                        var nb = bblk
+                                        flattenBlockTail(nb)
+                                        let nested = emptyItems()
+                                        let npath = listCopy(path)
+                                        npath.push(desc)
+                                        desugarDescribeBlock(pa, 0, npath, nb, nested)
+                                        if (pa.failed) {
+                                            return
+                                        }
+                                        for (x in nested) {
+                                            out.push(x)
+                                        }
+                                    }
+                                    case none -> {
+                                        errAt(pa, e.span, "`describe()` needs a `(\"name\", \{ ... \})` body")
+                                        pa.failed = true
+                                        return
+                                    }
+                                }
+                            } else if (callee == "beforeAll" || callee == "beforeEach" || callee == "afterEach" || callee == "afterAll") {
+                                desugarHook(pa, e, args, path, out)
+                                if (pa.failed) {
+                                    return
+                                }
+                            } else {
+                                errAt(pa, e.span, "unsupported statement in a describe body: `" + callee + "(...)` (expected test/it/describe or a hook)")
+                                pa.failed = true
+                                return
+                            }
+                        }
+                        case none -> {
+                            errAt(pa, e.span, "expected `test(...)`, `it(...)`, `describe(...)` or a hook in a describe body")
+                            pa.failed = true
+                            return
+                        }
+                    }
+                }
+                case none -> {
+                    errAt(pa, stmtSpan(stmt), "expected `test(...)`, `it(...)`, `describe(...)` or a hook in a describe body")
+                    pa.failed = true
+                    return
+                }
+            }
+        }
+}
+
+fn desugarHook(pa: Parser, e: Expr, args: List<CallArg>, path: List<string>, out: List<Item>) {
+        let hook = callCalleeName(e)
+        let known = hookKind(hook)
+        match (known) {
+            case some(kind) -> {
+                let b = argBlockAt(e, args, 0)
+                match (b) {
+                    case some(bblk) -> {
+                        var name = "__pkl_hook_" + kind + "_"
+                        name += joinStrs(path, " > ")
+                        out.push(Item(emptyStrs(), emptyAttrs(), e.span, ItemKind.Fn(FnDecl(name, e.span, Visibility.Default, false, emptyGenericParams(), emptyParams(), none, FnBody.Block(bblk)))))
+                    }
+                    case none -> {
+                        errAt(pa, e.span, "`" + hook + "()` needs a `\{ ... \}` body block")
+                        pa.failed = true
+                        return
+                    }
+                }
+            }
+            case none -> {
+                errAt(pa, e.span, "unknown hook `" + hook + "`")
+                pa.failed = true
+            }
+        }
+}
+
+fn describeCallStr(pa: Parser, e: Expr, args: List<CallArg>, index: int) -> string {
+        let a = argAt(args, index)
+        match (a) {
+            case some(aa) -> {
+                match (strLiteralOf(aa.value)) {
+                    case some(segs) -> {
+                        var out = ""
+                        for (seg in segs) {
+                            match (seg) {
+                                case StrPart.Text(text) -> out += text
+                                case StrPart.Expr(_) -> {
+                                    errAt(pa, e.span, "interpolation is not allowed in a test description")
+                                    pa.failed = true
+                                    return ""
+                                }
+                            }
+                        }
+                        return out
+                    }
+                    case none -> {
+                        errAt(pa, e.span, "test description must be a string literal")
+                        pa.failed = true
+                        return ""
+                    }
+                }
+            }
+            case none -> {
+                errAt(pa, e.span, "test description must be a string literal")
+                pa.failed = true
+                return ""
+            }
+        }
+}
+
+fn parseFn(pa: Parser) -> FnDecl {
+        let start = span(pa)
+        expect(pa, Tok.Fn)
+        if (pa.failed) {
+            return dummyFnDecl()
+        }
+        let name = expectFnName(pa)
+        if (pa.failed) {
+            return dummyFnDecl()
+        }
+        let generics = parseGenericParams(pa)
+        if (pa.failed) {
+            return dummyFnDecl()
+        }
+        let params = parseParamList(pa)
+        if (pa.failed) {
+            return dummyFnDecl()
+        }
+        let returnTy = parseOptionalReturnType(pa)
+        if (pa.failed) {
+            return dummyFnDecl()
+        }
+        let body = parseFnBody(pa)
+        if (pa.failed) {
+            return dummyFnDecl()
+        }
+        let span = start.to(prevSpan(pa))
+        FnDecl(name, span, Visibility.Default, false, generics, params, returnTy, body)
+}
+
+fn parseOptionalReturnType(pa: Parser) -> TypeExpr? {
+        if (eat(pa, Tok.Arrow)) {
+            let t = parseType(pa)
+            if (pa.failed) {
+                return none
+            }
+            return t
+        }
+        if (eat(pa, Tok.Colon)) {
+            let t = parseType(pa)
+            if (pa.failed) {
+                return none
+            }
+            return t
+        }
+        none
+}
+
+fn expectFnName(pa: Parser) -> string {
+        let k = kind(pa)
+        match (k) {
+            case Tok.Ident(s) -> {
+                bump(pa)
+                return s
+            }
+            case _ -> {
+                if (let some(ci) = contextualIdent(k)) {
+                    bump(pa)
+                    return ci
+                }
+                errAt(pa, span(pa), "expected a function name, found " + describeTok(k))
+                pa.failed = true
+                return ""
+            }
+        }
+}
+
+fn parseGenericParams(pa: Parser) -> List<GenericParam> {
+        if (!at(pa, Tok.Lt)) {
+            return emptyGenericParams()
+        }
+        bump(pa)
+        let out = emptyGenericParams()
+        while (true) {
+            let name = expectIdent(pa, "type parameter")
+            if (pa.failed) {
+                return emptyGenericParams()
+            }
+            let span = prevSpan(pa)
+            out.push(GenericParam(name, span))
+            if (at(pa, Tok.Comma)) {
+                bump(pa)
+                newlines(pa)
+            } else {
+                break
+            }
+        }
+        consumeGt(pa, 1)
+        if (pa.failed) {
+            return emptyGenericParams()
+        }
+        out
+}
+
+fn parseParamList(pa: Parser) -> List<Param> {
+        expect(pa, Tok.LParen)
+        if (pa.failed) {
+            return emptyParams()
+        }
+        let params = emptyParams()
+        if (at(pa, Tok.RParen)) {
+            bump(pa)
+            return params
+        }
+        while (true) {
+            let start = span(pa)
+            let attrs = parseAttributes(pa)
+            if (pa.failed) {
+                return emptyParams()
+            }
+            let rest = eat(pa, Tok.Ellipsis)
+            let name = expectIdent(pa, "parameter")
+            if (pa.failed) {
+                return emptyParams()
+            }
+            var ty: TypeExpr? = none
+            if (eat(pa, Tok.Colon)) {
+                ty = parseType(pa)
+                if (pa.failed) {
+                    return emptyParams()
+                }
+            }
+            var default: Expr? = none
+            if (eat(pa, Tok.Assign)) {
+                let d = parseExpr(pa)
+                if (pa.failed) {
+                    return emptyParams()
+                }
+                default = d
+            }
+            params.push(Param(name, ty, default, rest, attrs, start.to(prevSpan(pa))))
+            if (eat(pa, Tok.Comma)) {
+                continuationAfter(pa, Tok.Comma)
+                if (at(pa, Tok.RParen)) {
+                    break
+                }
+            } else {
+                break
+            }
+        }
+        expect(pa, Tok.RParen)
+        if (pa.failed) {
+            return emptyParams()
+        }
+        params
+}
+
+fn parseFnBody(pa: Parser) -> FnBody {
+        if (eat(pa, Tok.FatArrow)) {
+            let e = parseExpr(pa)
+            if (pa.failed) {
+                return dummyFnBody()
+            }
+            return FnBody.Expr(e)
+        }
+        if (at(pa, Tok.LBrace)) {
+            let b = parseBlock(pa)
+            if (pa.failed) {
+                return dummyFnBody()
+            }
+            return FnBody.Block(b)
+        }
+        FnBody.Block(emptyBlock())
+}
+
+fn parseBlock(pa: Parser) -> Block {
+        let start = span(pa)
+        expect(pa, Tok.LBrace)
+        if (pa.failed) {
+            return emptyBlock()
+        }
+        let stmts = emptyStmts()
+        var expr: Expr? = none
+        newlines(pa)
+        while (true) {
+            if (at(pa, Tok.RBrace) || at(pa, Tok.Eof)) {
+                break
+            }
+            let s = parseStmt(pa)
+            if (pa.failed) {
+                return emptyBlock()
+            }
+            var isTail = false
+            if (at(pa, Tok.RBrace) || at(pa, Tok.Eof)) {
+                isTail = true
+            } else {
+                match (peekNonNl(pa, 1)) {
+                    case some(t) -> isTail = t == Tok.RBrace
+                    case none -> isTail = true
+                }
+            }
+            if (isTail) {
+                newlines(pa)
+                match (s) {
+                    case Stmt.Expr(e) -> expr = e
+                    case _ -> stmts.push(s)
+                }
+                break
+            }
+            expectStmtEnd(pa)
+            if (pa.failed) {
+                return emptyBlock()
+            }
+            stmts.push(s)
+        }
+        expect(pa, Tok.RBrace)
+        if (pa.failed) {
+            return emptyBlock()
+        }
+        Block(stmts, expr, start.to(prevSpan(pa)))
+}
+
+fn parseStmt(pa: Parser) -> Stmt {
+        let attrs = parseAttributes(pa)
+        if (pa.failed) {
+            return dummyStmt()
+        }
+        var stmt = parseStmtInner(pa)
+        if (pa.failed) {
+            return dummyStmt()
+        }
+        if (len(attrs) > 0) {
+            match (stmt) {
+                case Stmt.Let(pattern, ty, init, mutable, attrs2, span) if len(attrs2) == 0 -> {
+                    stmt = Stmt.Let(pattern, ty, init, mutable, attrs, span)
+                }
+                case _ -> errHere(pa, "attributes are only supported on `let`/`var` bindings")
+            }
+        }
+        stmt
+}
+
+fn parseStmtInner(pa: Parser) -> Stmt {
+        let k = kind(pa)
+        if (k == Tok.Let || k == Tok.Var) {
+            let mutable = at(pa, Tok.Var)
+            let spanStart = span(pa)
+            bump(pa)
+            let pat = parsePattern(pa)
+            if (pa.failed) {
+                return dummyStmt()
+            }
+            var ty: TypeExpr? = none
+            if (eat(pa, Tok.Colon)) {
+                ty = parseType(pa)
+                if (pa.failed) {
+                    return dummyStmt()
+                }
+            }
+            var init: Expr? = none
+            if (eat(pa, Tok.Assign)) {
+                continuationAfter(pa, Tok.Assign)
+                let e = parseExpr(pa)
+                if (pa.failed) {
+                    return dummyStmt()
+                }
+                init = e
+            }
+            let span = spanStart.to(prevSpan(pa))
+            Stmt.Let(pat, ty, init, mutable, emptyAttrs(), span)
+        } else if (k == Tok.Const) {
+            let start = span(pa)
+            bump(pa)
+            let name = expectIdent(pa, "constant name")
+            if (pa.failed) {
+                return dummyStmt()
+            }
+            var ty: TypeExpr? = none
+            if (eat(pa, Tok.Colon)) {
+                ty = parseType(pa)
+                if (pa.failed) {
+                    return dummyStmt()
+                }
+            }
+            expect(pa, Tok.Assign)
+            if (pa.failed) {
+                return dummyStmt()
+            }
+            continuationAfter(pa, Tok.Assign)
+            let value = parseExpr(pa)
+            if (pa.failed) {
+                return dummyStmt()
+            }
+            let span = start.to(prevSpan(pa))
+            Stmt.Const(name, ty, value, span)
+        } else if (k == Tok.Return) {
+            let start = span(pa)
+            bump(pa)
+            var value: Expr? = none
+            if (!(at(pa, Tok.Newline) || at(pa, Tok.RBrace) || at(pa, Tok.Eof))) {
+                let e = parseExpr(pa)
+                if (pa.failed) {
+                    return dummyStmt()
+                }
+                value = e
+            }
+            let span = start.to(prevSpan(pa))
+            Stmt.Return(value, span)
+        } else if (k == Tok.Break) {
+            let start = span(pa)
+            bump(pa)
+            let span = start.to(prevSpan(pa))
+            Stmt.Break(span)
+        } else if (k == Tok.Continue) {
+            let start = span(pa)
+            bump(pa)
+            let span = start.to(prevSpan(pa))
+            Stmt.Continue(span)
+        } else if (k == Tok.While) {
+            parseWhileStmt(pa)
+        } else if (k == Tok.For) {
+            parseForStmt(pa)
+        } else if (k == Tok.Try) {
+            parseTryStmt(pa)
+        } else if (k == Tok.Throw) {
+            parseThrowStmt(pa)
+        } else if (k == Tok.Semicolon) {
+            let span = span(pa)
+            bump(pa)
+            Stmt.Empty(span)
+        } else if (k == Tok.Newline) {
+            let span = span(pa)
+            bump(pa)
+            Stmt.Empty(span)
+        } else {
+            let e = parseExpr(pa)
+            if (pa.failed) {
+                return dummyStmt()
+            }
+            Stmt.Expr(e)
+        }
+}
+
+fn parseWhileStmt(pa: Parser) -> Stmt {
+        let start = span(pa)
+        expect(pa, Tok.While)
+        if (pa.failed) {
+            return dummyStmt()
+        }
+        expect(pa, Tok.LParen)
+        if (pa.failed) {
+            return dummyStmt()
+        }
+        let cond = parseExpr(pa)
+        if (pa.failed) {
+            return dummyStmt()
+        }
+        expect(pa, Tok.RParen)
+        if (pa.failed) {
+            return dummyStmt()
+        }
+        let body = parseBlock(pa)
+        if (pa.failed) {
+            return dummyStmt()
+        }
+        let span = start.to(prevSpan(pa))
+        Stmt.While(cond, body, span)
+}
+
+fn parseTryStmt(pa: Parser) -> Stmt {
+        let start = span(pa)
+        expect(pa, Tok.Try)
+        if (pa.failed) {
+            return dummyStmt()
+        }
+        let body = parseBlock(pa)
+        if (pa.failed) {
+            return dummyStmt()
+        }
+
+        var binder: string? = none
+        var handler: Block? = none
+        var hasHandler = false
+        if (eat(pa, Tok.Catch)) {
+            if (eat(pa, Tok.LParen)) {
+                let name = expectIdent(pa, "exception name")
+                if (pa.failed) {
+                    return dummyStmt()
+                }
+                binder = name
+                expect(pa, Tok.RParen)
+                if (pa.failed) {
+                    return dummyStmt()
+                }
+            }
+            let h = parseBlock(pa)
+            if (pa.failed) {
+                return dummyStmt()
+            }
+            handler = h
+            hasHandler = true
+        }
+
+        if (at(pa, Tok.Catch)) {
+            errHere(pa, "a `try` can only have one `catch`")
+            return dummyStmt()
+        }
+
+        var fin: Block? = none
+        var hasFinally = false
+        if (eat(pa, Tok.Finally)) {
+            let f = parseBlock(pa)
+            if (pa.failed) {
+                return dummyStmt()
+            }
+            fin = f
+            hasFinally = true
+        }
+
+        if (!hasHandler && !hasFinally) {
+            errAt(pa, start, "`try` needs a `catch` or a `finally`")
+            return dummyStmt()
+        }
+
+        let span = start.to(prevSpan(pa))
+        Stmt.Try(body, binder, handler, fin, span)
+}
+
+fn parseThrowStmt(pa: Parser) -> Stmt {
+        let start = span(pa)
+        expect(pa, Tok.Throw)
+        if (pa.failed) {
+            return dummyStmt()
+        }
+        continuationAfter(pa, Tok.Throw)
+        let value = parseExpr(pa)
+        if (pa.failed) {
+            return dummyStmt()
+        }
+        let span = start.to(prevSpan(pa))
+        Stmt.Throw(value, span)
+}
+
+fn parseForStmt(pa: Parser) -> Stmt {
+        let start = span(pa)
+        expect(pa, Tok.For)
+        if (pa.failed) {
+            return dummyStmt()
+        }
+        expect(pa, Tok.LParen)
+        if (pa.failed) {
+            return dummyStmt()
+        }
+
+        var header: ForHeader
+        if (scanForHeaderIsIteration(pa)) {
+            let pattern = parsePattern(pa)
+            if (pa.failed) {
+                return dummyStmt()
+            }
+            expect(pa, Tok.In)
+            if (pa.failed) {
+                return dummyStmt()
+            }
+            let sequence = parseExpr(pa)
+            if (pa.failed) {
+                return dummyStmt()
+            }
+            header = ForHeader.In(pattern, sequence)
+        } else {
+            let init = parseStmt(pa)
+            if (pa.failed) {
+                return dummyStmt()
+            }
+            expect(pa, Tok.Semicolon)
+            if (pa.failed) {
+                return dummyStmt()
+            }
+            if (at(pa, Tok.Newline)) {
+                newlines(pa)
+            }
+            let cond = parseExpr(pa)
+            if (pa.failed) {
+                return dummyStmt()
+            }
+            expect(pa, Tok.Semicolon)
+            if (pa.failed) {
+                return dummyStmt()
+            }
+            if (at(pa, Tok.Newline)) {
+                newlines(pa)
+            }
+            let step = parseExpr(pa)
+            if (pa.failed) {
+                return dummyStmt()
+            }
+            header = ForHeader.Range(init, cond, step)
+        }
+        expect(pa, Tok.RParen)
+        if (pa.failed) {
+            return dummyStmt()
+        }
+        let body = parseBlock(pa)
+        if (pa.failed) {
+            return dummyStmt()
+        }
+        let span = start.to(prevSpan(pa))
+        Stmt.For(header, body, span)
+}
+
+fn scanForHeaderIsIteration(pa: Parser) -> bool {
+        var depth = 0
+        var i = pa.pos
+        while (true) {
+            let t = pa.tokens[minOf(i, len(pa.tokens) - 1)].token.kind
+            if (t == Tok.LParen || t == Tok.LBracket || t == Tok.LBrace) {
+                depth = depth + 1
+            } else if (t == Tok.RParen || t == Tok.RBracket || t == Tok.RBrace) {
+                if (depth == 0) {
+                    break
+                }
+                depth = depth - 1
+            } else if (t == Tok.In) {
+                return true
+            } else if (t == Tok.Newline) {
+                if (depth == 0) {
+                    return false
+                }
+            } else if (t == Tok.Eof) {
+                return false
+            }
+            i = i + 1
+        }
+        false
+}
+
+fn parseConst(pa: Parser) -> ConstDecl {
+        let start = span(pa)
+        expect(pa, Tok.Const)
+        if (pa.failed) {
+            return dummyConstDecl()
+        }
+        let name = expectIdent(pa, "constant name")
+        if (pa.failed) {
+            return dummyConstDecl()
+        }
+        var ty: TypeExpr? = none
+        if (eat(pa, Tok.Colon)) {
+            ty = parseType(pa)
+            if (pa.failed) {
+                return dummyConstDecl()
+            }
+        }
+        expect(pa, Tok.Assign)
+        if (pa.failed) {
+            return dummyConstDecl()
+        }
+        continuationAfter(pa, Tok.Assign)
+        let value = parseExpr(pa)
+        if (pa.failed) {
+            return dummyConstDecl()
+        }
+        let span = start.to(prevSpan(pa))
+        expectStmtEnd(pa)
+        if (pa.failed) {
+            return dummyConstDecl()
+        }
+        ConstDecl(name, Visibility.Default, ty, value, span)
+}
+
+fn parseGlobal(pa: Parser) -> GlobalDecl {
+        let start = span(pa)
+        expect(pa, Tok.Var)
+        if (pa.failed) {
+            return dummyGlobalDecl()
+        }
+        let name = expectIdent(pa, "global name")
+        if (pa.failed) {
+            return dummyGlobalDecl()
+        }
+        var ty: TypeExpr? = none
+        if (eat(pa, Tok.Colon)) {
+            ty = parseType(pa)
+            if (pa.failed) {
+                return dummyGlobalDecl()
+            }
+        }
+        expect(pa, Tok.Assign)
+        if (pa.failed) {
+            return dummyGlobalDecl()
+        }
+        continuationAfter(pa, Tok.Assign)
+        let value = parseExpr(pa)
+        if (pa.failed) {
+            return dummyGlobalDecl()
+        }
+        let span = start.to(prevSpan(pa))
+        expectStmtEnd(pa)
+        if (pa.failed) {
+            return dummyGlobalDecl()
+        }
+        GlobalDecl(name, Visibility.Default, ty, value, span)
+}
+
+fn parseType(pa: Parser) -> TypeExpr {
+        let start = span(pa)
+        var ty = parseTypePrefix(pa)
+        if (pa.failed) {
+            return dummyType()
+        }
+        while (at(pa, Tok.Question)) {
+            bump(pa)
+            let span = start.to(prevSpan(pa))
+            ty = TypeExpr(span, TypeExprKind.Option(ty))
+        }
+        ty
+}
+
+fn parseTypePrefix(pa: Parser) -> TypeExpr {
+        let start = span(pa)
+        let k = kind(pa)
+        if (k == Tok.Star) {
+            bump(pa)
+            let inner = parseType(pa)
+            if (pa.failed) {
+                return dummyType()
+            }
+            let span = start.to(inner.span)
+            TypeExpr(span, TypeExprKind.Pointer(inner))
+        } else if (k == Tok.Amp) {
+            bump(pa)
+            let inner = parseType(pa)
+            if (pa.failed) {
+                return dummyType()
+            }
+            let span = start.to(inner.span)
+            TypeExpr(span, TypeExprKind.Ref(inner))
+        } else if (k == Tok.Fn) {
+            bump(pa)
+            expect(pa, Tok.LParen)
+            if (pa.failed) {
+                return dummyType()
+            }
+            let pts = emptyTypeExprs()
+            if (!at(pa, Tok.RParen)) {
+                while (true) {
+                    pts.push(parseType(pa))
+                    if (pa.failed) {
+                        return dummyType()
+                    }
+                    if (eat(pa, Tok.Comma)) {
+                        continuationAfter(pa, Tok.Comma)
+                    } else {
+                        break
+                    }
+                }
+            }
+            expect(pa, Tok.RParen)
+            if (pa.failed) {
+                return dummyType()
+            }
+            let isAsync = false
+            var ret: TypeExpr? = none
+            if (eat(pa, Tok.Arrow) || eat(pa, Tok.Colon)) {
+                let r = parseType(pa)
+                if (pa.failed) {
+                    return dummyType()
+                }
+                ret = r
+            }
+            let span = start.to(prevSpan(pa))
+            TypeExpr(span, TypeExprKind.Fn(pts, ret, isAsync))
+        } else if (k == Tok.LParen) {
+            bump(pa)
+            let parts = emptyTypeExprs()
+            if (!at(pa, Tok.RParen)) {
+                while (true) {
+                    parts.push(parseType(pa))
+                    if (pa.failed) {
+                        return dummyType()
+                    }
+                    if (eat(pa, Tok.Comma)) {
+                        continuationAfter(pa, Tok.Comma)
+                        if (at(pa, Tok.RParen)) {
+                            break
+                        }
+                    } else {
+                        break
+                    }
+                }
+            }
+            expect(pa, Tok.RParen)
+            if (pa.failed) {
+                return dummyType()
+            }
+            if (at(pa, Tok.Arrow)) {
+                bump(pa)
+                let ret = parseType(pa)
+                if (pa.failed) {
+                    return dummyType()
+                }
+                let span = start.to(prevSpan(pa))
+                return TypeExpr(span, TypeExprKind.Fn(parts, ret, false))
+            }
+            if (len(parts) == 1) {
+                let span = start.to(prevSpan(pa))
+                let last = parts.pop()
+                TypeExpr(span, last.kind)
+            } else {
+                let span = start.to(prevSpan(pa))
+                TypeExpr(span, TypeExprKind.Tuple(parts))
+            }
+        } else {
+            var singleIdent = ""
+            match (k) {
+                case Tok.Ident(s) -> singleIdent = s
+                case _ -> {}
+            }
+            if (singleIdent == "_") {
+                bump(pa)
+                TypeExpr(start, TypeExprKind.Infer)
+            } else if (isIdentTok(k)) {
+                let path = emptyStrs()
+                let span0 = start
+                while (true) {
+                    path.push(expectIdent(pa, "type name"))
+                    if (pa.failed) {
+                        return dummyType()
+                    }
+                    if (at(pa, Tok.Dot)) {
+                        bump(pa)
+                    } else {
+                        break
+                    }
+                }
+                let span = span0.to(prevSpan(pa))
+                if (at(pa, Tok.Lt)) {
+                    let args = parseTypeArgs(pa)
+                    if (pa.failed) {
+                        return dummyType()
+                    }
+                    let base = TypeExpr(span, TypeExprKind.Path(path))
+                    let span2 = span0.to(prevSpan(pa))
+                    TypeExpr(span2, TypeExprKind.Generic(base, args))
+                } else {
+                    TypeExpr(span, TypeExprKind.Path(path))
+                }
+            } else {
+                errAt(pa, start, "expected a type, found " + describeTok(k))
+                pa.failed = true
+                dummyType()
+            }
+        }
+}
+
+fn parseTypeArgs(pa: Parser) -> List<TypeExpr> {
+        expect(pa, Tok.Lt)
+        if (pa.failed) {
+            return emptyTypeExprs()
+        }
+        let args = emptyTypeExprs()
+        if (at(pa, Tok.Gt)) {
+            bump(pa)
+            return args
+        }
+        while (true) {
+            args.push(parseType(pa))
+            if (pa.failed) {
+                return emptyTypeExprs()
+            }
+            if (at(pa, Tok.Comma)) {
+                bump(pa)
+                continuationAfter(pa, Tok.Comma)
+                if (at(pa, Tok.Gt)) {
+                    bump(pa)
+                    break
+                }
+                if (at(pa, Tok.Shr)) {
+                    splitShiftAsTwoGt(pa)
+                    bump(pa)
+                    break
+                }
+            } else if (at(pa, Tok.Gt)) {
+                bump(pa)
+                break
+            } else if (at(pa, Tok.Shr)) {
+                splitShiftAsTwoGt(pa)
+                bump(pa)
+                break
+            } else {
+                errHere(pa, "expected `>` or `,` in type arguments, found " + describeTok(kind(pa)))
+                pa.failed = true
+                return emptyTypeExprs()
+            }
+        }
+        args
+}
+
+fn splitShiftAsTwoGt(pa: Parser) {
+        if (!(kind(pa) == Tok.Shr)) {
+            return
+        }
+        let span = span(pa)
+        pa.tokens[pa.pos].token = Token(Tok.Gt, span)
+        pa.tokens.insert(pa.pos + 1, plainTok(Tok.Gt, span))
+}
+
+fn consumeGt(pa: Parser, n: int) {
+        var remaining = n
+        while (remaining > 0) {
+            let k = kind(pa)
+            if (k == Tok.Gt) {
+                bump(pa)
+                remaining = remaining - 1
+            } else if (k == Tok.Shr) {
+                splitShiftAsTwoGt(pa)
+            } else {
+                errHere(pa, "expected `>` or `>>`, found " + describeTok(k))
+                pa.failed = true
+                return
+            }
+        }
+}
+
+fn parsePattern(pa: Parser) -> Pattern {
+        let p = parsePatternInner(pa)
+        if (pa.failed) {
+            return Pattern.Wildcard
+        }
+        if (at(pa, Tok.Pipe)) {
+            let alts = emptyPatterns()
+            alts.push(p)
+            while (eat(pa, Tok.Pipe)) {
+                let q = parsePatternInner(pa)
+                if (pa.failed) {
+                    return Pattern.Wildcard
+                }
+                alts.push(q)
+            }
+            return Pattern.Or(alts)
+        }
+        p
+}
+
+fn parsePatternInner(pa: Parser) -> Pattern {
+        let k = kind(pa)
+        match (k) {
+            case Tok.Ident(s) if s == "_" -> {
+                bump(pa)
+                Pattern.Wildcard
+            }
+            case Tok.Number -> {
+                let t = advance(pa)
+                if (t.data.isf) {
+                    Pattern.Literal(Lit.Float(t.data.text))
+                } else {
+                    Pattern.Literal(Lit.Int(intLitValue(pa, t.data.ival, t.data.text, t.token.span)))
+                }
+            }
+            case Tok.Str(_) -> {
+                let t = advance(pa)
+                match (t.token.kind) {
+                    case Tok.Str(lit) -> Pattern.Literal(Lit.String(stringParts(pa, lit)))
+                    case _ -> Pattern.Wildcard
+                }
+            }
+            case Tok.Char(_) -> {
+                let t = advance(pa)
+                match (t.token.kind) {
+                    case Tok.Char(c) -> Pattern.Literal(Lit.Char(c))
+                    case _ -> Pattern.Wildcard
+                }
+            }
+            case Tok.True -> {
+                bump(pa)
+                Pattern.Literal(Lit.Bool(true))
+            }
+            case Tok.False -> {
+                bump(pa)
+                Pattern.Literal(Lit.Bool(false))
+            }
+            case Tok.None -> {
+                bump(pa)
+                Pattern.Literal(Lit.None)
+            }
+            case Tok.Minus -> {
+                bump(pa)
+                let t = advance(pa)
+                if (t.data.isf) {
+                    Pattern.Literal(Lit.Float("-" + t.data.text))
+                } else {
+                    Pattern.Literal(Lit.Int(-(intLitValue(pa, t.data.ival, "-" + t.data.text, t.token.span))))
+                }
+            }
+            case Tok.LParen -> {
+                bump(pa)
+                let parts = emptyPatterns()
+                if (!at(pa, Tok.RParen)) {
+                    while (true) {
+                        parts.push(parsePattern(pa))
+                        if (pa.failed) {
+                            return Pattern.Wildcard
+                        }
+                        if (eat(pa, Tok.Comma)) {
+                            continuationAfter(pa, Tok.Comma)
+                            if (at(pa, Tok.RParen)) {
+                                break
+                            }
+                        } else {
+                            break
+                        }
+                    }
+                }
+                expect(pa, Tok.RParen)
+                if (pa.failed) {
+                    return Pattern.Wildcard
+                }
+                if (len(parts) == 1) {
+                    parts.pop()
+                } else {
+                    Pattern.Tuple(parts)
+                }
+            }
+            case _ -> {
+                let isName = isIdentTok(k) || isSomeStr(contextualIdent(k))
+                if (isName) {
+                    let path = emptyStrs()
+                    path.push(expectIdent(pa, "pattern"))
+                    if (pa.failed) {
+                        return Pattern.Wildcard
+                    }
+                    while (at(pa, Tok.Dot)) {
+                        bump(pa)
+                        path.push(expectIdent(pa, "pattern path"))
+                        if (pa.failed) {
+                            return Pattern.Wildcard
+                        }
+                    }
+                    if (at(pa, Tok.LParen)) {
+                        bump(pa)
+                        let payloads = emptyPatterns()
+                        if (!at(pa, Tok.RParen)) {
+                            while (true) {
+                                payloads.push(parsePattern(pa))
+                                if (pa.failed) {
+                                    return Pattern.Wildcard
+                                }
+                                if (eat(pa, Tok.Comma)) {
+                                    continuationAfter(pa, Tok.Comma)
+                                    if (at(pa, Tok.RParen)) {
+                                        break
+                                    }
+                                } else {
+                                    break
+                                }
+                            }
+                        }
+                        expect(pa, Tok.RParen)
+                        if (pa.failed) {
+                            return Pattern.Wildcard
+                        }
+                        Pattern.Variant(path, payloads)
+                    } else if (at(pa, Tok.Colon)) {
+                        bump(pa)
+                        let ty = parseType(pa)
+                        if (pa.failed) {
+                            return Pattern.Wildcard
+                        }
+                        Pattern.Binding(path[0], ty)
+                    } else if (len(path) > 1) {
+                        Pattern.Variant(path, emptyPatterns())
+                    } else {
+                        Pattern.Binding(path[0], none)
+                    }
+                } else {
+                    errAt(pa, span(pa), "expected a pattern, found " + describeTok(k))
+                    pa.failed = true
+                    Pattern.Wildcard
+                }
+            }
+        }
+}
+
+fn stringParts(pa: Parser, lit: StrLit) -> List<StrPart> {
+        let parts = emptyStrParts()
+        for (seg in lit.segments) {
+            match (seg) {
+                case StrSeg.Text(text) -> parts.push(StrPart.Text(text))
+                case StrSeg.Expr(tokens) -> {
+                    let sub = Parser(tokens, pa.diags)
+                    let e = parseExpr(sub)
+                    if (sub.failed) {
+                        pa.failed = true
+                        return emptyStrParts()
+                    }
+                    parts.push(StrPart.Expr(e))
+                }
+            }
+        }
+        parts
+}
+
+fn parseExpr(pa: Parser) -> Expr {
+        let lhs = parseBinary(pa, 0)
+        if (pa.failed) {
+            return dummyExpr()
+        }
+        let op = match (kind(pa)) {
+            case Tok.Assign -> AssignOp.Assign
+            case Tok.PlusEq -> AssignOp.Add
+            case Tok.MinusEq -> AssignOp.Sub
+            case Tok.StarEq -> AssignOp.Mul
+            case Tok.SlashEq -> AssignOp.Div
+            case Tok.PercentEq -> AssignOp.Mod
+            case Tok.ShlEq -> AssignOp.Shl
+            case Tok.ShrEq -> AssignOp.Shr
+            case Tok.AndEq -> AssignOp.BitAnd
+            case Tok.OrEq -> AssignOp.BitOr
+            case Tok.XorEq -> AssignOp.BitXor
+            case _ -> { return lhs }
+        }
+        let opTok = assignOpTok(op)
+        bump(pa)
+        continuationAfter(pa, opTok)
+        let value = parseExpr(pa)
+        if (pa.failed) {
+            return dummyExpr()
+        }
+        let span = lhs.span.to(value.span)
+        Expr(span, ExprKind.Assign(lhs, op, value))
+}
+
+fn parseBinary(pa: Parser, minPrec: int) -> Expr {
+        var lhs = parseUnary(pa)
+        if (pa.failed) {
+            return dummyExpr()
+        }
+        while (true) {
+            if (at(pa, Tok.Newline) && nextBeginsContinuation(pa)) {
+                newlines(pa)
+            }
+            if (at(pa, Tok.As) || at(pa, Tok.Is)) {
+                let isAs = at(pa, Tok.As)
+                let opSpan = span(pa)
+                bump(pa)
+                var castKind = CastKind.Is
+                if (isAs && at(pa, Tok.Question)) {
+                    bump(pa)
+                    castKind = CastKind.TryAs
+                } else if (isAs) {
+                    castKind = CastKind.As
+                }
+                let ty = parseType(pa)
+                if (pa.failed) {
+                    return dummyExpr()
+                }
+                let span = lhs.span.to(opSpan).to(ty.span)
+                lhs = Expr(span, ExprKind.Cast(lhs, ty, castKind))
+                continue
+            }
+            let t = kind(pa)
+            let info = binopInfo(t)
+            match (info) {
+                case some(inf) -> {
+                    if (inf.prec < minPrec) {
+                        break
+                    }
+                    let op = inf.op
+                    bump(pa)
+                    continuationAfter(pa, t)
+                    var rightMin = inf.prec + 1
+                    if (op == BinOp.Pow) {
+                        rightMin = inf.prec
+                    }
+                    let rhs = parseBinary(pa, rightMin)
+                    if (pa.failed) {
+                        return dummyExpr()
+                    }
+                    lhs = Expr(lhs.span.to(rhs.span), ExprKind.Binary(op, lhs, rhs))
+                }
+                case none -> { break }
+            }
+        }
+        lhs
+}
+
+fn parseUnary(pa: Parser) -> Expr {
+        let start = span(pa)
+        let k = kind(pa)
+        var op: UnOp? = none
+        if (k == Tok.Minus) {
+            op = UnOp.Neg
+        } else if (k == Tok.Bang) {
+            op = UnOp.Not
+        } else if (k == Tok.Tilde) {
+            op = UnOp.BitNot
+        } else if (k == Tok.Star) {
+            op = UnOp.Deref
+        } else if (k == Tok.Amp) {
+            op = UnOp.AddrOf
+        }
+        match (op) {
+            case some(o) -> {
+                bump(pa)
+                let operand = parseUnary(pa)
+                if (pa.failed) {
+                    return dummyExpr()
+                }
+                let span = start.to(operand.span)
+                Expr(span, ExprKind.Unary(o, operand))
+            }
+            case none -> parsePostfix(pa)
+        }
+}
+
+fn parsePostfix(pa: Parser) -> Expr {
+        var e = parsePrimary(pa)
+        if (pa.failed) {
+            return dummyExpr()
+        }
+        while (true) {
+            if (at(pa, Tok.Newline) && nextBeginsContinuation(pa)) {
+                newlines(pa)
+            }
+            let spanStart = e.span
+            let k = kind(pa)
+            if (k == Tok.Dot) {
+                bump(pa)
+                let name = expectIdent(pa, "member name")
+                if (pa.failed) {
+                    return dummyExpr()
+                }
+                let span = spanStart.to(prevSpan(pa))
+                e = Expr(span, ExprKind.Member(e, name))
+            } else if (k == Tok.QuestionDot) {
+                bump(pa)
+                let name = expectIdent(pa, "member name")
+                if (pa.failed) {
+                    return dummyExpr()
+                }
+                let span = spanStart.to(prevSpan(pa))
+                e = Expr(span, ExprKind.OptAccess(e, name))
+            } else if (k == Tok.Question) {
+                bump(pa)
+                let span = spanStart.to(prevSpan(pa))
+                e = Expr(span, ExprKind.OptUnwrap(e))
+            } else if (k == Tok.LParen) {
+                let args = parseCallArgsInternal(pa)
+                if (pa.failed) {
+                    return dummyExpr()
+                }
+                let span = spanStart.to(prevSpan(pa))
+                e = Expr(span, ExprKind.Call(e, args))
+            } else if (k == Tok.LBracket) {
+                bump(pa)
+                let idx = parseExpr(pa)
+                if (pa.failed) {
+                    return dummyExpr()
+                }
+                expect(pa, Tok.RBracket)
+                if (pa.failed) {
+                    return dummyExpr()
+                }
+                let span = spanStart.to(prevSpan(pa))
+                e = Expr(span, ExprKind.Index(e, idx))
+            } else {
+                break
+            }
+        }
+        e
+}
+
+fn parseCallArgsInternal(pa: Parser) -> List<CallArg> {
+        expect(pa, Tok.LParen)
+        if (pa.failed) {
+            return emptyCallArgs()
+        }
+        let args = emptyCallArgs()
+        if (at(pa, Tok.RParen)) {
+            bump(pa)
+            return args
+        }
+        while (true) {
+            let start = span(pa)
+            let spread = eat(pa, Tok.Ellipsis)
+            var name: string? = none
+            if (peekIsNamedArg(pa)) {
+                let n = expectIdent(pa, "argument name")
+                if (pa.failed) {
+                    return emptyCallArgs()
+                }
+                expect(pa, Tok.Colon)
+                if (pa.failed) {
+                    return emptyCallArgs()
+                }
+                name = n
+            }
+            let value = parseExpr(pa)
+            if (pa.failed) {
+                return emptyCallArgs()
+            }
+            args.push(CallArg(name, value, spread, start.to(prevSpan(pa))))
+            if (eat(pa, Tok.Comma)) {
+                continuationAfter(pa, Tok.Comma)
+                if (at(pa, Tok.RParen)) {
+                    break
+                }
+            } else {
+                break
+            }
+        }
+        expect(pa, Tok.RParen)
+        if (pa.failed) {
+            return emptyCallArgs()
+        }
+        args
+}
+
+fn peekIsNamedArg(pa: Parser) -> bool {
+        if (!isIdentTok(kind(pa))) {
+            return false
+        }
+        peekAt(pa, 1) == Tok.Colon
+}
+
+fn parsePrimary(pa: Parser) -> Expr {
+        let start = span(pa)
+        let k = kind(pa)
+        match (k) {
+            case Tok.Number -> {
+                let t = advance(pa)
+                var isFloat = t.data.isf || suffStartsF(t.data.suf)
+                if (isFloat) {
+                    Expr(t.token.span, ExprKind.Lit(Lit.Float(t.data.text)))
+                } else {
+                    Expr(t.token.span, ExprKind.Lit(Lit.Int(intLitValue(pa, t.data.ival, t.data.text, t.token.span))))
+                }
+            }
+            case Tok.Str(lit) -> {
+                let t = advance(pa)
+                let parts = stringParts(pa, match (t.token.kind) {
+                    case Tok.Str(l2) -> l2
+                    case _ -> lit
+                })
+                if (pa.failed) {
+                    return dummyExpr()
+                }
+                Expr(t.token.span, ExprKind.Lit(Lit.String(parts)))
+            }
+            case Tok.Char(_) -> {
+                let t = advance(pa)
+                match (t.token.kind) {
+                    case Tok.Char(c) -> Expr(t.token.span, ExprKind.Lit(Lit.Char(c)))
+                    case _ -> dummyExpr()
+                }
+            }
+            case Tok.True -> {
+                bump(pa)
+                Expr(start, ExprKind.Lit(Lit.Bool(true)))
+            }
+            case Tok.False -> {
+                bump(pa)
+                Expr(start, ExprKind.Lit(Lit.Bool(false)))
+            }
+            case Tok.None -> {
+                bump(pa)
+                Expr(start, ExprKind.Lit(Lit.None))
+            }
+            case Tok.This -> {
+                bump(pa)
+                Expr(start, ExprKind.This)
+            }
+            case Tok.Super -> {
+                bump(pa)
+                Expr(start, ExprKind.Super)
+            }
+            case Tok.If -> parseIf(pa)
+            case Tok.Match -> parseMatch(pa)
+            case Tok.Unsafe -> {
+                bump(pa)
+                let body = parseBlock(pa)
+                if (pa.failed) {
+                    return dummyExpr()
+                }
+                let span = start.to(prevSpan(pa))
+                Expr(span, ExprKind.Unsafe(body))
+            }
+            case Tok.Await -> {
+                bump(pa)
+                let inner = parseUnary(pa)
+                if (pa.failed) {
+                    return dummyExpr()
+                }
+                let span = start.to(inner.span)
+                Expr(span, ExprKind.Await(inner))
+            }
+            case Tok.Async -> {
+                if (peekAt(pa, 1) == Tok.Fn) {
+                    parseAsyncLambda(pa, start)
+                } else {
+                    // `async` not followed by `fn` in expression position is
+                    // just the contextual identifier.
+                    bump(pa)
+                    Expr(start.to(prevSpan(pa)), ExprKind.Ident("async"))
+                }
+            }
+            case Tok.Ident(_) -> {
+                let flavor = genericCallFlavor(pa)
+                var isGeneric = false
+                match (flavor) {
+                    case some(f) -> isGeneric = f == GenericCallFlavor.Call || f == GenericCallFlavor.Value
+                    case none -> {}
+                }
+                if (isGeneric) {
+                    return parseGenericCall(pa, start)
+                }
+                let name = expectIdent(pa, "expression")
+                if (pa.failed) {
+                    return dummyExpr()
+                }
+                Expr(start.to(prevSpan(pa)), ExprKind.Ident(name))
+            }
+            case Tok.Task -> {
+                // `task { body }` — sugar for `thread_spawn(fn() { body })`,
+                // desugared here so check and emit see an ordinary spawn call
+                // and the task carries its state exactly as a hand-written
+                // closure does (the block becomes the closure body, captures
+                // and all). The `{` may sit on the next line, but a bare
+                // `task` that is not followed by a block stays the contextual
+                // keyword used as a plain identifier.
+                if (let some(t) = peekNonNl(pa, 1)) {
+                    if (t == Tok.LBrace) {
+                        bump(pa)
+                        newlines(pa)
+                        let body = parseBlock(pa)
+                        if (pa.failed) {
+                            return dummyExpr()
+                        }
+                        let end = prevSpan(pa)
+                        let closure = Expr(body.span, ExprKind.Lambda(emptyParams(), none, false, FnBody.Block(body)))
+                        let cargs = emptyCallArgs()
+                        cargs.push(CallArg(none, closure, false, end))
+                        Expr(start.to(end), ExprKind.Call(Expr(start, ExprKind.Ident("thread_spawn")), cargs))
+                    } else {
+                        bump(pa)
+                        Expr(start.to(prevSpan(pa)), ExprKind.Ident("task"))
+                    }
+                } else {
+                    bump(pa)
+                    Expr(start.to(prevSpan(pa)), ExprKind.Ident("task"))
+                }
+            }
+            case _ -> {
+                if (let some(name) = contextualIdent(k)) {
+                    bump(pa)
+                    Expr(start.to(prevSpan(pa)), ExprKind.Ident(name))
+                } else if (k == Tok.Fn) {
+                    parseLambda(pa, start)
+                } else if (k == Tok.LParen) {
+                    parseParenExpr(pa)
+                } else if (k == Tok.LBracket) {
+                    bump(pa)
+                    let elems = emptyExprs()
+                    if (!at(pa, Tok.RBracket)) {
+                        while (true) {
+                            elems.push(parseExpr(pa))
+                            if (pa.failed) {
+                                return dummyExpr()
+                            }
+                            if (eat(pa, Tok.Comma)) {
+                                continuationAfter(pa, Tok.Comma)
+                                if (at(pa, Tok.RBracket)) {
+                                    break
+                                }
+                            } else {
+                                break
+                            }
+                        }
+                    }
+                    expect(pa, Tok.RBracket)
+                    if (pa.failed) {
+                        return dummyExpr()
+                    }
+                    let span = start.to(prevSpan(pa))
+                    Expr(span, ExprKind.Array(elems))
+                } else if (k == Tok.LBrace) {
+                    if (looksLikeMapLiteral(pa)) {
+                        parseMapLiteral(pa, start)
+                    } else {
+                        let b = parseBlock(pa)
+                        if (pa.failed) {
+                            return dummyExpr()
+                        }
+                        let span = start.to(prevSpan(pa))
+                        Expr(span, ExprKind.Block(b))
+                    }
+                } else {
+                    errAt(pa, start, "expected an expression, found " + describeTok(k))
+                    pa.failed = true
+                    dummyExpr()
+                }
+            }
+        }
+}
+
+fn looksLikeMapLiteral(pa: Parser) -> bool {
+        var depth = 0
+        var i = pa.pos + 1
+        while (true) {
+            let t = pa.tokens[minOf(i, len(pa.tokens) - 1)].token.kind
+            if (t == Tok.LBrace || t == Tok.LBracket || t == Tok.LParen) {
+                depth = depth + 1
+            } else if (t == Tok.RBrace) {
+                if (depth == 0) {
+                    break
+                }
+                depth = depth - 1
+            } else if (t == Tok.RBracket || t == Tok.RParen) {
+                depth = depth - 1
+            } else if (t == Tok.Eof) {
+                break
+            } else if (t == Tok.Newline) {
+                if (depth == 0) {
+                    return false
+                }
+            } else if (t == Tok.Colon) {
+                if (depth == 0) {
+                    return true
+                }
+            }
+            i = i + 1
+        }
+        false
+}
+
+fn parseMapLiteral(pa: Parser, start: Span) -> Expr {
+        expect(pa, Tok.LBrace)
+        if (pa.failed) {
+            return dummyExpr()
+        }
+        let entries = emptyMapEntries()
+        newlines(pa)
+        if (!at(pa, Tok.RBrace)) {
+            while (true) {
+                let k = parseExpr(pa)
+                if (pa.failed) {
+                    return dummyExpr()
+                }
+                expect(pa, Tok.Colon)
+                if (pa.failed) {
+                    return dummyExpr()
+                }
+                continuationAfter(pa, Tok.Colon)
+                let v = parseExpr(pa)
+                if (pa.failed) {
+                    return dummyExpr()
+                }
+                entries.push(MapEntry(k, v))
+                if (eat(pa, Tok.Comma)) {
+                    continuationAfter(pa, Tok.Comma)
+                    newlines(pa)
+                    if (at(pa, Tok.RBrace)) {
+                        break
+                    }
+                } else {
+                    break
+                }
+            }
+        }
+        expect(pa, Tok.RBrace)
+        if (pa.failed) {
+            return dummyExpr()
+        }
+        let span = start.to(prevSpan(pa))
+        Expr(span, ExprKind.Map(entries))
+}
+
+fn parseParenExpr(pa: Parser) -> Expr {
+        let start = span(pa)
+        var e = tryParseLambdaParens(pa, start)
+        if (pa.failed) {
+            return dummyExpr()
+        }
+        match (e) {
+            case some(le) -> { return le }
+            case none -> {}
+        }
+        expect(pa, Tok.LParen)
+        if (pa.failed) {
+            return dummyExpr()
+        }
+        let first = parseExpr(pa)
+        if (pa.failed) {
+            return dummyExpr()
+        }
+        if (at(pa, Tok.Comma)) {
+            let items = emptyExprs()
+            items.push(first)
+            while (eat(pa, Tok.Comma)) {
+                continuationAfter(pa, Tok.Comma)
+                if (at(pa, Tok.RParen)) {
+                    break
+                }
+                items.push(parseExpr(pa))
+                if (pa.failed) {
+                    return dummyExpr()
+                }
+            }
+            expect(pa, Tok.RParen)
+            if (pa.failed) {
+                return dummyExpr()
+            }
+            let span = start.to(prevSpan(pa))
+            return Expr(span, ExprKind.Tuple(items))
+        }
+        expect(pa, Tok.RParen)
+        if (pa.failed) {
+            return dummyExpr()
+        }
+        let span = start.to(prevSpan(pa))
+        Expr(span, first.kind)
+}
+
+fn tryParseLambdaParens(pa: Parser, start: Span) -> Expr? {
+        let saved = pa.pos
+        if (!at(pa, Tok.LParen)) {
+            return none
+        }
+        var depth = 0
+        var i = pa.pos
+        var lambdaFound = false
+        while (true) {
+            let t = pa.tokens[minOf(i, len(pa.tokens) - 1)].token.kind
+            if (t == Tok.LParen || t == Tok.LBracket || t == Tok.LBrace) {
+                depth = depth + 1
+            } else if (t == Tok.RParen) {
+                depth = depth - 1
+                if (depth == 0) {
+                    var j = i + 1
+                    while (pa.tokens[minOf(j, len(pa.tokens) - 1)].token.kind == Tok.Newline) {
+                        j = j + 1
+                    }
+                    let nxt = pa.tokens[minOf(j, len(pa.tokens) - 1)].token.kind
+                    if (nxt == Tok.Arrow || nxt == Tok.FatArrow) {
+                        lambdaFound = true
+                        break
+                    }
+                    return none
+                }
+            } else if (t == Tok.Eof) {
+                return none
+            }
+            i = i + 1
+        }
+        if (!lambdaFound) {
+            return none
+        }
+        pa.pos = saved
+        bump(pa) // LParen
+        let params = emptyParams()
+        if (!at(pa, Tok.RParen)) {
+            while (true) {
+                let ps = span(pa)
+                let rest = eat(pa, Tok.Ellipsis)
+                let name = expectIdent(pa, "lambda parameter")
+                if (pa.failed) {
+                    return none
+                }
+                var ty: TypeExpr? = none
+                if (eat(pa, Tok.Colon)) {
+                    ty = parseType(pa)
+                    if (pa.failed) {
+                        return none
+                    }
+                }
+                params.push(Param(name, ty, none, rest, emptyAttrs(), ps.to(prevSpan(pa))))
+                if (eat(pa, Tok.Comma)) {
+                    continuationAfter(pa, Tok.Comma)
+                    if (at(pa, Tok.RParen)) {
+                        break
+                    }
+                } else {
+                    break
+                }
+            }
+        }
+        expect(pa, Tok.RParen)
+        if (pa.failed) {
+            return none
+        }
+        newlines(pa)
+        var arrow = Tok.Arrow
+        if (at(pa, Tok.FatArrow)) {
+            arrow = Tok.FatArrow
+        }
+        bump(pa)
+        continuationAfter(pa, arrow)
+        var body: FnBody
+        var returnTy: TypeExpr? = none
+        if (arrow == Tok.FatArrow) {
+            let e = parseExpr(pa)
+            if (pa.failed) {
+                return none
+            }
+            body = FnBody.Expr(e)
+        } else {
+            let ret = parseType(pa)
+            if (pa.failed) {
+                return none
+            }
+            let b = parseBlock(pa)
+            if (pa.failed) {
+                return none
+            }
+            returnTy = ret
+            body = FnBody.Block(b)
+        }
+        let span = start.to(prevSpan(pa))
+        Expr(span, ExprKind.Lambda(params, returnTy, false, body))
+}
+
+fn parseLambda(pa: Parser, start: Span) -> Expr {
+        expect(pa, Tok.Fn)
+        if (pa.failed) {
+            return dummyExpr()
+        }
+        let params = parseParamList(pa)
+        if (pa.failed) {
+            return dummyExpr()
+        }
+        let returnTy = parseOptionalReturnType(pa)
+        if (pa.failed) {
+            return dummyExpr()
+        }
+        let body = parseFnBody(pa)
+        if (pa.failed) {
+            return dummyExpr()
+        }
+        let span = start.to(prevSpan(pa))
+        Expr(span, ExprKind.Lambda(params, returnTy, false, body))
+}
+
+fn parseAsyncLambda(pa: Parser, start: Span) -> Expr {
+        expect(pa, Tok.Async)
+        if (pa.failed) {
+            return dummyExpr()
+        }
+        expect(pa, Tok.Fn)
+        if (pa.failed) {
+            return dummyExpr()
+        }
+        let params = parseParamList(pa)
+        if (pa.failed) {
+            return dummyExpr()
+        }
+        let returnTy = parseOptionalReturnType(pa)
+        if (pa.failed) {
+            return dummyExpr()
+        }
+        let body = parseFnBody(pa)
+        if (pa.failed) {
+            return dummyExpr()
+        }
+        let end = prevSpan(pa)
+        // Inner lambda carries the user's return annotation and body; its span
+        // is the body's own span so checker/emit keying stays distinct.
+        var innerSpan = start
+        match (body) {
+            case FnBody.Block(b) -> { innerSpan = b.span }
+            case FnBody.Expr(e) -> { innerSpan = e.span }
+        }
+        let inner = Expr(innerSpan, ExprKind.Lambda(emptyParams(), returnTy, false, body))
+        // Outer lambda carries the user's parameters; its body is exactly the
+        // inner lambda, so calling it builds the future.
+        let bodyBlock = Block(emptyStmts(), inner, start.to(end))
+        Expr(start.to(end), ExprKind.Lambda(params, none, false, FnBody.Block(bodyBlock)))
+}
+
+fn typeArgStart(pa: Parser, k: Tok) -> bool {
+        isIdentTok(k) || k == Tok.Star || k == Tok.Amp || k == Tok.Fn || k == Tok.LParen
+}
+
+fn genericCallFlavor(pa: Parser) -> GenericCallFlavor? {
+        var ix = pa.pos
+        if (!isIdentTok(pa.tokens[minOf(ix, len(pa.tokens) - 1)].token.kind)) {
+            return none
+        }
+        ix = ix + 1
+        if (!(pa.tokens[minOf(ix, len(pa.tokens) - 1)].token.kind == Tok.Lt)) {
+            return none
+        }
+        if (!typeArgStart(pa, pa.tokens[minOf(ix + 1, len(pa.tokens) - 1)].token.kind)) {
+            return none
+        }
+        var depth = 0
+        while (true) {
+            let t = pa.tokens[minOf(ix, len(pa.tokens) - 1)].token.kind
+            if (t == Tok.Lt) {
+                depth = depth + 1
+            } else if (t == Tok.Gt) {
+                if (depth < 1) {
+                    return none
+                }
+                depth = depth - 1
+                if (depth == 0) {
+                    return genericFlavorAfterClose(pa, ix)
+                }
+            } else if (t == Tok.Shr) {
+                if (depth < 2) {
+                    return none
+                }
+                depth = depth - 2
+                if (depth == 0) {
+                    return genericFlavorAfterClose(pa, ix)
+                }
+            } else if (t == Tok.Eof) {
+                return none
+            } else if (t == Tok.Newline) {
+                return none
+            } else if (t == Tok.Number || t == Tok.LBrace || t == Tok.RBrace || t == Tok.Semicolon) {
+                // No type argument list contains a literal, a block, or a
+                // statement end, so the bracket was never a generic.
+                return none
+            }
+            ix = ix + 1
+        }
+}
+
+fn genericFlavorAfterClose(pa: Parser, ix: int) -> GenericCallFlavor {
+        var j = ix + 1
+        while (pa.tokens[minOf(j, len(pa.tokens) - 1)].token.kind == Tok.Newline) {
+            j = j + 1
+        }
+        if (pa.tokens[minOf(j, len(pa.tokens) - 1)].token.kind == Tok.LParen) {
+            return GenericCallFlavor.Call
+        }
+        let a = pa.tokens[minOf(ix + 1, len(pa.tokens) - 1)].token.kind
+        if (isIdentTok(a) || a == Tok.Gt || a == Tok.Ge || a == Tok.Shr || a == Tok.Eof) {
+            GenericCallFlavor.None
+        } else {
+            GenericCallFlavor.Value
+        }
+}
+
+fn parseGenericCall(pa: Parser, start: Span) -> Expr {
+        let name = expectIdent(pa, "function name")
+        if (pa.failed) {
+            return dummyExpr()
+        }
+        let typeArgs = parseTypeArgs(pa)
+        if (pa.failed) {
+            return dummyExpr()
+        }
+        if (!at(pa, Tok.LParen)) {
+            let span = start.to(prevSpan(pa))
+            return Expr(span, ExprKind.GenericCall(name, typeArgs))
+        }
+        let callArgs = parseCallArgsInternal(pa)
+        if (pa.failed) {
+            return dummyExpr()
+        }
+        let lastArg = lastArgAt(callArgs)
+        var lastSpan = start
+        if (let some(a) = lastArg) {
+            lastSpan = a.span
+        }
+        let calleeSpan = start.to(prevSpan(pa)).to(lastSpan)
+        let span = start.to(prevSpan(pa))
+        let callee = Expr(calleeSpan, ExprKind.GenericCall(name, typeArgs))
+        Expr(span, ExprKind.Call(callee, callArgs))
+}
+
+fn parseIf(pa: Parser) -> Expr {
+        let start = span(pa)
+        expect(pa, Tok.If)
+        if (pa.failed) {
+            return dummyExpr()
+        }
+        expect(pa, Tok.LParen)
+        if (pa.failed) {
+            return dummyExpr()
+        }
+        var cond: IfCond
+        if (at(pa, Tok.Let) || at(pa, Tok.Var)) {
+            bump(pa)
+            let pat = parsePattern(pa)
+            if (pa.failed) {
+                return dummyExpr()
+            }
+            expect(pa, Tok.Assign)
+            if (pa.failed) {
+                return dummyExpr()
+            }
+            continuationAfter(pa, Tok.Assign)
+            let value = parseExpr(pa)
+            if (pa.failed) {
+                return dummyExpr()
+            }
+            expect(pa, Tok.RParen)
+            if (pa.failed) {
+                return dummyExpr()
+            }
+            cond = IfCond.Binding(pat, value)
+        } else {
+            let c = parseExpr(pa)
+            if (pa.failed) {
+                return dummyExpr()
+            }
+            expect(pa, Tok.RParen)
+            if (pa.failed) {
+                return dummyExpr()
+            }
+            cond = IfCond.Cond(c)
+        }
+        let then = parseBlock(pa)
+        if (pa.failed) {
+            return dummyExpr()
+        }
+        var elseElse: Expr? = none
+        if (at(pa, Tok.Newline)) {
+            if (optTokIs(peekNonNl(pa, 1), Tok.Else)) {
+                newlines(pa)
+                let e = parseElse(pa)
+                if (pa.failed) {
+                    return dummyExpr()
+                }
+                elseElse = e
+            }
+        } else if (at(pa, Tok.Else)) {
+            let e = parseElse(pa)
+            if (pa.failed) {
+                return dummyExpr()
+            }
+            elseElse = e
+        }
+        let span = start.to(prevSpan(pa))
+        Expr(span, ExprKind.If(cond, then, elseElse))
+}
+
+fn parseElse(pa: Parser) -> Expr {
+        expect(pa, Tok.Else)
+        if (pa.failed) {
+            return dummyExpr()
+        }
+        if (at(pa, Tok.If)) {
+            parseIf(pa)
+        } else {
+            let b = parseBlock(pa)
+            if (pa.failed) {
+                return dummyExpr()
+            }
+            let span = b.span
+            Expr(span, ExprKind.Block(b))
+        }
+}
+
+fn parseMatch(pa: Parser) -> Expr {
+        let start = span(pa)
+        expect(pa, Tok.Match)
+        if (pa.failed) {
+            return dummyExpr()
+        }
+        expect(pa, Tok.LParen)
+        if (pa.failed) {
+            return dummyExpr()
+        }
+        let scrutinee = parseExpr(pa)
+        if (pa.failed) {
+            return dummyExpr()
+        }
+        expect(pa, Tok.RParen)
+        if (pa.failed) {
+            return dummyExpr()
+        }
+        expect(pa, Tok.LBrace)
+        if (pa.failed) {
+            return dummyExpr()
+        }
+        let arms = emptyMatchArms()
+        newlines(pa)
+        while (true) {
+            if (at(pa, Tok.RBrace) || at(pa, Tok.Eof)) {
+                break
+            }
+            let armStart = span(pa)
+            var catchAll = false
+            if (eat(pa, Tok.Else)) {
+                catchAll = true
+            } else {
+                expect(pa, Tok.Case)
+                if (pa.failed) {
+                    return dummyExpr()
+                }
+            }
+            var pattern: Pattern
+            if (catchAll || at(pa, Tok.Arrow)) {
+                pattern = Pattern.Wildcard
+            } else {
+                let first = parsePattern(pa)
+                if (pa.failed) {
+                    return dummyExpr()
+                }
+                if (eat(pa, Tok.Comma)) {
+                    let pats = emptyPatterns()
+                    pats.push(first)
+                    pats.push(parsePattern(pa))
+                    if (pa.failed) {
+                        return dummyExpr()
+                    }
+                    while (eat(pa, Tok.Comma)) {
+                        pats.push(parsePattern(pa))
+                        if (pa.failed) {
+                            return dummyExpr()
+                        }
+                    }
+                    pattern = Pattern.Or(pats)
+                } else {
+                    pattern = first
+                }
+            }
+            var guard: Expr? = none
+            if (at(pa, Tok.If)) {
+                bump(pa)
+                let g = parseExpr(pa)
+                if (pa.failed) {
+                    return dummyExpr()
+                }
+                guard = g
+            }
+            expect(pa, Tok.Arrow)
+            if (pa.failed) {
+                return dummyExpr()
+            }
+            let body = parseExpr(pa)
+            if (pa.failed) {
+                return dummyExpr()
+            }
+            let armSpan = armStart.to(body.span)
+            arms.push(MatchArm(pattern, guard, body, armSpan))
+            if (at(pa, Tok.Newline)) {
+                newlines(pa)
+            } else if (at(pa, Tok.RBrace) || at(pa, Tok.Eof)) {
+                break
+            } else {
+                errHere(pa, "expected end of match arm, found " + describeTok(kind(pa)))
+                pa.failed = true
+                return dummyExpr()
+            }
+        }
+        expect(pa, Tok.RBrace)
+        if (pa.failed) {
+            return dummyExpr()
+        }
+        let span = start.to(prevSpan(pa))
+        Expr(span, ExprKind.Match(scrutinee, arms))
+}
+
+fn parseTypeDecl(pa: Parser, isClass: bool) -> ClassDecl {
+        let start = span(pa)
+        bump(pa) // class | struct
+        var what = "struct name"
+        if (isClass) {
+            what = "class name"
+        }
+        let name = expectIdent(pa, what)
+        if (pa.failed) {
+            return dummyClassDecl()
+        }
+        let generics = parseGenericParams(pa)
+        if (pa.failed) {
+            return dummyClassDecl()
+        }
+        var extends: TypeExpr? = none
+        let implements = emptyTypeExprs()
+        if (isClass && at(pa, Tok.Extends)) {
+            bump(pa)
+            let e = parseType(pa)
+            if (pa.failed) {
+                return dummyClassDecl()
+            }
+            extends = e
+        }
+        if (at(pa, Tok.Implements)) {
+            bump(pa)
+            while (true) {
+                implements.push(parseType(pa))
+                if (pa.failed) {
+                    return dummyClassDecl()
+                }
+                if (eat(pa, Tok.Comma)) {
+                    continuationAfter(pa, Tok.Comma)
+                    newlines(pa)
+                } else {
+                    break
+                }
+            }
+        }
+        expect(pa, Tok.LBrace)
+        if (pa.failed) {
+            return dummyClassDecl()
+        }
+        let members = parseClassMembers(pa)
+        if (pa.failed) {
+            return dummyClassDecl()
+        }
+        expect(pa, Tok.RBrace)
+        if (pa.failed) {
+            return dummyClassDecl()
+        }
+        let span = start.to(prevSpan(pa))
+        ClassDecl(name, span, Visibility.Default, generics, extends, implements, members)
+}
+
+fn parseEnum(pa: Parser) -> EnumDecl {
+        let start = span(pa)
+        bump(pa)
+        let name = expectIdent(pa, "enum name")
+        if (pa.failed) {
+            return dummyEnumDecl()
+        }
+        let generics = parseGenericParams(pa)
+        if (pa.failed) {
+            return dummyEnumDecl()
+        }
+        let implements = emptyTypeExprs()
+        if (at(pa, Tok.Implements)) {
+            bump(pa)
+            while (true) {
+                implements.push(parseType(pa))
+                if (pa.failed) {
+                    return dummyEnumDecl()
+                }
+                if (eat(pa, Tok.Comma)) {
+                    continuationAfter(pa, Tok.Comma)
+                } else {
+                    break
+                }
+            }
+        }
+        expect(pa, Tok.LBrace)
+        if (pa.failed) {
+            return dummyEnumDecl()
+        }
+        let variants = emptyEnumVariants()
+        newlines(pa)
+        while (true) {
+            if (at(pa, Tok.RBrace) || at(pa, Tok.Eof)) {
+                break
+            }
+            let vstart = span(pa)
+            if (at(pa, Tok.Case)) {
+                bump(pa)
+            }
+            let vname = expectIdent(pa, "enum variant")
+            if (pa.failed) {
+                return dummyEnumDecl()
+            }
+            let fields = emptyEnumFields()
+            var discriminant: int? = none
+            if (at(pa, Tok.LParen)) {
+                bump(pa)
+                if (!at(pa, Tok.RParen)) {
+                    while (true) {
+                        let fname = expectIdent(pa, "variant field")
+                        if (pa.failed) {
+                            return dummyEnumDecl()
+                        }
+                        expect(pa, Tok.Colon)
+                        if (pa.failed) {
+                            return dummyEnumDecl()
+                        }
+                        let ty = parseType(pa)
+                        if (pa.failed) {
+                            return dummyEnumDecl()
+                        }
+                        fields.push(EnumField(fname, ty))
+                        if (eat(pa, Tok.Comma)) {
+                            continuationAfter(pa, Tok.Comma)
+                            if (at(pa, Tok.RParen)) {
+                                break
+                            }
+                        } else {
+                            break
+                        }
+                    }
+                }
+                expect(pa, Tok.RParen)
+                if (pa.failed) {
+                    return dummyEnumDecl()
+                }
+            } else if (at(pa, Tok.Assign)) {
+                bump(pa)
+                let t = advance(pa)
+                if (let some(v) = t.data.ival) {
+                    discriminant = v
+                } else {
+                    errAt(pa, t.token.span, "enum discriminants must be integer literals")
+                    pa.failed = true
+                    return dummyEnumDecl()
+                }
+            }
+            variants.push(EnumVariant(vname, fields, discriminant, vstart.to(prevSpan(pa))))
+            if (at(pa, Tok.Newline)) {
+                newlines(pa)
+            } else if (at(pa, Tok.RBrace) || at(pa, Tok.Eof)) {
+                break
+            } else {
+                errHere(pa, "expected newline or `,` between enum variants")
+                pa.failed = true
+                return dummyEnumDecl()
+            }
+        }
+        expect(pa, Tok.RBrace)
+        if (pa.failed) {
+            return dummyEnumDecl()
+        }
+        let span = start.to(prevSpan(pa))
+        EnumDecl(name, span, Visibility.Default, generics, variants, implements)
+}
+
+fn parseInterface(pa: Parser) -> InterfaceDecl {
+        let start = span(pa)
+        bump(pa)
+        let name = expectIdent(pa, "interface name")
+        if (pa.failed) {
+            return dummyInterfaceDecl()
+        }
+        let generics = parseGenericParams(pa)
+        if (pa.failed) {
+            return dummyInterfaceDecl()
+        }
+        let extends = emptyTypeExprs()
+        if (at(pa, Tok.Extends)) {
+            bump(pa)
+            while (true) {
+                extends.push(parseType(pa))
+                if (pa.failed) {
+                    return dummyInterfaceDecl()
+                }
+                if (eat(pa, Tok.Comma)) {
+                    continuationAfter(pa, Tok.Comma)
+                } else {
+                    break
+                }
+            }
+        }
+        expect(pa, Tok.LBrace)
+        if (pa.failed) {
+            return dummyInterfaceDecl()
+        }
+        let members = emptyIfaceMembers()
+        newlines(pa)
+        while (true) {
+            if (at(pa, Tok.RBrace) || at(pa, Tok.Eof)) {
+                break
+            }
+            let k = kind(pa)
+            if (k == Tok.Fn) {
+                let m = parseMethod(pa, false)
+                if (pa.failed) {
+                    return dummyInterfaceDecl()
+                }
+                members.push(InterfaceMember.Method(m))
+            } else if (k == Tok.Property) {
+                let pstart = span(pa)
+                bump(pa)
+                let name2 = expectIdent(pa, "property name")
+                if (pa.failed) {
+                    return dummyInterfaceDecl()
+                }
+                var ty: TypeExpr? = none
+                if (eat(pa, Tok.Colon)) {
+                    ty = parseType(pa)
+                    if (pa.failed) {
+                        return dummyInterfaceDecl()
+                    }
+                }
+                let pspan = pstart.to(prevSpan(pa))
+                var ty2 = TypeExpr(pspan, TypeExprKind.Infer)
+                if (let some(utt) = ty) {
+                    ty2 = utt
+                }
+                members.push(InterfaceMember.Property(name2, ty2, pspan))
+            } else if (k == Tok.Const) {
+                bump(pa)
+                let cname = expectIdent(pa, "constant name")
+                if (pa.failed) {
+                    return dummyInterfaceDecl()
+                }
+                var ty3: TypeExpr? = none
+                if (eat(pa, Tok.Colon)) {
+                    ty3 = parseType(pa)
+                    if (pa.failed) {
+                        return dummyInterfaceDecl()
+                    }
+                }
+                expect(pa, Tok.Assign)
+                if (pa.failed) {
+                    return dummyInterfaceDecl()
+                }
+                let value = parseExpr(pa)
+                if (pa.failed) {
+                    return dummyInterfaceDecl()
+                }
+                let span = start.to(prevSpan(pa))
+                members.push(InterfaceMember.Const(cname, value, span))
+                let _ = Tok.Eof
+            } else if (k == Tok.Newline) {
+                bump(pa)
+            } else {
+                errHere(pa, "expected `fn`, `property`, or `const` in interface")
+                pa.failed = true
+                return dummyInterfaceDecl()
+            }
+            if (at(pa, Tok.Newline)) {
+                newlines(pa)
+            }
+        }
+        expect(pa, Tok.RBrace)
+        if (pa.failed) {
+            return dummyInterfaceDecl()
+        }
+        let span = start.to(prevSpan(pa))
+        InterfaceDecl(name, span, Visibility.Default, generics, extends, members)
+}
+
+fn parseClassMembers(pa: Parser) -> List<ClassMember> {
+        let members = emptyProcMembers()
+        newlines(pa)
+        while (true) {
+            if (at(pa, Tok.RBrace) || at(pa, Tok.Eof)) {
+                break
+            }
+            members.push(parseClassMember(pa))
+            if (pa.failed) {
+                return emptyProcMembers()
+            }
+            if (at(pa, Tok.Newline)) {
+                newlines(pa)
+            }
+        }
+        members
+}
+
+fn parseClassMember(pa: Parser) -> ClassMember {
+        let start = span(pa)
+        let attrs = parseAttributes(pa)
+        if (pa.failed) {
+            return dummyClassMember()
+        }
+        var visibility = Visibility.Default
+        var isStatic = false
+        var isOverride = false
+        var isConst = false
+        var isAsync = false
+
+        while (true) {
+            let k = kind(pa)
+            if (k == Tok.Public) {
+                bump(pa)
+                visibility = Visibility.Public
+                let _ = true
+            } else if (k == Tok.Private) {
+                bump(pa)
+                visibility = Visibility.Private
+                let _ = true
+            } else if (k == Tok.Protected) {
+                bump(pa)
+                visibility = Visibility.Protected
+                let _ = true
+            } else if (k == Tok.Static) {
+                bump(pa)
+                isStatic = true
+            } else if (k == Tok.Async) {
+                bump(pa)
+                isAsync = true
+            } else if (k == Tok.Override) {
+                bump(pa)
+                isOverride = true
+            } else if (k == Tok.Const) {
+                bump(pa)
+                isConst = true
+            } else {
+                break
+            }
+        }
+
+        let k = kind(pa)
+        var fieldSyntax = isFieldSyntax(!isConst, k)
+        if (!fieldSyntax && len(attrs) > 0) {
+            for (a in attrs) {
+                errAt(pa, a.span, "attribute `#[...]` is only supported on class/struct fields")
+            }
+        }
+
+        if (isConst) {
+            let name = expectIdent(pa, "constant name")
+            if (pa.failed) {
+                return dummyClassMember()
+            }
+            var ty: TypeExpr? = none
+            if (eat(pa, Tok.Colon)) {
+                ty = parseType(pa)
+                if (pa.failed) {
+                    return dummyClassMember()
+                }
+            }
+            expect(pa, Tok.Assign)
+            if (pa.failed) {
+                return dummyClassMember()
+            }
+            continuationAfter(pa, Tok.Assign)
+            let value = parseExpr(pa)
+            if (pa.failed) {
+                return dummyClassMember()
+            }
+            let span = start.to(prevSpan(pa))
+            expectStmtEnd(pa)
+            if (pa.failed) {
+                return dummyClassMember()
+            }
+            return ClassMember.Const(name, visibility, ty, value, span)
+        }
+
+        if (k == Tok.Constructor && (peekAt(pa, 1) == Tok.LParen || peekAt(pa, 1) == Tok.Dot)) {
+            bump(pa)
+            var name: string? = none
+            if (at(pa, Tok.Dot)) {
+                bump(pa)
+                name = expectIdent(pa, "constructor name")
+                if (pa.failed) {
+                    return dummyClassMember()
+                }
+            }
+            let params = parseParamList(pa)
+            if (pa.failed) {
+                return dummyClassMember()
+            }
+            let body = parseBlock(pa)
+            if (pa.failed) {
+                return dummyClassMember()
+            }
+            let span = start.to(prevSpan(pa))
+            return ClassMember.Constructor(ConstructorDecl(name, span, visibility, params, body))
+        }
+
+        if (k == Tok.Property) {
+            let p = parsePropertyWith(pa, start, visibility, isStatic)
+            if (pa.failed) {
+                return dummyClassMember()
+            }
+            return ClassMember.Property(p)
+        }
+
+        if (k == Tok.Fn) {
+            var m = parseMethod(pa, isOverride)
+            if (pa.failed) {
+                return dummyClassMember()
+            }
+            m.isStatic = isStatic
+            m.isAsync = isAsync
+            m.visibility = visibility
+            return ClassMember.Method(m)
+        }
+
+        if (k == Tok.Operator && isOperatorSymbol(peekAt(pa, 1))) {
+            let opm = parseOperatorMethod(pa, start, isOverride)
+            if (pa.failed) {
+                return dummyClassMember()
+            }
+            return ClassMember.Method(opm)
+        }
+
+        if ((k == Tok.Init || k == Tok.Deinit) && peekAt(pa, 1) == Tok.LBrace) {
+            bump(pa)
+            let body = parseBlock(pa)
+            if (pa.failed) {
+                return dummyClassMember()
+            }
+            if (k == Tok.Init) {
+                return ClassMember.Init(body)
+            } else {
+                return ClassMember.Deinit(body)
+            }
+        }
+
+        if (k == Tok.Let || k == Tok.Var) {
+            bump(pa)
+            let name = expectIdent(pa, "field name")
+            if (pa.failed) {
+                return dummyClassMember()
+            }
+            var ty: TypeExpr? = none
+            if (eat(pa, Tok.Colon)) {
+                ty = parseType(pa)
+                if (pa.failed) {
+                    return dummyClassMember()
+                }
+            }
+            var init: Expr? = none
+            if (eat(pa, Tok.Assign)) {
+                continuationAfter(pa, Tok.Assign)
+                let e = parseExpr(pa)
+                if (pa.failed) {
+                    return dummyClassMember()
+                }
+                init = e
+            }
+            let span = start.to(prevSpan(pa))
+            expectStmtEnd(pa)
+            if (pa.failed) {
+                return dummyClassMember()
+            }
+            return ClassMember.Field(name, ty, init, visibility, isStatic, false, attrs, span)
+        }
+
+        if (memberFieldName(k)) {
+            let name = expectIdent(pa, "field name")
+            if (pa.failed) {
+                return dummyClassMember()
+            }
+            var ty: TypeExpr? = none
+            if (eat(pa, Tok.Colon)) {
+                ty = parseType(pa)
+                if (pa.failed) {
+                    return dummyClassMember()
+                }
+            }
+            var init: Expr? = none
+            if (eat(pa, Tok.Assign)) {
+                continuationAfter(pa, Tok.Assign)
+                let e = parseExpr(pa)
+                if (pa.failed) {
+                    return dummyClassMember()
+                }
+                init = e
+            }
+            let span = start.to(prevSpan(pa))
+            expectStmtEnd(pa)
+            if (pa.failed) {
+                return dummyClassMember()
+            }
+            return ClassMember.Field(name, ty, init, visibility, isStatic, false, attrs, span)
+        }
+
+        errHere(pa, "expected a class member, found " + describeTok(kind(pa)))
+        pa.failed = true
+        dummyClassMember()
+}
+
+fn parsePropertyWith(pa: Parser, start: Span, visibility: Visibility, isStatic: bool) -> PropertyDecl {
+        expect(pa, Tok.Property)
+        if (pa.failed) {
+            return dummyPropertyDecl()
+        }
+        let name = expectIdent(pa, "property name")
+        if (pa.failed) {
+            return dummyPropertyDecl()
+        }
+        var ty: TypeExpr? = none
+        if (eat(pa, Tok.Colon)) {
+            ty = parseType(pa)
+            if (pa.failed) {
+                return dummyPropertyDecl()
+            }
+        }
+        parsePropertyBodyParts(pa, start, visibility, isStatic, name, ty)
+}
+
+fn parsePropertyBodyParts(pa: Parser, start: Span, visibility: Visibility, isStatic: bool, name: string, ty: TypeExpr?) -> PropertyDecl {
+        expect(pa, Tok.LBrace)
+        if (pa.failed) {
+            return dummyPropertyDecl()
+        }
+        var get: PropertyAccessor? = none
+        var set: PropertyAccessor? = none
+        newlines(pa)
+        while (true) {
+            if (at(pa, Tok.RBrace) || at(pa, Tok.Eof)) {
+                break
+            }
+            let k = kind(pa)
+            if (k == Tok.Get) {
+                bump(pa)
+                let a = parsePropertyAccessor(pa)
+                if (pa.failed) {
+                    return dummyPropertyDecl()
+                }
+                get = a
+            } else if (k == Tok.Set) {
+                bump(pa)
+                let a = parsePropertyAccessor(pa)
+                if (pa.failed) {
+                    return dummyPropertyDecl()
+                }
+                set = a
+            } else {
+                errHere(pa, "expected `get` or `set` in property")
+                pa.failed = true
+                return dummyPropertyDecl()
+            }
+            if (at(pa, Tok.Newline)) {
+                newlines(pa)
+            } else if (at(pa, Tok.RBrace) || at(pa, Tok.Eof)) {
+                break
+            } else {
+                errHere(pa, "expected newline between property accessors")
+                pa.failed = true
+                return dummyPropertyDecl()
+            }
+        }
+        expect(pa, Tok.RBrace)
+        if (pa.failed) {
+            return dummyPropertyDecl()
+        }
+        let span = start.to(prevSpan(pa))
+        PropertyDecl(name, span, visibility, ty, get, set, isStatic)
+}
+
+fn parsePropertyAccessor(pa: Parser) -> PropertyAccessor {
+        if (at(pa, Tok.FatArrow)) {
+            bump(pa)
+            let e = parseExpr(pa)
+            if (pa.failed) {
+                return PropertyAccessor.Expr(dummyExpr())
+            }
+            return PropertyAccessor.Expr(e)
+        }
+        if (at(pa, Tok.LBrace)) {
+            let b = parseBlock(pa)
+            if (pa.failed) {
+                return PropertyAccessor.Block(emptyBlock())
+            }
+            return PropertyAccessor.Block(b)
+        }
+        errHere(pa, "expected `=> expr` or `\{ ... \}` in property accessor")
+        pa.failed = true
+        PropertyAccessor.Expr(dummyExpr())
+}
+
+fn parseMethod(pa: Parser, isOverride: bool) -> MethodDecl {
+        let start = span(pa)
+        expect(pa, Tok.Fn)
+        if (pa.failed) {
+            return dummyMethodDecl()
+        }
+        let name = expectFnName(pa)
+        if (pa.failed) {
+            return dummyMethodDecl()
+        }
+        let generics = parseGenericParams(pa)
+        if (pa.failed) {
+            return dummyMethodDecl()
+        }
+        let params = parseParamList(pa)
+        if (pa.failed) {
+            return dummyMethodDecl()
+        }
+        let returnTy = parseOptionalReturnType(pa)
+        if (pa.failed) {
+            return dummyMethodDecl()
+        }
+        let body = parseOptionalBody(pa)
+        if (pa.failed) {
+            return dummyMethodDecl()
+        }
+        let span = start.to(prevSpan(pa))
+        MethodDecl(name, span, Visibility.Default, false, isOverride, false, false, none, generics, params, returnTy, body)
+}
+
+fn parseOptionalBody(pa: Parser) -> FnBody? {
+        if (eat(pa, Tok.FatArrow)) {
+            let e = parseExpr(pa)
+            if (pa.failed) {
+                return none
+            }
+            return FnBody.Expr(e)
+        }
+        if (at(pa, Tok.LBrace)) {
+            let b = parseBlock(pa)
+            if (pa.failed) {
+                return none
+            }
+            return FnBody.Block(b)
+        }
+        none
+}
+
+fn parseOperatorMethod(pa: Parser, start: Span, isOverride: bool) -> MethodDecl {
+        expect(pa, Tok.Operator)
+        if (pa.failed) {
+            return dummyMethodDecl()
+        }
+        var op = ""
+        let k = kind(pa)
+        if (k == Tok.Plus) {
+            op = "+"
+        } else if (k == Tok.Minus) {
+            op = "-"
+        } else if (k == Tok.Star) {
+            op = "*"
+        } else if (k == Tok.Slash) {
+            op = "/"
+        } else if (k == Tok.Percent) {
+            op = "%"
+        } else if (k == Tok.StarStar) {
+            op = "**"
+        } else if (k == Tok.EqEq) {
+            op = "=="
+        } else if (k == Tok.NotEq) {
+            op = "!="
+        } else if (k == Tok.Lt) {
+            op = "<"
+        } else if (k == Tok.Le) {
+            op = "<="
+        } else if (k == Tok.Gt) {
+            op = ">"
+        } else if (k == Tok.Ge) {
+            op = ">="
+        } else if (k == Tok.Shl) {
+            op = "<<"
+        } else if (k == Tok.Shr) {
+            op = ">>"
+        } else if (k == Tok.Amp) {
+            op = "&"
+        } else if (k == Tok.Pipe) {
+            op = "|"
+        } else if (k == Tok.Caret) {
+            op = "^"
+        } else if (k == Tok.LBracket) {
+            bump(pa)
+            if (eat(pa, Tok.RBracket)) {
+                op = "[]"
+            } else {
+                errHere(pa, "expected `]` after `[` in index operator")
+                pa.failed = true
+                return dummyMethodDecl()
+            }
+        } else {
+            errHere(pa, "expected an operator symbol, found " + describeTok(k))
+            pa.failed = true
+            return dummyMethodDecl()
+        }
+        bump(pa)
+        let generics = parseGenericParams(pa)
+        if (pa.failed) {
+            return dummyMethodDecl()
+        }
+        let params = parseParamList(pa)
+        if (pa.failed) {
+            return dummyMethodDecl()
+        }
+        let returnTy = parseOptionalReturnType(pa)
+        if (pa.failed) {
+            return dummyMethodDecl()
+        }
+        let body = parseOptionalBody(pa)
+        if (pa.failed) {
+            return dummyMethodDecl()
+        }
+        let span = start.to(prevSpan(pa))
+        MethodDecl(op, span, Visibility.Default, false, isOverride, false, false, op, generics, params, returnTy, body)
+}

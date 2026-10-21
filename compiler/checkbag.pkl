@@ -1,0 +1,467 @@
+module compiler.checkbag
+
+import * from compiler.ast
+import { Span, Diagnostic, DiagnosticSink } from compiler.diag
+import * from compiler.ty
+import * from compiler.resolvebag
+
+// ==== check bag (classes/enums) ====
+
+class Local {
+    var ty: Ty
+    var mutable: bool
+    var manual: bool
+    var freed: bool
+    var moved: bool
+
+    constructor(ty: Ty, mutable: bool, manual: bool, freed: bool, moved: bool) {
+        this.ty = ty
+        this.mutable = mutable
+        this.manual = manual
+        this.freed = freed
+        this.moved = moved
+    }
+}
+
+class MovedBits {
+    var moved: bool
+    var freed: bool
+
+    constructor(moved: bool, freed: bool) {
+        this.moved = moved
+        this.freed = freed
+    }
+}
+
+class TypeKey {
+    var name: string
+    var args: Map<string, Ty>
+
+    constructor(name: string, args: Map<string, Ty>) {
+        this.name = name
+        this.args = args
+    }
+}
+
+class FieldCount {
+    var name: string
+    var count: int
+
+    constructor(name: string, count: int) {
+        this.name = name
+        this.count = count
+    }
+}
+
+class ManualFns {
+    var rets: List<string>
+    var params: Map<string, List<bool>>
+
+    constructor(rets: List<string>, params: Map<string, List<bool>>) {
+        this.rets = rets
+        this.params = params
+    }
+}
+
+class Checker {
+    var prog: Program
+    var resolved: ResolvedProgram
+    var diags: DiagnosticSink
+    var scopes: List<Map<string, Local>>
+    var types: Map<string, Ty>
+    var selfTy: Ty?
+    var selfArgs: Map<string, Ty>
+    var retTy: Ty
+    var fnGenerics: List<string>
+    var namedCtorParams: List<Ty>?
+    var namedCtorDelegated: bool
+    var superCtorParams: List<Ty>?
+    var loopDepth: int
+    var retManual: bool
+    var manualRetFns: List<string>
+    var manualParamFns: Map<string, List<bool>>
+    var pendingOwnedCalls: List<Span>
+    var unsafeDepth: int
+
+    constructor(prog: Program, resolved: ResolvedProgram, diags: DiagnosticSink) {
+        this.prog = prog
+        this.resolved = resolved
+        this.diags = diags
+        this.scopes = [emptyMapLocal()]
+        this.types = emptyMapStrTy()
+        this.selfTy = none
+        this.selfArgs = emptyMapStrTy()
+        this.retTy = Ty.Empty
+        this.fnGenerics = emptyStrList()
+        this.namedCtorParams = none
+        this.namedCtorDelegated = false
+        this.superCtorParams = none
+        this.loopDepth = 0
+        this.retManual = false
+        let mf = collectManualFns(prog)
+        this.manualRetFns = mf.rets
+        this.manualParamFns = mf.params
+        this.pendingOwnedCalls = emptySpanList()
+        this.unsafeDepth = 0
+    }
+
+
+    // ---- scope helpers -----------------------------------------------------
+
+
+
+
+    /// Validate `#[...]` attributes on a `let`/`var` binding and report
+    /// whether the binding is `#[manualAlloc]`.
+
+    /// Mark a local as `#[manualAlloc]` after `bindPattern` inserted it.
+
+
+
+
+    /// If `e` is a bare identifier naming a live `#[manualAlloc]` local, return
+    /// its name. Naming it in an owning position hands over ownership.
+
+    /// Mark a pending `#[manualAlloc]`-returning call as consumed by the
+    /// enclosing owned position.
+
+    /// Is `e` a fresh allocation that an owned position may take directly:
+    /// a class/struct constructor call, or a call to a `#[manualAlloc]`
+    /// function.
+
+    /// Check the arguments at an owned-parameter boundary: each owned parameter
+    /// receives a `#[manualAlloc]` binding (moved) or a fresh allocation.
+
+    /// Snapshot the consumption state (`moved`, `freed`) of every live local,
+    /// so a branch can be analysed from the state at the join point and merged
+    /// afterwards.
+
+
+    /// Union the consumption bits of `b` into `a` (a value consumed on *either*
+    /// path must be treated as consumed after the join).
+
+
+
+
+
+    // ---- assignability -----------------------------------------------------
+
+    /// Is `got` acceptable where `want` is declared?
+
+
+    /// `checkAssignable`, except a `byte` target also accepts an `int` literal
+    /// in 0..=255 or an ASCII `char` literal.
+
+    /// `&T` is supported only as a function parameter type.
+
+    // ---- type table lookups ------------------------------------------------
+
+
+    /// Substitute concrete args for a type's generic `Var`s.
+
+    /// The `(name, generic-args)` pair that backs this type for member lookup.
+
+
+
+    /// The element type `T` of an `Iterable<T>`, or `none`.
+
+    /// True if `desc` extends/structurally inherits `anc` through the class
+    /// chain (used for upcast/downcast checks in casts).
+
+    /// True if `got`'s declared interfaces include `want` (or an ancestor).
+
+    // ---- member lookup -----------------------------------------------------
+
+
+
+
+
+    /// The instance field names that carry an initializer in the class/struct
+    /// declaration, used to derive the synthesized constructor's parameters.
+
+    /// Parameter types of the constructor a named constructor delegates to.
+
+    /// The nearest explicit-primary-constructor ancestor of `name` together
+    /// with the number of instance-field slots belonging to classes up to and
+    /// including that ancestor.
+
+    /// Synthesized-constructor parameter types for `name`.
+
+    /// Check a named constructor: the body must be exactly one `this(...)`
+    /// delegation to the primary constructor.
+
+    // ---- bodies ------------------------------------------------------------
+
+    /// Validate `#[...]` attributes on a parameter and report whether it is
+    /// `#[manualAlloc]` (the function takes ownership of the argument).
+
+    /// Validate `#[...]` field attributes and report whether the field is
+    /// `#[manualAlloc]` (owned, freed recursively with its object).
+
+    /// Treat `value` as an owned position: move a manual binding, accept a fresh
+    /// allocation, or reject anything else. `what` names the destination.
+
+
+
+
+
+
+    /// Handle a block/expression tail value as an ownership position: either it
+    /// is the owned return of a `#[manualAlloc]` function, or a leaked result.
+
+
+
+    /// Check one statement, then report any `#[manualAlloc]`-returning call
+    /// whose result was not consumed into an owned position within it.
+
+
+    /// `try BODY catch (BINDER)? BLOCK finally BLOCK?`
+    ///
+    /// The payload is a `string`, so a handler always knows what it holds. The
+    /// binder is declared in its own scope so the handler nests inside it rather
+    /// than leaking `e` into whatever follows the `try`.
+
+
+
+
+    // ---- bodies ------------------------------------------------------------
+
+    /// Validate a single field declaration: type annotation, initializer,
+    /// `#[manualAlloc]` ownership. Shared by class and struct bodies.
+
+
+
+
+    /// Type-check a property's accessor bodies. The getter is a value of the
+    /// property type and runs with `this` live; the setter receives the new
+    /// value bound to `value` and reads `this`.
+
+
+// ---- expressions --------------------------------------------------------
+
+    /// Typecheck an expression, recording its inferred type into the type map.
+
+
+
+    /// Type an interpolated string: check every embedded expression (so the
+    /// codegen side table has its type and unresolved names are reported), and
+    /// the literal itself is a `string`.
+
+
+
+
+    /// Type of a method call. For an `async` method this is the future
+    /// (`() -> R`), which `await` then drives.
+
+    /// Type an explicit generic call `name<T>(...)` used as a value (callee).
+
+
+    /// The `view(obj)` byte-view form: a managed object's machine address,
+    /// typed as a raw `*int`. Unsafe-gated like `alloc`/`free`; the argument
+    /// must be an allocated value (another managed slot stays the owner - a
+    /// view does not root anything by itself).
+
+
+    /// Validate `assert(cond, msg?)`: the condition must be a `bool`, an
+    /// optional second argument a `string` (only used when it fails).
+
+    /// `expect(value)` typed as the value's type.
+
+    /// Statement count of an `expect(...)` / `expect(...).not()` chain.
+
+    /// The value argument of the outermost `expect(...)` in an assertion chain.
+
+    /// Validate an `expect(v).<method>(...)` assertion.
+
+    /// Validate `x.free()` on a `#[manualAlloc]` binding and mark it released.
+
+    /// Check a call's arguments against a plain positional signature.
+
+    /// Check a generic function call `name(args)` by **inferring** its type
+    /// arguments from the (already-checked) arguments.
+
+    /// Argument checking against a signature whose expressions have already
+    /// been checked: reads the argument types back from `got` instead of
+    /// re-checking them (so inference's single pass stays single).
+
+    /// Variadic-aware argument checking against `ParamInfo`s. Params flagged
+    /// `rest` absorb any remaining positional arguments without arity errors.
+
+
+
+
+    /// A map index must be assignable to the map's key type. Byte-keyed maps
+    /// additionally accept in-range `int` literals (via `checkAssignRhs`).
+
+
+
+    /// Comparison operands must actually be comparable. Concrete rules:
+    /// numbers compare with every operator (mixed `int`/`float` included);
+    /// `char` pairs compare with every operator; `==`/`!=` may additionally
+    /// pair identical types. Everything else is an error.
+
+
+
+
+
+    /// `min(a, b)` / `max(a, b)`: two arguments of the same numeric type;
+    /// the result has that type.
+
+    /// `clamp(x, lo, hi)`: three arguments of the same numeric type;
+    /// the result has that type.
+
+    /// `str(x)`: an `int`, `float`, `bool`, or `char` value rendered as
+    /// `string` (matching the runtime's `pickle_str_from_*` family).
+
+
+
+    /// `read_file(path)`: reads a whole file as `string`, or `none` when the
+    /// file cannot be read. Errors are values (no exceptions).
+
+    /// `write_file(path, text)`: overwrites `path` with `text`'s UTF-8 bytes
+    /// and returns `true` on success, `false` on failure.
+
+    /// `file_exists(path)`: whether the path exists on the filesystem.
+
+    /// `delete(path)`: removes a file at `path`; `false` when it is missing or
+    /// cannot be removed.
+
+    /// `mkdir(path)`: creates a directory at `path`; `false` when it already
+    /// exists or cannot be created.
+
+    /// `list_dir(path)`: lists a directory as `List<string>?` of child paths
+    /// (full paths), or `none` when the path is not a readable directory.
+
+    /// `stream_open_read/write/append(path)`: opens a buffered file stream,
+    /// returning `Stream?` (`none` when the path cannot be opened).
+
+    /// `stdout_stream()` / `stderr_stream()`: a write-only console stream.
+
+    /// `args()`: the program's command-line arguments (excluding the program
+    /// name) as a `List<string>`.
+
+    /// `exit(code)`: terminate the process with a numeric exit code.
+
+    /// `thread_spawn(body)` and `once_run(o, body)`. `bodyIndex` is the
+    /// argument that has to be a zero-argument function: a lambda, or a name
+    /// bound to one. The other arguments are handles (`int`).
+
+    /// `captureBegin()`: enter the test-harness capture mode (turns failing
+    /// asserts into recorded failures) without clearing any pending message.
+
+    /// `captureTake()`: drain the captured failure message as `string?`, or
+    /// `none` when nothing was recorded.
+
+    /// A process-handle operand: `h` must be a `Stream` (or untyped).
+
+    /// `run_cmd(argv, cwd, envs, env_removes, stdin_bytes, max_out,
+    /// timeout_ms, inherit_io)`: runs a subprocess to completion and returns
+    /// `(int?, string, string, bool)?` -- exit code, stdout, stderr, and a
+    /// timeout flag -- or `none` when the program cannot be spawned.
+
+    /// `run_spawn(argv, cwd, envs, env_removes, max_out)`: start a child and
+    /// return a `Stream?` handle for asynchronous `proc_*` access.
+
+    /// `proc_wait(h)` / `proc_running(h)` / `proc_code(h)` / `proc_kill(h)` /
+    /// `proc_in_close(h)`: single-handle process queries.
+
+    /// `proc_out_read(h, n)` / `proc_err_read(h, n)`: drained bytes as
+    /// `List<byte>?`.
+
+    /// `proc_in_write(h, b)`: write `b` (a `List<byte>`) to the child's stdin,
+    /// returning the number of bytes written.
+
+    /// `current_dir()`: the workspace directory as `string?`.
+
+
+
+    /// Validate that a match arm's pattern can actually match a scrutinee of
+    /// type `st`. Binding/wildcard/tuple patterns are structurally fine;
+    /// literals must share the scrutinee's domain, and string patterns may
+    /// not interpolate.
+
+
+
+    /// Whether `from` can be safely cast to `to`: numeric conversions,
+    /// option<->inner, class inheritance (either direction), and
+    /// conforming interfaces.
+}
+
+// ==== ctor-support helpers (closure) ====
+
+fn emptyMapLocal() -> Map<string, Local> {
+    let m = {"::seed::": Local(Ty.Int, false, false, false, false)}
+    m.remove("::seed::")
+    m
+}
+
+fn emptyMapStrTy() -> Map<string, Ty> {
+    let m = {"::seed::": Ty.Int}
+    m.remove("::seed::")
+    m
+}
+
+fn emptyStrList() -> List<string> {
+    var l = [""]
+    l.pop()
+    l
+}
+
+fn collectManualFns(prog: Program) -> ManualFns {
+    var rets = emptyStrList()
+    var params = emptyMapStrBoolList()
+    for (item in prog.items) {
+        let f = match (item.kind) {
+            case ItemKind.Fn(f) -> f
+            case ItemKind.Test(f) -> f
+            case _ -> none
+        }
+        if (let some(ff) = f) {
+            let has = fn(attrs: List<Attribute>) -> bool {
+                var i = 0
+                while (i < len(attrs)) {
+                    if (attrs[i].name == "manualAlloc") {
+                        return true
+                    }
+                    i = i + 1
+                }
+                false
+            }
+            if (has(item.attrs)) {
+                rets.push(ff.name)
+            }
+            var flags = emptyBools()
+            for (p in ff.params) {
+                flags.push(has(p.attrs))
+            }
+            var anyOwned = false
+            for (b in flags) {
+                if (b) {
+                    anyOwned = true
+                }
+            }
+            if (anyOwned) {
+                params[ff.name] = flags
+            }
+        }
+    }
+    ManualFns(rets, params)
+}
+
+fn emptySpanList() -> List<Span> {
+    var l = [Span(0, 0)]
+    l.pop()
+    l
+}
+
+fn emptyMapStrBoolList() -> Map<string, List<bool>> {
+    let m = {"::seed::": emptyBools()}
+    m.remove("::seed::")
+    m
+}
+
+fn emptyBools() -> List<bool> {
+    var l = [true]
+    l.pop()
+    l
+}

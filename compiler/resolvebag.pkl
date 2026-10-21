@@ -1,0 +1,646 @@
+module compiler.resolvebag
+
+import * from compiler.ast
+import { Span, Diagnostic, DiagnosticSink } from compiler.diag
+import * from compiler.ty
+
+// ==== resolve bag (classes/enums) ====
+
+class ParamInfo {
+    var name: string
+    var ty: Ty
+    var hasDefault: bool
+    var rest: bool
+    var span: Span
+
+    constructor(name: string, ty: Ty, hasDefault: bool, rest: bool, span: Span) {
+        this.name = name
+        this.ty = ty
+        this.hasDefault = hasDefault
+        this.rest = rest
+        this.span = span
+    }
+}
+
+class CallableInfo {
+    var name: string
+    var span: Span
+    var visibility: Visibility
+    var isAsync: bool
+    var isStatic: bool
+    var isOverride: bool
+    var isAbstract: bool
+    var operator: string?
+    var generics: List<string>
+    var params: List<ParamInfo>
+    var ret: Ty
+
+    constructor(name: string, span: Span, visibility: Visibility, isAsync: bool, isStatic: bool, isOverride: bool, isAbstract: bool, operator: string?, generics: List<string>, params: List<ParamInfo>, ret: Ty) {
+        this.name = name
+        this.span = span
+        this.visibility = visibility
+        this.isAsync = isAsync
+        this.isStatic = isStatic
+        this.isOverride = isOverride
+        this.isAbstract = isAbstract
+        this.operator = operator
+        this.generics = generics
+        this.params = params
+        this.ret = ret
+    }
+}
+
+class FieldInfo {
+    var name: string
+    var visibility: Visibility
+    var isStatic: bool
+    var mutable: bool
+    var const_: bool
+    var manual: bool
+    var ty: Ty
+    var span: Span
+
+    constructor(name: string, visibility: Visibility, isStatic: bool, mutable: bool, const_: bool, manual: bool, ty: Ty, span: Span) {
+        this.name = name
+        this.visibility = visibility
+        this.isStatic = isStatic
+        this.mutable = mutable
+        this.const_ = const_
+        this.manual = manual
+        this.ty = ty
+        this.span = span
+    }
+}
+
+class PropertyInfo {
+    var name: string
+    var visibility: Visibility
+    var isStatic: bool
+    var ty: Ty
+    var hasGet: bool
+    var hasSet: bool
+    var span: Span
+
+    constructor(name: string, visibility: Visibility, isStatic: bool, ty: Ty, hasGet: bool, hasSet: bool, span: Span) {
+        this.name = name
+        this.visibility = visibility
+        this.isStatic = isStatic
+        this.ty = ty
+        this.hasGet = hasGet
+        this.hasSet = hasSet
+        this.span = span
+    }
+}
+
+class CtorInfo {
+    var span: Span
+    var visibility: Visibility
+    var params: List<ParamInfo>
+
+    constructor(span: Span, visibility: Visibility, params: List<ParamInfo>) {
+        this.span = span
+        this.visibility = visibility
+        this.params = params
+    }
+}
+
+class NamedCtorInfo {
+    var name: string
+    var ctor: CtorInfo
+
+    constructor(name: string, ctor: CtorInfo) {
+        this.name = name
+        this.ctor = ctor
+    }
+}
+
+class ClassTable {
+    var name: string
+    var span: Span
+    var visibility: Visibility
+    var generics: List<string>
+    var extends: Ty?
+    var implements: List<Ty>
+    var fields: List<FieldInfo>
+    var methods: List<CallableInfo>
+    var properties: List<PropertyInfo>
+    var ctor: CtorInfo?
+    var namedCtors: List<NamedCtorInfo>
+    var consts: List<FieldInfo>
+
+    constructor(name: string, span: Span, visibility: Visibility, generics: List<string>, extends: Ty?, implements: List<Ty>, fields: List<FieldInfo>, methods: List<CallableInfo>, properties: List<PropertyInfo>, ctor: CtorInfo?, namedCtors: List<NamedCtorInfo>, consts: List<FieldInfo>) {
+        this.name = name
+        this.span = span
+        this.visibility = visibility
+        this.generics = generics
+        this.extends = extends
+        this.implements = implements
+        this.fields = fields
+        this.methods = methods
+        this.properties = properties
+        this.ctor = ctor
+        this.namedCtors = namedCtors
+        this.consts = consts
+    }
+}
+
+class EnumTable {
+    var name: string
+    var span: Span
+    var visibility: Visibility
+    var generics: List<string>
+    var implements: List<Ty>
+    var variants: List<EnumVariantInfo>
+
+    constructor(name: string, span: Span, visibility: Visibility, generics: List<string>, implements: List<Ty>, variants: List<EnumVariantInfo>) {
+        this.name = name
+        this.span = span
+        this.visibility = visibility
+        this.generics = generics
+        this.implements = implements
+        this.variants = variants
+    }
+}
+
+class EnumVariantInfo {
+    var name: string
+    var fields: List<Ty>
+    var span: Span
+
+    constructor(name: string, fields: List<Ty>, span: Span) {
+        this.name = name
+        this.fields = fields
+        this.span = span
+    }
+}
+
+class InterfaceMemberInfo {
+    var span: Span
+    var name: string
+    var isProperty: bool
+    var ty: Ty
+    var params: List<ParamInfo>
+
+    constructor(span: Span, name: string, isProperty: bool, ty: Ty, params: List<ParamInfo>) {
+        this.span = span
+        this.name = name
+        this.isProperty = isProperty
+        this.ty = ty
+        this.params = params
+    }
+}
+
+class InterfaceTable {
+    var name: string
+    var span: Span
+    var visibility: Visibility
+    var generics: List<string>
+    var extends: List<Ty>
+    var members: List<InterfaceMemberInfo>
+
+    constructor(name: string, span: Span, visibility: Visibility, generics: List<string>, extends: List<Ty>, members: List<InterfaceMemberInfo>) {
+        this.name = name
+        this.span = span
+        this.visibility = visibility
+        this.generics = generics
+        this.extends = extends
+        this.members = members
+    }
+}
+
+class MethodSig {
+    var name: string
+    var params: List<ParamInfo>
+    var ret: Ty
+    var isStatic: bool
+
+    constructor(name: string, params: List<ParamInfo>, ret: Ty, isStatic: bool) {
+        this.name = name
+        this.params = params
+        this.ret = ret
+        this.isStatic = isStatic
+    }
+}
+
+class PendingFn {
+    var f: FnDecl
+    var isTest: bool
+
+    constructor(f: FnDecl, isTest: bool) {
+        this.f = f
+        this.isTest = isTest
+    }
+}
+
+class MemberTables {
+    var fields: List<FieldInfo>
+    var methods: List<CallableInfo>
+    var properties: List<PropertyInfo>
+    var ctor: CtorInfo?
+    var namedCtors: List<NamedCtorInfo>
+    var consts: List<FieldInfo>
+
+    constructor(fields: List<FieldInfo>, methods: List<CallableInfo>, properties: List<PropertyInfo>, ctor: CtorInfo?, namedCtors: List<NamedCtorInfo>, consts: List<FieldInfo>) {
+        this.fields = fields
+        this.methods = methods
+        this.properties = properties
+        this.ctor = ctor
+        this.namedCtors = namedCtors
+        this.consts = consts
+    }
+}
+
+class ResolvedProgram {
+    var types: Map<string, TypeTableEntry>
+    var fns: Map<string, List<CallableInfo>>
+    var consts: List<FieldInfo>
+    /// Top-level `var` slots. Kept apart from `consts` because `const` is
+    /// inlined at each use site while a global needs a real data symbol.
+    var globals: List<FieldInfo>
+    var importAliases: Map<string, List<string>>
+    var modulePath: List<string>
+
+    constructor(types: Map<string, TypeTableEntry>, fns: Map<string, List<CallableInfo>>, consts: List<FieldInfo>, globals: List<FieldInfo>, importAliases: Map<string, List<string>>, modulePath: List<string>) {
+        this.types = types
+        this.fns = fns
+        this.consts = consts
+        this.globals = globals
+        this.importAliases = importAliases
+        this.modulePath = modulePath
+    }
+
+    fn resolveTy(te: TypeExpr, generics: List<string>, diags: DiagnosticSink) -> Ty {
+        TypeCtx(diags, this.types, this.importAliases).resolveTy(te, generics)
+    }
+}
+
+class Resolver {
+    var diags: DiagnosticSink
+    var types: Map<string, TypeTableEntry>
+    var fns: Map<string, List<CallableInfo>>
+    var consts: List<FieldInfo>
+    var globals: List<FieldInfo>
+    var importAliases: Map<string, List<string>>
+    var modulePath: List<string>
+
+    constructor(diags: DiagnosticSink) {
+        this.diags = diags
+        this.types = emptyMapTypes()
+        this.fns = emptyMapFns()
+        this.consts = emptyFieldInfos()
+        this.globals = emptyFieldInfos()
+        this.importAliases = emptyMapAliases()
+        this.modulePath = emptyStrs()
+    }
+
+
+
+
+
+
+
+
+    /// A top-level `var` occupies real storage, so it is tracked in its own
+    /// table rather than `consts` (which is inlined at use sites). Keeping the
+    /// two separate is what lets the emitter decide "copy a literal" vs
+    /// "emit a load from a data symbol".
+
+/// Type of a top-level `var` declared without a `: T` annotation.
+///
+/// Inference is deliberately limited to an integer literal (optionally
+/// negated) because that is the only initializer shape the emitter can turn
+/// into static data; anything else resolves to `Unknown` and is reported as
+/// unsupported later, at codegen, rather than silently guessing.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+}
+
+class TypeCtx {
+    var diags: DiagnosticSink
+    var types: Map<string, TypeTableEntry>
+    var importAliases: Map<string, List<string>>
+
+    constructor(diags: DiagnosticSink, types: Map<string, TypeTableEntry>, importAliases: Map<string, List<string>>) {
+        this.diags = diags
+        this.types = types
+        this.importAliases = importAliases
+    }
+
+    fn resolveTy( te: TypeExpr, generics: List<string>) -> Ty {
+        match (te.kind) {
+            case TypeExprKind.Path(p) -> this.resolvePath(p, generics, te.span)
+            case TypeExprKind.Generic(base, args) -> {
+                let bare = this.resolveTy(base, generics)
+                let argTys = emptyTys()
+                for (a in args) {
+                    argTys.push(this.resolveTy(a, generics))
+                }
+                this.instantiate(bare, argTys, te.span)
+            }
+            case TypeExprKind.Option(inner) -> optOf(this.resolveTy(inner, generics))
+            case TypeExprKind.Tuple(items) -> {
+                if (len(items) == 1) {
+                    this.resolveTy(items[0], generics)
+                } else {
+                    let ps = emptyTys()
+                    for (t in items) {
+                        ps.push(this.resolveTy(t, generics))
+                    }
+                    Ty.Tuple(ps)
+                }
+            }
+            case TypeExprKind.Fn(params, ret, isAsync) -> {
+                let ps = emptyTys()
+                for (t in params) {
+                    ps.push(this.resolveTy(t, generics))
+                }
+                var r = Ty.Empty
+                if (let some(rr) = ret) {
+                    r = this.resolveTy(rr, generics)
+                }
+                let _ = isAsync
+                Ty.Fn(ps, r)
+            }
+            case TypeExprKind.Pointer(inner) -> Ty.Ptr(this.resolveTy(inner, generics))
+            case TypeExprKind.Ref(inner) -> Ty.Ref(this.resolveTy(inner, generics))
+            case TypeExprKind.Infer -> Ty.Unknown
+        }
+    }
+
+    fn bareType( entry: TypeTableEntry) -> Ty {
+        match (entry) {
+            case TypeTableEntry.Class(t) -> Ty.Class(t.name, varsOf(t.generics))
+            case TypeTableEntry.Struct(t) -> Ty.Struct(t.name, varsOf(t.generics))
+            case TypeTableEntry.Enum(t) -> Ty.Enum(t.name, varsOf(t.generics))
+            case TypeTableEntry.Interface(t) -> Ty.Interface(t.name, varsOf(t.generics))
+        }
+    }
+
+    fn resolvePath( path: List<string>, generics: List<string>, span: Span) -> Ty {
+        if (len(path) == 1) {
+            if (path[0] == "List") {
+                return Ty.List(Ty.Unknown)
+            }
+            if (path[0] == "Map") {
+                return Ty.Map(Ty.Unknown, Ty.Unknown)
+            }
+            if (path[0] == "Stream") {
+                return Ty.Stream
+            }
+            for (g in generics) {
+                if (g == path[0]) {
+                    return Ty.Var(g)
+                }
+            }
+            if (let some(t) = primitive(path[0])) {
+                return t
+            }
+        }
+        if (len(path) == 1) {
+            if (this.types.has(path[0])) {
+                return this.bareType(this.types[path[0]])
+            }
+        } else if (this.importAliases.has(path[0])) {
+            let last = path[len(path) - 1]
+            if (this.types.has(last)) {
+                return this.bareType(this.types[last])
+            }
+        }
+        this.diags.emit(Diagnostic.errorAt(span, "unknown type `" + renderPath(path) + "`").withCode("E0210").note("expected a class, struct, enum, interface, or built-in type"))
+        Ty.Unknown
+    }
+
+    fn instantiate( bare: Ty, args: List<Ty>, span: Span) -> Ty {
+        var name = ""
+        var expected = emptyStrs()
+        match (bare) {
+            case Ty.List(_) -> {
+                if (len(args) > 0) {
+                    let e = args[0]
+                    if (holdsRef(e)) {
+                        this.diags.emit(Diagnostic.errorAt(span, "lists of `&T` references are not supported yet").withCode("E0213"))
+                    }
+                }
+                if (len(args) > 0) {
+                    return Ty.List(args[0])
+                } else {
+                    return Ty.List(Ty.Unknown)
+                }
+            }
+            case Ty.Map(_, _) -> {
+                var k = Ty.Unknown
+                var v = Ty.Unknown
+                if (len(args) > 0) {
+                    k = args[0]
+                }
+                if (len(args) > 1) {
+                    v = args[1]
+                }
+                return Ty.Map(k, v)
+            }
+            case Ty.Class(n, _) -> {
+                name = n
+                expected = this.genericsOf(n)
+            }
+            case Ty.Struct(n, _) -> {
+                name = n
+                expected = this.genericsOf(n)
+            }
+            case Ty.Enum(n, _) -> {
+                name = n
+                expected = this.genericsOf(n)
+            }
+            case Ty.Interface(n, _) -> {
+                name = n
+                expected = this.genericsOf(n)
+            }
+            case _ -> {
+                this.diags.emit(Diagnostic.errorAt(span, "type is not generic").withCode("E0211"))
+                return bare
+            }
+        }
+        if (len(args) != len(expected)) {
+            this.diags.emit(Diagnostic.errorAt(span, "wrong number of type arguments for `" + name + "`: expected " + str(len(expected)) + ", found " + str(len(args))).withCode("E0212").note("declared generic parameters: " + renderList(expected)))
+        }
+        match (bare) {
+            case Ty.Class(n, _) -> Ty.Class(n, args)
+            case Ty.Struct(n, _) -> Ty.Struct(n, args)
+            case Ty.Enum(n, _) -> Ty.Enum(n, args)
+            case Ty.Interface(n, _) -> Ty.Interface(n, args)
+            case other -> other
+        }
+    }
+
+    fn genericsOf( name: string) -> List<string> {
+        if (this.types.has(name)) {
+            entryGenerics(this.types[name])
+        } else {
+            emptyStrs()
+        }
+    }
+}
+
+enum TypeTableEntry {
+    Class(t: ClassTable)
+    Struct(t: ClassTable)
+    Enum(t: EnumTable)
+    Interface(t: InterfaceTable)
+}
+
+enum ItemKindDecl {
+    Class(c: ClassDecl)
+    Struct(s: StructDecl)
+    Enum(e: EnumDecl)
+    Interface(i: InterfaceDecl)
+}
+
+// ==== ctor-support helpers (closure) ====
+
+fn entryGenerics(e: TypeTableEntry) -> List<string> {
+    match (e) {
+        case TypeTableEntry.Class(t) -> t.generics
+        case TypeTableEntry.Struct(t) -> t.generics
+        case TypeTableEntry.Interface(t) -> t.generics
+        case TypeTableEntry.Enum(t) -> t.generics
+    }
+}
+
+fn renderPath(path: List<string>) -> string {
+    var out = ""
+    var i = 0
+    while (i < len(path)) {
+        if (i > 0) {
+            out += "."
+        }
+        out += path[i]
+        i = i + 1
+    }
+    out
+}
+
+fn renderList(items: List<string>) -> string {
+    if (len(items) == 0) {
+        "none"
+    } else {
+        var out = ""
+        var i = 0
+        while (i < len(items)) {
+            if (i > 0) {
+                out += ", "
+            }
+            out += items[i]
+            i = i + 1
+        }
+        out
+    }
+}
+
+fn varsOf(gs: List<string>) -> List<Ty> {
+    var out = emptyTys()
+    var i = 0
+    while (i < len(gs)) {
+        out.push(Ty.Var(gs[i]))
+        i = i + 1
+    }
+    out
+}
+
+fn primitive(name: string) -> Ty? {
+    if (name == "bool") {
+        Ty.Bool
+    } else if (name == "char") {
+        Ty.Char
+    } else if (name == "byte") {
+        Ty.Byte
+    } else if (name == "int" || name == "i64") {
+        Ty.Int
+    } else if (name == "float" || name == "f64") {
+        Ty.Float
+    } else if (name == "string") {
+        Ty.String
+    } else if (name == "void") {
+        Ty.Empty
+    } else {
+        none
+    }
+}
+
+fn holdsRef(t: Ty) -> bool {
+    match (t) {
+        case Ty.Ref(_) -> true
+        case Ty.Option(x) -> match (x) {
+            case Ty.Ref(_) -> true
+            case _ -> false
+        }
+        case _ -> false
+    }
+}
+
+fn emptyMapTypes() -> Map<string, TypeTableEntry> {
+    let m = {"::seed::": TypeTableEntry.Enum(EnumTable("", Span(0, 0), Visibility.Public, emptyStrs(), emptyTys(), emptyVariantInfos()))}
+    m.remove("::seed::")
+    m
+}
+
+fn emptyMapFns() -> Map<string, List<CallableInfo>> {
+    let m = {"::seed::": emptyCallableInfos()}
+    m.remove("::seed::")
+    m
+}
+
+fn emptyFieldInfos() -> List<FieldInfo> {
+    var l = [FieldInfo("", Visibility.Public, false, false, false, false, Ty.Bool, Span(0, 0))]
+    l.pop()
+    l
+}
+
+fn emptyMapAliases() -> Map<string, List<string>> {
+    let m = {"::seed::": emptyStrs()}
+    m.remove("::seed::")
+    m
+}
+
+fn emptyVariantInfos() -> List<EnumVariantInfo> {
+    var l = [EnumVariantInfo("", emptyTys(), Span(0, 0))]
+    l.pop()
+    l
+}
+
+fn emptyCallableInfos() -> List<CallableInfo> {
+    var l = [mkBuiltin(Span(0, 0), "", emptyParamInfos(), Ty.Bool)]
+    l.pop()
+    l
+}
+
+fn mkBuiltin(span: Span, name: string, params: List<ParamInfo>, ret: Ty) -> CallableInfo {
+    var ps = emptyParamInfos()
+    for (p in params) {
+        p.rest = true
+        ps.push(p)
+    }
+    CallableInfo(name, span, Visibility.Public, false, true, false, false, none, emptyStrs(), ps, ret)
+}
+
+fn emptyParamInfos() -> List<ParamInfo> {
+    var l = [ParamInfo("", Ty.Bool, false, false, Span(0, 0))]
+    l.pop()
+    l
+}
+
