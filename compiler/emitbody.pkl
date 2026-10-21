@@ -1,0 +1,1402 @@
+﻿// emitbody - the fn/class body-builder layer carved out of emitcore.
+// Closure by walker_scan.ps1: the walker spine never reaches the body builders,
+// so nothing remaining in emitcore references them; emitbody imports emitcore
+// one-way for the walkers (expr/expr1/stmt/stmt1) and the spine utilities.
+
+module compiler.emitbody
+
+import * from compiler.ast
+import { Span, Diagnostic, DiagnosticSink } from compiler.diag
+import { IrBlock, IrFunc, IrGlobal, IrModule, IrParam, IrTy, emptyIrBlocks, emptyIrGlobals, emptyIrParams, emptyIrTys, emptyModule, irTyStr, irxParseFloat } from compiler.ir
+import { CallableInfo, ClassTable, CtorInfo, entryGenerics, EnumTable, FieldInfo, ParamInfo, PropertyInfo, ResolvedProgram, TypeTableEntry } from compiler.resolvebag
+import { collectExprTypes } from compiler.checkcore
+import { containsStr, isNoneStr, spanKey } from compiler.checkutil
+import * from compiler.ty
+import { f64ToBits } from compiler.x64
+import * from compiler.emitutil
+import { Emitter } from compiler.emittypes
+import * from compiler.emitprim
+import * from compiler.emitreadsglobal
+import * from compiler.emitleaf
+import * from compiler.emitleaf2
+import * from compiler.emitcore
+
+fn emit(em: Emitter) {
+             // A well-formed integer literal that does not fit i64. Parsing
+             // degrades such a literal to 0, so this is the only thing standing
+             // between an out-of-range literal and a silently wrong constant.
+             // The Rust emitter rejects it in `lit`, where the literal's own span
+             // is out of reach, hence the zero span; bail before emitting anything
+             // so a rejected module never reaches the linker.
+             if (em.prog.intLiteralOverflow) {
+                 bad(em, Span(0, 0), "integer literal out of range for i64")
+                 return
+             }
+             for (item in em.prog.items) {
+               match (item.kind) {
+                   case ItemKind.Global(g) -> em.globalDecls[g.name] = g
+                   case _ -> {}
+               }
+           }
+           registerGlobals(em)
+           for (item in em.prog.items) {
+               match (item.kind) {
+                   case ItemKind.Const(c) -> recordConstInit(em, c.name, c.value)
+                   case ItemKind.Fn(f) -> recordFnDecl(em, f.name, f)
+                   case ItemKind.Test(f) -> recordFnDecl(em, f.name, f)
+                   case ItemKind.Class(c) -> recordClassDecl(em, c.name, c)
+                   case _ -> {}
+               }
+           }
+        for (item in em.prog.items) {
+            var itName = "?"
+            match (item.kind) {
+                case ItemKind.Fn(f) -> {
+                    itName = f.name
+                    registerFn(em, f, false, item.attrs)
+                }
+                case ItemKind.Test(f) -> {
+                    itName = f.name
+                    registerFn(em, f, true, item.attrs)
+                }
+                case ItemKind.Class(c) -> {
+                    itName = c.name
+                    registerClassByName(em, c.name)
+                }
+                case ItemKind.Struct(s) -> registerStructItem(em, s)
+                case _ -> {}
+            }
+            if (em.failed) {
+                break
+            }
+        }
+        // Every class is now registered. Discover which instance methods are
+        // overridden so calls through ancestor-typed receivers can route them
+        // on the runtime class id.
+        buildVirtualDispatch(em)
+        // Static fields are initialized once at program start. Register the
+        // initializer only after every class id is assigned.
+        if (!(len(em.staticInits) == 0)) {
+            var inits = em.staticInits
+em.staticInits = emptyStaticInitEntries()
+            em.staticInitId = pushClassFunc(em, "static.init", "pkl_static_init", FnSource.StaticInit(inits))
+        }
+        // Managed top-level `var`s have no static bytes. Register every slot as a
+        // GC root first, then store each initializer, because an initializer is
+        // the first code that can allocate.
+        if (!(len(em.managedGlobalInits) == 0)) {
+            var ginits = em.managedGlobalInits
+            em.managedGlobalInits = emptyManagedGlobalInits()
+            em.globalsInitId = pushClassFunc(em, "globals.init", "pkl_globals_init", FnSource.GlobalsInit(ginits))
+        }
+        // Test modules have no `main`, so the class-registration preamble
+        // cannot ride on one; synthesize `pkl_test_setup` when there is
+        // anything to set up.
+        var hasTests = false
+        for (item in em.prog.items) {
+            match (item.kind) {
+                case ItemKind.Test(_) -> hasTests = true
+                case _ -> {}
+            }
+        }
+        if (hasTests && (!(len(em.classes) == 0) || isSomeInt(em.staticInitId) || isSomeInt(em.globalsInitId))) {
+            em.testSetupId = pushClassFunc(em, "test.setup", "pkl_test_setup", FnSource.TestSetup)
+        }
+        // A split-linked module (a runtime member with no `main`) still needs
+        // its registration/globals/static preamble callable from the linking
+        // program. The symbol is created even when there is nothing to set up
+        // so references to it always bind; the body early-returns empty.
+        if (!(em.moduleSetupSymbol == "")) {
+            pushClassFunc(em, "module.setup", em.moduleSetupSymbol, FnSource.TestSetup)
+        }
+        registerLambdas(em)
+        // Instantiated generic functions are registered lazily while their
+        // callers compile, so keep consuming newly-appended function ids.
+        //
+        // Pass 1: lower every body with the propagation checks suppressed, purely
+        // to record which function calls which and which bodies contain a `throw`
+        // of their own. Pass 2 re-runs the same loop for real. `buildFunc`
+        // replaces each function entry wholesale and every cache that hands out a
+        // `FuncId` is keyed, so re-running over the same ids overwrites pass 1
+        // cleanly instead of appending to it.
+        em.analyzing = true
+        buildAll(em)
+        em.analyzing = false
+        if (em.failed) {
+            // Nothing to re-lower: report what the analysis pass found.
+            for (d in em.suppressed) {
+                em.diags.emit(d)
+            }
+            em.suppressed = emptyDiagnostics()
+            return
+        }
+        em.suppressed = emptyDiagnostics()
+        em.progMayThrow = len(em.directThrow.keys()) > 0
+        if (em.progMayThrow) {
+            solveMayThrow(em)
+        }
+        buildAll(em)
+    }
+
+fn buildAll(em: Emitter) {
+        var ix = 0
+        while (ix < len(em.fidList)) {
+            var fid = em.fidList[ix]
+            buildFunc(em, fid)
+            ix = ix + 1
+        }
+    }
+
+fn buildFunc(em: Emitter, fid: int) {
+        em.fname = em.irModule.funcs[fid].name
+        em.symbol = em.irModule.funcs[fid].symbol
+        em.fparams = emptyIrParams()
+        em.fslots = emptyIrTys()
+        em.env = emptyIntScopeMap()
+        em.env.push(seedIntScopeMap())
+        em.manualEnv = emptyScopeMaps()
+        em.manualEnv.push(seedScopeMap())
+        em.blocks = emptyIrBlocks()
+        em.blocks.push(IrBlock(0, emptyIrInstrs(), IrTerm.Unreachable))
+        em.nextBlock = 1
+        em.nextTemp = 0
+        em.loops = emptyLoopCtxs()
+        em.cur = 0
+        // Reset the exception context per function alongside `loops`. Both stacks
+        // balance themselves on a clean lowering, but a pass that bailed out
+        // early can leave them dirty -- and the two-pass driver re-runs this
+        // function, so pass 2 must not inherit that.
+        em.finallys = emptyBlocks()
+        em.handlers = emptyHandlerCtxs()
+        em.inThrowTransfer = false
+        em.owner = none
+        em.currentFid = fid
+        em.iceDepth = 0
+        em.icePath = emptyStrs()
+        em.iceSeq = emptyStrs()
+
+        if (let some(s) = em.instantonSubst.get(fid)) {
+            em.currentSubst = s
+        } else {
+            em.currentSubst = emptyStringTyMap()
+        }
+        var fg = emptyStrs()
+        if (let some(g) = em.fidGenerics.get(fid)) {
+            fg = g
+        } else {
+            if (let some(s) = em.fsource.get(fid)) {
+                var tl: FnDecl? = none
+                match (s) {
+                    case FnSource.TopLevel(f) -> tl = f
+                    case _ -> {}
+                }
+                if (let some(t) = tl) {
+                    for (g in t.generics) {
+                        fg.push(g.name)
+                    }
+                }
+            }
+        }
+        em.fnGenerics = fg
+
+var isMain = em.irModule.funcs[fid].isMain
+        if (let some(src) = em.fsource.get(fid)) {
+            match (src) {
+                case FnSource.TopLevel(f) -> {
+                    var infoOpt: CallableInfo? = none
+                    if (let some(i) = em.finfo.get(fid)) {
+                        infoOpt = i
+                    }
+                    if (let none = infoOpt) {
+                        return
+                    }
+                    var info = seedCallableInfo()
+                    if (let some(i) = infoOpt) {
+                        info = i
+                    }
+                    declareParams(em, info.params)
+                    adoptManualParams(em, f.params)
+                    var m = mapTy(em, info.ret, f.span)
+                    if (let some(r) = m) {
+                        em.fret = r
+                    } else {
+                        em.fret = IrTy.Unit
+                    }
+                    emitBody(em, f.body)
+                }
+                case FnSource.Lambda(lambda, caps, pts, rt, owner) -> buildLambdaBody(em, lambda, caps, pts, rt, owner, fid)
+                case FnSource.Trampoline(span, target, pts, rt) -> {
+                    em.owner = none
+                    buildTrampoline(em, span, target, pts, rt)
+                }
+case FnSource.MethodTrampoline(span, target, pts, rt, branches) -> {
+                    em.owner = none
+                    buildMethodTrampoline(em, span, target, pts, rt, branches)
+                }
+                case FnSource.SpreadTrampoline(span, target, pts, rt, recv) -> {
+                    em.owner = none
+                    buildSpreadTrampoline(em, span, target, pts, rt, recv)
+                }
+                case FnSource.Ctor(table, inits, initBlocks, cd) -> {
+                    em.owner = ownerFor(em, fid, table.name)
+                    buildCtorBody(em, table, inits, initBlocks, cd)
+                }
+                case FnSource.NamedCtor(table, cd) -> {
+                    em.owner = ownerFor(em, fid, table.name)
+                    buildNamedCtor(em, table, cd)
+                }
+                case FnSource.Deinit(table, body) -> {
+                    em.owner = ownerFor(em, fid, table.name)
+                    buildDeinitBody(em, table, body)
+                }
+                case FnSource.Method(table, md) -> {
+                    var infoOpt2: CallableInfo? = none
+                    if (let some(i) = em.finfo.get(fid)) {
+                        infoOpt2 = i
+                    }
+                    if (let none = infoOpt2) {
+                        return
+                    }
+                    var info2 = seedCallableInfo()
+                    if (let some(i) = infoOpt2) {
+                        info2 = i
+                    }
+                    em.owner = ownerFor(em, fid, table.name)
+                    buildMethodBody(em, table, md, info2)
+                }
+                case FnSource.AsyncFn(f, hidden) -> {
+                    var infoOpt3: CallableInfo? = none
+                    if (let some(i) = em.finfo.get(fid)) {
+                        infoOpt3 = i
+                    }
+                    if (let none = infoOpt3) {
+                        return
+                    }
+                    var info3 = seedCallableInfo()
+                    if (let some(i) = infoOpt3) {
+                        info3 = i
+                    }
+                    declareParams(em, info3.params)
+                    adoptManualParams(em, f.params)
+                    // The wrapper returns the future: a closure snapshotting
+                    // each parameter under its own name (slot 0 is the hidden
+                    // body). Runs no user code.
+                    em.fret = IrTy.Ptr
+                    var captures = emptyCaptures()
+                    for (p in info3.params) {
+                        captures.push(Capture(p.name, p.ty, p.span))
+                    }
+                    if (let some(obj) = closureObj(em, Expr(f.span, ExprKind.Ident("")), hidden, captures)) {
+                        term(em, IrTerm.Return(obj))
+                    }
+                }
+                case FnSource.AsyncBody(f, pts, rt) -> buildAsyncBody(em, f, pts, rt)
+                case FnSource.AsyncMethod(table, md, hidden, isStatic, thisTy) -> {
+                    var infoOpt4: CallableInfo? = none
+                    if (let some(i) = em.finfo.get(fid)) {
+                        infoOpt4 = i
+                    }
+                    if (let none = infoOpt4) {
+                        return
+                    }
+                    var info4 = seedCallableInfo()
+                    if (let some(i) = infoOpt4) {
+                        info4 = i
+                    }
+                    em.owner = ownerFor(em, fid, table.name)
+                    buildAsyncMethodWrapper(em, md, info4, hidden, isStatic, thisTy)
+                }
+                case FnSource.AsyncMethodBody(table, md, pts, rt, isStatic) -> {
+                    em.owner = ownerFor(em, fid, table.name)
+                    buildAsyncMethodBody(em, md, pts, rt, isStatic)
+                }
+                case FnSource.Property(table, pd, pinfo, isSet, isStatic) -> {
+                    em.owner = ownerFor(em, fid, table.name)
+                    buildPropertyBody(em, table, pd, pinfo, isSet, isStatic)
+                }
+                case FnSource.StaticInit(inits) -> buildStaticInit(em, inits)
+                case FnSource.GlobalsInit(inits) -> buildGlobalsInit(em, inits)
+                case FnSource.TestSetup -> {
+                    em.fret = IrTy.Unit
+                    injectClassRegistrations(em)
+                    term(em, IrTerm.Return(none))
+                }
+            }
+        }
+        if (em.failed) {
+            return
+        }
+
+        var isFirstTest = !(isSomeInt(em.testSetupId)) && em.irModule.funcs[fid].isTest
+        if (isFirstTest) {
+            var k = 0
+            while (k < fid) {
+                if (em.irModule.funcs[k].isTest) {
+                    isFirstTest = false
+                    break
+                }
+                k = k + 1
+            }
+        }
+        if (isMain || isFirstTest) {
+            injectClassRegistrations(em)
+        }
+
+        var rname = em.irModule.funcs[fid].name
+        var rsym = em.irModule.funcs[fid].symbol
+        var rmain = em.irModule.funcs[fid].isMain
+        var rtest = em.irModule.funcs[fid].isTest
+        var rtags = em.irModule.funcs[fid].tags
+        em.irModule.funcs[fid] = IrFunc(em.fname, em.symbol, em.fparams, em.fret, em.fslots, 0, em.blocks, rmain, rtest, rtags)
+    }
+
+fn blockTailAsReturn(em: Emitter, b: Block) {
+        let trySlot = stmtsWithTryTail(em, b.stmts, em.fret)
+        if (let some(ts) = trySlot) {
+            // `blockIntoSlot` already option-boxed a scalar tail into a `Ptr`
+            // result slot, so the loaded value matches `fret` as-is.
+            let t = load(em, ts)
+            term(em, IrTerm.Return(t))
+            return
+        }
+        for (s in b.stmts) {
+            if (stmt(em, s)) {
+                continue
+            }
+            return
+        }
+        if (let some(e) = b.expr) {
+            if (!(irTyTag(em.fret) == irTyTag(IrTy.Unit))) {
+                if (let some(t) = expr(em, e)) {
+                    var tv = t
+                    if (irTyTag(em.fret) == irTyTag(IrTy.Ptr)) {
+                        var vt = Ty.Unknown
+                        if (let some(gt) = tyOf(em, e.span)) {
+                            vt = gt
+                        }
+                        if (let some(w) = optionWrap(em, tv, vt, e.span)) {
+                            tv = w
+                        }
+                    }
+                    term(em, IrTerm.Return(tv))
+                }
+            } else {
+                let _ = expr(em, e)
+                term(em, IrTerm.Return(none))
+            }
+        } else {
+            if (irTyTag(em.fret) == irTyTag(IrTy.Unit)) {
+                term(em, IrTerm.Return(none))
+            }
+        }
+    }
+
+fn emitBody(em: Emitter, body: FnBody?) -> bool {
+        em.iceSeq = emptyStrs()
+        if (let some(b) = body) {
+            match (b) {
+                case FnBody.Block(bb) -> {
+                    pushScope(em)
+                    blockTailAsReturn(em, bb)
+                    popScope(em)
+                }
+                case FnBody.Expr(e) -> {
+                    if (irTyTag(em.fret) == irTyTag(IrTy.Unit)) {
+                        let _ = expr(em, e)
+                    } else {
+                        if (let some(t) = expr(em, e)) {
+                            var tv = t
+                            if (irTyTag(em.fret) == irTyTag(IrTy.Ptr)) {
+                                var vt = Ty.Unknown
+                                if (let some(gt) = tyOf(em, e.span)) {
+                                    vt = gt
+                                }
+                                if (let some(w) = optionWrap(em, tv, vt, e.span)) {
+                                    tv = w
+                                }
+                            }
+                            term(em, IrTerm.Return(tv))
+                        }
+                    }
+                }
+            }
+        }
+        tailCleanup(em)
+    }
+
+fn buildLambdaBody(em: Emitter, lambda: Expr, captures: List<Capture>, pty: List<Ty>, ret: Ty, owner: int?, fid: int) {
+        let _ = fid
+        var params = emptyParams()
+        var lb = FnBody.Expr(Expr(Span(0, 0), ExprKind.This))
+        match (lambda.kind) {
+            case ExprKind.Lambda(ps, _rt, _ia, b) -> {
+                params = ps
+                lb = b
+            }
+            case _ -> {
+                bad(em, lambda.span, "lambda lost its body")
+                return
+            }
+        }
+        var ptys = pty
+        if (len(ptys) == 0) {
+            var known = false
+            if (let some(t) = em.types.get(spanKey(lambda.span))) {
+                match (t) {
+                    case Ty.Fn(pts, _) -> {
+                        ptys = pts
+                        known = true
+                    }
+                    case _ -> {}
+                }
+            }
+            if (!known) {
+                bad(em, lambda.span, "lambda parameter types are not statically known")
+                return
+            }
+        }
+        if (let some(ir) = mapTy(em, ret, lambda.span)) {
+            em.fret = ir
+        }
+        em.owner = owner
+
+        // Slot 0 is the closure object; it must stay at fparam index 0 so the
+        // JIT hands the closure to slot 0.
+        var envIr = IrTy.Ptr
+        var envSlot = newSlot(em, envIr)
+        em.fparams.push(IrParam("env", envIr))
+        declare(em, "env", envSlot)
+        var envObj = load(em, envSlot)
+
+        // The lambda's own parameters, typed from the checker's Fn signature,
+        // occupy slots 1..=n matching their argument order.
+        var i = 0
+        while (i < len(params)) {
+            var p = params[i]
+            var t = Ty.Unknown
+            if (i < len(ptys)) {
+                t = ptys[i]
+            }
+            var ir = IrTy.Ptr
+            if (let some(r) = mapTy(em, t, p.span)) {
+                ir = r
+            }
+            var slot = newSlot(em, ir)
+            em.fparams.push(IrParam(p.name, ir))
+            declare(em, p.name, slot)
+            i = i + 1
+        }
+
+        // Captured values go into fresh slots after every parameter; a capture
+        // whose name a parameter shadows is skipped.
+        var ci = 0
+        while (ci < len(captures)) {
+            var cap = captures[ci]
+            var v = -1
+            if (let some(fv) = fieldRead(em, cap.span, envObj, cap.ty, 1 + ci)) {
+                v = fv
+            } else {
+                return
+            }
+            var ir = IrTy.Ptr
+            if (let some(r) = mapTy(em, cap.ty, cap.span)) {
+                ir = r
+            }
+            var slot = newSlot(em, ir)
+            instr(em, IrInstr.StoreSlot(slot, v))
+            var shadowed = len(em.env) == 0
+            if (!shadowed) {
+                for (p in params) {
+                    if (p.name == cap.name) {
+                        shadowed = true
+                        break
+                    }
+                }
+            }
+            if (!shadowed) {
+                declare(em, cap.name, slot)
+            }
+            ci = ci + 1
+        }
+        let _ = emitBody(em, lb)
+    }
+
+fn buildAsyncBody(em: Emitter, f: FnDecl, pty: List<Ty>, ret: Ty) -> bool {
+        var m = mapTy(em, ret, f.span)
+        if (let some(r) = m) {
+            em.fret = r
+        }
+        em.owner = none
+        var envIr = IrTy.Ptr
+        var envSlot = newSlot(em, envIr)
+        em.fparams.push(IrParam("env", envIr))
+        declare(em, "env", envSlot)
+        var envObj = load(em, envSlot)
+        var i = 0
+        while (i < len(f.params)) {
+            var p = f.params[i]
+            var t = Ty.Unknown
+            if (i < len(pty)) {
+                t = pty[i]
+            }
+            var v = 0
+            var fr = fieldRead(em, p.span, envObj, t, 1 + i)
+            if (let none = fr) {
+                return false
+            }
+            if (let some(x) = fr) {
+                v = x
+            }
+            var ir = IrTy.Ptr
+            var mt = mapTy(em, t, p.span)
+            if (let some(r2) = mt) {
+                ir = r2
+            }
+            var slot = newSlot(em, ir)
+            instr(em, IrInstr.StoreSlot(slot, v))
+            declare(em, p.name, slot)
+            i = i + 1
+        }
+        emitBody(em, f.body)
+        tailCleanup(em)
+        true
+    }
+
+fn buildAsyncMethodBody(em: Emitter, md: MethodDecl, pty: List<Ty>, ret: Ty, isStatic: bool) -> bool {
+        var m = mapTy(em, ret, md.span)
+        if (let some(r) = m) {
+            em.fret = r
+        }
+        var envIr = IrTy.Ptr
+        var envSlot = newSlot(em, envIr)
+        em.fparams.push(IrParam("env", envIr))
+        declare(em, "env", envSlot)
+        var envObj = load(em, envSlot)
+        var base = 0
+        if (!isStatic) {
+            base = 1
+        }
+        if (!isStatic) {
+            var t = Ty.Unknown
+            if (len(pty) > 0) {
+                t = pty[0]
+            }
+            var v = 0
+            var fr = fieldRead(em, md.span, envObj, t, 1)
+            if (let none = fr) {
+                return false
+            }
+            if (let some(x) = fr) {
+                v = x
+            }
+            var ir = IrTy.Ptr
+            var mt = mapTy(em, t, md.span)
+            if (let some(r2) = mt) {
+                ir = r2
+            }
+            var slot = newSlot(em, ir)
+            instr(em, IrInstr.StoreSlot(slot, v))
+            declare(em, "this", slot)
+        }
+        var i = 0
+        while (i < len(md.params)) {
+            var p = md.params[i]
+            var t = Ty.Unknown
+            if (i + base < len(pty)) {
+                t = pty[i + base]
+            }
+            var v = 0
+            var fr = fieldRead(em, p.span, envObj, t, 1 + base + i)
+            if (let none = fr) {
+                return false
+            }
+            if (let some(x) = fr) {
+                v = x
+            }
+            var ir = IrTy.Ptr
+            var mt = mapTy(em, t, p.span)
+            if (let some(r2) = mt) {
+                ir = r2
+            }
+            var slot = newSlot(em, ir)
+            instr(em, IrInstr.StoreSlot(slot, v))
+            declare(em, p.name, slot)
+            i = i + 1
+        }
+        emitBody(em, md.body)
+        tailCleanup(em)
+        true
+    }
+
+fn buildMethodTrampoline(em: Emitter, span: Span, target: int, pty: List<Ty>, ret: Ty, branches: List<DispatchBranch>) {
+        var m = mapTy(em, ret, span)
+        if (let some(r) = m) {
+            em.fret = r
+        }
+        var envIr = IrTy.Ptr
+        var envSlot = newSlot(em, envIr)
+        em.fparams.push(IrParam("env", envIr))
+        declare(em, "env", envSlot)
+        var env = load(em, envSlot)
+        var one = intConst(em, 1)
+        var receiver = externCallT1(em, "pickle_obj_slot_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [env, one])
+        var real = emptyInts()
+        var i = 0
+        while (i < len(pty)) {
+            var t = pty[i]
+            var ir = IrTy.Ptr
+            var mt = mapTy(em, t, span)
+            if (let some(r) = mt) {
+                ir = r
+            }
+            var slot = newSlot(em, ir)
+            var pname = "arg" + str(i)
+            em.fparams.push(IrParam(pname, ir))
+            declare(em, pname, slot)
+            real.push(load(em, slot))
+            i = i + 1
+        }
+        if (len(branches) == 0) {
+            var args = emptyInts()
+            args.push(receiver)
+            for (r in real) {
+                args.push(r)
+            }
+            if (irTyTag(em.fret) == irTyTag(IrTy.Unit)) {
+                instr(em, IrInstr.Call(none, Callee.Func(target), args))
+                term(em, IrTerm.Return(none))
+            } else {
+                var dst = temp(em)
+                instr(em, IrInstr.Call(dst, Callee.Func(target), args))
+                term(em, IrTerm.Return(dst))
+            }
+            return
+        }
+        var anchor = Expr(span, ExprKind.Ident(""))
+        var retSlot = newSlot(em, em.fret)
+        var join = newBlock(em)
+        for (b in branches) {
+            var cb = newBlock(em)
+            var next = newBlock(em)
+            var dc = intConst(em, b.cid)
+            var found = externCallT1(em, "pickle_class_is", [IrTy.Ptr, IrTy.Int], IrTy.Bool, [receiver, dc])
+            term(em, IrTerm.BranchIf(found, cb, next))
+            em.cur = cb
+            var bargs = emptyInts()
+            bargs.push(receiver)
+            for (r in real) {
+                bargs.push(r)
+            }
+            var val = emitCallTo(em, b.fid, bargs, anchor)
+            instr(em, IrInstr.StoreSlot(retSlot, val))
+            term(em, IrTerm.Branch(join))
+            em.cur = next
+        }
+        var fargs = emptyInts()
+        fargs.push(receiver)
+        for (r in real) {
+            fargs.push(r)
+        }
+        var fval = emitCallTo(em, target, fargs, anchor)
+        instr(em, IrInstr.StoreSlot(retSlot, fval))
+        term(em, IrTerm.Branch(join))
+        em.cur = join
+        var dst = temp(em)
+        instr(em, IrInstr.LoadSlot(dst, retSlot))
+        term(em, IrTerm.Return(dst))
+    }
+
+fn emitCtorBlock(em: Emitter, b: Block) -> bool {
+        emitCtorBlockFrom(em, b, 0)
+    }
+
+fn emitCtorBlockFrom(em: Emitter, b: Block, fromIdx: int) -> bool {
+        pushScope(em)
+        var i = fromIdx
+        while (i < len(b.stmts)) {
+            if (!stmt(em, b.stmts[i])) {
+                popScope(em)
+                return false
+            }
+            i = i + 1
+        }
+        if (let some(e) = b.expr) {
+            let _ = expr(em, e)
+        }
+        popScope(em)
+        true
+    }
+
+fn emitSuperChain(em: Emitter, ownerName: string, delegation: Expr) -> bool {
+        var args = emptyCallArgs()
+        var isCall = false
+        match (delegation.kind) {
+            case ExprKind.Call(_super, a) -> {
+                args = a
+                isCall = true
+            }
+            case _ -> {}
+        }
+        if (!isCall) {
+            return bad(em, delegation.span, "`super(...)` delegation is malformed")
+        }
+        var parent = ""
+        var hasParent = false
+        if (let some(t) = tableOf(em, ownerName)) {
+            if (let some(ext) = t.extends) {
+                if (let some(p) = named(ext)) {
+                    parent = p
+                    hasParent = true
+                }
+            }
+        }
+        if (!hasParent) {
+            return bad(em, delegation.span, "`super(...)` requires a superclass")
+        }
+        var pt: ClassTable? = tableOf(em, parent)
+        if (let none = pt) {
+            return bad(em, delegation.span, "`" + parent + "` is not a class")
+        }
+        var vals = emptyCtorArgVals()
+        for (a in args) {
+            if (a.spread) {
+                return bad(em, a.span, "spread arguments are not lowered yet")
+            }
+            var vO = expr(em, a.value)
+            if (let none = vO) {
+                return false
+            }
+            var v = 0
+            if (let some(x) = vO) {
+                v = x
+            }
+            var ty = Ty.Unknown
+            if (let some(t) = tyOf(em, a.value.span)) {
+                ty = t
+            }
+            vals.push(CtorArgVal(v, ty, a.value.span))
+        }
+        var ptable = seedClassTable()
+        if (let some(t) = pt) {
+            ptable = t
+        }
+        emitCtorChain(em, parent, ptable, vals, delegation.span)
+    }
+
+fn emitSynthesizedSuperChain(em: Emitter, ancestor: string, count: int) -> bool {
+        var at: ClassTable? = tableOf(em, ancestor)
+        if (let none = at) {
+            return true
+        }
+        var atable = seedClassTable()
+        if (let some(t) = at) {
+            atable = t
+        }
+        var cparams = emptyParamInfos()
+        if (let some(c) = atable.ctor) {
+            cparams = c.params
+        }
+        var vals = emptyCtorArgVals()
+        var i = 0
+        while (i < count && i < len(cparams)) {
+            var p = cparams[i]
+            var v = load(em, i)
+            vals.push(CtorArgVal(v, p.ty, p.span))
+            i = i + 1
+        }
+        emitCtorChain(em, ancestor, atable, vals, atable.span)
+    }
+
+fn emitCtorChain(em: Emitter, cname: string, ct: ClassTable, vals: List<CtorArgVal>, span: Span) -> bool {
+        pushScope(em)
+        var cd: ConstructorDecl? = none
+        if (let some(decl) = em.classDecls.get(cname)) {
+            for (m in decl.members) {
+                match (m) {
+                    case ClassMember.Constructor(c) -> {
+                        if (let none = c.name) {
+                            cd = c
+                            break
+                        }
+                    }
+                    case _ -> {}
+                }
+            }
+        }
+        var hasCtCtor = false
+        if (let some(_) = ct.ctor) {
+            hasCtCtor = true
+        }
+        if (hasCtCtor) {
+            if (let none = cd) {
+                popScope(em)
+                return bad(em, span, "`" + cname + "` primary constructor is missing")
+            }
+            var ctorDecl = seedConstructorDecl()
+            if (let some(x) = cd) {
+                ctorDecl = x
+            }
+            var cparams = emptyParamInfos()
+            if (let some(c) = ct.ctor) {
+                cparams = c.params
+            }
+            if (!(len(cparams) == len(vals))) {
+                popScope(em)
+                return bad(em, span, "`super(...)` passes " + str(len(vals)) + " argument(s) but `" + cname + "` expects " + str(len(cparams)))
+            }
+            var w = 0
+            while (w < len(cparams)) {
+                var pr = cparams[w]
+                var av = vals[w]
+                var ir = IrTy.Ptr
+                if (let some(r) = mapTy(em, pr.ty, pr.span)) {
+                    ir = r
+                }
+                var slot = newSlot(em, ir)
+                var stored = av.v
+                if (irTyTag(ir) == irTyTag(IrTy.Ptr)) {
+                    var wrapped = optionWrap(em, av.v, av.ty, av.span)
+                    if (let none = wrapped) {
+                        popScope(em)
+                        return false
+                    }
+                    var wv = 0
+                    if (let some(x) = wrapped) {
+                        wv = x
+                    }
+                    stored = wv
+                }
+                instr(em, IrInstr.StoreSlot(slot, stored))
+                declare(em, pr.name, slot)
+                w = w + 1
+            }
+            var hasDel = false
+            var del = ctorSuperDelegation(ctorDecl.body)
+            if (let some(dg) = del) {
+                hasDel = true
+                if (!emitSuperChain(em, cname, dg)) {
+                    popScope(em)
+                    return false
+                }
+            }
+            if (hasDel) {
+                if (!emitCtorBlockFrom(em, ctorDecl.body, 1)) {
+                    popScope(em)
+                    return false
+                }
+            } else {
+                if (!emitCtorBlock(em, ctorDecl.body)) {
+                    popScope(em)
+                    return false
+                }
+            }
+        } else {
+            var meta = synthesizedCtorParamMeta(em, cname)
+            if (!(len(meta.slots) == len(vals))) {
+                popScope(em)
+                return bad(em, span, "`super(...)` passes " + str(len(vals)) + " argument(s) but `" + cname + "` expects " + str(len(meta.slots)))
+            }
+            var thisSlotO = lookup(em, "this")
+            if (let none = thisSlotO) {
+                popScope(em)
+                return bad(em, span, "`this` is not available in the constructor chain")
+            }
+            var thisSlot = 0
+            if (let some(s) = thisSlotO) {
+                thisSlot = s
+            }
+            var thisObj = load(em, thisSlot)
+            if (!(meta.chainName == "")) {
+                var candVals = emptyCtorArgVals()
+                var kk = 0
+                while (kk < meta.chainCount && kk < len(vals)) {
+                    candVals.push(vals[kk])
+                    kk = kk + 1
+                }
+                if (let some(at2) = tableOf(em, meta.chainName)) {
+                    emitCtorChain(em, meta.chainName, at2, candVals, span)
+                }
+            }
+            var ifields = allInstanceFields(em, cname)
+            var z = 0
+            while (z < len(meta.slots)) {
+                var slot2 = meta.slots[z]
+                if (slot2 < 0) {
+                    z = z + 1
+                    continue
+                }
+                var av2 = vals[z]
+                var f = ifields[slot2]
+                var repO = elemRep(em, f.ty, f.span)
+                if (let none = repO) {
+                    popScope(em)
+                    return false
+                }
+                var rep = ElemRep.ptr()
+                if (let some(r) = repO) {
+                    rep = r
+                }
+                var packedO = packForPointerBoundary(em, rep, av2.v, av2.ty, av2.span)
+                if (let none = packedO) {
+                    popScope(em)
+                    return false
+                }
+                var packed = 0
+                if (let some(p) = packedO) {
+                    packed = p
+                }
+                var boxedO = boxForStore(em, rep, packed, elemIr(f.ty))
+                if (let none = boxedO) {
+                    popScope(em)
+                    return false
+                }
+                var boxed = 0
+                if (let some(b) = boxedO) {
+                    boxed = b
+                }
+                fieldStore(em, thisObj, slot2, f.ty, boxed)
+                z = z + 1
+            }
+        }
+        popScope(em)
+        true
+    }
+
+fn buildCtorBody(em: Emitter, table: ClassTable, inits: List<SlotInit>, initBlocks: List<Block>, ctor: ConstructorDecl?) -> bool {
+        var ifields = allInstanceFields(em, table.name)
+        var params = emptyCtorParams()
+        var meta = synthesizedCtorParamMeta(em, table.name)
+        var hasCtor = false
+        if (let some(_) = table.ctor) {
+            hasCtor = true
+        }
+        if (hasCtor) {
+            var ctorParams = emptyParamInfos()
+            if (let some(c) = table.ctor) {
+                ctorParams = c.params
+            }
+            for (p in ctorParams) {
+                params.push(CtorParam(p.name, p.ty, p.span, -1))
+            }
+        } else {
+            var anc = nearestExplicitPrimaryAncestor(em, table.name)
+            if (let some(a) = anc) {
+                if (let some(t) = tableOf(em, a.name)) {
+                    if (let some(c2) = t.ctor) {
+                        for (p in c2.params) {
+                            params.push(CtorParam(p.name, p.ty, p.span, -1))
+                        }
+                    }
+                }
+            }
+            for (slot in meta.slots) {
+                if (slot < 0) {
+                    continue
+                }
+                var f = ifields[slot]
+                params.push(CtorParam(f.name, f.ty, f.span, slot))
+            }
+        }
+        var i = 0
+        while (i < len(params)) {
+            var pm = params[i]
+            var ir = IrTy.Ptr
+            if (let some(r) = mapTy(em, pm.ty, table.span)) {
+                ir = r
+            }
+            em.fslots.push(ir)
+            em.fparams.push(IrParam(pm.name, ir))
+            declare(em, pm.name, i)
+            i = i + 1
+        }
+        em.fret = IrTy.Ptr
+
+        var cid = PICKLE_CLASS_USER_BASE
+        if (let some(o) = em.owner) {
+            cid = o
+        }
+        var thisSlot = newSlot(em, IrTy.Ptr)
+        declare(em, "this", thisSlot)
+
+        var cidT = intConst(em, cid)
+        var nT = intConst(em, len(ifields))
+        var created = externCallT1(em, "pickle_class_new", [IrTy.Int, IrTy.Int], IrTy.Ptr, [cidT, nT])
+        instr(em, IrInstr.StoreSlot(thisSlot, created))
+
+        var thisObj = load(em, thisSlot)
+
+        for (si in inits) {
+            var slot = si.slot
+            var f = ifields[slot]
+            var ty = f.ty
+            var manual = f.manual
+            var vO = expr(em, si.init)
+            if (let none = vO) {
+                return false
+            }
+            var v = 0
+            if (let some(x) = vO) {
+                v = x
+            }
+            if (manual) {
+                v = externCallT1(em, "pickle_manual_adopt", [IrTy.Ptr], IrTy.Ptr, [v])
+            }
+            var repO = elemRep(em, ty, table.span)
+            if (let none = repO) {
+                return false
+            }
+            var rep = ElemRep.ptr()
+            if (let some(r) = repO) {
+                rep = r
+            }
+            var vt = Ty.Unknown
+            if (let some(t) = tyOf(em, si.init.span)) {
+                vt = t
+            }
+            var packedO = packForPointerBoundary(em, rep, v, vt, si.init.span)
+            if (let none = packedO) {
+                return false
+            }
+            var packed = 0
+            if (let some(p) = packedO) {
+                packed = p
+            }
+            var boxedO = boxForStore(em, rep, packed, elemIr(ty))
+            if (let none = boxedO) {
+                return false
+            }
+            var boxed = 0
+            if (let some(b) = boxedO) {
+                boxed = b
+            }
+            fieldStore(em, thisObj, slot, ty, boxed)
+        }
+
+        var j = 0
+        while (j < len(params)) {
+            var pm2 = params[j]
+            if (pm2.fieldSlot >= 0) {
+                var v2 = load(em, j)
+                var rep2O = elemRep(em, pm2.ty, pm2.span)
+                if (let none = rep2O) {
+                    return false
+                }
+                var rep2 = ElemRep.ptr()
+                if (let some(r) = rep2O) {
+                    rep2 = r
+                }
+                var packed2O = packForPointerBoundary(em, rep2, v2, pm2.ty, pm2.span)
+                if (let none = packed2O) {
+                    return false
+                }
+                var packed2 = 0
+                if (let some(p) = packed2O) {
+                    packed2 = p
+                }
+                var boxed2O = boxForStore(em, rep2, packed2, elemIr(pm2.ty))
+                if (let none = boxed2O) {
+                    return false
+                }
+                var boxed2 = 0
+                if (let some(b) = boxed2O) {
+                    boxed2 = b
+                }
+                fieldStore(em, thisObj, pm2.fieldSlot, pm2.ty, boxed2)
+            }
+            j = j + 1
+        }
+
+        if (let some(cd) = ctor) {
+            var del = ctorSuperDelegation(cd.body)
+            if (let some(dg) = del) {
+                if (!emitSuperChain(em, table.name, dg)) {
+                    return false
+                }
+                if (!emitCtorBlockFrom(em, cd.body, 1)) {
+                    return false
+                }
+            } else {
+                if (!emitCtorBlock(em, cd.body)) {
+                    return false
+                }
+            }
+        }
+        if (let none = ctor) {
+            if (!(meta.chainName == "")) {
+                if (!emitSynthesizedSuperChain(em, meta.chainName, meta.chainCount)) {
+                    return false
+                }
+            }
+        }
+        for (b in initBlocks) {
+            if (!emitCtorBlock(em, b)) {
+                return false
+            }
+        }
+
+        var done = load(em, thisSlot)
+        term(em, IrTerm.Return(done))
+        tailCleanup(em)
+        true
+    }
+
+fn buildNamedCtor(em: Emitter, table: ClassTable, cd: ConstructorDecl) -> bool {
+        var info: CtorInfo? = none
+        if (let some(n) = cd.name) {
+            for (nc in table.namedCtors) {
+                if (nc.name == n) {
+                    info = nc.ctor
+                    break
+                }
+            }
+        }
+        var params = emptyParamInfos()
+        if (let some(c) = info) {
+            params = c.params
+        }
+        var i = 0
+        while (i < len(params)) {
+            var p = params[i]
+            var ir = IrTy.Ptr
+            if (let some(r) = mapTy(em, p.ty, p.span)) {
+                ir = r
+            }
+            em.fslots.push(ir)
+            em.fparams.push(IrParam(p.name, ir))
+            declare(em, p.name, i)
+            i = i + 1
+        }
+        em.fret = IrTy.Ptr
+
+        var dg: Expr? = namedCtorDelegation(cd.body)
+        if (let none = dg) {
+            return bad(em, cd.span, "named constructor body must be a single `this(...)` delegation to the primary constructor")
+        }
+        var delegation = Expr(Span(0, 0), ExprKind.Ident("x"))
+        if (let some(d2) = dg) {
+            delegation = d2
+        }
+        var args = emptyCallArgs()
+        var isCall = false
+        match (delegation.kind) {
+            case ExprKind.Call(_callee, a) -> {
+                args = a
+                isCall = true
+            }
+            case _ -> {}
+        }
+        if (!isCall) {
+            return bad(em, cd.span, "named constructor delegation is malformed")
+        }
+
+        var cid = PICKLE_CLASS_USER_BASE
+        if (let some(c2) = em.classByName.get(table.name)) {
+            cid = c2
+        }
+        var primaryOpt: int? = em.ctorIds.get(cid)
+        if (let none = primaryOpt) {
+            return bad(em, cd.span, "`" + table.name + "` has no constructor")
+        }
+        var primary = 0
+        if (let some(p2) = primaryOpt) {
+            primary = p2
+        }
+        var fparams = em.irModule.funcs[primary].params
+        var argTemps = emptyInts()
+        var ai = 0
+        while (ai < len(args)) {
+            var a = args[ai]
+            if (a.spread) {
+                return bad(em, a.span, "spread arguments are not lowered yet")
+            }
+            var tO = expr(em, a.value)
+            if (let none = tO) {
+                return false
+            }
+            var t = 0
+            if (let some(x) = tO) {
+                t = x
+            }
+            var isPtr = false
+            if (ai < len(fparams)) {
+                if (irTyTag(fparams[ai].ty) == irTyTag(IrTy.Ptr)) {
+                    isPtr = true
+                }
+            }
+            if (isPtr) {
+                var vt = Ty.Unknown
+                if (let some(gt) = tyOf(em, a.value.span)) {
+                    vt = gt
+                }
+                var wrapped = optionWrap(em, t, vt, a.value.span)
+                if (let none = wrapped) {
+                    return false
+                }
+                var wv = 0
+                if (let some(x) = wrapped) {
+                    wv = x
+                }
+                t = wv
+            }
+            argTemps.push(t)
+            ai = ai + 1
+        }
+        var dst = temp(em)
+        instr(em, IrInstr.Call(dst, Callee.Func(primary), argTemps))
+        term(em, IrTerm.Return(dst))
+        true
+    }
+
+fn buildDeinitBody(em: Emitter, table: ClassTable, body: Block) -> bool {
+        let _ = table
+        em.fslots.push(IrTy.Ptr)
+        em.fparams.push(IrParam("this", IrTy.Ptr))
+        declare(em, "this", 0)
+        em.fret = IrTy.Unit
+        if (!emitCtorBlock(em, body)) {
+            return false
+        }
+        tailCleanup(em)
+        true
+    }
+
+fn buildMethodBody(em: Emitter, table: ClassTable, md: MethodDecl, info: CallableInfo) -> bool {
+        let _ = table
+        var d = 0
+        if (!info.isStatic) {
+            em.fslots.push(IrTy.Ptr)
+            em.fparams.push(IrParam("this", IrTy.Ptr))
+            declare(em, "this", 0)
+            d = 1
+        }
+        var i = 0
+        while (i < len(info.params)) {
+            var p = info.params[i]
+            var ir = IrTy.Ptr
+            if (let some(r) = mapTy(em, p.ty, p.span)) {
+                ir = r
+            }
+            var slot = d + i
+            em.fslots.push(ir)
+            em.fparams.push(IrParam(p.name, ir))
+            declare(em, p.name, slot)
+            i = i + 1
+        }
+        var mret = mapTy(em, info.ret, md.span)
+        if (let some(r) = mret) {
+            em.fret = r
+        } else {
+            em.fret = IrTy.Unit
+        }
+emitBody(em, md.body)
+        tailCleanup(em)
+        true
+    }
+
+fn buildPropertyBody(em: Emitter, table: ClassTable, pd: PropertyDecl, info: PropertyInfo, isSet: bool, isStatic: bool) -> bool {
+        let _ = table
+        var d = 0
+        if (!isStatic) {
+            em.fslots.push(IrTy.Ptr)
+            em.fparams.push(IrParam("this", IrTy.Ptr))
+            declare(em, "this", 0)
+            d = 1
+        }
+        if (isSet) {
+            var ir = IrTy.Ptr
+            if (let some(r) = mapTy(em, info.ty, pd.span)) {
+                ir = r
+            }
+            em.fslots.push(ir)
+            em.fparams.push(IrParam("value", ir))
+            declare(em, "value", d)
+            em.fret = IrTy.Unit
+        } else {
+            var gret = mapTy(em, info.ty, pd.span)
+            if (let some(r) = gret) {
+                em.fret = r
+            } else {
+                em.fret = IrTy.Ptr
+            }
+        }
+        var accessor: PropertyAccessor? = none
+        if (isSet) {
+            accessor = pd.set
+        } else {
+            accessor = pd.get
+        }
+        if (let some(a) = accessor) {
+            match (a) {
+                case PropertyAccessor.Expr(e) -> {
+                    if (irTyIsUnit(em.fret)) {
+                        let _ = expr(em, e)
+                        term(em, IrTerm.Return(none))
+                    } else {
+                        if (let some(t) = expr(em, e)) {
+                            term(em, IrTerm.Return(t))
+                        }
+                    }
+                }
+                case PropertyAccessor.Block(b) -> {
+                    emitBody(em, FnBody.Block(b))
+                }
+            }
+        }
+        tailCleanup(em)
+        true
+    }
+
+fn buildStaticInit(em: Emitter, inits: List<StaticInitEntry>) {
+        em.fret = IrTy.Unit
+        for (e in inits) {
+            buildStaticDefault(em, e.cid, e.slot)
+            if (em.failed) {
+                return
+            }
+        }
+        for (e in inits) {
+            if (let some(x) = e.value) {
+                em.owner = e.cid
+                buildStaticInitOne(em, e.cid, e.slot, x)
+                if (em.failed) {
+                    return
+                }
+            }
+        }
+        term(em, IrTerm.Return(none))
+    }
+
+fn buildGlobalsInit(em: Emitter, inits: List<ManagedGlobalInit>) {
+        em.fret = IrTy.Unit
+        var rootAddId = externId(em, "pickle_gc_root_add", [IrTy.Int], IrTy.Int)
+        for (init in inits) {
+            var slotAddress = temp(em)
+            instr(em, IrInstr.GlobalAddr(slotAddress, init.gid))
+            instr(em, IrInstr.Call(none, Callee.Extern(rootAddId), [slotAddress]))
+        }
+        for (init in inits) {
+            if (let some(value) = expr(em, init.value)) {
+                instr(em, IrInstr.StoreGlobal(init.gid, value, init.ty))
+            } else {
+                if (em.failed) {
+                    return
+                }
+            }
+        }
+        term(em, IrTerm.Return(none))
+    }
+
+fn buildStaticInitOne(em: Emitter, cid: int, slot: int, x: Expr) {
+        if (let some(info) = staticFieldAt(em, cid, slot)) {
+            var fieldTy = info.ty
+            var vO = expr(em, x)
+            if (let some(v) = vO) {
+                var vt = Ty.Unknown
+                if (let some(t) = tyOf(em, x.span)) {
+                    vt = t
+                }
+                let _ = staticAssign(em, x.span, AssignOp.Assign, cid, slot, fieldTy, v, vt)
+            }
+        }
+    }
+
