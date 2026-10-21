@@ -1,0 +1,2695 @@
+﻿// emitleaf2 - second half of the walker-free leaf pool (emitleaf split for the
+// binder export-size limit probe; same closed pool, no other difference).
+
+module compiler.emitleaf2
+
+import * from compiler.ast
+import { Diagnostic, DiagnosticSink, Span } from compiler.diag
+import { IrBlock, IrFunc, IrGlobal, IrInstr, IrTerm, IrTy, emptyIrBlocks } from compiler.ir
+import { ResolvedProgram } from compiler.resolve
+import * from compiler.ty
+import * from compiler.emitutil
+import { Emitter } from compiler.emittypes
+import * from compiler.emitprim
+import * from compiler.emitreadsglobal
+import * from compiler.emitleaf
+
+fn thisValue(em: Emitter, e: Expr) -> int? {
+        if (let some(slot) = lookup(em, "this")) {
+            return load(em, slot)
+        }
+        bad(em, e.span, "`this` is not available here")
+        none
+    }
+
+fn optIsPresent(em: Emitter, p: int) -> int? {
+        var nul = nullTemp(em)
+        if (let some(n) = nul) {
+            var dst = temp(em)
+            instr(em, IrInstr.BinOp(dst, IrBinOp.Ne, p, n))
+            return dst
+        }
+        none
+    }
+
+fn optResolve(em: Emitter, p: int, inner: Ty, span: Span) -> int? {
+        var ir = mapTy(em, inner, span)
+        if (let some(ir) = ir) {
+            if (irTyTag(ir) == irTyTag(IrTy.Int)) {
+                return externCallT1(em, "pickle_unbox_i64", [IrTy.Ptr], IrTy.Int, [p])
+            } else if (irTyTag(ir) == irTyTag(IrTy.Float)) {
+                return externCallT1(em, "pickle_unbox_f64", [IrTy.Ptr], IrTy.Float, [p])
+            } else if (irTyTag(ir) == irTyTag(IrTy.Bool)) {
+                return externCallT1(em, "pickle_unbox_bool", [IrTy.Ptr], IrTy.Bool, [p])
+            } else if (irTyTag(ir) == irTyTag(IrTy.Char)) {
+                return externCallT1(em, "pickle_unbox_char", [IrTy.Ptr], IrTy.Char, [p])
+            }
+            return p
+        }
+        none
+    }
+
+fn optUnwrapVal(em: Emitter, span: Span, p: int, inner: Ty) -> int? {
+        var resIr0 = mapTy(em, inner, span)
+        if (let some(resIr) = resIr0) {
+            var resSlot = newSlot(em, resIr)
+            var present = optIsPresent(em, p)
+            if (let some(present) = present) {
+                var someId = newBlock(em)
+                var noneId = newBlock(em)
+                var join = newBlock(em)
+                term(em, IrTerm.BranchIf(present, someId, noneId))
+                em.cur = noneId
+                externCallVoid(em, "pickle_panic_none_unwrap", emptyIrTys(), emptyInts())
+                term(em, IrTerm.Branch(join))
+                em.cur = someId
+                var v = optResolve(em, p, inner, span)
+                if (let some(v) = v) {
+                    instr(em, IrInstr.StoreSlot(resSlot, v))
+                    term(em, IrTerm.Branch(join))
+                    em.cur = join
+                    return load(em, resSlot)
+                }
+                return none
+            }
+            return none
+        }
+        none
+    }
+
+fn propertyTyOf(em: Emitter, cname: string, name: string) -> Ty {
+        if (let some(entry) = em.resolved.types.get(cname)) {
+            match (entry) {
+                case TypeTableEntry.Class(t) -> {
+                    for (p in t.properties) {
+                        if (p.name == name) {
+                            return p.ty
+                        }
+                    }
+                    return Ty.Unknown
+                }
+                case TypeTableEntry.Struct(t) -> {
+                    for (p in t.properties) {
+                        if (p.name == name) {
+                            return p.ty
+                        }
+                    }
+                    return Ty.Unknown
+                }
+                case _ -> {}
+            }
+        }
+        Ty.Unknown
+    }
+
+fn userClassId(em: Emitter, ty: Ty) -> UserClassRef? {
+        match (ty) {
+            case Ty.Class(n, args) -> {
+                if (len(args) == 0) {
+                    var cidO = em.classByName.get(n)
+                    if (let some(cid) = cidO) {
+                        return UserClassRef(n, cid)
+                    }
+                }
+                none
+            }
+            case _ -> none
+        }
+    }
+
+fn asciiLitInt(em: Emitter, x: Expr) -> int? {
+        match (x.kind) {
+            case ExprKind.Lit(Lit.Char(c)) -> {
+                if ((c as int) <= 0x7F) {
+                    return intConst(em, c as int)
+                }
+                none
+            }
+            case _ -> none
+        }
+    }
+
+fn combineCond(em: Emitter, isAnd: bool, a: int, b: int) -> int {
+        var res = newSlot(em, IrTy.Bool)
+        var rhsId = newBlock(em)
+        var shortId = newBlock(em)
+        var join = newBlock(em)
+        if (isAnd) {
+            term(em, IrTerm.BranchIf(a, rhsId, shortId))
+        } else {
+            term(em, IrTerm.BranchIf(a, shortId, rhsId))
+        }
+        em.cur = rhsId
+        instr(em, IrInstr.StoreSlot(res, b))
+        term(em, IrTerm.Branch(join))
+        em.cur = shortId
+        var sv = temp(em)
+        instr(em, IrInstr.Const(sv, IrConst.Bool(!isAnd)))
+        instr(em, IrInstr.StoreSlot(res, sv))
+        term(em, IrTerm.Branch(join))
+        em.cur = join
+        load(em, res)
+    }
+
+fn castToOption(em: Emitter, span: Span, v: int, src: Ty, inner: Ty) -> int? {
+        if (let some(si) = innerOption(src)) {
+            if (tyEq(si, inner)) {
+                return v
+            }
+            if (!(isNumeric(si) && isNumeric(inner))) {
+                bad(em, span, "`" + bareName(src) + " as? " + bareName(inner) + "` is not lowered yet")
+                return none
+            }
+            var resSlot = newSlot(em, IrTy.Ptr)
+            var present = optIsPresent(em, v)
+            if (let none = present) {
+                return none
+            }
+            var presentId = 0
+            if (let some(p) = present) {
+                presentId = p
+            }
+            var someId = newBlock(em)
+            var noneId = newBlock(em)
+            var join = newBlock(em)
+            term(em, IrTerm.BranchIf(presentId, someId, noneId))
+            em.cur = noneId
+            var n = nullTemp(em)
+            if (let none = n) {
+                return none
+            }
+            var nId = 0
+            if (let some(nn) = n) {
+                nId = nn
+            }
+            instr(em, IrInstr.StoreSlot(resSlot, nId))
+            term(em, IrTerm.Branch(join))
+            em.cur = someId
+            var iv = optResolve(em, v, si, span)
+            if (let none = iv) {
+                return none
+            }
+            var ivId = 0
+            if (let some(ivv) = iv) {
+                ivId = ivv
+            }
+            var cv = convert(em, span, ivId, si, inner)
+            if (let none = cv) {
+                return none
+            }
+            var cvId = 0
+            if (let some(c) = cv) {
+                cvId = c
+            }
+            var wrapped = optionWrap(em, cvId, inner, span)
+            if (let none = wrapped) {
+                return none
+            }
+            var wId = 0
+            if (let some(w) = wrapped) {
+                wId = w
+            }
+            instr(em, IrInstr.StoreSlot(resSlot, wId))
+            term(em, IrTerm.Branch(join))
+            em.cur = join
+            return load(em, resSlot)
+        }
+        var cv = convert(em, span, v, src, inner)
+        if (let none = cv) {
+            return none
+        }
+        var cvId = 0
+        if (let some(c) = cv) {
+            cvId = c
+        }
+        optionWrap(em, cvId, inner, span)
+    }
+
+fn convert(em: Emitter, span: Span, v: int, src: Ty, to: Ty) -> int? {
+if (tyEq(src, to)) {
+                  return v
+              }
+              // `*T` and `int` are the same machine word. `castRelated` allows the
+              // pair so container ABI bodies can store an object address in a word
+              // slot; the move is a plain register copy, with no trap value and no
+              // new representation.
+              if ((isPtr(src) && to == Ty.Int) || (src == Ty.Int && isPtr(to))) {
+                  return v
+              }
+              // A function value is a raw 64-bit code address in the IR domain
+              // - the same word `IrConst::FuncAddr` bakes into
+              // `pickle_class_register` calls. Moving the word between an `fn`
+              // value and an `int` slot is a plain register copy; the GC engine
+              // stores `deinit` addresses as int words and casts them back to
+              // callables only at invocation.
+              if ((isFnValue(src) && to == Ty.Int) || (src == Ty.Int && isFnValue(to))) {
+                  return v
+              }
+        if (isNumeric(src) && isNumeric(to)) {
+            if ((src == Ty.Int || src == Ty.Byte) && (to == Ty.Int || to == Ty.Byte)) {
+                return v
+            }
+            if (src == Ty.Int && to == Ty.Float) {
+                var dst = temp(em)
+                instr(em, IrInstr.Itof(dst, v))
+                return dst
+            }
+            if (src == Ty.Float && to == Ty.Int) {
+                var dst = temp(em)
+                instr(em, IrInstr.Ftoi(dst, v))
+                return dst
+            }
+            bad(em, span, "cannot cast `" + bareName(src) + "` to `" + bareName(to) + "`")
+            return none
+        }
+        if (src == Ty.Char && (to == Ty.Int || to == Ty.Byte)) {
+            var dst = temp(em)
+            instr(em, IrInstr.Chartoi(dst, v))
+            return dst
+        }
+        if ((src == Ty.Int || src == Ty.Byte) && to == Ty.Char) {
+            var dst = temp(em)
+            instr(em, IrInstr.Itochar(dst, v))
+            return dst
+        }
+        var fromRef = userClassId(em, src)
+        var toRef = userClassId(em, to)
+        if (let some(fr) = fromRef) {
+            if (let some(tr) = toRef) {
+                if (isAncestor(em, tr.name, fr.name)) {
+                    return v
+                }
+                var dc = intConst(em, tr.id)
+                return externCallT1(em, "pickle_class_cast", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [v, dc])
+            }
+        }
+        var toIf = ifaceOf(to)
+        if (let some(ti) = toIf) {
+            var ifaceId = ifaceIdFor(em, ti.name, ti.args, span)
+            if (let some(id) = ifaceId) {
+                var dc = intConst(em, id)
+                return externCallT1(em, "pickle_iface_cast", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [v, dc])
+            }
+            return none
+        }
+        if (let some(_) = ifaceOf(src)) {
+            var toCid = userClassId(em, to)
+            if (let none = toCid) {
+                bad(em, span, "`" + bareName(src) + " as " + bareName(to) + "` is not lowered yet")
+                return none
+            }
+            var tcId = 0
+            if (let some(tc) = toCid) {
+                tcId = tc.id
+            }
+            var dc = intConst(em, tcId)
+            return externCallT1(em, "pickle_class_cast", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [v, dc])
+        }
+        bad(em, span, "`" + bareName(src) + " as " + bareName(to) + "` is not lowered yet (class/interface casts need inheritance)")
+        none
+    }
+
+fn tyDbg(em: Emitter, t: Ty?) -> string {
+        var out = "<none>"
+        if (let some(tt) = t) {
+            match (tt) {
+                case Ty.Ptr(pr) -> out = "<ptr:" + tyDbg(em, pr) + ">"
+                case Ty.Class(n, a) -> out = "<class:" + n + ":" + str(len(a)) + ">"
+                case Ty.Struct(n, a) -> out = "<struct:" + n + ":" + str(len(a)) + ">"
+                case Ty.Var(n) -> out = "<var:" + n + ">"
+                case _ -> out = "<other>"
+            }
+        }
+        out
+    }
+
+fn fieldAssign(em: Emitter, span: Span, op: AssignOp, obj: int, fieldTy: Ty, slot: int, v: int, vt: Ty, owned: bool) -> int? {
+        var repO = elemRep(em, fieldTy, span)
+        if (let none = repO) {
+            return none
+        }
+        var rep = ElemRep.ptr()
+        if (let some(r) = repO) {
+            rep = r
+        }
+        if (op == AssignOp.Assign) {
+            if (owned) {
+                var idxc = intConst(em, slot)
+                var old = externCallT1(em, "pickle_obj_slot_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [obj, idxc])
+                var vOwn = externCallT1(em, "pickle_manual_adopt", [IrTy.Ptr], IrTy.Ptr, [v])
+                var packed = packForPointerBoundary(em, rep, vOwn, vt, span)
+                if (let none = packed) {
+                    return none
+                }
+                var packedId = 0
+                if (let some(p) = packed) {
+                    packedId = p
+                }
+                var boxed = boxForStore(em, rep, packedId, elemIr(fieldTy))
+                var storeId = 0
+                if (let some(b) = boxed) {
+                    storeId = b
+                } else {
+                    return none
+                }
+                fieldStore(em, obj, slot, fieldTy, storeId)
+                externCallVoid(em, "pickle_manual_free", [IrTy.Ptr], [old])
+                return vOwn
+            }
+            var packed = packForPointerBoundary(em, rep, v, vt, span)
+            if (let none = packed) {
+                return none
+            }
+            var packedId = 0
+            if (let some(p) = packed) {
+                packedId = p
+            }
+            var boxed = boxForStore(em, rep, packedId, elemIr(fieldTy))
+            var storeId = 0
+            if (let some(b) = boxed) {
+                storeId = b
+            } else {
+                return none
+            }
+            fieldStore(em, obj, slot, fieldTy, storeId)
+            return v
+        }
+if (rep.isPtr) {
+            if (fieldTy != Ty.String) {
+                bad(em, span, "compound assignment to a non-scalar field is not lowered yet")
+                return none
+            }
+            // String field: read the current string, concatenate, store back.
+            var idxc = intConst(em, slot)
+            var cur = externCallT1(em, "pickle_obj_slot_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [obj, idxc])
+            var dstO = combineCompound(em, span, op, fieldTy, cur, v, "field")
+            if (let none = dstO) {
+                return none
+            }
+            var dst = 0
+            if (let some(d) = dstO) {
+                dst = d
+            }
+            var boxed = boxForStore(em, rep, dst, elemIr(fieldTy))
+            var storeId = 0
+            if (let some(b) = boxed) {
+                storeId = b
+            } else {
+                return none
+            }
+            fieldStore(em, obj, slot, fieldTy, storeId)
+            return dst
+        }
+        var idxc = intConst(em, slot)
+        var raw = externCallT1(em, "pickle_obj_slot_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [obj, idxc])
+        var cur = externCallT1(em, rep.unboxSym, [IrTy.Ptr], rep.ir, [raw])
+        var dst = temp(em)
+        instr(em, IrInstr.BinOp(dst, assignOpcode(op), cur, v))
+        var boxed = boxForStore(em, rep, dst, elemIr(fieldTy))
+        var storeId = 0
+        if (let some(b) = boxed) {
+            storeId = b
+        } else {
+            return none
+        }
+        fieldStore(em, obj, slot, fieldTy, storeId)
+        dst
+    }
+
+fn fieldStore(em: Emitter, obj: int, slot: int, fieldTy: Ty, boxed: int) {
+        var idx = intConst(em, slot)
+        externCallVoid(em, "pickle_obj_slot_set", [IrTy.Ptr, IrTy.Int, IrTy.Ptr], [obj, idx, boxed])
+        let _ = fieldTy
+    }
+
+fn combineCompound(em: Emitter, span: Span, op: AssignOp, ty: Ty, cur: int, v: int, what: string) -> int? {
+        match (ty) {
+            case Ty.String -> {
+                if (op != AssignOp.Add) {
+                    bad(em, span, "compound assignment on this string only supports `+=`")
+                    return none
+                }
+                return externCallT1(em, "pickle_str_concat", [IrTy.Str, IrTy.Str], IrTy.Str, [cur, v])
+            }
+            case _ -> {}
+        }
+        var scalar = scalarIr(ty)
+        if (let some(_) = scalar) {
+            var dst = temp(em)
+            instr(em, IrInstr.BinOp(dst, assignOpcode(op), cur, v))
+            return dst
+        }
+        bad(em, span, "compound assignment to a non-scalar " + what + " is not lowered yet")
+        none
+    }
+
+fn staticFieldAt(em: Emitter, cid: int, slot: int) -> FieldInfo? {
+        for (p in em.classes) {
+            if (p.classId == cid) {
+                var count = 0
+                for (f in p.table.fields) {
+                    if (f.isStatic) {
+                        if (count == slot) {
+                            return f
+                        }
+                        count = count + 1
+                    }
+                }
+                return none
+            }
+        }
+        none
+    }
+
+fn staticAssign(em: Emitter, span: Span, op: AssignOp, cid: int, slot: int, fieldTy: Ty, v: int, vt: Ty) -> int? {
+        var repO = elemRep(em, fieldTy, span)
+        if (let none = repO) {
+            return none
+        }
+        var rep = ElemRep.ptr()
+        if (let some(r) = repO) {
+            rep = r
+        }
+        if (op == AssignOp.Assign) {
+            var packed = packForPointerBoundary(em, rep, v, vt, span)
+            if (let none = packed) {
+                return none
+            }
+            var packedId = 0
+            if (let some(p) = packed) {
+                packedId = p
+            }
+            var boxed = boxForStore(em, rep, packedId, elemIr(fieldTy))
+            var storeId = 0
+            if (let some(b) = boxed) {
+                storeId = b
+            } else {
+                return none
+            }
+            staticStore(em, cid, slot, storeId)
+            return v
+        }
+if (rep.isPtr) {
+            if (fieldTy != Ty.String) {
+                bad(em, span, "compound assignment to a non-scalar static field is not lowered yet")
+                return none
+            }
+            // String static field: read the current string, concatenate, store back.
+            var c = intConst(em, cid)
+            var s = intConst(em, slot)
+            var cur = externCallT1(em, "pickle_static_get", [IrTy.Int, IrTy.Int], IrTy.Ptr, [c, s])
+            var dstO = combineCompound(em, span, op, fieldTy, cur, v, "static field")
+            if (let none = dstO) {
+                return none
+            }
+            var dst = 0
+            if (let some(d) = dstO) {
+                dst = d
+            }
+            var boxed = boxForStore(em, rep, dst, elemIr(fieldTy))
+            var storeId = 0
+            if (let some(b) = boxed) {
+                storeId = b
+            } else {
+                return none
+            }
+            staticStore(em, cid, slot, storeId)
+            return dst
+        }
+        var c = intConst(em, cid)
+        var s = intConst(em, slot)
+        var raw = externCallT1(em, "pickle_static_get", [IrTy.Int, IrTy.Int], IrTy.Ptr, [c, s])
+        var cur = externCallT1(em, rep.unboxSym, [IrTy.Ptr], rep.ir, [raw])
+        var dst = temp(em)
+        instr(em, IrInstr.BinOp(dst, assignOpcode(op), cur, v))
+        var boxed = boxForStore(em, rep, dst, elemIr(fieldTy))
+        var storeId = 0
+        if (let some(b) = boxed) {
+            storeId = b
+        } else {
+            return none
+        }
+        staticStore(em, cid, slot, storeId)
+        dst
+    }
+
+fn listStore(em: Emitter, obj: int, idx: int, rep: ElemRep, elem: Ty, v: int) -> int? {
+        var boxed = 0
+        if (rep.isPtr) {
+            boxed = v
+        } else {
+            boxed = externCallT1(em, rep.boxSym, [elemIr(elem)], IrTy.Ptr, [v])
+        }
+        externCallVoid(em, "pickle_list_set", [IrTy.Ptr, IrTy.Int, IrTy.Ptr], [obj, idx, boxed])
+        0
+    }
+
+fn strIndexByte(em: Emitter, op: AssignOp, s: int, i: int, v: int) -> int {
+        if (op == AssignOp.Assign) {
+            return v
+        }
+        var cur = externCallT1(em, "pickle_str_get", [IrTy.Ptr, IrTy.Int], IrTy.Int, [s, i])
+        var dst = temp(em)
+        instr(em, IrInstr.BinOp(dst, assignOpcode(op), cur, v))
+        dst
+    }
+
+fn patternTestCond(em: Emitter, p: Pattern, st: Ty, a: int, span: Span) -> int? {
+        match (p) {
+            case Pattern.Literal(lit) -> {
+                var noneLit = false
+                match (lit) {
+                    case Lit.None -> noneLit = true
+                    case _ -> {}
+                }
+                if (noneLit && isOption(st)) {
+                    var present = optIsPresent(em, a)
+                    if (let none = present) {
+                        return none
+                    }
+                    var pv = 0
+                    if (let some(x) = present) {
+                        pv = x
+                    }
+                    var f = constTemp(em, IrConst.Bool(false))
+                    var dst = temp(em)
+                    instr(em, IrInstr.BinOp(dst, IrBinOp.Eq, pv, f))
+                    return dst
+                }
+                var isStr = false
+                match (st) {
+                    case Ty.String -> isStr = true
+                    case _ -> {}
+                }
+                if (isStr) {
+                    var text = ""
+                    var stringOk = true
+                    match (lit) {
+                        case Lit.String(parts) -> {
+                            for (part in parts) {
+                                match (part) {
+                                    case StrPart.Text(t) -> text = text + t
+                                    case StrPart.Expr(_) -> {
+                                        bad(em, span, "string match patterns may not interpolate")
+                                        return none
+                                    }
+                                }
+                            }
+                        }
+                        case _ -> {
+                            bad(em, span, "this match pattern is not lowered yet")
+                            return none
+                        }
+                    }
+                    let _ = stringOk
+                    var b = strConst(em, text)
+                    var cmp = externCallT1(em, "pickle_str_cmp", [IrTy.Str, IrTy.Str], IrTy.Int, [a, b])
+                    var zero = intConst(em, 0)
+                    var dst = temp(em)
+                    instr(em, IrInstr.BinOp(dst, IrBinOp.Eq, cmp, zero))
+                    return dst
+                }
+                var lb = patternLiteralTemp(em, lit, st, span)
+                if (let none = lb) {
+                    return none
+                }
+                var lbV = 0
+                if (let some(x) = lb) {
+                    lbV = x
+                }
+                var dst = temp(em)
+                instr(em, IrInstr.BinOp(dst, IrBinOp.Eq, a, lbV))
+                return dst
+            }
+            case Pattern.Variant(path, payloads) -> {
+                var isSomeOpt = false
+                if (len(path) == 1) {
+                    if (path[0] == "some" && isOption(st)) {
+                        isSomeOpt = true
+                    }
+                }
+                if (!isSomeOpt) {
+                    var isEnumTy = false
+                    match (st) {
+                        case Ty.Enum(_, _) -> isEnumTy = true
+                        case _ -> {}
+                    }
+                    if (isEnumTy) {
+                        return enumVariantCond(em, p, st, a, span)
+                    }
+                    bad(em, span, "this match pattern is not lowered yet")
+                    return none
+                }
+                var inner = Ty.Unknown
+                if (let some(i) = innerOption(st)) {
+                    inner = i
+                }
+                var present = optIsPresent(em, a)
+                if (let none = present) {
+                    return none
+                }
+                var presentV = 0
+                if (let some(x) = present) {
+                    presentV = x
+                }
+                var needsNested = false
+                var payloadP = Pattern.Wildcard
+                if (len(payloads) >= 1) {
+                    var pl = payloads[0]
+                    var simple = false
+                    match (pl) {
+                        case Pattern.Wildcard -> simple = true
+                        case Pattern.Binding(_, _) -> simple = true
+                        case _ -> {}
+                    }
+                    payloadP = pl
+                    needsNested = !(simple)
+                }
+                if (!needsNested) {
+                    return presentV
+                }
+                var resSlot = newSlot(em, IrTy.Bool)
+                var onPresent = newBlock(em)
+                var onAbsent = newBlock(em)
+                var bjoin = newBlock(em)
+                term(em, IrTerm.BranchIf(presentV, onPresent, onAbsent))
+                em.cur = onPresent
+                var resolved = optResolve(em, a, inner, span)
+                if (let none = resolved) {
+                    return none
+                }
+                var resolvedV = 0
+                if (let some(x) = resolved) {
+                    resolvedV = x
+                }
+                var innerCond = patternTestCond(em, payloadP, inner, resolvedV, span)
+                if (let none = innerCond) {
+                    return none
+                }
+                var icv = 0
+                if (let some(x) = innerCond) {
+                    icv = x
+                }
+                instr(em, IrInstr.StoreSlot(resSlot, icv))
+                term(em, IrTerm.Branch(bjoin))
+                em.cur = onAbsent
+                var f = constTemp(em, IrConst.Bool(false))
+                instr(em, IrInstr.StoreSlot(resSlot, f))
+                term(em, IrTerm.Branch(bjoin))
+                em.cur = bjoin
+                return load(em, resSlot)
+            }
+            case Pattern.Tuple(parts) -> {
+                var tupleTys: List<Ty> = emptyTys()
+                match (st) {
+                    case Ty.Tuple(tt) -> tupleTys = tt
+                    case _ -> {
+                        bad(em, span, "a tuple pattern requires a tuple scrutinee")
+                        return none
+                    }
+                }
+                if (len(tupleTys) != len(parts)) {
+                    bad(em, span, "tuple pattern arity does not match the scrutinee type")
+                    return none
+                }
+var acc: int? = none
+                var i = 0
+                while (i < len(parts)) {
+                    var c = tuplePartCond(em, parts[i], tupleTys[i], a, i, span)
+                    if (let some(cv) = c) {
+                        if (let some(prev) = acc) {
+                            acc = combineCond(em, true, prev, cv)
+                        } else {
+                            acc = cv
+                        }
+                    }
+                    i = i + 1
+                }
+                if (let some(v) = acc) {
+                    return v
+                }
+                constTemp(em, IrConst.Bool(true))
+            }
+            case Pattern.Or(alts) -> {
+                var acc: int? = none
+                for (alt in alts) {
+                    var c = patternTestCond(em, alt, st, a, span)
+                    if (let none = c) {
+                        return none
+                    }
+                    var cv = 0
+                    if (let some(x) = c) {
+                        cv = x
+                    }
+                    if (let some(prev) = acc) {
+                        acc = combineCond(em, false, prev, cv)
+                    } else {
+                        acc = cv
+                    }
+                }
+                if (let some(v) = acc) {
+                    return v
+                }
+                bad(em, span, "an or-pattern has no alternatives")
+                none
+            }
+            case _ -> {
+                bad(em, span, "this match pattern is not lowered yet")
+                none
+            }
+        }
+    }
+
+fn tuplePartCond(em: Emitter, part: Pattern, elem: Ty, a: int, i: int, span: Span) -> int? {
+        var isSimple = false
+        match (part) {
+            case Pattern.Binding(_, _) -> isSimple = true
+            case Pattern.Wildcard -> isSimple = true
+            case _ -> {}
+        }
+        if (isSimple) {
+            return none
+        }
+        var idx = constTemp(em, IrConst.Int(i))
+        var rep = elemRep(em, elem, span)
+        if (let none = rep) {
+            return none
+        }
+        var repV = ElemRep.ptr()
+        if (let some(r) = rep) {
+            repV = r
+        }
+        var raw = externCallT1(em, "pickle_tuple_field", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [a, idx])
+        var un = raw
+        if (!(repV.isPtr)) {
+            un = externCallT1(em, repV.unboxSym, [IrTy.Ptr], repV.ir, [raw])
+        }
+        patternTestCond(em, part, elem, un, span)
+    }
+
+fn patternLiteralTemp(em: Emitter, lit: Lit, st: Ty, span: Span) -> int? {
+        match (lit) {
+            case Lit.Int(value) -> {
+                var isFloat = false
+                match (st) {
+                    case Ty.Float -> isFloat = true
+                    case _ -> {}
+                }
+                if (isFloat) {
+                    var i = constTemp(em, IrConst.Int(value))
+                    var d = temp(em)
+                    instr(em, IrInstr.Itof(d, i))
+                    return d
+                }
+                constTemp(em, IrConst.Int(value))
+            }
+            case Lit.Float(text) -> {
+                var isIntOrByte = false
+                match (st) {
+                    case Ty.Int -> isIntOrByte = true
+                    case Ty.Byte -> isIntOrByte = true
+                    case _ -> {}
+                }
+                var value = floatVal(text)
+                if (isIntOrByte) {
+                    var iv = value as int
+                    var back = iv as float
+                    if (back == value) {
+                        return constTemp(em, IrConst.Int(iv))
+                    }
+                    bad(em, span, "float pattern does not represent an integer")
+                    return none
+                }
+                constTemp(em, IrConst.Float(value))
+            }
+            case Lit.Bool(b) -> {
+                var isBool = false
+                match (st) {
+                    case Ty.Bool -> isBool = true
+                    case _ -> {}
+                }
+                if (isBool) {
+                    return constTemp(em, IrConst.Bool(b))
+                }
+                bad(em, span, "this match pattern is not lowered yet")
+                none
+            }
+            case Lit.Char(c) -> {
+                var isChar = false
+                var isByte = false
+                match (st) {
+                    case Ty.Char -> isChar = true
+                    case Ty.Byte -> isByte = true
+                    case _ -> {}
+                }
+                if (isChar) {
+                    return constTemp(em, IrConst.Char(c))
+                }
+                if (isByte) {
+                    if ((c as int) <= 0x7F) {
+                        return constTemp(em, IrConst.Int(c as int))
+                    }
+                    bad(em, span, "a non-ASCII char pattern has no `byte` value")
+                    return none
+                }
+                bad(em, span, "this match pattern is not lowered yet")
+                none
+            }
+            case _ -> {
+                bad(em, span, "this match pattern is not lowered yet")
+                none
+            }
+        }
+    }
+
+fn matchScrutineeIr(em: Emitter, st: Ty) -> IrTy? {
+        match (st) {
+            case Ty.Int -> scalarIrOf(st)
+            case Ty.Byte -> scalarIrOf(st)
+            case Ty.Float -> scalarIrOf(st)
+            case Ty.Bool -> scalarIrOf(st)
+            case Ty.Char -> scalarIrOf(st)
+            case Ty.String -> IrTy.Str
+            case Ty.Option(_) -> IrTy.Ptr
+            case Ty.Class(_, _) -> IrTy.Ptr
+            case Ty.Struct(_, _) -> IrTy.Ptr
+            case Ty.Enum(_, _) -> IrTy.Ptr
+            case Ty.Interface(_, _) -> IrTy.Ptr
+            case Ty.List(_) -> IrTy.Ptr
+            case Ty.Map(_, _) -> IrTy.Ptr
+            case Ty.Tuple(_) -> IrTy.Ptr
+            case Ty.Range(_) -> IrTy.Ptr
+            case _ -> none
+        }
+    }
+
+fn bindMatchValue(em: Emitter, p: Pattern, st: Ty, v: int, span: Span) -> bool {
+        match (p) {
+            case Pattern.Wildcard -> true
+            case Pattern.Literal(_) -> true
+            case Pattern.Binding(name, _) -> {
+                var ir = IrTy.Str
+                match (st) {
+                    case Ty.String -> {}
+                    case _ -> {
+                        var m = mapTy(em, st, span)
+                        if (let none = m) {
+                            return false
+                        }
+                        if (let some(mv) = m) {
+                            ir = mv
+                        }
+                    }
+                }
+                declareBinding(em, name, ir, v)
+                true
+            }
+            case Pattern.Variant(path, payloads) -> {
+                var isSomeOpt = false
+                if (len(path) == 1) {
+                    if (path[0] == "some" && isOption(st)) {
+                        isSomeOpt = true
+                    }
+                }
+                if (!isSomeOpt) {
+                    var isEnumTy = false
+                    match (st) {
+                        case Ty.Enum(_, _) -> isEnumTy = true
+                        case _ -> {}
+                    }
+                    if (!isEnumTy) {
+                        bad(em, span, "this match pattern is not lowered yet")
+                        return false
+                    }
+                    var ename = ""
+                    match (st) {
+                        case Ty.Enum(en, _) -> ename = en
+                        case _ -> {}
+                    }
+                    var tableO: EnumTable? = none
+                    if (let some(entry) = em.resolved.types.get(ename)) {
+                        match (entry) {
+                            case TypeTableEntry.Enum(t) -> tableO = t
+                            case _ -> {}
+                        }
+                    }
+                    if (let none = tableO) {
+                        bad(em, span, "unknown enum type `" + ename + "`")
+                        return false
+                    }
+                    if (let some(table) = tableO) {
+                        var vname = ""
+                        var valid = false
+                        if (len(path) == 2) {
+                            vname = path[1]
+                            valid = true
+                        }
+                        if (len(path) == 1) {
+                            vname = path[0]
+                            valid = true
+                        }
+                        if (!valid) {
+                            bad(em, span, "invalid enum variant pattern")
+                            return false
+                        }
+                        var vi = -1
+                        var found = false
+                        var ix = 0
+                        for (variant in table.variants) {
+                            if (variant.name == vname) {
+                                vi = ix
+                                found = true
+                                break
+                            }
+                            ix = ix + 1
+                        }
+                        if (!found) {
+                            bad(em, span, "enum `" + ename + "` has no variant `" + vname + "`")
+                            return false
+                        }
+                        var ftypes = table.variants[vi].fields
+                        var pi = 0
+                        while (pi < len(payloads)) {
+                            var ft = Ty.Unknown
+                            if (pi < len(ftypes)) {
+                                ft = ftypes[pi]
+                            }
+                            var idx = constTemp(em, IrConst.Int(pi))
+                            var raw = externCallT1(em, "pickle_enum_field", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [v, idx])
+                            var pv = raw
+                            var rep = elemRep(em, ft, span)
+                            if (let none = rep) {
+                                return false
+                            }
+                            var repV = ElemRep.ptr()
+                            if (let some(r) = rep) {
+                                repV = r
+                            }
+                            if (!(repV.isPtr)) {
+                                pv = externCallT1(em, repV.unboxSym, [IrTy.Ptr], repV.ir, [raw])
+                            }
+                            if (!(bindPatternValue(em, payloads[pi], ft, pv, span))) {
+                                return false
+                            }
+                            pi = pi + 1
+                        }
+                        return true
+                    }
+                    return false
+                }
+                var inner = Ty.Unknown
+                if (let some(i) = innerOption(st)) {
+                    inner = i
+                }
+                var resolved = optResolve(em, v, inner, span)
+                if (let none = resolved) {
+                    return false
+                }
+                var resolvedV = 0
+                if (let some(x) = resolved) {
+                    resolvedV = x
+                }
+                if (len(payloads) == 0) {
+                    return true
+                }
+                bindPatternValue(em, payloads[0], inner, resolvedV, span)
+            }
+            case Pattern.Tuple(parts) -> {
+                var tupleTys: List<Ty> = emptyTys()
+                match (st) {
+                    case Ty.Tuple(tt) -> tupleTys = tt
+                    case _ -> {
+                        bad(em, span, "a tuple pattern requires a tuple scrutinee")
+                        return false
+                    }
+                }
+                if (len(tupleTys) != len(parts)) {
+                    bad(em, span, "tuple pattern arity does not match the scrutinee type")
+                    return false
+                }
+                var i = 0
+                while (i < len(parts)) {
+                    var idx = constTemp(em, IrConst.Int(i))
+                    var raw = externCallT1(em, "pickle_tuple_field", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [v, idx])
+                    var pv = raw
+                    var rep = elemRep(em, tupleTys[i], span)
+                    if (let none = rep) {
+                        return false
+                    }
+                    var repV = ElemRep.ptr()
+                    if (let some(r) = rep) {
+                        repV = r
+                    }
+                    if (!(repV.isPtr)) {
+                        pv = externCallT1(em, repV.unboxSym, [IrTy.Ptr], repV.ir, [raw])
+                    }
+                    if (!(bindPatternValue(em, parts[i], tupleTys[i], pv, span))) {
+                        return false
+                    }
+                    i = i + 1
+                }
+                true
+            }
+            case Pattern.Or(_) -> true
+        }
+    }
+
+fn bindPatternValue(em: Emitter, p: Pattern, ty: Ty, v: int, span: Span) -> bool {
+        bindMatchValue(em, p, ty, v, span)
+    }
+
+fn bindEnumPayloads(em: Emitter, span: Span, table: EnumTable, vi: int, payloads: List<Pattern>, sSlot: int) -> int? {
+        var ftypes = table.variants[vi].fields
+var acc: int? = none
+        var pi = 0
+        while (pi < len(payloads)) {
+            var p = payloads[pi]
+            var ft = Ty.Unknown
+            if (pi < len(ftypes)) {
+                ft = ftypes[pi]
+            }
+            var rep = elemRep(em, ft, span)
+            if (let none = rep) {
+                return none
+            }
+            var repV = ElemRep.ptr()
+            if (let some(r) = rep) {
+                repV = r
+            }
+            var idx = temp(em)
+            instr(em, IrInstr.Const(idx, IrConst.Int(pi)))
+            var sv = load(em, sSlot)
+            var raw = externCallT1(em, "pickle_enum_field", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [sv, idx])
+            var ir = IrTy.Ptr
+            var val = raw
+            if (!(repV.isPtr)) {
+                val = externCallT1(em, repV.unboxSym, [IrTy.Ptr], repV.ir, [raw])
+                ir = repV.ir
+            }
+            match (p) {
+                case Pattern.Wildcard -> {}
+                case Pattern.Binding(name, _) -> {
+                    var slot = newSlot(em, ir)
+                    instr(em, IrInstr.StoreSlot(slot, val))
+                    declare(em, name, slot)
+                }
+                case _ -> {
+                    if (!(bindPatternValue(em, p, ft, val, span))) {
+                        return none
+                    }
+                    var root = newSlot(em, IrTy.Ptr)
+                    instr(em, IrInstr.StoreSlot(root, val))
+var rv = load(em, root)
+                    var c = patternTestCond(em, p, ft, rv, span)
+                    if (let none = c) {
+                        return none
+                    }
+                    var cv = 0
+                    if (let some(x) = c) {
+                        cv = x
+                    }
+                    if (let some(prev) = acc) {
+                        acc = combineCond(em, true, prev, cv)
+                    } else {
+                        acc = cv
+                    }
+                }
+            }
+            pi = pi + 1
+        }
+        if (let some(v) = acc) {
+            return v
+        }
+        -1
+    }
+
+fn enumVariantCond(em: Emitter, p: Pattern, st: Ty, v: int, span: Span) -> int? {
+        var path: List<string> = emptyStrs()
+        var payloads: List<Pattern> = emptyPatterns()
+        match (p) {
+            case Pattern.Variant(pa, pl) -> {
+                path = pa
+                payloads = pl
+            }
+            case _ -> {
+                bad(em, span, "this match pattern is not lowered yet")
+                return none
+            }
+        }
+        var isEnumTy = false
+        match (st) {
+            case Ty.Enum(_, _) -> isEnumTy = true
+            case _ -> {}
+        }
+        if (!isEnumTy) {
+            bad(em, span, "this match pattern is not lowered yet")
+            return none
+        }
+        var ename = ""
+        match (st) {
+            case Ty.Enum(en, _) -> ename = en
+            case _ -> {}
+        }
+        var tableO: EnumTable? = none
+        if (let some(entry) = em.resolved.types.get(ename)) {
+            match (entry) {
+                case TypeTableEntry.Enum(t) -> tableO = t
+                case _ -> {}
+            }
+        }
+        if (let none = tableO) {
+            bad(em, span, "unknown enum type `" + ename + "`")
+            return none
+        }
+        if (let some(table) = tableO) {
+            var vname = ""
+            var valid = false
+            if (len(path) == 2) {
+                vname = path[1]
+                valid = true
+            }
+            if (len(path) == 1) {
+                vname = path[0]
+                valid = true
+            }
+            if (!valid) {
+                bad(em, span, "invalid enum variant pattern")
+                return none
+            }
+            var vi = -1
+            var found = false
+            var ix = 0
+            for (variant in table.variants) {
+                if (variant.name == vname) {
+                    vi = ix
+                    found = true
+                    break
+                }
+                ix = ix + 1
+            }
+            if (!found) {
+                bad(em, span, "enum `" + ename + "` has no variant `" + vname + "`")
+                return none
+            }
+            var tag = externCallT1(em, "pickle_enum_tag", [IrTy.Ptr], IrTy.Int, [v])
+            var viT = constTemp(em, IrConst.Int(vi))
+            var eq = temp(em)
+            instr(em, IrInstr.BinOp(eq, IrBinOp.Eq, tag, viT))
+            var testable = false
+            for (pl in payloads) {
+                var simple = false
+                match (pl) {
+                    case Pattern.Binding(_, _) -> simple = true
+                    case Pattern.Wildcard -> simple = true
+                    case _ -> {}
+                }
+                if (!simple) {
+                    testable = true
+                    break
+                }
+            }
+            if (!testable) {
+                return eq
+            }
+            var root = newSlot(em, IrTy.Ptr)
+            instr(em, IrInstr.StoreSlot(root, v))
+            var resSlot = newSlot(em, IrTy.Bool)
+            var onMatch = newBlock(em)
+            var onOther = newBlock(em)
+            var bjoin = newBlock(em)
+            term(em, IrTerm.BranchIf(eq, onMatch, onOther))
+            em.cur = onMatch
+            var innerConds = bindEnumPayloadCond(em, span, table, vi, payloads, root)
+            if (let none = innerConds) {
+                return none
+            }
+            var val = constTemp(em, IrConst.Bool(true))
+            if (let some(ic) = innerConds) {
+                val = ic
+            }
+            instr(em, IrInstr.StoreSlot(resSlot, val))
+            term(em, IrTerm.Branch(bjoin))
+            em.cur = onOther
+            var f = constTemp(em, IrConst.Bool(false))
+            instr(em, IrInstr.StoreSlot(resSlot, f))
+            term(em, IrTerm.Branch(bjoin))
+            em.cur = bjoin
+            return load(em, resSlot)
+        }
+        none
+    }
+
+fn bindEnumPayloadCond(em: Emitter, span: Span, table: EnumTable, vi: int, payloads: List<Pattern>, vSlot: int) -> int? {
+        var ftypes = table.variants[vi].fields
+        var acc: int? = none
+        var pi = 0
+        while (pi < len(payloads)) {
+            var p = payloads[pi]
+            var simple = false
+            match (p) {
+                case Pattern.Binding(_, _) -> simple = true
+                case Pattern.Wildcard -> simple = true
+                case _ -> {}
+            }
+            if (simple) {
+                pi = pi + 1
+                continue
+            }
+            var ft = Ty.Unknown
+            if (pi < len(ftypes)) {
+                ft = ftypes[pi]
+            }
+            var idx = constTemp(em, IrConst.Int(pi))
+            var sv = load(em, vSlot)
+            var raw = externCallT1(em, "pickle_enum_field", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [sv, idx])
+            var pv = raw
+            var rep = elemRep(em, ft, span)
+            if (let none = rep) {
+                return none
+            }
+            var repV = ElemRep.ptr()
+            if (let some(r) = rep) {
+                repV = r
+            }
+            if (!(repV.isPtr)) {
+                pv = externCallT1(em, repV.unboxSym, [IrTy.Ptr], repV.ir, [raw])
+            }
+            var root = newSlot(em, IrTy.Ptr)
+            instr(em, IrInstr.StoreSlot(root, pv))
+            var rv = load(em, root)
+            var isEnumAndVariant = false
+            match (ft) {
+                case Ty.Enum(_, _) -> {
+                    var isVariant = false
+                    match (p) {
+                        case Pattern.Variant(_, _) -> isVariant = true
+                        case _ -> {}
+                    }
+                    if (isVariant) {
+                        isEnumAndVariant = true
+                    }
+                }
+                case _ -> {}
+            }
+            var c = patternTestCond(em, p, ft, rv, span)
+            if (isEnumAndVariant) {
+                c = enumVariantCond(em, p, ft, rv, span)
+            }
+            if (let none = c) {
+                return none
+            }
+            var cv = 0
+            if (let some(x) = c) {
+                cv = x
+            }
+            if (let some(prev) = acc) {
+                acc = combineCond(em, true, prev, cv)
+            } else {
+                acc = cv
+            }
+            pi = pi + 1
+        }
+        if (let some(v) = acc) {
+            return v
+        }
+        -1
+    }
+
+fn userCallableFirst(em: Emitter, name: string) -> CallableInfo? {
+        if (let some(infos) = em.resolved.fns.get(name)) {
+            for (c in infos) {
+                if (!(c.span.start == 0 && c.span.end == 0)) {
+                    return c
+                }
+            }
+        }
+        none
+    }
+
+fn isFnDispatchable(em: Emitter, callee: Expr) -> bool {
+        match (callee.kind) {
+            case ExprKind.Ident(name) -> {
+                if (em.irModule.funcsByName.has(name)) {
+                    return false
+                }
+                if (em.classByName.has(name)) {
+                    return false
+                }
+                if (strListHas(["print", "println", "len", "alloc", "free", "view", "assert", "expect", "abs", "range", "min", "max", "clamp", "str", "bytes", "read_file", "write_file", "file_exists", "delete", "list_dir", "mkdir", "stream_open_read", "stream_open_write", "stream_open_append", "stdout_stream", "stderr_stream", "args", "exit", "run_cmd", "run_spawn", "proc_wait", "proc_running", "proc_code", "proc_kill", "proc_out_read", "proc_err_read", "proc_in_write", "proc_in_close", "current_dir", "captureBegin", "captureTake", "gcCollect", "gcAllocationsSinceGc", "gcBytesSinceGc", "gcCollectionCount", "gcSetThreshold"], name)) {
+                    return false
+                }
+            }
+            case ExprKind.GenericCall(_, _) -> {
+                return false
+            }
+            case _ -> {}
+        }
+        var isFn = false
+        if (let some(t) = em.types.get(spanKey(callee.span))) {
+            match (t) {
+                case Ty.Fn(_, _) -> isFn = true
+                case _ -> {}
+            }
+        }
+        isFn
+    }
+
+fn peelExpect(em: Emitter, e: Expr) -> ExpectPeel? {
+        match (e.kind) {
+            case ExprKind.Call(callee, args) -> {
+                var unnamed = false
+                if (len(args) == 1) {
+                    if (let none = args[0].name) {
+                        unnamed = true
+                    }
+                }
+                if (len(args) == 1 && !(args[0].spread) && unnamed) {
+                    var calledExpect = false
+                    match (callee.kind) {
+                        case ExprKind.Ident(n) -> {
+                            if (n == "expect") {
+                                calledExpect = true
+                            }
+                        }
+                        case _ -> {}
+                    }
+                    if (calledExpect) {
+                        return ExpectPeel(args[0].value, false)
+                    }
+                }
+                if (len(args) == 0) {
+                    match (callee.kind) {
+                        case ExprKind.Member(object, name) -> {
+                            if (name == "not") {
+                                var p = peelExpect(em, object)
+                                if (let some(pp) = p) {
+                                    return ExpectPeel(pp.value, !(pp.negated))
+                                }
+                            }
+                        }
+                        case _ -> {}
+                    }
+                }
+                none
+            }
+            case _ -> none
+        }
+    }
+
+fn expectSingleArg(em: Emitter, e: Expr, method: string, args: List<CallArg>) -> CallArg? {
+        if (!(len(args) == 1)) {
+            bad(em, e.span, "`.`" + method + "(expected)` takes exactly one argument")
+            return none
+        }
+        var named = false
+        if (let some(_) = args[0].name) {
+            named = true
+        }
+        if (named || args[0].spread) {
+            bad(em, args[0].span, "`.`" + method + "()` takes a plain positional argument")
+            return none
+        }
+        args[0]
+    }
+
+fn expectNoArgs(em: Emitter, e: Expr, method: string, args: List<CallArg>) -> bool {
+        if (len(args) == 0) {
+            return true
+        }
+        bad(em, e.span, "`.`" + method + "()` takes no arguments")
+        false
+    }
+
+fn expectEqCond(em: Emitter, v: int, it: IrTy, w: int, wit: IrTy, negated: bool, span: Span) -> int? {
+        if (managedIr(it) || managedIr(wit)) {
+            var res = externCallT1(em, "pickle_expect_obj_eq", [IrTy.Ptr, IrTy.Ptr], IrTy.Int, [v, w])
+            return cmpZero(em, res, IrBinOp.Ne, negated)
+        }
+        var vf = v
+        var wf = w
+        var unFloat = irTyTag(it) == irTyTag(IrTy.Float) || irTyTag(wit) == irTyTag(IrTy.Float)
+        if (unFloat) {
+            if (!(irTyTag(it) == irTyTag(IrTy.Float))) {
+                if (let some(f) = floatCast(em, v)) {
+                    vf = f
+                } else {
+                    return none
+                }
+            }
+            if (!(irTyTag(wit) == irTyTag(IrTy.Float))) {
+                if (let some(f) = floatCast(em, w)) {
+                    wf = f
+                } else {
+                    return none
+                }
+            }
+        }
+        var dst = temp(em)
+        instr(em, IrInstr.BinOp(dst, flipCmp(IrBinOp.Eq, negated), vf, wf))
+        dst
+    }
+
+fn floatCast(em: Emitter, v: int) -> int? {
+        var dst = temp(em)
+        instr(em, IrInstr.Itof(dst, v))
+        dst
+    }
+
+fn coerceToFloat(em: Emitter, v: int, ty: IrTy?) -> int {
+        var isFloat = false
+        if (let some(t) = ty) {
+            match (t) {
+                case IrTy.Float -> isFloat = true
+                case _ -> {}
+            }
+        }
+        if (isFloat) {
+            return v
+        }
+        var d = floatCast(em, v)
+        if (let some(x) = d) {
+            return x
+        }
+        return v
+    }
+
+fn expectTruthy(em: Emitter, v: int, it: IrTy, need: bool, span: Span) -> int? {
+        match (it) {
+            case IrTy.Bool -> {
+                var dst = temp(em)
+                var z = boolConst(em, false)
+                instr(em, IrInstr.BinOp(dst, flipCmp(IrBinOp.Ne, !need), v, z))
+                dst
+            }
+            case IrTy.Char -> {
+                var dst = temp(em)
+                var z = charConst(em, 0)
+                instr(em, IrInstr.BinOp(dst, flipCmp(IrBinOp.Ne, !need), v, z))
+                dst
+            }
+            case IrTy.Int -> {
+                var dst = temp(em)
+                var zero = intConst(em, 0)
+                instr(em, IrInstr.BinOp(dst, flipCmp(IrBinOp.Ne, !need), v, zero))
+                dst
+            }
+            case IrTy.Float -> {
+                var dst = temp(em)
+                var z = floatConst(em, 0.0)
+                instr(em, IrInstr.BinOp(dst, flipCmp(IrBinOp.Ne, !need), v, z))
+                dst
+            }
+            case IrTy.Str | IrTy.Ptr -> {
+                var lenv = externCallT1(em, "pickle_str_len", [IrTy.Ptr], IrTy.Int, [v])
+                cmpZero(em, lenv, IrBinOp.Ne, !need)
+            }
+            case IrTy.Unit -> cmpZero(em, intConst(em, 0), IrBinOp.Ne, !need)
+        }
+    }
+
+fn expectStr(em: Emitter, t: int, it: IrTy, span: Span) -> int? {
+        match (it) {
+            case IrTy.Int -> externCallT1(em, "pickle_str_from_i64", [IrTy.Int], IrTy.Str, [t])
+            case IrTy.Float -> externCallT1(em, "pickle_str_from_f64", [IrTy.Float], IrTy.Str, [t])
+            case IrTy.Bool -> externCallT1(em, "pickle_str_from_bool", [IrTy.Bool], IrTy.Str, [t])
+            case IrTy.Char -> externCallT1(em, "pickle_str_from_char", [IrTy.Char], IrTy.Str, [t])
+            case IrTy.Str | IrTy.Ptr -> externCallT1(em, "pickle_expect_display", [IrTy.Ptr], IrTy.Str, [t])
+            case IrTy.Unit -> strConst(em, "none")
+        }
+    }
+
+fn printSpreadList(em: Emitter, span: Span, sp: int, elem: Ty) -> bool {
+        var sym = "pickle_print_obj"
+        var printIr = IrTy.Ptr
+        match (elem) {
+            case Ty.Int -> {
+                sym = "pickle_print_i64"
+                printIr = IrTy.Int
+            }
+            case Ty.Float -> {
+                sym = "pickle_print_f64"
+                printIr = IrTy.Float
+            }
+            case Ty.Bool -> {
+                sym = "pickle_print_bool"
+                printIr = IrTy.Bool
+            }
+            case Ty.Byte -> {
+                sym = "pickle_print_byte"
+                printIr = IrTy.Int
+            }
+            case Ty.Char -> {
+                sym = "pickle_print_char"
+                printIr = IrTy.Char
+            }
+            case _ -> {}
+        }
+        var repO = elemRep(em, elem, span)
+        if (let none = repO) {
+            return false
+        }
+        var rep = ElemRep.ptr()
+        if (let some(re) = repO) {
+            rep = re
+        }
+        var seqSlot = newSlot(em, IrTy.Ptr)
+        var idxSlot = newSlot(em, IrTy.Int)
+        var lenSlot = newSlot(em, IrTy.Int)
+        instr(em, IrInstr.StoreSlot(seqSlot, sp))
+        var zero = temp(em)
+        instr(em, IrInstr.Const(zero, IrConst.Int(0)))
+        instr(em, IrInstr.StoreSlot(idxSlot, zero))
+        var seqL = load(em, seqSlot)
+        var lenT = externCallT1(em, "pickle_list_len", [IrTy.Ptr], IrTy.Int, [seqL])
+        instr(em, IrInstr.StoreSlot(lenSlot, lenT))
+        var condId = newBlock(em)
+        var bodyId = newBlock(em)
+        var nextId = newBlock(em)
+        var endId = newBlock(em)
+        term(em, IrTerm.Branch(condId))
+        em.cur = condId
+        var curT = load(em, idxSlot)
+        var endL = load(em, lenSlot)
+        var cmp = temp(em)
+        instr(em, IrInstr.BinOp(cmp, IrBinOp.Lt, curT, endL))
+        term(em, IrTerm.BranchIf(cmp, bodyId, endId))
+        em.cur = bodyId
+        var curI = load(em, idxSlot)
+        var seqL2 = load(em, seqSlot)
+        var raw = externCallT1(em, "pickle_list_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [seqL2, curI])
+        var isScalarElem = false
+        match (elem) {
+            case Ty.Int | Ty.Float | Ty.Bool | Ty.Byte | Ty.Char -> isScalarElem = true
+            case _ -> {}
+        }
+        var v = raw
+        if (!rep.isPtr && isScalarElem) {
+            v = externCallT1(em, rep.unboxSym, [IrTy.Ptr], rep.ir, [raw])
+        }
+        externCallVoid(em, sym, [printIr], [v])
+        term(em, IrTerm.Branch(nextId))
+        em.cur = nextId
+        var c = load(em, idxSlot)
+        var one = temp(em)
+        instr(em, IrInstr.Const(one, IrConst.Int(1)))
+        var nxt = temp(em)
+        instr(em, IrInstr.BinOp(nxt, IrBinOp.Add, c, one))
+        instr(em, IrInstr.StoreSlot(idxSlot, nxt))
+        term(em, IrTerm.Branch(condId))
+        em.cur = endId
+        true
+    }
+
+fn genericUserFn(em: Emitter, name: string) -> bool {
+        if (let some(infos) = em.resolved.fns.get(name)) {
+            for (c in infos) {
+                if (!(c.span.start == 0 && c.span.end == 0)) {
+                    return len(c.generics) > 0
+                }
+            }
+        }
+        false
+    }
+
+fn genericOwner(em: Emitter) -> string? {
+        if (let some(cid) = em.owner) {
+            var name = classOfName(em, cid)
+            if (containsStr(name, "<")) {
+                return name
+            }
+        }
+        none
+    }
+
+fn checkPropagates(em: Emitter, fid: int) -> bool {
+        if (!em.progMayThrow) {
+            return false
+        }
+        // A `finally` running on a throw path already has the flag set; a check
+        // there would see the throw we are transferring on, not a new one.
+        if (em.inThrowTransfer) {
+            return false
+        }
+        if (let some(v) = em.mayThrow.get(fid)) {
+            v
+        } else {
+            true
+        }
+    }
+
+fn solveMayThrow(em: Emitter) {
+        var throws = emptyIntBoolMap()
+        for (fid in em.directThrow.keys()) {
+            throws[fid] = true
+        }
+        var changed = true
+        while (changed) {
+            changed = false
+            for (caller in em.callEdges.keys()) {
+                var alreadyThrows = false
+                if (let some(already) = throws.get(caller)) {
+                    alreadyThrows = already
+                }
+                if (alreadyThrows) {
+                    continue
+                }
+                if (let some(callees) = em.callEdges.get(caller)) {
+                    for (callee in callees) {
+                        var calleeThrows = false
+                        if (let some(c) = throws.get(callee)) {
+                            calleeThrows = c
+                        }
+                        if (calleeThrows) {
+                            throws[caller] = true
+                            changed = true
+                        }
+                    }
+                }
+            }
+        }
+        var result = emptyIntBoolMap()
+        for (fid in em.fidList) {
+            var v = false
+            if (let some(hit) = throws.get(fid)) {
+                v = hit
+            }
+            result[fid] = v
+        }
+        em.mayThrow = result
+    }
+
+fn performExit(em: Emitter, exit: Exit) {
+        match (exit) {
+            case Exit.Return(v) -> {
+                term(em, IrTerm.Return(v))
+            }
+            case Exit.Branch(target) -> {
+                term(em, IrTerm.Branch(target))
+            }
+            case Exit.Propagate -> {
+                var v: int? = none
+                if (irTyTag(em.fret) == irTyTag(IrTy.Unit)) {
+                    v = none
+                } else if (irTyTag(em.fret) == irTyTag(IrTy.Ptr)) {
+                    v = nullTemp(em)
+                } else {
+                    v = exitZero(em)
+                }
+                term(em, IrTerm.Return(v))
+            }
+        }
+        em.cur = newBlock(em)
+    }
+
+fn sortKind(em: Emitter, elem: Ty, span: Span) -> int? {
+        var kind = -1
+        var ok = true
+        match (elem) {
+            case Ty.Int | Ty.Byte | Ty.Char | Ty.Bool -> {
+                kind = 0
+                ok = true
+            }
+            case Ty.Float -> {
+                kind = 1
+                ok = true
+            }
+            case Ty.String -> {
+                kind = 2
+                ok = true
+            }
+            case _ -> ok = false
+        }
+        if (!ok) {
+            bad(em, span, "`sort` is not lowered for `List<" + bareName(elem) + ">`")
+            return none
+        }
+        constTemp(em, IrConst.Int(kind))
+    }
+
+fn classImplementsIface(em: Emitter, cid: int, ifaceId: int) -> bool {
+        var cur: int? = cid
+        var guard = 0
+        while (guard < 64) {
+            guard = guard + 1
+            if (let none = cur) {
+                return false
+            }
+            if (let some(c) = cur) {
+                var bucketsO = em.classIfaceBuckets.get(c)
+                if (let some(buckets) = bucketsO) {
+                    for (b in buckets) {
+                        if (b.ifaceId == ifaceId) {
+                            return true
+                        }
+                    }
+                }
+                cur = none
+                for (p in em.classes) {
+                    if (p.classId == c) {
+                        cur = p.parent
+                        break
+                    }
+                }
+            }
+        }
+        false
+    }
+
+fn genericFnValue(em: Emitter, e: Expr, name: string, typeArgs: List<TypeExpr>) -> int? {
+        var info = userCallableFirst(em, name)
+        if (let none = info) {
+            bad(em, e.span, "unknown generic function `" + name + "`")
+            return none
+        }
+        var inf = seedCallableInfo()
+        if (let some(x) = info) {
+            inf = x
+        }
+        var argTys = emptyTys()
+        for (te in typeArgs) {
+            var t = em.resolved.resolveTy(te, em.fnGenerics, em.diags)
+            argTys.push(substTy(em, t))
+        }
+        if (!(len(argTys) == len(inf.generics))) {
+            bad(em, e.span, "`" + name + "` takes " + str(len(inf.generics)) + " type argument(s), found " + str(len(argTys)))
+            return none
+        }
+        genericFnValueFor(em, e, inf, argTys)
+    }
+
+fn genericFnValueFor(em: Emitter, e: Expr, info: CallableInfo, argTys: List<Ty>) -> int? {
+        if (anyHasVar(argTys)) {
+            bad(em, e.span, "cannot use the generic function `" + info.name + "` as a value with unresolved type arguments")
+            return none
+        }
+        var name = info.name
+        var map = emptyStringTyMap()
+        var zi = 0
+        while (zi < len(info.generics) && zi < len(argTys)) {
+            map[info.generics[zi]] = argTys[zi]
+            zi = zi + 1
+        }
+        var key2 = instKey(name, argTys)
+        var fid = 0
+        var fidO = em.instantiations.get(key2)
+        if (let some(f) = fidO) {
+            fid = f
+        } else {
+            var ifg = instantiateGenericFn(em, e.span, info, name, argTys, map)
+            if (let some(f2) = ifg) {
+                fid = f2
+            } else {
+                return none
+            }
+        }
+        var tramp = 0
+        var tg = valueTrampoline(em, e.span, fid)
+        if (let some(t) = tg) {
+            tramp = t
+        } else {
+            return none
+        }
+        closureObj(em, e, tramp, emptyCaptures())
+    }
+
+fn valueTrampoline(em: Emitter, span: Span, target: int) -> int? {
+        if (let some(t) = em.trampFids.get(target)) {
+            return t
+        }
+        var info = seedCallableInfo()
+        var infO = em.finfo.get(target)
+        if (let none = infO) {
+            bad(em, span, "no signature recorded for instantiated function FuncId(" + str(target) + ")")
+            return none
+        }
+        if (let some(x) = infO) {
+            info = x
+        }
+        var pty = emptyTys()
+        for (p in info.params) {
+            pty.push(p.ty)
+        }
+        var ret = info.ret
+        var anyBad = false
+        for (pt in pty) {
+            if (let none = mapTy(em, pt, span)) {
+                anyBad = true
+            }
+        }
+        if (anyBad) {
+            bad(em, span, "cannot map an instantiated function value's parameters")
+            return none
+        }
+        if (let none = mapTy(em, ret, span)) {
+            bad(em, span, "cannot map an instantiated function value's return type")
+            return none
+        }
+        var t = pushClassFunc(em, "fn.value", "pkl_tramp_" + str(target), FnSource.Trampoline(span, target, pty, ret))
+        em.trampFids[target] = t
+        t
+    }
+
+fn inferGenericFnArgs(em: Emitter, span: Span, info: CallableInfo, args: List<CallArg>) -> List<Ty>? {
+        var map = emptyStringTyMap()
+        var i = 0
+        while (i < len(args)) {
+            var a = args[i]
+            if (a.spread) {
+                bad(em, a.span, "spread arguments are not lowered yet")
+                return none
+            }
+            if (let none = a.name) {
+                if (i < len(info.params)) {
+                    var want = info.params[i]
+                    var got = Ty.Unknown
+                    if (let some(t) = tyOf(em, a.value.span)) {
+                        got = t
+                    }
+                    inferFrom(want.ty, got, map)
+                }
+            }
+            i = i + 1
+        }
+        var missing = emptyStrs()
+        for (g in info.generics) {
+            if (!(map.has(g))) {
+                missing.push(g)
+            }
+        }
+        if (!(len(missing) == 0)) {
+            var plural = ""
+            if (len(missing) == 1) {
+                plural = ""
+            } else {
+                plural = "s"
+            }
+            var names = ""
+            var mi = 0
+            for (g in missing) {
+                if (mi > 0) {
+                    names = names + ", "
+                }
+                names = names + "`" + g + "`"
+                mi = mi + 1
+            }
+            bad(em, span, "cannot infer the type argument" + plural + " " + names + " for `" + info.name + "`; specify them explicitly like `" + info.name + "<...>(...)`")
+            return none
+        }
+        var out = emptyTys()
+        for (g in info.generics) {
+            var got = Ty.Unknown
+            if (let some(t) = map.get(g)) {
+                got = t
+            }
+            out.push(got)
+        }
+        out
+    }
+
+fn instantiateGenericFn(em: Emitter, span: Span, info: CallableInfo, keyName: string, keyTys: List<Ty>, map: Map<string, Ty>) -> int? {
+        var name = info.name
+        var fO = em.fnDecls.get(name)
+        if (let none = fO) {
+            bad(em, span, "no declaration for generic function `" + name + "`")
+            return none
+        }
+        var f = seedFnDecl()
+        if (let some(d) = fO) {
+            f = d
+        }
+        var hasDefRest = false
+        for (p in f.params) {
+            if (p.rest) {
+                hasDefRest = true
+            }
+            if (let some(_) = p.default) {
+                hasDefRest = true
+            }
+        }
+        if (hasDefRest) {
+            bad(em, span, "generic function `" + name + "` with default or rest parameters is not lowered yet")
+            return none
+        }
+        var params = emptyParamInfos()
+        for (p in info.params) {
+            params.push(ParamInfo(p.name, subst(p.ty, map), p.hasDefault, p.rest, p.span))
+        }
+        var ret = subst(info.ret, map)
+        var symbol = "pkl_" + name + "__"
+        var si = 0
+        for (t in keyTys) {
+            if (si > 0) {
+                symbol = symbol + "_"
+            }
+            symbol = symbol + sanitizeSymbol(bareName(t))
+            si = si + 1
+        }
+        var n = 0
+        var symTaken = false
+        var fj = 0
+        while (fj < len(em.irModule.funcs)) {
+            if (em.irModule.funcs[fj].symbol == symbol) {
+                symTaken = true
+                break
+            }
+            fj = fj + 1
+        }
+        while (symTaken) {
+            n = n + 1
+            symbol = symbol + "_v" + str(n)
+            symTaken = false
+            var fk = 0
+            while (fk < len(em.irModule.funcs)) {
+                if (em.irModule.funcs[fk].symbol == symbol) {
+                    symTaken = true
+                    break
+                }
+                fk = fk + 1
+            }
+        }
+        if (f.isAsync) {
+            // The instantiation is the wrapper; a hidden future body (with the
+            // lambda ABI) is registered first so the wrapper can name it. Both
+            // carry the substitution, mirroring the non-generic pair.
+            var hiddenSymbol = symbol + "__future"
+            var hidden = len(em.irModule.funcs)
+            em.irModule.funcs.push(IrFunc(name + "__future", hiddenSymbol, emptyIrParams(), IrTy.Unit, emptyIrTys(), 0, emptyIrBlocks(), false, false, emptyStrs()))
+            em.fidList.push(hidden)
+            var htys = emptyTys()
+            for (p in params) {
+                htys.push(p.ty)
+            }
+            em.fsource[hidden] = FnSource.AsyncBody(f, htys, ret)
+            var hiddenInfo = CallableInfo(info.name, info.span, info.visibility, info.isAsync, info.isStatic, info.isOverride, info.isAbstract, info.operator, info.generics, emptyParamInfos(), info.ret)
+            em.finfo[hidden] = hiddenInfo
+            em.instantonSubst[hidden] = map
+            var hg = emptyStrs()
+            for (g in f.generics) {
+                hg.push(g.name)
+            }
+            em.fidGenerics[hidden] = hg
+            var wfid = len(em.irModule.funcs)
+            em.irModule.funcs.push(IrFunc(name, symbol, emptyIrParams(), IrTy.Unit, emptyIrTys(), 0, emptyIrBlocks(), false, false, emptyStrs()))
+            em.fidList.push(wfid)
+            em.fsource[wfid] = FnSource.AsyncFn(f, hidden)
+            em.finfo[wfid] = CallableInfo(info.name, info.span, info.visibility, info.isAsync, info.isStatic, info.isOverride, info.isAbstract, info.operator, info.generics, params, ret)
+            var stys = emptyTys()
+            for (p in params) {
+                stys.push(p.ty)
+            }
+            em.srcParamTys[wfid] = stys
+            em.instantonSubst[wfid] = map
+            var wg = emptyStrs()
+            for (g in f.generics) {
+                wg.push(g.name)
+            }
+            em.fidGenerics[wfid] = wg
+            em.instantiations[instKey(keyName, keyTys)] = wfid
+            return wfid
+        }
+        var fid = len(em.irModule.funcs)
+        em.irModule.funcs.push(IrFunc(name, symbol, emptyIrParams(), IrTy.Unit, emptyIrTys(), 0, emptyIrBlocks(), false, false, emptyStrs()))
+        em.fidList.push(fid)
+        em.fsource[fid] = FnSource.TopLevel(f)
+        em.finfo[fid] = CallableInfo(info.name, info.span, info.visibility, info.isAsync, info.isStatic, info.isOverride, info.isAbstract, info.operator, info.generics, params, ret)
+        var stys = emptyTys()
+        for (p in info.params) {
+            stys.push(subst(p.ty, map))
+        }
+        em.srcParamTys[fid] = stys
+        em.instantonSubst[fid] = map
+        em.instantiations[instKey(keyName, keyTys)] = fid
+        fid
+    }
+
+fn closureObj(em: Emitter, e: Expr, fid: int, captures: List<Capture>) -> int? {
+        var cid = 0
+        if (let some(c) = registerClosureClass(em, len(captures), e.span)) {
+            cid = c
+        } else {
+            return none
+        }
+        var cidT = intConst(em, cid)
+        var nT = intConst(em, len(captures) + 1)
+        var obj = externCallT1(em, "pickle_class_new", [IrTy.Int, IrTy.Int], IrTy.Ptr, [cidT, nT])
+        var addr = temp(em)
+        instr(em, IrInstr.Const(addr, IrConst.FuncAddr(fid)))
+        var boxed = externCallT1(em, "pickle_box_i64", [IrTy.Int], IrTy.Ptr, [addr])
+        var zero = intConst(em, 0)
+        externCallVoid(em, "pickle_obj_slot_set", [IrTy.Ptr, IrTy.Int, IrTy.Ptr], [obj, zero, boxed])
+        var i = 0
+        while (i < len(captures)) {
+            var cap = captures[i]
+            var slot = -1
+            if (let some(s) = lookup(em, cap.name)) {
+                slot = s
+            } else {
+                bad(em, cap.span, "cannot capture `" + cap.name + "` (not in scope here)")
+                return none
+            }
+            var v = load(em, slot)
+            var vt = cap.ty
+            if (let some(t) = tyOf(em, cap.span)) {
+                vt = t
+            }
+            var rep = ElemRep.ptr()
+            if (let some(r) = elemRep(em, cap.ty, cap.span)) {
+                rep = r
+            } else {
+                return none
+            }
+            var packed = 0
+            var pf = packForPointerBoundary(em, rep, v, vt, cap.span)
+            if (let some(p) = pf) {
+                packed = p
+            } else {
+                return none
+            }
+            var boxed2 = 0
+            var bf = boxForStore(em, rep, packed, elemIr(cap.ty))
+            if (let some(b) = bf) {
+                boxed2 = b
+            } else {
+                return none
+            }
+            var idx = intConst(em, 1 + i)
+            externCallVoid(em, "pickle_obj_slot_set", [IrTy.Ptr, IrTy.Int, IrTy.Ptr], [obj, idx, boxed2])
+            i = i + 1
+        }
+        obj
+    }
+
+fn lambdaValue(em: Emitter, e: Expr) -> int? {
+        var baseKey = lambdaKey(none, e.span)
+        var hasInst = false
+        if (let some(_) = em.currentFid) {
+            hasInst = true
+        }
+        var instKeyStr = baseKey
+        if (hasInst) {
+            instKeyStr = lambdaKey(em.currentFid, e.span)
+        }
+        var fid: int? = none
+        if (hasInst) {
+            var f1 = em.lambdaFids.get(instKeyStr)
+            if (let some(v) = f1) {
+                fid = v
+            }
+        }
+        if (let none = fid) {
+            var f2 = em.lambdaFids.get(baseKey)
+            if (let some(v) = f2) {
+                fid = v
+            }
+        }
+        if (let none = fid) {
+            if (let some(cls) = genericOwner(em)) {
+                bad(em, e.span, "a lambda inside the generic class/struct `" + cls + "` is not lowered yet")
+                return none
+            }
+            var inst = 0
+            var instOk = false
+            if (let some(i) = em.currentFid) {
+                if (len(em.currentSubst) == 0) {
+                    instOk = instOk
+                } else {
+                    inst = i
+                    instOk = true
+                }
+            }
+            if (!instOk) {
+                bad(em, e.span, "this lambda was not registered for lowering")
+                return none
+            }
+            var caps0 = emptyCaptures()
+            var cg = em.lambdaCaps.get(baseKey)
+            if (let some(c) = cg) {
+                caps0 = c
+            }
+            var owner: int? = none
+            var og = em.lambdaOwners.get(spanKey(e.span))
+            if (let some(o) = og) {
+                owner = o
+            }
+            var sub = emptyStringTyMap()
+            var sg = em.instantonSubst.get(inst)
+            if (let some(s) = sg) {
+                sub = s
+            }
+            var le2 = Expr(Span(0, 0), ExprKind.This)
+            var lg = em.lambdaExprs.get(spanKey(e.span))
+            if (let some(l) = lg) {
+                le2 = l
+            } else {
+                bad(em, e.span, "this lambda was not registered for lowering")
+                return none
+            }
+            var base: int? = none
+            base = inst
+            fid = registerLambdaAt(em, le2, caps0, owner, sub, base)
+        }
+        if (let none = fid) {
+            bad(em, e.span, "this lambda was not registered for lowering")
+            return none
+        }
+        var caps = emptyCaptures()
+        var gotCaps = false
+        if (hasInst) {
+            var c1 = em.lambdaCaps.get(instKeyStr)
+            if (let some(c) = c1) {
+                caps = c
+                gotCaps = true
+            }
+        }
+        if (!gotCaps) {
+            var c2 = em.lambdaCaps.get(baseKey)
+            if (let some(c) = c2) {
+                caps = c
+            }
+        }
+        var fidV = 0
+        if (let some(f) = fid) {
+            fidV = f
+        } else {
+            bad(em, e.span, "this lambda was not registered for lowering")
+            return none
+        }
+        closureObj(em, e, fidV, caps)
+    }
+
+fn fnValueClosure(em: Emitter, e: Expr, fid: int) -> int? {
+        let _ = fid
+        var tramp = 0
+        var tg = em.fnTramp.get(spanKey(e.span))
+        if (let some(t) = tg) {
+            tramp = t
+        } else {
+            bad(em, e.span, "function value was not registered for dynamic dispatch")
+            return none
+        }
+        return closureObj(em, e, tramp, emptyCaptures())
+    }
+
+fn genericFnArgValue(em: Emitter, v: Expr, hint: Ty) -> int? {
+        var name = ""
+        var isIdent = false
+        match (v.kind) {
+            case ExprKind.Ident(n) -> {
+                name = n
+                isIdent = true
+            }
+            case _ -> {}
+        }
+        if (!isIdent) {
+            return none
+        }
+        var info = userCallableFirst(em, name)
+        if (let none = info) {
+            return none
+        }
+        var inf = seedCallableInfo()
+        if (let some(x) = info) {
+            inf = x
+        }
+        if (len(inf.generics) == 0) {
+            return none
+        }
+        var pty = emptyTys()
+        for (p in inf.params) {
+            pty.push(p.ty)
+        }
+        var sig = Ty.Fn(pty, inf.ret)
+        var map = emptyStringTyMap()
+        inferFrom(sig, hint, map)
+        var argTys = emptyTys()
+        for (g in inf.generics) {
+            var got = Ty.Unknown
+            if (let some(t) = map.get(g)) {
+                got = t
+            }
+            argTys.push(got)
+        }
+        var hasBadArg = false
+        for (at in argTys) {
+            var badKind = false
+            match (at) {
+                case Ty.Unknown -> badKind = true
+                case Ty.Var(_) -> badKind = true
+                case _ -> {}
+            }
+            if (hasVar(at) || badKind) {
+                hasBadArg = true
+            }
+        }
+        if (hasBadArg) {
+            return none
+        }
+        genericFnValueFor(em, v, inf, argTys)
+    }
+
+fn boxForStore(em: Emitter, rep: ElemRep, v: int, vTy: IrTy) -> int? {
+        if (rep.isPtr) {
+            return v
+        }
+        externCallT1(em, rep.boxSym, [vTy], IrTy.Ptr, [v])
+    }
+
+fn packMapKey(em: Emitter, rep: ElemRep, v: int, vt: Ty, span: Span) -> int? {
+        if (rep.isPtr) {
+            optionWrap(em, v, vt, span)
+        } else {
+            var vIrO = mapTy(em, vt, span)
+            if (let none = vIrO) {
+                return none
+            }
+            var vIr = IrTy.Int
+            if (let some(t) = vIrO) {
+                vIr = t
+            }
+            externCallT1(em, rep.boxSym, [vIr], IrTy.Ptr, [v])
+        }
+    }
+
+fn ptrElementAddr(em: Emitter, base: int, idx: int, elem: IrTy, span: Span) -> int? {
+        var stride = -1
+        if (irTyTag(elem) == irTyTag(IrTy.Bool)) {
+            stride = 1
+        } else if (irTyTag(elem) == irTyTag(IrTy.Char)) {
+            stride = 4
+        } else if (irTyTag(elem) == irTyTag(IrTy.Int)) {
+            stride = 8
+        } else if (irTyTag(elem) == irTyTag(IrTy.Float)) {
+            stride = 8
+        }
+        if (stride < 0) {
+            bad(em, span, "this pointee type is not indexed yet")
+            return none
+        }
+        var s = intConst(em, stride)
+        var off = temp(em)
+        instr(em, IrInstr.BinOp(off, IrBinOp.Mul, idx, s))
+        var addr = temp(em)
+        instr(em, IrInstr.BinOp(addr, IrBinOp.Add, base, off))
+        addr
+    }
+
+fn staticRead(em: Emitter, span: Span, cid: int, slot: int, fieldTy: Ty) -> int? {
+        var rp = elemRep(em, fieldTy, span)
+        if (let some(rep) = rp) {
+            var c = intConst(em, cid)
+            var s = intConst(em, slot)
+            var raw = externCallT1(em, "pickle_static_get", [IrTy.Int, IrTy.Int], IrTy.Ptr, [c, s])
+            if (rep.isPtr) {
+                return raw
+            }
+            return externCallT1(em, rep.unboxSym, [IrTy.Ptr], rep.ir, [raw])
+        }
+        none
+    }
+
+fn staticStore(em: Emitter, cid: int, slot: int, boxed: int) {
+        var c = intConst(em, cid)
+        var s = intConst(em, slot)
+        externCallVoid(em, "pickle_static_set", [IrTy.Int, IrTy.Int, IrTy.Ptr], [c, s, boxed])
+    }
+
+fn allInstanceFields(em: Emitter, cname: string) -> List<FieldInfo> {
+        var out = emptyFieldInfos()
+        for (cn in ancestry(em, cname)) {
+            var own = ownInstanceFields(em, cn)
+            for (f in own) {
+                out.push(f)
+            }
+        }
+        out
+    }
+
+fn fieldAt(em: Emitter, cid: int, idx: int) -> FieldInfo {
+        for (p in em.classes) {
+            if (p.classId == cid) {
+                var all = allInstanceFields(em, p.name)
+                if (idx < len(all)) {
+                    return all[idx]
+                }
+                return seedFieldInfo()
+            }
+        }
+        seedFieldInfo()
+    }
+
+fn classOfName(em: Emitter, cid: int) -> string {
+        for (p in em.classes) {
+            if (p.classId == cid) {
+                return p.name
+            }
+        }
+        "class#" + str(cid)
+    }
+
+fn forInSeqTy(em: Emitter, span: Span) -> Ty? {
+        if (let some(t) = tyOf(em, span)) {
+            match (t) {
+                case Ty.Ref(inner) -> inner
+                case other -> other
+            }
+        } else {
+            none
+        }
+    }
+
+fn tailCleanup(em: Emitter) -> bool {
+        var dead = false
+        match (em.blocks[em.cur].term) {
+            case IrTerm.Unreachable -> dead = true
+            case _ -> {}
+        }
+        if (dead && irTyTag(em.fret) == irTyTag(IrTy.Unit)) {
+            em.blocks[em.cur].term = IrTerm.Return(none)
+        }
+        true
+    }
+
+fn buildSpreadTrampoline(em: Emitter, span: Span, target: int, pty: List<Ty>, ret: Ty, receiver: bool) {
+        var m = mapTy(em, ret, span)
+        if (let some(r) = m) {
+            em.fret = r
+        }
+        var recvSlot = 0
+        if (receiver) {
+            recvSlot = newSlot(em, IrTy.Ptr)
+            em.fparams.push(IrParam("recv", IrTy.Ptr))
+            declare(em, "recv", recvSlot)
+        }
+        var listSlot = newSlot(em, IrTy.Ptr)
+        em.fparams.push(IrParam("boxed", IrTy.Ptr))
+        declare(em, "boxed", listSlot)
+        var list = load(em, listSlot)
+        var real = emptyInts()
+        var i = 0
+        while (i < len(pty)) {
+            var idx = intConst(em, i)
+            var raw = externCallT1(em, "pickle_list_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [list, idx])
+            var rep = elemRep(em, pty[i], span)
+            if (let some(re) = rep) {
+                if (re.isPtr) {
+                    real.push(raw)
+                } else {
+                    var v = externCallT1(em, re.unboxSym, [IrTy.Ptr], re.ir, [raw])
+                    real.push(v)
+                }
+            } else {
+                return
+            }
+            i = i + 1
+        }
+        var args = emptyInts()
+        if (receiver) {
+            args.push(load(em, recvSlot))
+        }
+        for (r in real) {
+            args.push(r)
+        }
+        if (irTyTag(em.fret) == irTyTag(IrTy.Unit)) {
+            instr(em, IrInstr.Call(none, Callee.Func(target), args))
+            term(em, IrTerm.Return(none))
+        } else {
+            var dst = temp(em)
+            instr(em, IrInstr.Call(dst, Callee.Func(target), args))
+            term(em, IrTerm.Return(dst))
+        }
+    }
+
+fn buildTrampoline(em: Emitter, span: Span, target: int, pty: List<Ty>, ret: Ty) {
+        var m = mapTy(em, ret, span)
+        if (let some(r) = m) {
+            em.fret = r
+        }
+        var envSlot = newSlot(em, IrTy.Ptr)
+        em.fparams.push(IrParam("env", IrTy.Ptr))
+        declare(em, "env", envSlot)
+        var args = emptyInts()
+        for (t in pty) {
+            var it = mapTy(em, t, span)
+            var ir = IrTy.Ptr
+            if (let some(r) = it) {
+                ir = r
+            }
+            var slot = newSlot(em, ir)
+            var pname = "arg" + str(len(em.fparams) - 1)
+            em.fparams.push(IrParam(pname, ir))
+            declare(em, pname, slot)
+            args.push(load(em, slot))
+        }
+        if (irTyTag(em.fret) == irTyTag(IrTy.Unit)) {
+            instr(em, IrInstr.Call(none, Callee.Func(target), args))
+            term(em, IrTerm.Return(none))
+        } else {
+            var dst = temp(em)
+            instr(em, IrInstr.Call(dst, Callee.Func(target), args))
+            term(em, IrTerm.Return(dst))
+        }
+    }
+
+fn buildAsyncMethodWrapper(em: Emitter, md: MethodDecl, info: CallableInfo, hidden: int, isStatic: bool, thisTy: Ty?) -> bool {
+        var d = 0
+        var captures = emptyCaptures()
+        if (!isStatic) {
+            em.fslots.push(IrTy.Ptr)
+            em.fparams.push(IrParam("this", IrTy.Ptr))
+            declare(em, "this", 0)
+            var ct = Ty.Unknown
+            if (let some(t) = thisTy) {
+                ct = t
+            }
+            captures.push(Capture("this", ct, md.span))
+            d = 1
+        }
+        var i = 0
+        while (i < len(info.params)) {
+            var p = info.params[i]
+            var ir = IrTy.Ptr
+            if (let some(r) = mapTy(em, p.ty, p.span)) {
+                ir = r
+            }
+            var slot = d + i
+            em.fslots.push(ir)
+            em.fparams.push(IrParam(p.name, ir))
+            declare(em, p.name, slot)
+            captures.push(Capture(p.name, p.ty, p.span))
+            i = i + 1
+        }
+        em.fret = IrTy.Ptr
+        if (let some(obj) = closureObj(em, Expr(md.span, ExprKind.Ident("")), hidden, captures)) {
+            term(em, IrTerm.Return(obj))
+        }
+        true
+    }
+
+fn nearestExplicitPrimaryAncestor(em: Emitter, name: string) -> AncestorMeta? {
+        var found: AncestorMeta? = none
+        var base = 0
+        for (cname in ancestry(em, name)) {
+            var own = ownInstanceFields(em, cname)
+            var hasCtor = false
+            if (let some(t) = tableOf(em, cname)) {
+                if (let some(_) = t.ctor) {
+                    hasCtor = true
+                }
+            }
+            if (hasCtor) {
+                found = AncestorMeta(cname, base + len(own))
+            }
+            base = base + len(own)
+        }
+        found
+    }
+
+fn totalInstanceSlotCount(em: Emitter, name: string) -> int {
+        var total = 0
+        for (c in ancestry(em, name)) {
+            total = total + len(ownInstanceFields(em, c))
+        }
+        total
+    }
+
+fn synthesizedCtorParamMeta(em: Emitter, name: string) -> CtorParamMeta {
+        var cc = collectInstanceInits(em, name)
+        var empty = emptyInts()
+        for (si in cc) {
+            empty.push(si.slot)
+        }
+        var slots = emptyInts()
+        var cparamCount = 0
+        var cutBase = 0
+        var anc = nearestExplicitPrimaryAncestor(em, name)
+        var hasAnc = false
+        if (let some(a) = anc) {
+            hasAnc = true
+            if (let some(t) = tableOf(em, a.name)) {
+                if (let some(c) = t.ctor) {
+                    cparamCount = len(c.params)
+                    var k = 0
+                    while (k < cparamCount) {
+                        slots.push(-1)
+                        k = k + 1
+                    }
+                }
+            }
+            cutBase = a.endSlot
+        }
+        var base = 0
+        for (cname in ancestry(em, name)) {
+            var own = ownInstanceFields(em, cname)
+            var contribute = false
+            if (hasAnc) {
+                if (base >= cutBase) {
+                    contribute = true
+                }
+            } else {
+                contribute = true
+            }
+            if (contribute) {
+                var i = 0
+                while (i < len(own)) {
+                    var abs = base + i
+                    var hasInit = false
+                    for (e in empty) {
+                        if (e == abs) {
+                            hasInit = true
+                            break
+                        }
+                    }
+                    if (!hasInit) {
+                        slots.push(abs)
+                    }
+                    i = i + 1
+                }
+            }
+            base = base + len(own)
+        }
+        var chainName = ""
+        var chainCount = 0
+        if (let some(a2) = anc) {
+            chainName = a2.name
+            chainCount = cparamCount
+        }
+        CtorParamMeta(slots, chainName, chainCount)
+    }
+
+fn buildStaticDefault(em: Emitter, cid: int, slot: int) {
+        if (let some(info) = staticFieldAt(em, cid, slot)) {
+            var fieldTy = info.ty
+            if (let some(rep) = elemRep(em, fieldTy, info.span)) {
+                var def = 0
+                if (rep.isPtr) {
+                    if (let some(n) = nullTemp(em)) {
+                        def = n
+                    }
+                } else {
+                    if (let some(z) = zeroScalar(em, elemIr(fieldTy), info.span)) {
+                        def = z
+                    }
+                }
+                if (let some(b) = boxForStore(em, rep, def, elemIr(fieldTy))) {
+                    staticStore(em, cid, slot, b)
+                }
+            }
+        }
+    }
+
+fn injectClassRegistrations(em: Emitter) {
+        if (len(em.classes) == 0 && isNoneInt(em.staticInitId) && isNoneInt(em.globalsInitId) && len(em.extraSetups) == 0) {
+            return
+        }
+        var plans = emptyRegPlans()
+        for (p in em.classes) {
+            var fields = allInstanceFields(em, p.name)
+            var owned = 0
+            var fi = 0
+            while (fi < len(fields)) {
+                if (fields[fi].manual && fi < 64) {
+                    owned = owned | (1 << fi)
+                }
+                fi = fi + 1
+            }
+            var parentCid = 0
+            if (let some(pv) = p.parent) {
+                parentCid = pv
+            }
+            plans.push(RegPlan(p.name, totalInstanceSlotCount(em, p.name), p.classId, parentCid, owned))
+        }
+        var instrs = emptyIrInstrs()
+        for (rp in plans) {
+            var sid = internString(em, rp.name)
+            var addr = temp(em)
+            instrs.push(IrInstr.Const(addr, IrConst.StrAddr(sid)))
+            var addrLen = temp(em)
+            instrs.push(IrInstr.Const(addrLen, IrConst.Int(len(bytesOf(rp.name)))))
+            var countT = temp(em)
+            instrs.push(IrInstr.Const(countT, IrConst.Int(rp.fieldCount)))
+            var maskT = temp(em)
+            var m = -1
+            if (rp.fieldCount < 64) {
+                m = (1 << rp.fieldCount) - 1
+            }
+            instrs.push(IrInstr.Const(maskT, IrConst.Int(m)))
+            var ownedT = temp(em)
+            instrs.push(IrInstr.Const(ownedT, IrConst.Int(rp.owned)))
+            var finT = temp(em)
+            var deinitO = em.deinitIds.get(rp.cid)
+            if (let some(fid2) = deinitO) {
+                instrs.push(IrInstr.Const(finT, IrConst.FuncAddr(fid2)))
+            } else {
+                instrs.push(IrInstr.Const(finT, IrConst.Int(0)))
+            }
+            var parT = temp(em)
+            instrs.push(IrInstr.Const(parT, IrConst.Int(rp.parent)))
+            var ex = externId(em, "pickle_class_register", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], IrTy.Unit)
+            instrs.push(IrInstr.Call(none, Callee.Extern(ex), [addr, addrLen, countT, maskT, ownedT, finT, parT]))
+            var buckets = emptyIfaceBuckets()
+            if (let some(b) = em.classIfaceBuckets.get(rp.cid)) {
+                buckets = b
+            }
+            for (bk in buckets) {
+                var cidT = temp(em)
+                instrs.push(IrInstr.Const(cidT, IrConst.Int(rp.cid)))
+                var iidT = temp(em)
+                instrs.push(IrInstr.Const(iidT, IrConst.Int(bk.ifaceId)))
+                var exMark = externId(em, "pickle_class_add_interface", [IrTy.Int, IrTy.Int], IrTy.Unit)
+                instrs.push(IrInstr.Call(none, Callee.Extern(exMark), [cidT, iidT]))
+                for (db in bk.methods) {
+                    var idxT = temp(em)
+                    instrs.push(IrInstr.Const(idxT, IrConst.Int(db.cid)))
+                    var fnT = temp(em)
+                    instrs.push(IrInstr.Const(fnT, IrConst.FuncAddr(db.fid)))
+                    var exM = externId(em, "pickle_class_add_iface_method", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], IrTy.Unit)
+                    instrs.push(IrInstr.Call(none, Callee.Extern(exM), [cidT, iidT, idxT, fnT]))
+                }
+            }
+        }
+        // Managed global roots are registered before `pkl_static_init` so a
+        // static initializer can never observe an unrooted slot. It runs after
+        // class registration because a `Ptr` initializer may call a constructor,
+        // which reads the descriptor that registration creates.
+        if (let some(fid4) = em.globalsInitId) {
+            instrs.push(IrInstr.Call(none, Callee.Func(fid4), emptyInts()))
+        }
+        // Peer objects' setup functions (split link): their classes are
+        // registered and their globals rooted before this object's static
+        // initializers run, because a static initializer may call into a peer.
+        for (s in em.extraSetups) {
+            var exU = externId(em, s, emptyIrTys(), IrTy.Unit)
+            instrs.push(IrInstr.Call(none, Callee.Extern(exU), emptyInts()))
+        }
+        if (let some(fid3) = em.staticInitId) {
+            instrs.push(IrInstr.Call(none, Callee.Func(fid3), emptyInts()))
+        }
+        var ni = emptyIrInstrs()
+        for (x in instrs) {
+            ni.push(x)
+        }
+        for (o in em.blocks[0].instrs) {
+            ni.push(o)
+        }
+        em.blocks[0].instrs = ni
+    }

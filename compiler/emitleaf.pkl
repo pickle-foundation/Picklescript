@@ -1,0 +1,2472 @@
+﻿// emitleaf - everything below the primary expr/expr1/stmt/stmt1 walkers.
+// This pool is closed over the walker law (locked_scan.ps1): no member reaches the
+// walker spine, emitcore imports the pool, and the pool imports nothing from emitcore.
+// Semantic regions (registration, class slots, match/cast payloads, generic enums,
+// loop helpers, marshals) stay adjacent to their /// docs exactly as in emitcore.
+
+module compiler.emitleaf
+
+import * from compiler.ast
+import { Diagnostic, DiagnosticSink, Span } from compiler.diag
+import { IrBlock, IrFunc, IrGlobal, IrInstr, IrTerm, IrTy, emptyIrBlocks } from compiler.ir
+import { ResolvedProgram } from compiler.resolve
+import * from compiler.ty
+import * from compiler.emitutil
+import { Emitter } from compiler.emittypes
+import * from compiler.emitprim
+import * from compiler.emitreadsglobal
+
+fn recordConstInit(em: Emitter, name: string, value: Expr) {
+   em.constsInits[name] = value
+   }
+
+fn registerGlobals(em: Emitter) {
+   var next = 0
+   for (info in em.resolved.globals) {
+   let name = info.name
+   if (em.globalIds.has(name)) {
+   em.globalFailures.push(GlobalFailure(name, info.span, "top-level `var " + name + "` is declared more than once"))
+   continue
+   }
+   var slot: IrTy? = none
+   if (let some(t) = globalIrTy(info.ty)) {
+   slot = t
+   } else {
+   em.globalFailures.push(GlobalFailure(name, info.span, "top-level `var " + name + "` has type `" + tyDbg(em, info.ty) + "`, which has no global lowering yet"))
+   continue
+   }
+   var decl: GlobalDecl? = none
+   if (em.globalDecls.has(name)) {
+   decl = em.globalDecls[name]
+   }
+   if (let some(d) = decl) {
+   if (let some(ity) = slot) {
+   var res = globalInitBytes(d.value, ity, name)
+if (res.err != "") {
+    em.globalFailures.push(GlobalFailure(name, info.span, res.err))
+    continue
+}
+let gid = next
+     next += 1
+     em.globalIds[name] = gid
+     em.irModule.globals.push(IrGlobal(globalSymbol(name), ity, hasTypeExpr(d.ty), res.bytes))
+if (ity == IrTy.Str || ity == IrTy.Ptr) {
+    // A managed initializer is real run-time code, so it may call and allocate,
+    // but it may not read another global. `pkl_globals_init` roots every slot
+    // before it evaluates any initializer, so every slot is still null while
+    // initializers run; reject the read here rather than hand back a null
+    // dereference.
+    //
+    // The slot and its id are registered above, before this check, exactly as on
+    // the native path. A rejected global is still a declared global, so a later
+    // read of it must not turn into a second, misleading "not lowered yet"
+    // diagnostic -- only the root cause should be reported.
+    if (let some(other) = globalInitReadsGlobal(em, d.value)) {
+        em.globalFailures.push(GlobalFailure(name, info.span,
+            "the initializer of top-level `var " + name + "` reads `" + other + "`, but global initializers run after every slot is rooted and before any is filled, so it would read a null value"))
+        continue
+    }
+        em.managedGlobalInits.push(ManagedGlobalInit(gid, ity, d.value))
+     }
+   }
+   } else {
+   em.globalFailures.push(GlobalFailure(name, info.span, "top-level `var " + name + "` has no initializer"))
+   continue
+   }
+   }
+   }
+
+fn recordFnDecl(em: Emitter, name: string, f: FnDecl) {
+        em.fnDecls[name] = f
+    }
+
+fn recordClassDecl(em: Emitter, name: string, c: ClassDecl) {
+        em.classDecls[name] = c
+    }
+
+fn methodDef(em: Emitter, cid: int, mname: string, fid: int, isStatic: bool) {
+        var key = pairKey(str(cid), mname)
+        if (!em.methodIds.has(key)) {
+            em.methodIds[key] = MethodRef(fid, isStatic)
+            em.methodSeq.push(MethodEntry(cid, mname, fid, isStatic))
+        }
+    }
+
+fn registerFn(em: Emitter, f: FnDecl, isTest: bool, attrs: List<Attribute>) -> bool {
+        if (!(len(f.generics) == 0)) {
+            return false
+        }
+        var hasDefaultOrRest = false
+        for (p in f.params) {
+            if (p.rest) {
+                hasDefaultOrRest = true
+            } else if (let none = p.default) {
+                // no default value
+            } else {
+                hasDefaultOrRest = true
+            }
+        }
+        if (hasDefaultOrRest) {
+            return false
+        }
+        if (let some(info) = userCallable(em, f.name)) {
+            var okParams = true
+            for (p in info.params) {
+                if (let none = mapTy(em, p.ty, f.span)) {
+                    okParams = false
+                }
+            }
+            var okRet = true
+            if (let none = mapTy(em, info.ret, f.span)) {
+                okRet = false
+            }
+            if (!okParams || !okRet) {
+                return false
+            }
+            if (f.isAsync) {
+                registerAsyncFn(em, f, isTest, attrs, info)
+                return true
+            }
+            var fid = len(em.irModule.funcs)
+            var symbol = symbolForAttrs(em, f.name, isTest, attrs)
+            em.irModule.funcsByName[f.name] = fid
+            em.irModule.funcs.push(IrFunc(f.name, symbol, emptyIrParams(), IrTy.Unit, emptyIrTys(), 0, emptyIrBlocks(), !isTest && f.name == "main", isTest, itemTags(attrs)))
+            em.fidList.push(fid)
+            em.fsource[fid] = FnSource.TopLevel(f)
+            em.finfo[fid] = info
+            var stys = emptyTys()
+            for (p in info.params) {
+                stys.push(p.ty)
+            }
+            em.srcParamTys[fid] = stys
+            return true
+        }
+        false
+    }
+
+fn registerAsyncFn(em: Emitter, f: FnDecl, isTest: bool, attrs: List<Attribute>, info: CallableInfo) {
+        var symbol = symbolForAttrs(em, f.name, isTest, attrs)
+        var hiddenName = f.name + "__future"
+        var hiddenSymbol = symbol + "__future"
+        var hidden = len(em.irModule.funcs)
+        em.irModule.funcsByName[hiddenName] = hidden
+        em.irModule.funcs.push(IrFunc(hiddenName, hiddenSymbol, emptyIrParams(), IrTy.Unit, emptyIrTys(), 0, emptyIrBlocks(), false, false, emptyStrs()))
+        em.fidList.push(hidden)
+        var htys = emptyTys()
+        for (p in info.params) {
+            htys.push(p.ty)
+        }
+        em.fsource[hidden] = FnSource.AsyncBody(f, htys, info.ret)
+        var hiddenInfo = CallableInfo(info.name, info.span, info.visibility, info.isAsync, info.isStatic, info.isOverride, info.isAbstract, info.operator, info.generics, emptyParamInfos(), info.ret)
+        em.finfo[hidden] = hiddenInfo
+        var wfid = len(em.irModule.funcs)
+        em.irModule.funcsByName[f.name] = wfid
+        em.irModule.funcs.push(IrFunc(f.name, symbol, emptyIrParams(), IrTy.Unit, emptyIrTys(), 0, emptyIrBlocks(), !isTest && f.name == "main", isTest, itemTags(attrs)))
+        em.fidList.push(wfid)
+        em.fsource[wfid] = FnSource.AsyncFn(f, hidden)
+        em.finfo[wfid] = info
+        var stys = emptyTys()
+        for (p in info.params) {
+            stys.push(p.ty)
+        }
+        em.srcParamTys[wfid] = stys
+    }
+
+fn registerAsyncMethod(em: Emitter, cname: string, table: ClassTable, md: MethodDecl, info: CallableInfo, cid: int, args: List<Ty>, isStruct: bool, suffix: string, map: Map<string, Ty>?) {
+        var thisTy: Ty? = none
+        if (!info.isStatic) {
+            if (isStruct) {
+                thisTy = Ty.Struct(cname, args)
+            } else {
+                thisTy = Ty.Class(cname, args)
+            }
+        }
+        var pty = emptyTys()
+        if (let some(t) = thisTy) {
+            pty.push(t)
+        }
+        for (p in info.params) {
+            pty.push(p.ty)
+        }
+        var stem = ""
+        if (info.isStatic) {
+            stem = "pkl_" + cname + "_sm_" + md.name
+        } else {
+            stem = "pkl_" + cname + "_" + md.name
+        }
+        var hidden = pushClassFunc(em, cname + "." + md.name + ".future", stem + suffix + "__future", FnSource.AsyncMethodBody(table, md, pty, info.ret, info.isStatic))
+        var hiddenInfo = CallableInfo(info.name, info.span, info.visibility, info.isAsync, info.isStatic, info.isOverride, info.isAbstract, info.operator, info.generics, emptyParamInfos(), info.ret)
+        em.finfo[hidden] = hiddenInfo
+        em.fidOwner[hidden] = cid
+        if (let some(s) = map) {
+            em.instantonSubst[hidden] = s
+            em.fidGenerics[hidden] = table.generics
+        }
+        var wfid = pushClassFunc(em, cname + "." + md.name, stem + suffix, FnSource.AsyncMethod(table, md, hidden, info.isStatic, thisTy))
+        em.finfo[wfid] = info
+        var stys = emptyTys()
+        for (p in info.params) {
+            stys.push(p.ty)
+        }
+        em.srcParamTys[wfid] = stys
+        methodDef(em, cid, md.name, wfid, info.isStatic)
+        em.fidOwner[wfid] = cid
+        if (let some(s) = map) {
+            em.instantonSubst[wfid] = s
+            em.fidGenerics[wfid] = table.generics
+        }
+    }
+
+fn registerClassByName(em: Emitter, name: string) -> bool {
+        if (hasStr(em.classAttempted, name)) {
+            return false
+        }
+        em.classAttempted.push(name)
+        if (let some(decl) = em.classDecls.get(name)) {
+            if (let some(table) = classEntry(em, name)) {
+                if (let some(ext) = table.extends) {
+                    if (let some(p) = named(ext)) {
+                        if (em.classDecls.has(p)) {
+                            registerClassByName(em, p)
+                        }
+                    }
+                }
+                maybeRegisterClass(em, name, decl.members, table, decl.span)
+                return true
+            }
+        }
+        false
+    }
+
+fn classEntry(em: Emitter, name: string) -> ClassTable? {
+        if (let some(entry) = em.resolved.types.get(name)) {
+            match (entry) {
+                case TypeTableEntry.Class(t) -> {
+                    return t
+                }
+                case _ -> {}
+            }
+        }
+        none
+    }
+
+fn registerStructItem(em: Emitter, s: StructDecl) -> bool {
+        em.structMembers[s.name] = s.members
+        if (let some(entry) = em.resolved.types.get(s.name)) {
+            match (entry) {
+                case TypeTableEntry.Struct(t) -> maybeRegisterClass(em, s.name, s.members, t, s.span)
+                case _ -> {}
+            }
+        }
+        true
+    }
+
+fn tableOf(em: Emitter, name: string) -> ClassTable? {
+        if (let some(entry) = em.resolved.types.get(name)) {
+            match (entry) {
+                case TypeTableEntry.Class(t) -> {
+                    return t
+                }
+                case TypeTableEntry.Struct(t) -> {
+                    return t
+                }
+                case _ -> {}
+            }
+        }
+        for (p in em.classes) {
+            if (p.name == name) {
+                return p.table
+            }
+        }
+        if (em.closureTables.has(name)) {
+            return em.closureTables.get(name)
+        }
+        none
+    }
+
+fn parentName(em: Emitter, name: string) -> string? {
+        if (let some(t) = tableOf(em, name)) {
+            if (let some(ext) = t.extends) {
+                return named(ext)
+            }
+        }
+        none
+    }
+
+fn ancestry(em: Emitter, name: string) -> List<string> {
+        var chain = [name]
+        var cur = name
+        var guard = 0
+        while (guard < 64) {
+            guard = guard + 1
+            if (let some(p) = parentName(em, cur)) {
+                chain.push(p)
+                cur = p
+            } else {
+                break
+            }
+        }
+        var reversed = emptyStrs()
+        var i = len(chain) - 1
+        while (i >= 0) {
+            reversed.push(chain[i])
+            i = i - 1
+        }
+        reversed
+    }
+
+fn isAncestor(em: Emitter, anc: string, desc: string) -> bool {
+        var chain = ancestry(em, desc)
+        var i = 0
+        while (i < len(chain)) {
+            if (chain[i] == anc) {
+                return true
+            }
+            i = i + 1
+        }
+        false
+    }
+
+fn buildVirtualDispatch(em: Emitter) {
+        var visible: Map<int, List<NamedFid>> = emptyNamedFidMap()
+        for (me in em.methodSeq) {
+            if (!me.isStatic) {
+                if (let some(l) = visible.get(me.cid)) {
+                    l.push(NamedFid(me.name, me.fid))
+                } else {
+                    var nf = [NamedFid(me.name, me.fid)]
+                    visible[me.cid] = nf
+                }
+            }
+        }
+        var mixedCname = ""
+        var mixedMname = ""
+        for (p in em.classes) {
+            if (let none = visible.get(p.classId)) {
+                continue
+            }
+            if (let some(names) = visible.get(p.classId)) {
+                for (nm in names) {
+                    var branches = emptyDispatchDepths()
+                    for (d in em.classes) {
+                        if (d.classId == p.classId) {
+                            continue
+                        }
+                        if (!isAncestor(em, p.name, d.name)) {
+                            continue
+                        }
+                        if (let some(dt) = tableOf(em, d.name)) {
+                            if (hasMethodName(dt, nm.name)) {
+                                if (let some(mr) = em.methodIds.get(pairKey(str(d.classId), nm.name))) {
+                                    if (mr.isStatic) {
+                                        if (mixedCname == "") {
+                                            mixedCname = d.name
+                                            mixedMname = nm.name
+                                        }
+                                    } else if (!(mr.fid == nm.fid)) {
+                                        var depth = chainDepth(ancestry(em, d.name), p.name)
+                                        branches.push(DispatchBranchDepth(d.classId, depth, mr.fid))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if (len(branches) == 0) {
+                        continue
+                    }
+                    sortBranches(branches)
+                    var db = emptyDispatchBranches()
+                    for (b in branches) {
+                        db.push(DispatchBranch(b.dcid, b.dfid))
+                    }
+                    em.virtualDispatch[pairKey(str(p.classId), nm.name)] = db
+                }
+            }
+        }
+        if (!(mixedCname == "")) {
+            if (let some(sp) = em.classDecls.get(mixedCname)) {
+                bad(em, sp.span, "`override` mixing static and instance methods (`" + mixedCname + "." + mixedMname + "`) is not lowered yet")
+            } else {
+                bad(em, Span(0, 0), "`override` mixing static and instance methods (`" + mixedCname + "." + mixedMname + "`) is not lowered yet")
+            }
+        }
+    }
+
+fn propDef(em: Emitter, cid: int, name: string, isSet: bool, fid: int) {
+        var key = tripleKey(str(cid), name, str(isSet))
+        if (!em.propertyIds.has(key)) {
+            em.propertyIds[key] = fid
+            em.propertySeq.push(PropertyEntry(cid, name, isSet, fid))
+        }
+    }
+
+fn staticPropDef(em: Emitter, cid: int, name: string, isSet: bool, fid: int) {
+        var key = tripleKey(str(cid), name, str(isSet))
+        if (!em.staticPropertyIds.has(key)) {
+            em.staticPropertyIds[key] = fid
+            em.staticPropSeq.push(PropertyEntry(cid, name, isSet, fid))
+        }
+    }
+
+fn ownInstanceFields(em: Emitter, name: string) -> List<FieldInfo> {
+        if (let some(t) = tableOf(em, name)) {
+            var out = emptyFieldInfos()
+            for (f in t.fields) {
+                if (!f.isStatic) {
+                    out.push(f)
+                }
+            }
+            out
+        } else {
+            emptyFieldInfos()
+        }
+    }
+
+fn collectInstanceInits(em: Emitter, name: string) -> List<SlotInit> {
+        var out = emptySlotInits()
+        var base = 0
+        for (cname in ancestry(em, name)) {
+            var own = ownInstanceFields(em, cname)
+            var decl = planName(cname)
+            var members: List<ClassMember>? = none
+            if (let some(d) = em.classDecls.get(decl)) {
+                members = d.members
+            } else if (em.structMembers.has(decl)) {
+                members = em.structMembers.get(decl)
+            }
+            if (let some(ms) = members) {
+                for (m in ms) {
+                    match (m) {
+                        case ClassMember.Field(fname, ty, init, vis, isSt, isCn, attrs, fspan) -> {
+                            if (!isSt) {
+                                if (let some(x) = init) {
+                                    var i = 0
+                                    var found = false
+                                    while (i < len(own)) {
+                                        if (own[i].name == fname) {
+                                            found = true
+                                            break
+                                        }
+                                        i = i + 1
+                                    }
+                                    if (found) {
+                                        out.push(SlotInit(base + i, x))
+                                    }
+                                }
+                            }
+                        }
+                        case _ -> {}
+                    }
+                }
+            }
+            base = base + len(own)
+        }
+        out
+    }
+
+fn collectInitBlocks(em: Emitter, name: string) -> List<Block> {
+        var out = emptyBlocks()
+        for (cname in ancestry(em, name)) {
+            var decl = planName(cname)
+            var members: List<ClassMember>? = none
+            if (let some(d) = em.classDecls.get(decl)) {
+                members = d.members
+            } else if (em.structMembers.has(decl)) {
+                members = em.structMembers.get(decl)
+            }
+            if (let some(ms) = members) {
+                for (m in ms) {
+                    match (m) {
+                        case ClassMember.Init(b) -> out.push(b)
+                        case _ -> {}
+                    }
+                }
+            }
+        }
+        out
+    }
+
+fn ifaceIdFor(em: Emitter, name: string, args: List<Ty>, span: Span) -> int? {
+        var key = instKey(name, args)
+        if (let some(id) = em.ifaceInstIds.get(key)) {
+            return id
+        }
+        var iface: InterfaceTable? = none
+        if (let some(entry) = em.resolved.types.get(name)) {
+            match (entry) {
+                case TypeTableEntry.Interface(t) -> iface = t
+                case _ -> {}
+            }
+        }
+        if (let some(t) = iface) {
+            var id = em.nextIfaceId
+            em.nextIfaceId = em.nextIfaceId + 1
+            if (!em.ifaceMembers.has(id)) {
+                var plan = emptyIfaceMemberList()
+                var mi = 0
+                for (m in t.members) {
+                    if (!m.isProperty) {
+                        plan.push(IfaceMember(m.name, mi))
+                        mi = mi + 1
+                    }
+                }
+                em.ifaceMembers[id] = plan
+            }
+            em.ifaceInstIds[key] = id
+            return id
+        }
+        bad(em, span, "`" + name + "` is not an interface")
+        none
+    }
+
+fn registerImplements(em: Emitter, cname: string, cid: int, ifaces: List<Ty>, span: Span) -> bool {
+        for (t in ifaces) {
+            if (let some(ir) = ifaceOf(t)) {
+                if (let some(id) = ifaceIdFor(em, ir.name, ir.args, span)) {
+                    var slots = emptyDispatchBranches()
+                    var members = em.ifaceMembers.get(id)
+                    if (let some(ms) = members) {
+                        for (m in ms) {
+                            if (let some(mr) = em.methodIds.get(pairKey(str(cid), m.name))) {
+                                if (mr.isStatic) {
+                                    bad(em, span, "interface method `" + m.name + "` must be an instance method on `" + cname + "`")
+                                    return false
+                                }
+                                slots.push(DispatchBranch(m.index, mr.fid))
+                            } else {
+                                bad(em, span, "`" + cname + "` implements `" + ir.name + "` but has no method `" + m.name + "`")
+                                return false
+                            }
+                        }
+                    }
+                    if (let some(b) = em.classIfaceBuckets.get(cid)) {
+                        b.push(IfaceBucket(id, slots))
+                    } else {
+                        em.classIfaceBuckets[cid] = [IfaceBucket(id, slots)]
+                    }
+                } else {
+                    return false
+                }
+            } else {
+                bad(em, span, "`" + cname + "` declares `implements` on a non-interface type `" + bareName(t) + "`")
+                return false
+            }
+        }
+        true
+    }
+
+fn maybeRegisterClass(em: Emitter, name: string, members: List<ClassMember>, table: ClassTable, span: Span) -> bool {
+        if (!(len(table.generics) == 0)) {
+            em.genericTypeMembers[name] = members
+            return true
+        }
+        var parent: string? = none
+        if (let some(ext) = table.extends) {
+            if (let some(nm) = named(ext)) {
+                parent = nm
+            }
+        }
+        var parentCid: int? = none
+        if (let some(p) = parent) {
+            if (let some(pcid) = em.classByName.get(p)) {
+                parentCid = pcid
+            } else {
+                return true
+            }
+        }
+        var parentMsg = ""
+        if (let some(p) = parent) {
+            parentMsg = p
+        }
+        var ctorDecl: ConstructorDecl? = none
+        for (m in members) {
+            match (m) {
+                case ClassMember.Constructor(c) -> {
+                    if (let none = c.name) {
+                        ctorDecl = c
+                    }
+                }
+                case _ -> {}
+            }
+        }
+        var parentExplicit = false
+        if (let some(p) = parent) {
+            if (let some(pt) = tableOf(em, p)) {
+                if (let some(_) = pt.ctor) {
+                    parentExplicit = true
+                }
+            }
+        }
+        if (let some(cd) = ctorDecl) {
+            if (parentExplicit) {
+                if (let none = ctorSuperDelegation(cd.body)) {
+                    bad(em, cd.span, "`" + name + "` constructor must call `super(...)` first to chain into `" + parentMsg + "`")
+                    return false
+                }
+            }
+        }
+        var inits = collectInstanceInits(em, name)
+        var initBlocks = collectInitBlocks(em, name)
+        var deinitBlock: Block? = none
+        for (m in members) {
+            match (m) {
+                case ClassMember.Deinit(b) -> deinitBlock = b
+                case _ -> {}
+            }
+        }
+        var statics = emptyStaticSlotInits()
+        for (f in table.fields) {
+            if (f.isStatic) {
+                if (let some(slot) = staticFieldSlot(table, f.name)) {
+                    var init: Expr? = none
+                    for (m in members) {
+                        match (m) {
+                            case ClassMember.Field(fname, ty, finit, vis, isSt, isCn, attrs, fspan) -> {
+                                if (isSt && fname == f.name) {
+                                    init = finit
+                                }
+                            }
+                            case _ -> {}
+                        }
+                    }
+                    statics.push(StaticSlotInit(slot, init))
+                }
+            }
+        }
+        var cid = PICKLE_CLASS_USER_BASE + em.cidSalt + len(em.classes)
+        for (si in statics) {
+            em.staticInits.push(StaticInitEntry(cid, si.slot, si.value))
+        }
+        for (f in table.consts) {
+            var value: Expr? = none
+            for (m in members) {
+                match (m) {
+                    case ClassMember.Const(cname, cvis, cty, cvalue, cspan) -> {
+                        if (cname == f.name) {
+                            value = cvalue
+                        }
+                    }
+                    case _ -> {}
+                }
+            }
+            if (let some(v) = value) {
+                em.classConsts[pairKey(str(cid), f.name)] = ClassConst(f, v)
+            }
+        }
+        var ctorFid = pushClassFunc(em, name + ".new", "pkl_" + name + "_new", FnSource.Ctor(table, inits, initBlocks, ctorDecl))
+        em.ctorIds[cid] = ctorFid
+        var ctorParams = emptyTys()
+        if (let some(c) = table.ctor) {
+            for (p in c.params) {
+                ctorParams.push(p.ty)
+            }
+        }
+        em.srcParamTys[ctorFid] = ctorParams
+        for (m in members) {
+            match (m) {
+                case ClassMember.Constructor(c) -> {
+                    if (let some(cname) = c.name) {
+                        var fid = pushClassFunc(em, name + "." + cname, "pkl_" + name + "_nc_" + cname, FnSource.NamedCtor(table, c))
+                        em.namedCtorIds[pairKey(str(cid), cname)] = fid
+                        var ncinfo: NamedCtorInfo? = none
+                        for (nc in table.namedCtors) {
+                            if (nc.name == cname) {
+                                ncinfo = nc
+                            }
+                        }
+                        var ps = emptyTys()
+                        if (let some(cinfo) = ncinfo) {
+                            for (p in cinfo.ctor.params) {
+                                ps.push(p.ty)
+                            }
+                        }
+                        em.srcParamTys[fid] = ps
+                    }
+                }
+                case _ -> {}
+            }
+        }
+        if (let some(body) = deinitBlock) {
+            var fid = pushClassFunc(em, name + ".deinit", "pkl_" + name + "_deinit", FnSource.Deinit(table, body))
+            em.deinitIds[cid] = fid
+        }
+        for (m in members) {
+            match (m) {
+                case ClassMember.Method(md) -> {
+                    var noBody = false
+                    if (let none = md.body) {
+                        noBody = true
+                    }
+                    if (noBody || !(len(md.generics) == 0)) {
+                        continue
+                    }
+                    var info: CallableInfo? = none
+                    for (i in table.methods) {
+                        if (i.name == md.name) {
+                            info = i
+                        }
+                    }
+                    if (let none = info) {
+                        continue
+                    }
+                    if (let some(inf) = info) {
+                        var skip = false
+                        for (p in inf.params) {
+                            if (p.hasDefault || p.rest) {
+                                skip = true
+                            }
+                        }
+                        if (skip) {
+                            continue
+                        }
+                        if (md.isAsync) {
+                            registerAsyncMethod(em, name, table, md, inf, cid, emptyTys(), false, "", none)
+                            continue
+                        }
+                        var symbol = ""
+                        if (inf.isStatic) {
+                            symbol = "pkl_" + name + "_sm_" + md.name
+                        } else {
+                            symbol = "pkl_" + name + "_" + md.name
+                        }
+                        var mid = pushClassFunc(em, name + "." + md.name, symbol, FnSource.Method(table, md))
+                        em.finfo[mid] = inf
+                        var ps = emptyTys()
+                        for (p in inf.params) {
+                            ps.push(p.ty)
+                        }
+                        em.srcParamTys[mid] = ps
+                        methodDef(em, cid, md.name, mid, inf.isStatic)
+                    }
+                }
+                case _ -> {}
+            }
+        }
+        for (m in members) {
+            match (m) {
+                case ClassMember.Property(pd) -> {
+                    var info: PropertyInfo? = none
+                    for (i in table.properties) {
+                        if (i.name == pd.name) {
+                            info = i
+                        }
+                    }
+                    if (let none = info) {
+                        continue
+                    }
+                    if (let some(pinf) = info) {
+                        var stem = ""
+                        if (pd.isStatic) {
+                            stem = "pkl_" + name + "_sm_" + pd.name + "_"
+                        } else {
+                            stem = "pkl_" + name + "_" + pd.name + "_"
+                        }
+                        if (pinf.hasGet) {
+                            var fid = pushClassFunc(em, name + "." + pd.name + ".get", stem + "get", FnSource.Property(table, pd, pinf, false, pd.isStatic))
+                            if (pd.isStatic) {
+                                staticPropDef(em, cid, pd.name, false, fid)
+                            } else {
+                                propDef(em, cid, pd.name, false, fid)
+                            }
+                        }
+                        if (pinf.hasSet) {
+                            var fid2 = pushClassFunc(em, name + "." + pd.name + ".set", stem + "set", FnSource.Property(table, pd, pinf, true, pd.isStatic))
+                            if (pd.isStatic) {
+                                staticPropDef(em, cid, pd.name, true, fid2)
+                            } else {
+                                propDef(em, cid, pd.name, true, fid2)
+                            }
+                        }
+                    }
+                }
+                case _ -> {}
+            }
+        }
+        if (let some(pcid) = parentCid) {
+            for (me in em.methodSeq) {
+                if (me.cid == pcid) {
+                    methodDef(em, cid, me.name, me.fid, me.isStatic)
+                }
+            }
+            for (pe in em.propertySeq) {
+                if (pe.cid == pcid) {
+                    propDef(em, cid, pe.name, pe.isSet, pe.fid)
+                }
+            }
+            for (pe in em.staticPropSeq) {
+                if (pe.cid == pcid) {
+                    staticPropDef(em, cid, pe.name, pe.isSet, pe.fid)
+                }
+            }
+        }
+        var implements = table.implements
+        em.classes.push(ClassPlan(name, cid, parentCid, table))
+        em.classByName[name] = cid
+        if (!(len(implements) == 0)) {
+            registerImplements(em, name, cid, implements, span)
+        }
+        true
+    }
+
+fn registerLambdas(em: Emitter) {
+        for (item in em.prog.items) {
+            var fnItem: FnDecl? = none
+            match (item.kind) {
+                case ItemKind.Fn(f) -> fnItem = f
+                case ItemKind.Test(f) -> fnItem = f
+                case ItemKind.Class(c) -> walkClassMembers(em, c.members, c.name)
+                case ItemKind.Struct(s) -> walkClassMembers(em, s.members, s.name)
+case ItemKind.Const(c) -> {
+                        var scope = emptyScopeMaps()
+                        var acc = emptyNameRefs()
+                        walkExpr(em, c.value, none, none, 0, scope, acc)
+                    }
+                    // A managed global's initializer is real code evaluated by
+                    // `pkl_globals_init`, so a lambda in it needs its hoisted body
+                    // and closure class registered exactly like one in a function
+                    // body. Scalar globals fold to bytes and cannot contain one.
+                    case ItemKind.Global(g) -> {
+                        var scope = emptyScopeMaps()
+                        var acc = emptyNameRefs()
+                        walkExpr(em, g.value, none, none, 0, scope, acc)
+                    }
+                case _ -> {}
+            }
+            if (let some(f) = fnItem) {
+                var scope = emptyScopeMaps()
+                var acc = emptyNameRefs()
+                if (let some(b) = f.body) {
+                    var generic = !(len(f.generics) == 0)
+                    var saved = em.genericFnCtx
+                    if (generic) {
+                        em.genericFnCtx = f.name
+                    }
+                    walkFnBody(em, b, none, none, 0, scope, acc)
+                    em.genericFnCtx = saved
+                }
+            }
+        }
+    }
+
+fn genericClassCtx(em: Emitter, cls: string) -> bool {
+        if (let some(entry) = em.resolved.types.get(cls)) {
+            match (entry) {
+                case TypeTableEntry.Class(c) -> { return !(len(c.generics) == 0) }
+                case TypeTableEntry.Struct(s) -> { return !(len(s.generics) == 0) }
+                case _ -> { return false }
+            }
+        }
+        false
+    }
+
+fn walkClassMembers(em: Emitter, members: List<ClassMember>, cls: string) {
+        var genericCtx = genericClassCtx(em, cls)
+        var savedCtx = em.genericCtxName
+        if (genericCtx) {
+            em.genericCtxName = cls
+        }
+        var ocid: int? = em.classByName.get(cls)
+        for (m in members) {
+            var scope = emptyScopeMaps()
+            var acc = emptyNameRefs()
+            match (m) {
+                case ClassMember.Field(fname, _, finit, _, _, _, _, _) -> {
+                    if (let some(e) = finit) {
+                        walkExpr(em, e, ocid, cls, 0, scope, acc)
+                    }
+                }
+                case ClassMember.Field(_, _, _, _, _, _, _, _) | ClassMember.Constructor(_) -> {}
+                case ClassMember.Method(md) -> {
+                    if (let some(b) = md.body) {
+                        walkFnBody(em, b, ocid, cls, 0, scope, acc)
+                    }
+                }
+                case ClassMember.Property(pd) -> {
+                    if (let some(a) = pd.get) {
+                        walkAccessor(em, a, ocid, cls)
+                    }
+                    if (let some(a2) = pd.set) {
+                        walkAccessor(em, a2, ocid, cls)
+                    }
+                }
+                case ClassMember.Init(b2) -> walkBlock(em, b2, ocid, cls, 0, scope, acc)
+                case ClassMember.Deinit(b2) -> walkBlock(em, b2, ocid, cls, 0, scope, acc)
+                case ClassMember.Const(_, _, _, cvalue, _) -> walkExpr(em, cvalue, ocid, cls, 0, scope, acc)
+            }
+        }
+        for (m in members) {
+            match (m) {
+                case ClassMember.Constructor(cd) -> {
+                    var scope = emptyScopeMaps()
+                    var acc = emptyNameRefs()
+                    walkBlock(em, cd.body, ocid, cls, 0, scope, acc)
+                }
+                case _ -> {}
+            }
+        }
+        em.genericCtxName = savedCtx
+    }
+
+fn walkAccessor(em: Emitter, a: PropertyAccessor, ownerCid: int?, ownerName: string?) {
+        var scope = emptyScopeMaps()
+        var acc = emptyNameRefs()
+        match (a) {
+            case PropertyAccessor.Expr(e) -> walkExpr(em, e, ownerCid, ownerName, 0, scope, acc)
+            case PropertyAccessor.Block(b) -> walkBlock(em, b, ownerCid, ownerName, 0, scope, acc)
+        }
+    }
+
+fn walkFnBody(em: Emitter, fb: FnBody, ownerCid: int?, ownerName: string?, lmark: int, scope: List<Map<string, bool>>, acc: List<NameRef>) {
+        match (fb) {
+            case FnBody.Block(b) -> walkBlock(em, b, ownerCid, ownerName, lmark, scope, acc)
+            case FnBody.Expr(e) -> walkExpr(em, e, ownerCid, ownerName, lmark, scope, acc)
+        }
+    }
+
+fn walkBlock(em: Emitter, b: Block, ownerCid: int?, ownerName: string?, lmark: int, scope: List<Map<string, bool>>, acc: List<NameRef>) {
+        for (s in b.stmts) {
+            walkStmt(em, s, ownerCid, ownerName, lmark, scope, acc)
+        }
+        if (let some(e) = b.expr) {
+            walkExpr(em, e, ownerCid, ownerName, lmark, scope, acc)
+        }
+    }
+
+fn walkStmt(em: Emitter, s: Stmt, ownerCid: int?, ownerName: string?, lmark: int, scope: List<Map<string, bool>>, acc: List<NameRef>) {
+        match (s) {
+            case Stmt.Let(pattern, _, init, _, _, _) -> {
+                if (let some(e) = init) {
+                    walkExpr(em, e, ownerCid, ownerName, lmark, scope, acc)
+                }
+                for (n in patternBinds(pattern)) {
+                    scopeBind(scope, n)
+                }
+            }
+            case Stmt.Const(cname, _, cvalue, _) -> {
+                walkExpr(em, cvalue, ownerCid, ownerName, lmark, scope, acc)
+                scopeBind(scope, cname)
+            }
+            case Stmt.Return(value, _) -> {
+                if (let some(e) = value) {
+                    walkExpr(em, e, ownerCid, ownerName, lmark, scope, acc)
+                }
+            }
+            case Stmt.Return(_, _) | Stmt.Break(_) | Stmt.Continue(_) | Stmt.Empty(_) -> {}
+            case Stmt.Throw(value, _) -> walkExpr(em, value, ownerCid, ownerName, lmark, scope, acc)
+            case Stmt.Try(body4, binder, handler, fin, _) -> {
+                // Each block gets its own scope, so a name bound inside a `try`
+                // body, handler, or `finally` never leaks out of it -- and the
+                // catch binder is only in scope for the handler body.
+                scope.push(emptyScopeMap())
+                walkBlock(em, body4, ownerCid, ownerName, lmark, scope, acc)
+                scope.pop()
+                if (let some(h) = handler) {
+                    scope.push(emptyScopeMap())
+                    if (let some(name) = binder) {
+                        scopeBind(scope, name)
+                    }
+                    walkBlock(em, h, ownerCid, ownerName, lmark, scope, acc)
+                    scope.pop()
+                }
+                if (let some(f) = fin) {
+                    scope.push(emptyScopeMap())
+                    walkBlock(em, f, ownerCid, ownerName, lmark, scope, acc)
+                    scope.pop()
+                }
+            }
+            case Stmt.Expr(e) -> walkExpr(em, e, ownerCid, ownerName, lmark, scope, acc)
+            case Stmt.While(cond, body2, _) -> {
+                walkExpr(em, cond, ownerCid, ownerName, lmark, scope, acc)
+                scope.push(emptyScopeMap())
+                walkBlock(em, body2, ownerCid, ownerName, lmark, scope, acc)
+                scope.pop()
+            }
+            case Stmt.For(header, body3, _) -> {
+                match (header) {
+                    case ForHeader.In(pattern, sequence) -> {
+                        walkExpr(em, sequence, ownerCid, ownerName, lmark, scope, acc)
+                        scope.push(emptyScopeMap())
+                        for (n in patternBinds(pattern)) {
+                            scopeBind(scope, n)
+                        }
+                        walkBlock(em, body3, ownerCid, ownerName, lmark, scope, acc)
+                        scope.pop()
+                    }
+                    case ForHeader.Range(init, cond, step) -> {
+                        scope.push(emptyScopeMap())
+                        walkStmt(em, init, ownerCid, ownerName, lmark, scope, acc)
+                        walkExpr(em, cond, ownerCid, ownerName, lmark, scope, acc)
+                        walkExpr(em, step, ownerCid, ownerName, lmark, scope, acc)
+                        walkBlock(em, body3, ownerCid, ownerName, lmark, scope, acc)
+                        scope.pop()
+                    }
+                }
+            }
+        }
+    }
+
+fn walkExpr(em: Emitter, e: Expr, ownerCid: int?, ownerName: string?, lmark: int, scope: List<Map<string, bool>>, acc: List<NameRef>) {
+        match (e.kind) {
+            case ExprKind.Ident(name) -> {
+                if (em.collectWrites) {
+                    return
+                }
+                if (!scopeContainsFrom(scope, lmark, name)) {
+                    acc.push(NameRef(name, e.span))
+                }
+                var shadowed = false
+                if (len(scope) >= 1) {
+                    shadowed = scope[len(scope) - 1].has(name)
+                }
+                if (!shadowed && em.irModule.funcsByName.has(name) && isFnTy(em, e.span)) {
+                    registerTrampoline(em, e.span, name)
+                }
+            }
+            case ExprKind.This -> acc.push(NameRef("this", e.span))
+            case ExprKind.Super -> acc.push(NameRef("__super", e.span))
+            case ExprKind.Lit(_) | ExprKind.GenericCall(_, _) -> {}
+            case ExprKind.Call(callee, args) -> {
+                walkExpr(em, callee, ownerCid, ownerName, lmark, scope, acc)
+                for (ca in args) {
+                    walkExpr(em, ca.value, ownerCid, ownerName, lmark, scope, acc)
+                }
+            }
+            case ExprKind.Member(object, name) -> {
+                walkExpr(em, object, ownerCid, ownerName, lmark, scope, acc)
+                var ot: Ty? = em.types.get(spanKey(object.span))
+                if (let some(otv) = ot) {
+                    var isCs = false
+                    match (otv) {
+                        case Ty.Class(_, _) -> isCs = true
+                        case Ty.Struct(_, _) -> isCs = true
+                        case _ -> {}
+                    }
+                    if (isCs) {
+                        var cidOpt: int? = classIdOf(em, otv, object.span)
+                        if (let some(cid) = cidOpt) {
+                            var mrOpt: MethodRef? = em.methodIds.get(pairKey(str(cid), name))
+                            if (let some(mr) = mrOpt) {
+                                if (!mr.isStatic && isFnTy(em, e.span)) {
+                                    registerMethodTrampoline(em, e.span, mr.fid, cid, name)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            case ExprKind.Index(object, index) -> {
+                walkExpr(em, object, ownerCid, ownerName, lmark, scope, acc)
+                walkExpr(em, index, ownerCid, ownerName, lmark, scope, acc)
+            }
+            case ExprKind.Binary(_, lhs, rhs) -> {
+                walkExpr(em, lhs, ownerCid, ownerName, lmark, scope, acc)
+                walkExpr(em, rhs, ownerCid, ownerName, lmark, scope, acc)
+            }
+            case ExprKind.Unary(_, operand) -> walkExpr(em, operand, ownerCid, ownerName, lmark, scope, acc)
+            case ExprKind.Assign(target, _, value) -> {
+                if (em.collectWrites) {
+                    var tgtIsIdent = false
+                    var tgtName = ""
+                    match (target.kind) {
+                        case ExprKind.Ident(n) -> {
+                            tgtIsIdent = true
+                            tgtName = n
+                        }
+                        case _ -> {}
+                    }
+                    if (tgtIsIdent) {
+                        if (!scopeContainsFrom(scope, lmark, tgtName)) {
+                            acc.push(NameRef(tgtName, target.span))
+                        }
+                    }
+                    return
+                }
+                walkExpr(em, target, ownerCid, ownerName, lmark, scope, acc)
+                walkExpr(em, value, ownerCid, ownerName, lmark, scope, acc)
+            }
+            case ExprKind.Lambda(lparams, _, isAsync, lbody) -> {
+                if (em.collectWrites) {
+                    return
+                }
+                if (let some(cls2) = em.genericCtxName) {
+                    bad(em, e.span, "a lambda inside the generic class/struct `" + cls2 + "` is not lowered yet")
+                    return
+                }
+                if (isAsync) {
+                    bad(em, e.span, "async lambdas are not lowered yet")
+                    return
+                }
+                for (p in lparams) {
+                    var pBad = false
+                    if (let some(_) = p.default) {
+                        pBad = true
+                    }
+                    if (p.rest || pBad) {
+                        bad(em, p.span, "lambda parameters cannot have defaults or rest markers")
+                        return
+                    }
+                }
+                var childMarker = len(scope)
+                var before = len(acc)
+                scope.push(boundParams(lparams))
+                walkFnBody(em, lbody, ownerCid, ownerName, childMarker, scope, acc)
+                var freeNames = splitOff(acc, before)
+                var before2 = len(acc)
+                em.collectWrites = true
+                walkFnBody(em, lbody, ownerCid, ownerName, childMarker, scope, acc)
+                em.collectWrites = false
+                var written = splitOff(acc, before2)
+                for (w in written) {
+                    if (isEnclosingGlobal(em, w.name)) {
+                        continue
+                    }
+                    var skipWrite = false
+                    if (let some(cid) = ownerCid) {
+                        var isField = false
+                        if (let some(_) = instanceFieldIndex(em, cid, w.name)) {
+                            isField = true
+                        }
+                        var isProp = em.propertyIds.has(tripleKey(str(cid), w.name, "false"))
+                        var isStaticF = false
+                        if (let some(_) = staticField(em, cid, w.name)) {
+                            isStaticF = true
+                        }
+                        if (isField || isProp || isStaticF || classConstDefined(em, cid, w.name)) {
+                            skipWrite = true
+                        }
+                    }
+                    if (skipWrite) {
+                        continue
+                    }
+                    bad(em, w.span, "assigning to `" + w.name + "` inside a lambda is not lowered yet: it is captured by value, and a hoisted body cannot mutate the enclosing binding (assign through a captured object's field instead)")
+                    return
+                }
+                scope.pop()
+                var capsOpt: List<Capture>? = decideCaptures(em, freeNames, ownerCid, ownerName, e.span)
+                var chosen: List<Capture> = emptyCaptures()
+                if (let some(c2) = capsOpt) {
+                    chosen = c2
+                } else {
+                    return
+                }
+                if (let some(_) = em.genericFnCtx) {
+                    em.lambdaCaps[lambdaKey(none, e.span)] = chosen
+                    em.lambdaOwners[spanKey(e.span)] = ownerCid
+                    em.lambdaExprs[spanKey(e.span)] = e
+                } else {
+                    registerLambda(em, e, chosen, ownerCid)
+                }
+                for (n in freeNames) {
+                    if (!scopeContainsFrom(scope, lmark, n.name)) {
+                        acc.push(NameRef(n.name, n.span))
+                    }
+                }
+            }
+            case ExprKind.If(cond, then, elseElse) -> {
+match (cond) {
+                    case IfCond.Cond(c) -> {
+                        walkExpr(em, c, ownerCid, ownerName, lmark, scope, acc)
+                        walkBlock(em, then, ownerCid, ownerName, lmark, scope, acc)
+                    }
+                    case IfCond.Binding(pattern, value) -> {
+                        walkExpr(em, value, ownerCid, ownerName, lmark, scope, acc)
+                        scope.push(emptyScopeMap())
+                        for (n in patternBinds(pattern)) {
+                            scopeBind(scope, n)
+                        }
+                        walkBlock(em, then, ownerCid, ownerName, lmark, scope, acc)
+                        scope.pop()
+                    }
+                }
+                if (let some(ee) = elseElse) {
+                    walkExpr(em, ee, ownerCid, ownerName, lmark, scope, acc)
+                }
+            }
+            case ExprKind.Match(scrutinee, arms) -> {
+                walkExpr(em, scrutinee, ownerCid, ownerName, lmark, scope, acc)
+                for (arm in arms) {
+                    scope.push(emptyScopeMap())
+                    for (n in patternBinds(arm.pattern)) {
+                        scopeBind(scope, n)
+                    }
+                    if (let some(g) = arm.guard) {
+                        walkExpr(em, g, ownerCid, ownerName, lmark, scope, acc)
+                    }
+                    walkExpr(em, arm.body, ownerCid, ownerName, lmark, scope, acc)
+                    scope.pop()
+                }
+            }
+            case ExprKind.Await(x) -> walkExpr(em, x, ownerCid, ownerName, lmark, scope, acc)
+            case ExprKind.Cast(expr, _, _) -> walkExpr(em, expr, ownerCid, ownerName, lmark, scope, acc)
+            case ExprKind.Unsafe(b) -> {
+                scope.push(emptyScopeMap())
+                walkBlock(em, b, ownerCid, ownerName, lmark, scope, acc)
+                scope.pop()
+            }
+            case ExprKind.Block(b) -> {
+                scope.push(emptyScopeMap())
+                walkBlock(em, b, ownerCid, ownerName, lmark, scope, acc)
+                scope.pop()
+            }
+            case ExprKind.Tuple(parts) -> {
+                for (x in parts) {
+                    walkExpr(em, x, ownerCid, ownerName, lmark, scope, acc)
+                }
+            }
+            case ExprKind.Array(parts) -> {
+                for (x in parts) {
+                    walkExpr(em, x, ownerCid, ownerName, lmark, scope, acc)
+                }
+            }
+            case ExprKind.Map(entries) -> {
+                for (kv in entries) {
+                    walkExpr(em, kv.key, ownerCid, ownerName, lmark, scope, acc)
+                    walkExpr(em, kv.value, ownerCid, ownerName, lmark, scope, acc)
+                }
+            }
+            case ExprKind.OptAccess(object, _) -> walkExpr(em, object, ownerCid, ownerName, lmark, scope, acc)
+            case ExprKind.OptUnwrap(inner) -> walkExpr(em, inner, ownerCid, ownerName, lmark, scope, acc)
+            case ExprKind.Range(start, end, _) -> {
+                walkExpr(em, start, ownerCid, ownerName, lmark, scope, acc)
+                walkExpr(em, end, ownerCid, ownerName, lmark, scope, acc)
+            }
+        }
+    }
+
+fn isFnTy(em: Emitter, span: Span) -> bool {
+        if (let some(t) = em.types.get(spanKey(span))) {
+            match (t) {
+                case Ty.Fn(_, _) -> { return true }
+                case _ -> { return false }
+            }
+        }
+        false
+    }
+
+fn decideCaptures(em: Emitter, free: List<NameRef>, ownerCid: int?, ownerName: string?, span: Span) -> List<Capture>? {
+        var seen = emptyScopeMap()
+        var caps = emptyCaptures()
+        var needsThis = false
+        for (fr in free) {
+            if (fr.name == "__super") {
+                bad(em, fr.span, "`super` inside a lambda is not lowered yet")
+                return none
+            }
+            if (seen.has(fr.name)) {
+                continue
+            }
+            seen[fr.name] = true
+            if (isEnclosingGlobal(em, fr.name)) {
+                continue
+            }
+            if (let some(cid) = ownerCid) {
+                var isField = false
+                if (let some(_) = instanceFieldIndex(em, cid, fr.name)) {
+                    isField = true
+                }
+                var isProp = em.propertyIds.has(tripleKey(str(cid), fr.name, "false"))
+                var isMethod = false
+                var mvO2 = em.methodIds.get(pairKey(str(cid), fr.name))
+                if (let some(mv2) = mvO2) {
+                    if (!(mv2.isStatic)) {
+                        isMethod = true
+                    }
+                }
+                if (isField || isProp || isMethod) {
+                    needsThis = true
+                    continue
+                }
+                var isStaticF = false
+                if (let some(_) = staticField(em, cid, fr.name)) {
+                    isStaticF = true
+                }
+                if (isStaticF || classConstDefined(em, cid, fr.name)) {
+                    continue
+                }
+            }
+            var ty: Ty = Ty.Unknown
+            if (let some(t2) = em.types.get(spanKey(fr.span))) {
+                ty = t2
+            } else {
+                bad(em, fr.span, "cannot infer the type of captured `" + fr.name + "`")
+                return none
+            }
+            caps.push(Capture(fr.name, ty, fr.span))
+        }
+        if (needsThis) {
+            var oname = ""
+            if (let some(on) = ownerName) {
+                oname = on
+            }
+            if (oname == "") {
+                bad(em, span, "internal: owner member with no owner name")
+                return none
+            }
+            caps.push(Capture("this", Ty.Class(oname, emptyTys()), span))
+        }
+        var i = 1
+        while (i < len(caps)) {
+            var j = i
+            while (j >= 1 && strLess(caps[j].name, caps[j - 1].name)) {
+                var tmp = caps[j]
+                caps[j] = caps[j - 1]
+                caps[j - 1] = tmp
+                j = j - 1
+            }
+            i = i + 1
+        }
+        if (len(caps) > MAX_LAMBDA_CAPTURES) {
+            bad(em, span, "this lambda captures " + str(len(caps)) + " values, more than the supported limit of " + str(MAX_LAMBDA_CAPTURES))
+            return none
+        }
+        caps
+    }
+
+fn isEnclosingGlobal(em: Emitter, name: string) -> bool {
+        if (em.irModule.funcsByName.has(name) || em.classDecls.has(name) || em.constsInits.has(name)) {
+            return true
+        }
+        match (name) {
+            case "print" -> true
+            case "println" -> true
+            case "len" -> true
+            case "alloc" -> true
+            case "free" -> true
+            case "view" -> true
+            case "assert" -> true
+            case "expect" -> true
+            case "abs" -> true
+            case "range" -> true
+            case "min" -> true
+            case "max" -> true
+            case "clamp" -> true
+            case "str" -> true
+            case "bytes" -> true
+            case "read_file" -> true
+            case "write_file" -> true
+            case "file_exists" -> true
+            case "delete" -> true
+            case "list_dir" -> true
+            case "mkdir" -> true
+            case "stream_open_read" -> true
+            case "stream_open_write" -> true
+            case "stream_open_append" -> true
+case "stdout_stream" -> true
+            case "stderr_stream" -> true
+            case "args" -> true
+            case "exit" -> true
+            case "run_cmd" -> true
+            case "run_spawn" -> true
+            case "proc_wait" -> true
+            case "proc_running" -> true
+            case "proc_code" -> true
+            case "proc_kill" -> true
+            case "proc_out_read" -> true
+            case "proc_err_read" -> true
+            case "proc_in_write" -> true
+            case "proc_in_close" -> true
+            case "current_dir" -> true
+            case "captureBegin" -> true
+            case "captureTake" -> true
+            case "thread_spawn" -> true
+            case "thread_join" -> true
+            case "thread_finished" -> true
+            case "thread_message" -> true
+            case "thread_count" -> true
+            case "thread_current" -> true
+            case "sleep_ms" -> true
+            case "thread_yield" -> true
+            case "mutex_new" -> true
+            case "mutex_lock" -> true
+            case "mutex_trylock" -> true
+            case "mutex_unlock" -> true
+            case "cond_new" -> true
+            case "cond_signal" -> true
+            case "cond_broadcast" -> true
+            case "cond_wait" -> true
+            case "sem_new" -> true
+            case "sem_acquire" -> true
+            case "sem_try_acquire" -> true
+            case "sem_release" -> true
+            case "atomic_new" -> true
+            case "atomic_load" -> true
+            case "atomic_store" -> true
+            case "atomic_add" -> true
+            case "atomic_cas" -> true
+            case "once_new" -> true
+            case "once_done" -> true
+            case "once_run" -> true
+            case "channel_new" -> true
+            case "channel_cap" -> true
+            case "channel_len" -> true
+            case "channel_send" -> true
+            case "channel_try_send" -> true
+            case "channel_recv" -> true
+            case "channel_try_recv" -> true
+            case "channel_close" -> true
+            case "channel_closed" -> true
+            case "gcCollect" -> true
+            case _ -> false
+        }
+    }
+
+fn inferLambdaRet(em: Emitter, body: FnBody) -> Ty {
+        match (body) {
+            case FnBody.Expr(e) -> {
+                if (let some(t) = em.types.get(spanKey(e.span))) {
+                    return t
+                }
+                Ty.Unknown
+            }
+            case FnBody.Block(b) -> {
+                match (b.expr) {
+                    case some(e2) -> {
+                        if (let some(t) = em.types.get(spanKey(e2.span))) {
+                            return t
+                        }
+                        Ty.Empty
+                    }
+                    case none -> Ty.Empty
+                }
+            }
+        }
+    }
+
+fn registerLambda(em: Emitter, lambda: Expr, captures: List<Capture>, ownerCid: int?) {
+        registerLambdaAt(em, lambda, captures, ownerCid, emptyStringTyMap(), none)
+    }
+
+fn registerLambdaAt(em: Emitter, lambda: Expr, captures: List<Capture>, ownerCid: int?, smap: Map<string, Ty>, base: int?) -> int? {
+        var lbody: FnBody = FnBody.Block(Block(emptyStmts(), none, Span(0, 0)))
+        match (lambda.kind) {
+            case ExprKind.Lambda(_, _, _, b) -> lbody = b
+            case _ -> { return none }
+        }
+        registerClosureClass(em, len(captures), lambda.span)
+        var fnty: Ty = Ty.Unknown
+        if (let some(t) = em.types.get(spanKey(lambda.span))) {
+            fnty = t
+        }
+        var pts: List<Ty> = emptyTys()
+        var isFnTy = false
+        match (fnty) {
+            case Ty.Fn(pts0, _) -> {
+                pts = pts0
+                isFnTy = true
+            }
+            case _ -> {}
+        }
+        if (!isFnTy) {
+            return none
+        }
+        if (paramsLen(lambda) != len(pts)) {
+            return none
+        }
+        var subbedPts = emptyTys()
+        for (pt in pts) {
+            subbedPts.push(subst(pt, smap))
+        }
+        var anyBad = false
+        for (pt in subbedPts) {
+            if (let none = mapTy(em, pt, lambda.span)) {
+                anyBad = true
+                break
+            }
+        }
+        if (anyBad) {
+            return none
+        }
+        var ret: Ty = Ty.Unknown
+        var isKnown = false
+        match (fnty) {
+            case Ty.Fn(_, r) -> {
+                var rIsUnknown = false
+                match (r) {
+                    case Ty.Unknown -> rIsUnknown = true
+                    case _ -> {}
+                }
+                if (!rIsUnknown) {
+                    ret = r
+                    isKnown = true
+                }
+            }
+            case _ -> {}
+        }
+        if (!isKnown) {
+            ret = inferLambdaRet(em, lbody)
+        }
+        var retIsUnknown = false
+        match (ret) {
+            case Ty.Unknown -> retIsUnknown = true
+            case _ -> {}
+        }
+        if (retIsUnknown) {
+            ret = inferLambdaRet(em, lbody)
+        }
+        var subbedRet = subst(ret, smap)
+        if (let none = mapTy(em, subbedRet, lambda.span)) {
+            return none
+        }
+        var subbedCaps = emptyCaptures()
+        for (c in captures) {
+            subbedCaps.push(Capture(c.name, subst(c.ty, smap), c.span))
+        }
+        var fid = pushClassFunc(em, "lambda", "pkl_closure_" + str(em.nextClosure), FnSource.Lambda(lambda, subbedCaps, subbedPts, subbedRet, ownerCid))
+        em.nextClosure = em.nextClosure + 1
+        em.instantonSubst[fid] = smap
+        em.lambdaFids[lambdaKey(base, lambda.span)] = fid
+        em.lambdaCaps[lambdaKey(base, lambda.span)] = subbedCaps
+        fid
+    }
+
+fn registerClosureClass(em: Emitter, captureCount: int, span: Span) -> int? {
+        if (captureCount > MAX_LAMBDA_CAPTURES) {
+            bad(em, span, "this lambda captures " + str(captureCount) + " values, more than the supported limit of " + str(MAX_LAMBDA_CAPTURES))
+            return none
+        }
+        var name2 = CLOSURE_CLASS_PREFIX + str(captureCount)
+        if (let some(cid) = em.classByName.get(name2)) {
+            return cid
+        }
+        var fields = emptyFieldInfos()
+        var fl = 0
+        while (fl <= captureCount) {
+            var fname = ""
+            if (fl == CLOSURE_FN_SLOT) {
+                fname = "__fn"
+            } else {
+                fname = "__c" + str(fl - 1)
+            }
+            fields.push(FieldInfo(fname, Visibility.Private, false, false, false, false, Ty.Int, span))
+            fl = fl + 1
+        }
+        var table = ClassTable(name2, span, Visibility.Private, emptyStrs(), none, emptyTys(), fields, emptyCallableInfos(), emptyPropertyInfos(), none, emptyNamedCtorInfos(), emptyFieldInfos())
+        var cid2 = PICKLE_CLASS_USER_BASE + em.cidSalt + len(em.classes)
+        em.closureTables[name2] = table
+        em.classByName[name2] = cid2
+        em.classes.push(ClassPlan(name2, cid2, none, table))
+        cid2
+    }
+
+fn registerTrampoline(em: Emitter, span: Span, fnName: string) {
+        var fidOpt: int? = em.irModule.funcsByName.get(fnName)
+        if (let none = fidOpt) {
+            return
+        }
+        var fid = 0
+        if (let some(fv) = fidOpt) {
+            fid = fv
+        }
+        var pty: List<Ty> = emptyTys()
+        var ret: Ty = Ty.Unknown
+        var hasFn = false
+        if (let some(t) = em.types.get(spanKey(span))) {
+            match (t) {
+                case Ty.Fn(pts, r) -> {
+                    pty = pts
+                    ret = r
+                    hasFn = true
+                }
+                case _ -> {}
+            }
+        }
+        if (!hasFn) {
+            return
+        }
+        var anyBad = false
+        for (pt in pty) {
+            if (let none = mapTy(em, pt, span)) {
+                anyBad = true
+                break
+            }
+        }
+        if (anyBad) {
+            return
+        }
+        if (let none = mapTy(em, ret, span)) {
+            return
+        }
+        var tramp = 0
+        if (let some(t) = em.trampFids.get(fid)) {
+            tramp = t
+        } else {
+            tramp = pushClassFunc(em, "fn.value", "pkl_tramp_" + str(fid), FnSource.Trampoline(span, fid, pty, ret))
+            em.trampFids[fid] = tramp
+        }
+        em.fnTramp[spanKey(span)] = tramp
+    }
+
+fn registerMethodTrampoline(em: Emitter, span: Span, fid: int, cid: int, name: string) {
+        var pty: List<Ty> = emptyTys()
+        var ret: Ty = Ty.Unknown
+        var hasFn = false
+        if (let some(t) = em.types.get(spanKey(span))) {
+            match (t) {
+                case Ty.Fn(pts, r) -> {
+                    pty = pts
+                    ret = r
+                    hasFn = true
+                }
+                case _ -> {}
+            }
+        }
+        if (!hasFn) {
+            return
+        }
+        var anyBad = false
+        for (pt in pty) {
+            if (let none = mapTy(em, pt, span)) {
+                anyBad = true
+                break
+            }
+        }
+        if (anyBad) {
+            return
+        }
+        if (let none = mapTy(em, ret, span)) {
+            return
+        }
+        var branches = emptyDispatchBranches()
+        if (let some(b) = em.virtualDispatch.get(pairKey(str(cid), name))) {
+            branches = b
+        }
+        var key = tripleKey(str(cid), name, str(fid))
+        var tramp = 0
+        if (let some(t) = em.methodTrampFids.get(key)) {
+            tramp = t
+        } else {
+            tramp = pushClassFunc(em, "fn.method.value", "pkl_mtramp_" + str(cid) + "_" + name + "_" + str(fid), FnSource.MethodTrampoline(span, fid, pty, ret, branches))
+            em.methodTrampFids[key] = tramp
+        }
+        em.fnTramp[spanKey(span)] = tramp
+    }
+
+fn instanceFieldIndex(em: Emitter, cid: int, name: string) -> int? {
+        var plan: ClassPlan? = none
+        for (p in em.classes) {
+            if (p.classId == cid) {
+                plan = p
+                break
+            }
+        }
+        if (let none = plan) {
+            return none
+        }
+        var pname = ""
+        if (let some(p) = plan) {
+            pname = p.name
+        }
+        absInstanceFieldSlot(em, pname, name)
+    }
+
+fn absInstanceFieldSlot(em: Emitter, cname: string, field: string) -> int? {
+        var base = 0
+        for (a in ancestry(em, cname)) {
+            var own = ownInstanceFields(em, a)
+            var i = 0
+            var found = false
+            while (i < len(own)) {
+                if (own[i].name == field) {
+                    found = true
+                    break
+                }
+                i = i + 1
+            }
+            if (found) {
+                return base + i
+            }
+            base = base + len(own)
+        }
+        none
+    }
+
+fn staticField(em: Emitter, cid: int, name: string) -> StaticFieldLoc? {
+        var plan: ClassPlan? = none
+        for (p in em.classes) {
+            if (p.classId == cid) {
+                plan = p
+                break
+            }
+        }
+        if (let none = plan) {
+            return none
+        }
+        var pname = ""
+        if (let some(p) = plan) {
+            pname = p.name
+        }
+        var chain = ancestry(em, pname)
+        var ci = len(chain)
+        while (ci >= 1) {
+            ci = ci - 1
+            var cn = chain[ci]
+            if (let some(tb) = tableOf(em, cn)) {
+                var slot: int? = staticFieldSlot(tb, name)
+                if (let some(sl) = slot) {
+                    var info: FieldInfo? = staticFieldInfo(tb, name)
+                    if (let some(inf) = info) {
+                        var dcid: int? = em.classByName.get(cn)
+                        if (let some(dc) = dcid) {
+                            return StaticFieldLoc(dc, sl, inf)
+                        }
+                    }
+                }
+            }
+        }
+        none
+    }
+
+fn classConstDefined(em: Emitter, cid: int, name: string) -> bool {
+        var plan: ClassPlan? = none
+        for (p in em.classes) {
+            if (p.classId == cid) {
+                plan = p
+                break
+            }
+        }
+        if (let none = plan) {
+            return false
+        }
+        var pname = ""
+        if (let some(p) = plan) {
+            pname = p.name
+        }
+        var chain = ancestry(em, pname)
+        var ci = len(chain)
+        while (ci >= 1) {
+            ci = ci - 1
+            var cn = chain[ci]
+            if (let some(dc) = em.classByName.get(cn)) {
+                if (em.classConsts.has(pairKey(str(dc), name))) {
+                    return true
+                }
+            }
+        }
+        false
+    }
+
+fn classIdOf(em: Emitter, ty: Ty, span: Span) -> int? {
+        var n = ""
+        var args = emptyTys()
+        var isTy = false
+        match (ty) {
+            case Ty.Class(nm, a) -> {
+                n = nm
+                args = a
+                isTy = true
+            }
+            case Ty.Struct(nm, a) -> {
+                n = nm
+                args = a
+                isTy = true
+            }
+            case _ -> {}
+        }
+        if (!isTy) {
+            return none
+        }
+        for (a in args) {
+            if (hasVar(a)) {
+                return none
+            }
+        }
+        if (len(args) == 0) {
+            return em.classByName.get(n)
+        }
+        var tableGenerics = -1
+        if (let some(entry) = em.resolved.types.get(n)) {
+            match (entry) {
+                case TypeTableEntry.Class(c) -> tableGenerics = len(c.generics)
+                case TypeTableEntry.Struct(s) -> tableGenerics = len(s.generics)
+                case _ -> {}
+            }
+        }
+        if (tableGenerics == -1) {
+            return none
+        }
+        if (tableGenerics != len(args)) {
+            return none
+        }
+        if (let some(cid) = em.classInstByArgs.get(instKey(n, args))) {
+            return cid
+        }
+        registerClassInstantiation(em, n, args, span)
+    }
+
+fn registerClassInstantiation(em: Emitter, name: string, args: List<Ty>, span: Span) -> int? {
+        if (let some(cid0) = em.classInstByArgs.get(instKey(name, args))) {
+            return cid0
+        }
+        var table = seedClassTable()
+        var isTable = false
+        if (let some(entry) = em.resolved.types.get(name)) {
+            match (entry) {
+                case TypeTableEntry.Class(c) -> {
+                    table = c
+                    isTable = true
+                }
+                case TypeTableEntry.Struct(s) -> {
+                    table = s
+                    isTable = true
+                }
+                case _ -> {}
+            }
+        }
+        if (!isTable) {
+            bad(em, span, "`" + name + "` is not a class or struct")
+            return none
+        }
+        if (len(table.generics) != len(args)) {
+            bad(em, span, "`" + name + "` takes " + str(len(table.generics)) + " type argument(s), found " + str(len(args)))
+            return none
+        }
+        var members2: List<ClassMember>? = none
+        if (let some(gm) = em.genericTypeMembers.get(name)) {
+            members2 = gm
+        }
+        if (let none = members2) {
+            bad(em, span, "`" + name + "` is not lowerable")
+            return none
+        }
+        var ms = emptyClassMembers()
+        if (let some(x) = members2) {
+            ms = x
+        }
+        if (let some(_) = table.extends) {
+            bad(em, span, "`" + name + "` with `extends` is not lowered yet")
+            return none
+        }
+        var hasOverride = false
+        for (m in ms) {
+            match (m) {
+                case ClassMember.Method(md) -> {
+                    if (md.isOverride) {
+                        hasOverride = true
+                    }
+                }
+                case _ -> {}
+            }
+        }
+        if (hasOverride) {
+            bad(em, span, "`" + name + "` uses `override`, which is not lowered yet")
+            return none
+        }
+        var hasNamedCtor = false
+        for (m in ms) {
+            match (m) {
+                case ClassMember.Constructor(cd2) -> {
+                    if (let some(_) = cd2.name) {
+                        hasNamedCtor = true
+                    }
+                }
+                case _ -> {}
+            }
+        }
+        if (hasNamedCtor) {
+            bad(em, span, "`" + name + "` uses named constructors, which are not lowered yet")
+            return none
+        }
+        var hasDeinit = false
+        for (m in ms) {
+            match (m) {
+                case ClassMember.Deinit(_) -> hasDeinit = true
+                case _ -> {}
+            }
+        }
+        if (hasDeinit) {
+            bad(em, span, "`" + name + "` uses `deinit`, which is not lowered yet for generic classes/structs")
+            return none
+        }
+        var hasProp = false
+        for (m in ms) {
+            match (m) {
+                case ClassMember.Property(_) -> hasProp = true
+                case _ -> {}
+            }
+        }
+        if (hasProp) {
+            bad(em, span, "`" + name + "` uses properties, which are not lowered yet for generic classes/structs")
+            return none
+        }
+        var hasStatic = !(len(table.consts) == 0)
+        for (f in table.fields) {
+            if (f.isStatic) {
+                hasStatic = true
+            }
+        }
+        if (hasStatic) {
+            bad(em, span, "`" + name + "` uses static state, which is not lowered yet for generic classes/structs")
+            return none
+        }
+        var map = emptyStringTyMap()
+        var gi = 0
+        while (gi < len(table.generics) && gi < len(args)) {
+            map[table.generics[gi]] = args[gi]
+            gi = gi + 1
+        }
+        var implements = emptyTys()
+        for (t in table.implements) {
+            implements.push(subst(t, map))
+        }
+        var suffix = ""
+        var fi = 0
+        for (a in args) {
+            if (fi > 0) {
+                suffix = suffix + "_"
+            }
+            suffix = suffix + sanitizeSymbol(bareName(a))
+            fi = fi + 1
+        }
+        var display = name + "<"
+        var di = 0
+        for (a in args) {
+            if (di > 0) {
+                display = display + ", "
+            }
+            display = display + bareName(a)
+            di = di + 1
+        }
+        display = display + ">"
+        var stabFields = emptyFieldInfos()
+        for (f in table.fields) {
+            var fsub = subst(f.ty, map)
+            stabFields.push(FieldInfo(f.name, f.visibility, f.isStatic, f.mutable, f.const_, f.manual, fsub, f.span))
+        }
+        var stabMethods = emptyCallableInfos()
+        for (m in table.methods) {
+            var nps = emptyParamInfos()
+            for (p in m.params) {
+                nps.push(ParamInfo(p.name, subst(p.ty, map), p.hasDefault, p.rest, p.span))
+            }
+            stabMethods.push(CallableInfo(m.name, m.span, m.visibility, m.isAsync, m.isStatic, m.isOverride, m.isAbstract, m.operator, m.generics, nps, subst(m.ret, map)))
+        }
+        var stabCtor: CtorInfo? = none
+        if (let some(c) = table.ctor) {
+            var nps2 = emptyParamInfos()
+            for (p in c.params) {
+                nps2.push(ParamInfo(p.name, subst(p.ty, map), p.hasDefault, p.rest, p.span))
+            }
+            stabCtor = CtorInfo(c.span, c.visibility, nps2)
+        }
+        var stable = ClassTable(display, table.span, table.visibility, table.generics, none, emptyTys(), stabFields, stabMethods, emptyPropertyInfos(), stabCtor, emptyNamedCtorInfos(), emptyFieldInfos())
+        var ctorDecl: ConstructorDecl? = none
+        for (m in ms) {
+            match (m) {
+                case ClassMember.Constructor(cd) -> {
+                    if (let none = cd.name) {
+                        ctorDecl = cd
+                        break
+                    }
+                }
+                case _ -> {}
+            }
+        }
+        var inits = collectInstanceInits(em, name)
+        var initBlocks = collectInitBlocks(em, name)
+        var cid = PICKLE_CLASS_USER_BASE + em.cidSalt + len(em.classes)
+        var ctorSymbol = uniqSymbol(em, "pkl_" + name + "_new__" + suffix)
+        var ctorFid = pushClassFunc(em, display + ".new", ctorSymbol, FnSource.Ctor(stable, inits, initBlocks, ctorDecl))
+        em.ctorIds[cid] = ctorFid
+        var sps = emptyParamInfos()
+        if (let some(c) = stable.ctor) {
+            sps = c.params
+        }
+        var srctys = emptyTys()
+        for (p in sps) {
+            srctys.push(p.ty)
+        }
+        em.srcParamTys[ctorFid] = srctys
+        em.instantonSubst[ctorFid] = map
+        em.fidOwner[ctorFid] = cid
+        em.fidGenerics[ctorFid] = table.generics
+        for (m in ms) {
+            match (m) {
+                case ClassMember.Method(md) -> {
+                    if (md.isOverride || !(len(md.generics) == 0)) {
+                        continue
+                    }
+                    if (let none = md.body) {
+                        continue
+                    }
+                    var minfo: CallableInfo? = none
+                    for (mm in stable.methods) {
+                        if (mm.name == md.name) {
+                            minfo = mm
+                        }
+                    }
+                    if (let none = minfo) {
+                        continue
+                    }
+var m2 = seedCallableInfo()
+                    if (let some(x) = minfo) {
+                        m2 = x
+                    }
+                    var hasDefRest = false
+                    for (p in m2.params) {
+                        if (p.hasDefault || p.rest) {
+                            hasDefRest = true
+                        }
+                    }
+                    if (hasDefRest) {
+                        continue
+                    }
+                    if (md.isAsync) {
+                        var isStruct = false
+                        if (let some(entry) = em.resolved.types.get(name)) {
+                            match (entry) {
+                                case TypeTableEntry.Struct(_) -> isStruct = true
+                                case _ -> {}
+                            }
+                        }
+                        registerAsyncMethod(em, display, stable, md, m2, cid, args, isStruct, "_" + suffix, map)
+                        continue
+                    }
+                    var tref = "pkl_" + name + "_" + md.name + "_" + suffix
+                    if (m2.isStatic) {
+                        tref = "pkl_" + name + "_sm_" + md.name + "_" + suffix
+                    }
+                    var symbol = uniqSymbol(em, tref)
+                    var mid = pushClassFunc(em, display + "." + md.name, symbol, FnSource.Method(stable, md))
+                    em.finfo[mid] = m2
+                    var mtys = emptyTys()
+                    for (p in m2.params) {
+                        mtys.push(p.ty)
+                    }
+                    em.srcParamTys[mid] = mtys
+                    em.methodIds[pairKey(str(cid), md.name)] = MethodRef(mid, m2.isStatic)
+                    em.instantonSubst[mid] = map
+                    em.fidOwner[mid] = cid
+                    em.fidGenerics[mid] = table.generics
+                }
+                case _ -> {}
+            }
+        }
+        em.classes.push(ClassPlan(display, cid, none, stable))
+        em.classInstByArgs[instKey(name, args)] = cid
+        em.classInstSubst[cid] = map
+        if (!(len(implements) == 0)) {
+            registerImplements(em, display, cid, implements, span)
+        }
+        cid
+    }
+
+fn ownerFor(em: Emitter, fid: int, cname: string) -> int? {
+        if (let some(o) = em.fidOwner.get(fid)) {
+            return o
+        }
+        if (let some(o2) = em.classByName.get(cname)) {
+            return o2
+        }
+        none
+    }
+
+fn pushClassFunc(em: Emitter, name: string, symbol: string, src: FnSource) -> int {
+        var fid = len(em.irModule.funcs)
+        em.irModule.funcs.push(IrFunc(name, symbol, emptyIrParams(), IrTy.Unit, emptyIrTys(), 0, emptyIrBlocks(), false, false, emptyStrs()))
+        em.fidList.push(fid)
+        em.fsource[fid] = src
+        fid
+    }
+
+fn symbolForAttrs(em: Emitter, name: string, isTest: bool, attrs: List<Attribute>) -> string {
+        if (let some(s) = itemSymbol(attrs)) {
+            em.overrides.push(s)
+            return s
+        }
+        symbolFor(name, isTest)
+    }
+
+fn userCallable(em: Emitter, name: string) -> CallableInfo? {
+        if (let some(infos) = em.resolved.fns.get(name)) {
+            var users = emptyCallableInfos()
+            for (c in infos) {
+                if (!(c.span.start == 0 && c.span.end == 0)) {
+                    users.push(c)
+                }
+            }
+            if (len(users) == 1) {
+                return users[0]
+            }
+        }
+        none
+    }
+
+fn annotTy(em: Emitter, ty: TypeExpr?, span: Span) -> IrTy? {
+        if (let some(te) = ty) {
+            match (te.kind) {
+                case TypeExprKind.Path(parts) -> {
+                    if (len(parts) == 1) {
+                        match (parts[0]) {
+                            case "Int" -> IrTy.Int
+                            case "Float" -> IrTy.Float
+                            case "Bool" -> IrTy.Bool
+                            case "Char" -> IrTy.Char
+                            case "String" -> IrTy.Str
+                            case _ -> IrTy.Ptr
+                        }
+                    } else {
+                        IrTy.Ptr
+                    }
+                }
+                case TypeExprKind.Pointer(inner) -> refAnnot(em, inner, span)
+                case TypeExprKind.Ref(inner) -> refAnnot(em, inner, span)
+                case _ -> {
+                    bad(em, span, "this type annotation is not lowered yet")
+                    none
+                }
+            }
+        } else {
+            bad(em, span, "`let` requires an initializer or a type annotation")
+            none
+        }
+    }
+
+fn refAnnot(em: Emitter, inner: TypeExpr, span: Span) -> IrTy? {
+        var opt: TypeExpr? = inner
+        var base = annotTy(em, opt, span)
+        match (base) {
+            case some(_) -> IrTy.Ptr
+            case none -> none
+        }
+    }
+
+fn declareManual(em: Emitter, name: string) {
+        var scope = em.manualEnv[len(em.manualEnv) - 1]
+        scope[name] = true
+    }
+
+fn isManual(em: Emitter, name: string) -> bool {
+        var i = len(em.manualEnv) - 1
+        while (i >= 0) {
+            if (em.manualEnv[i].has(name)) {
+                return true
+            }
+            i = i - 1
+        }
+        false
+    }
+
+fn lookup(em: Emitter, name: string) -> int? {
+        var i = len(em.env) - 1
+        while (i >= 0) {
+            if (em.env[i].has(name)) {
+                return em.env[i][name]
+            }
+            i = i - 1
+        }
+        none
+    }
+
+fn declareParams(em: Emitter, params: List<ParamInfo>) {
+        var i = 0
+        while (i < len(params)) {
+            var p = params[i]
+            var m = mapTy(em, p.ty, p.span)
+            var ir = IrTy.Ptr
+            if (let some(r) = m) {
+                ir = r
+            }
+            var slot = i
+            em.fslots.push(ir)
+            em.fparams.push(IrParam(p.name, ir))
+            declare(em, p.name, slot)
+            i = i + 1
+        }
+    }
+
+fn adoptManualParams(em: Emitter, params: List<Param>) {
+        for (p in params) {
+            var hasManual = false
+            for (a in p.attrs) {
+                if (a.name == "manualAlloc") {
+                    hasManual = true
+                }
+            }
+            if (!hasManual) {
+                continue
+            }
+            if (let none = lookup(em, p.name)) {
+                continue
+            }
+            var slot = 0
+            if (let some(s) = lookup(em, p.name)) {
+                slot = s
+            }
+            var v = load(em, slot)
+            var a2 = externCallT1(em, "pickle_manual_adopt", [IrTy.Ptr], IrTy.Ptr, [v])
+            instr(em, IrInstr.StoreSlot(slot, a2))
+            declareManual(em, p.name)
+        }
+    }
+
+fn packForPointerBoundary(em: Emitter, rep: ElemRep, v: int, vt: Ty, span: Span) -> int? {
+        if (rep.isPtr) {
+            optionWrap(em, v, vt, span)
+        } else {
+            v
+        }
+    }
+
+fn srcParamList(em: Emitter, fid: int) -> List<Ty> {
+        var p = emptyTys()
+        if (let some(v) = em.srcParamTys.get(fid)) {
+            p = v
+        }
+        p
+    }
+
+fn callRetFor(em: Emitter, fid: int) -> Ty {
+        var ret = Ty.Unknown
+        if (let some(i) = em.finfo.get(fid)) {
+            ret = i.ret
+        }
+        ret
+    }
+
+fn keyRep(em: Emitter, kty: Ty, span: Span) -> ElemRep? {
+        match (kty) {
+            case Ty.String -> ElemRep.ptr()
+            case Ty.Int -> ElemRep.scalar("pickle_box_i64", "pickle_unbox_i64", IrTy.Int)
+            case Ty.Float -> ElemRep.scalar("pickle_box_f64", "pickle_unbox_f64", IrTy.Float)
+            case Ty.Bool -> ElemRep.scalar("pickle_box_bool", "pickle_unbox_bool", IrTy.Bool)
+            case Ty.Byte -> ElemRep.scalar("pickle_box_i64", "pickle_unbox_i64", IrTy.Int)
+            case Ty.Char -> ElemRep.scalar("pickle_box_char", "pickle_unbox_char", IrTy.Char)
+case Ty.List(_) | Ty.Map(_, _) | Ty.Class(_, _) | Ty.Struct(_, _) | Ty.Enum(_, _) | Ty.Interface(_, _) | Ty.Range(_) | Ty.Option(_) | Ty.Tuple(_) -> ElemRep.ptr()
+            case Ty.Stream -> {
+                bad(em, span, "`Stream` map keys are not lowered yet")
+                none
+            }
+            case Ty.Ref(_) -> {
+                bad(em, span, "`&T` map keys are not lowered yet")
+                none
+            }
+            case Ty.None | Ty.Empty -> {
+                bad(em, span, "a map key of type `none` is impossible")
+                none
+            }
+            case Ty.Unknown -> {
+                bad(em, span, "map key type is not statically known")
+                none
+            }
+            case Ty.Var(_) -> {
+                bad(em, span, "generic map key types are not lowered yet")
+                none
+            }
+            case Ty.Ptr(_) -> {
+                bad(em, span, "`T*` map keys are not lowered yet")
+                none
+            }
+            case Ty.Fn(_, _) -> {
+                bad(em, span, "function map keys are not lowered yet")
+                none
+            }
+        }
+    }
+
+fn iterableElem(em: Emitter, ty: Ty) -> Ty? {
+        match (ty) {
+            case Ty.Interface(n, args) -> {
+                if (n == "Iterable") {
+                    if (len(args) > 0) {
+                        return args[0]
+                    }
+                    return Ty.Unknown
+                }
+                return none
+            }
+            case _ -> {}
+        }
+        var name = ""
+        var args = emptyTys()
+        match (ty) {
+            case Ty.Class(n, a) -> {
+                name = n
+                args = a
+            }
+            case Ty.Struct(n, a) -> {
+                name = n
+                args = a
+            }
+            case _ -> {
+                return none
+            }
+        }
+        var argsMap = emptyStringTyMap()
+        if (let some(entry) = em.resolved.types.get(name)) {
+            var gs = entryGenerics(entry)
+            var i = 0
+            while (i < len(gs)) {
+                if (i < len(args)) {
+                    argsMap[gs[i]] = args[i]
+                } else {
+                    argsMap[gs[i]] = Ty.Unknown
+                }
+                i = i + 1
+            }
+        }
+        var chain = emptyStrs()
+        var seen = emptyStrs()
+        chain.push(name)
+        while (len(chain) > 0) {
+            var cname = chain[len(chain) - 1]
+            chain.pop()
+            if (strListHas(seen, cname)) {
+                continue
+            }
+            seen.push(cname)
+            var table: ClassTable? = none
+            match (em.resolved.types.get(cname)) {
+                case some(TypeTableEntry.Class(t)) -> table = t
+                case some(TypeTableEntry.Struct(t)) -> table = t
+                case _ -> {}
+            }
+            if (let none = table) {
+                continue
+            }
+            if (let some(t) = table) {
+                for (i2 in t.implements) {
+                    match (i2) {
+                        case Ty.Interface(iname, iargs) -> {
+                            if (iname == "Iterable") {
+                                var el = Ty.Unknown
+                                if (len(iargs) > 0) {
+                                    el = iargs[0]
+                                }
+                                return subst(el, argsMap)
+                            }
+                        }
+                        case _ -> {}
+                    }
+                }
+                if (let some(p) = t.extends) {
+                    if (let some(nm) = named(p)) {
+                        chain.push(nm)
+                    }
+                }
+            }
+        }
+        none
+    }
+
+fn fieldRead(em: Emitter, span: Span, obj: int, fieldTy: Ty, slot: int) -> int? {
+        var rep = ElemRep.ptr()
+        if (let some(r) = elemRep(em, fieldTy, span)) {
+            rep = r
+        } else {
+            return none
+        }
+        var idx = intConst(em, slot)
+        var raw = externCallT1(em, "pickle_obj_slot_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [obj, idx])
+        if (rep.isPtr) {
+            return raw
+        }
+        externCallT1(em, rep.unboxSym, [IrTy.Ptr], rep.ir, [raw])
+    }
+
+fn pushLoop(em: Emitter, bt: int, ct: int) {
+        em.loops.push(LoopCtx(ct, bt))
+    }
+
+fn loopBreakTarget(em: Emitter) -> int? {
+        if (len(em.loops) == 0) {
+            return none
+        }
+        em.loops[len(em.loops) - 1].breakTarget
+    }
+
+fn loopContinueTarget(em: Emitter) -> int? {
+        if (len(em.loops) == 0) {
+            return none
+        }
+        em.loops[len(em.loops) - 1].continueTarget
+    }
+
+fn panicNoMatchAt(em: Emitter, span: Span, sv: int) {
+        externCallVoid(em, "pickle_panic_no_match", emptyIrTys(), emptyInts())
+    }
+
+fn concatStr(em: Emitter, parts: List<int>) -> int? {
+        if (len(parts) == 0) {
+            return strConst(em, "")
+        }
+        var acc = parts[0]
+        var i = 1
+        while (i < len(parts)) {
+            acc = externCallT1(em, "pickle_str_concat", [IrTy.Str, IrTy.Str], IrTy.Str, [acc, parts[i]])
+            i = i + 1
+        }
+        acc
+    }
+
+fn icePathTail(em: Emitter) -> string {
+        var tail = ""
+        var n = len(em.icePath)
+        var start = 0
+        if (n > 24) {
+            start = n - 24
+        }
+        var k = start
+        while (k < n) {
+            tail += em.icePath[k] + " -> "
+            k = k + 1
+        }
+        tail
+    }
+
+fn icePoke(em: Emitter, g: string) -> bool {
+        if (len(em.iceSeq) > 1000) {
+            var nxt = emptyStrs()
+            var start = len(em.iceSeq) - 400
+            var i = start
+            while (i < len(em.iceSeq)) {
+                nxt.push(em.iceSeq[i])
+                i = i + 1
+            }
+            em.iceSeq = nxt
+        }
+        em.iceSeq.push(g)
+        var n = len(em.iceSeq)
+        var maxP = 60
+        var minLaps = 100000
+        if (n <= maxP * 2) {
+            return true
+        }
+        var p = 2
+        while (p <= maxP) {
+            var ok = true
+            var j = 0
+            while (j < p) {
+                if (em.iceSeq[n - p - 1 - j] != em.iceSeq[n - 1 - j]) {
+                    ok = false
+                    j = p
+                }
+                j = j + 1
+            }
+            if (ok) {
+                var laps = 1
+                var back = 2 * p
+                while (back + p <= n) {
+                    var still = true
+                    var m = 0
+                    while (m < p) {
+                        if (em.iceSeq[n - back - m] != em.iceSeq[n - back + p - m]) {
+                            still = false
+                            m = p
+                        }
+                        m = m + 1
+                    }
+                    if (!(still)) {
+                        back = n + p
+                    } else {
+                        laps = laps + 1
+                        back = back + p
+                    }
+                }
+                if (laps >= minLaps) {
+                    return false
+                }
+            }
+            p = p + 1
+        }
+        true
+    }
