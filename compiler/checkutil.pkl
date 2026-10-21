@@ -1,0 +1,1983 @@
+﻿// checkutil - the checker utility layer carved one-way out of checkcore.
+// Closure by walker_scan.ps1: no member reaches the checkExpr/checkStmt spine,
+// checkcore imports the pool, and the pool imports nothing from checkcore.
+
+module compiler.checkutil
+
+import * from compiler.ast
+import { Diagnostic, DiagnosticSink, Span } from compiler.diag
+import * from compiler.ty
+import { entryName } from compiler.resolvecore
+import * from compiler.resolvebag
+import * from compiler.checkbag
+
+fn containsStr(hay: string, needle: string) -> bool {
+    let hb = bytes(hay)
+    let nb = bytes(needle)
+    if (len(nb) == 0) {
+        return true
+    }
+    if (len(nb) > len(hb)) {
+        return false
+    }
+    var i = 0
+    while (i <= len(hb) - len(nb)) {
+        var j = 0
+        var ok = true
+        while (j < len(nb)) {
+            if (hb[i + j] != nb[j]) {
+                ok = false
+            }
+            j = j + 1
+        }
+        if (ok) {
+            return true
+        }
+        i = i + 1
+    }
+    false
+}
+
+fn joinStrs(ts: List<string>, sep: string) -> string {
+    var out = ""
+    var i = 0
+    while (i < len(ts)) {
+        if (i > 0) {
+            out += sep
+        }
+        out += ts[i]
+        i = i + 1
+    }
+    out
+}
+
+fn listHasStr(l: List<string>, s: string) -> bool {
+    var i = 0
+    while (i < len(l)) {
+        if (l[i] == s) {
+            return true
+        }
+        i = i + 1
+    }
+    false
+}
+
+fn absDiffInt(a: int, b: int) -> int {
+    if (a >= b) {
+        a - b
+    } else {
+        b - a
+    }
+}
+
+fn spanKey(s: Span) -> string {
+    "{s.start}:{s.end}"
+}
+
+fn binOpName(op: BinOp) -> string {
+    match (op) {
+        case BinOp.Add -> "Add"
+        case BinOp.Sub -> "Sub"
+        case BinOp.Mul -> "Mul"
+        case BinOp.Div -> "Div"
+        case BinOp.Mod -> "Mod"
+        case BinOp.Pow -> "Pow"
+        case BinOp.Shl -> "Shl"
+        case BinOp.Shr -> "Shr"
+        case BinOp.BitAnd -> "BitAnd"
+        case BinOp.BitOr -> "BitOr"
+        case BinOp.BitXor -> "BitXor"
+        case BinOp.Lt -> "Lt"
+        case BinOp.Le -> "Le"
+        case BinOp.Gt -> "Gt"
+        case BinOp.Ge -> "Ge"
+        case BinOp.Eq -> "Eq"
+        case BinOp.Ne -> "Ne"
+        case BinOp.And -> "And"
+        case BinOp.Or -> "Or"
+        case BinOp.Range -> "Range"
+        case BinOp.RangeIncl -> "RangeIncl"
+        case BinOp.NullCoalesce -> "NullCoalesce"
+        case BinOp.Send -> "Send"
+        case BinOp.Is -> "Is"
+        case BinOp.In -> "In"
+    }
+}
+
+fn isNoneStr(s: string?) -> bool {
+    match (s) {
+        case none -> true
+        case some(_) -> false
+    }
+}
+
+fn isNoneExpr(e: Expr?) -> bool {
+    match (e) {
+        case none -> true
+        case some(_) -> false
+    }
+}
+
+fn classifyMessage(msg: string) -> string? {
+    let table = [
+        ["not lowered yet", "E0900"],
+        ["after `free()`", "E0501"],
+        ["after it was moved", "E0501"],
+        ["was already freed", "E0502"],
+        ["`free` is only available on a `#[manualAlloc]` binding", "E0503"],
+        ["cannot store `#[manualAlloc]`", "E0504"],
+        ["cannot assign `#[manualAlloc]`", "E0504"],
+        ["cannot bind `#[manualAlloc]`", "E0504"],
+        ["takes ownership of its argument", "E0504"],
+        ["cannot overwrite `#[manualAlloc]` binding", "E0505"],
+        ["cannot return `#[manualAlloc]` value", "E0505"],
+        ["`#[manualAlloc]` takes no arguments", "E0401"],
+        ["`#[manualAlloc]` attribute", "E0401"],
+        ["is not supported on static fields", "E0401"],
+        ["is not supported on constants", "E0401"],
+        ["requires an allocation initializer", "E0401"],
+        ["requires a class or struct type", "E0401"],
+        ["requires a class or struct return type", "E0401"],
+        ["must be a class or struct type", "E0401"],
+        ["owned field `", "E0401"],
+        ["unknown attribute `#[", "E0400"],
+        ["`#[tag", "E0400"],
+        ["attempt to call a non-function", "E0411"],
+        ["unknown generic function `", "E0410"],
+        [" argument(s), found ", "E0410"],
+        ["missing argument", "E0410"],
+        ["too many arguments in call", "E0410"],
+        ["named argument `", "E0410"],
+        ["cannot access member `", "E0420"],
+        ["left side of `??` is not", "E0430"],
+        ["`?.` on a non-option value", "E0430"],
+        ["cannot unwrap non-option value", "E0430"],
+        ["requires numeric or string operands", "E0430"],
+        ["bitwise operators require", "E0430"],
+        ["unary `", "E0430"],
+        ["requires a numeric operand", "E0430"],
+        ["requires a `bool` operand", "E0430"],
+        ["requires an `int` operand", "E0430"],
+        ["of a scalar requires a local variable", "E0430"],
+        ["currently only supports class, struct, pointer", "E0430"],
+        ["cannot dereference a value of type", "E0430"],
+        ["`alloc(T, count)`", "E0440"],
+        ["`alloc` element type", "E0440"],
+        ["`alloc` count must be an `int`", "E0440"],
+        ["`alloc` currently only supports scalar element types", "E0440"],
+        ["`free(p)` takes one argument", "E0440"],
+        ["`free` expects a pointer argument", "E0440"],
+        ["`free()` takes no arguments", "E0440"],
+        ["`view(obj)` takes one argument", "E0440"],
+        ["`view` needs a managed value", "E0440"],
+        ["may only be used inside an `unsafe` block", "E0520"],
+        ["type mismatch in ", "E0308"],
+        ["cannot return a value from a function with no return type", "E0310"],
+        ["`if` branches have mismatched types", "E0310"],
+        ["match arms produce inconsistent types", "E0310"],
+        ["condition must be a `bool`", "E0340"],
+        ["used outside of a loop", "E0320"],
+        ["`for (x in ...)` requires a sequence", "E0341"],
+        ["map keys must be `string` values", "E0342"],
+        ["map keys must be `", "E0342"],
+        ["index must be an `int`", "E0343"],
+        ["map index must be a `string`", "E0343"],
+        ["map index must be a `", "E0343"],
+        ["string index must be an `int`", "E0343"],
+        ["pointer index must be an `int`", "E0343"],
+        ["cannot index a value of type", "E0343"],
+        ["index assignment target must be a List", "E0343"],
+        ["indexing a pointer to a", "E0343"],
+        ["storing through a pointer to a", "E0343"],
+        ["use of undeclared name `", "E0351"],
+        ["cannot assign to undeclared name `", "E0351"],
+        ["no member `", "E0352"],
+        ["no assignable member `", "E0352"],
+        ["has no variant", "E0353"],
+        ["payload field(s); use `", "E0353"],
+        ["enum variant pattern requires a value of enum type", "E0353"],
+        ["cannot be constructed directly", "E0354"],
+        ["cannot assign to a member of a non-class value", "E0355"],
+        ["declares `implements", "E0360"],
+        ["`this` used outside of a class body", "E0361"],
+        ["`super` used outside of a class body", "E0361"],
+        ["no parent to call `super`", "E0361"],
+        ["can only be used as a named constructor's delegation", "E0361"],
+        ["may only delegate to `this(...)`", "E0361"],
+        ["cannot assign to immutable", "E0362"],
+        ["must be assigned on an instance", "E0362"],
+        ["must be assigned on the type", "E0362"],
+        ["has no setter", "E0362"],
+        ["assignment target must be a variable, member, or index", "E0362"],
+        ["cannot write through an immutable reference", "E0362"],
+        ["cannot write to a field", "E0362"],
+        ["can never succeed", "E0363"],
+        ["cannot cast `", "E0363"],
+        ["references are supported only as function parameter types", "E0700"],
+    ]
+    for (row in table) {
+        if (containsStr(msg, row[0])) {
+            return row[1]
+        }
+    }
+    none
+}
+
+fn emptyMapStrMoved() -> Map<string, MovedBits> {
+    let m = {"::seed::": MovedBits(false, false)}
+    m.remove("::seed::")
+    m
+}
+
+fn emptyMovedList() -> List<Map<string, MovedBits>> {
+    var l = [emptyMapStrMoved()]
+    l.pop()
+    l
+}
+
+fn copySpanList(l: List<Span>) -> List<Span> {
+    var out = emptySpanList()
+    for (s in l) {
+        out.push(s)
+    }
+    out
+}
+
+fn copyStrList(l: List<string>) -> List<string> {
+    var out = emptyStrList()
+    for (s in l) {
+        out.push(s)
+    }
+    out
+}
+
+fn spanEq(a: Span, b: Span) -> bool {
+    a.start == b.start && a.end == b.end
+}
+
+fn hasSpan(l: List<Span>, s: Span) -> bool {
+    for (x in l) {
+        if (spanEq(x, s)) {
+            return true
+        }
+    }
+    false
+}
+
+fn removeSpan(l: List<Span>, s: Span) -> bool {
+    var i = 0
+    while (i < len(l)) {
+        if (spanEq(l[i], s)) {
+            l.remove(i)
+            return true
+        }
+        i = i + 1
+    }
+    false
+}
+
+fn emptyTyList() -> List<Ty> {
+    var l = [Ty.Int]
+    l.pop()
+    l
+}
+
+fn tyVars(names: List<string>) -> List<Ty> {
+    var out = emptyTyList()
+    for (n in names) {
+        out.push(Ty.Var(n))
+    }
+    out
+}
+
+fn isClassOrStruct(t: Ty) -> bool {
+    match (t) {
+        case Ty.Class(_, _) -> true
+        case Ty.Struct(_, _) -> true
+        case _ -> false
+    }
+}
+
+fn isListSortable(t: Ty) -> bool {
+    match (t) {
+        case Ty.Int -> true
+        case Ty.Float -> true
+        case Ty.Byte -> true
+        case Ty.Char -> true
+        case Ty.Bool -> true
+        case Ty.String -> true
+        case _ -> false
+    }
+}
+
+fn mergeFlowTypes(a: Ty, b: Ty) -> Ty? {
+    if (tyEq(a, b)) {
+        return a
+    }
+    match (a) {
+        case Ty.None -> {
+            match (b) {
+                case Ty.None -> { return Ty.None }
+                case _ -> { return optOf(b) }
+            }
+        }
+        case _ -> {}
+    }
+    match (b) {
+        case Ty.None -> { return optOf(a) }
+        case _ -> {}
+    }
+    match (a) {
+        case Ty.Option(ia) -> {
+            if (tyEq(ia, b)) {
+                return a
+            }
+        }
+        case _ -> {}
+    }
+    match (b) {
+        case Ty.Option(ib) -> {
+            if (tyEq(ib, a)) {
+                return b
+            }
+        }
+        case _ -> {}
+    }
+    if (a == Ty.Unknown || b == Ty.Unknown) {
+        return Ty.Unknown
+    }
+    none
+}
+
+fn patternIntroducesBinding(p: Pattern) -> bool {
+    match (p) {
+        case Pattern.Binding(_, _) -> true
+        case Pattern.Wildcard -> false
+        case Pattern.Literal(_) -> false
+        case Pattern.Variant(_path, payloads) -> {
+            var any = false
+            for (pl in payloads) {
+                if (patternIntroducesBinding(pl)) {
+                    any = true
+                }
+            }
+            any
+        }
+        case Pattern.Tuple(parts) -> {
+            var any = false
+            for (pt in parts) {
+                if (patternIntroducesBinding(pt)) {
+                    any = true
+                }
+            }
+            any
+        }
+        case Pattern.Or(alts) -> {
+            var any = false
+            for (at in alts) {
+                if (patternIntroducesBinding(at)) {
+                    any = true
+                }
+            }
+            any
+        }
+    }
+}
+
+fn pushScope(ck: Checker) {
+        ck.scopes.push(emptyMapLocal())
+}
+
+fn popScope(ck: Checker) {
+        ck.scopes.pop()
+}
+
+fn declare(ck: Checker, name: string, ty: Ty, mutable: bool) {
+        ck.scopes[len(ck.scopes) - 1][name] = Local(ty, mutable, false, false, false)
+}
+
+fn checkLetAttributes(ck: Checker, attrs: List<Attribute>) -> bool {
+        var manual = false
+        for (a in attrs) {
+            if (a.name == "manualAlloc") {
+                if (len(a.args) > 0) {
+                    err(ck, a.span, "`#[manualAlloc]` takes no arguments")
+                }
+                if (manual) {
+                    err(ck, a.span, "duplicate `#[manualAlloc]` attribute")
+                }
+                manual = true
+            } else {
+                err(ck, a.span, "unknown attribute `#[{a.name}]`")
+            }
+        }
+        manual
+}
+
+fn markManual(ck: Checker, name: string) {
+        var i = len(ck.scopes) - 1
+        while (i >= 0) {
+            if (let some(l) = ck.scopes[i].get(name)) {
+                l.manual = true
+                return
+            }
+            i = i - 1
+        }
+}
+
+fn isManual(ck: Checker, name: string) -> bool {
+        if (let some(l) = lookup(ck, name)) {
+            l.manual
+        } else {
+            false
+        }
+}
+
+fn isFreed(ck: Checker, name: string) -> bool {
+        if (let some(l) = lookup(ck, name)) {
+            l.freed
+        } else {
+            false
+        }
+}
+
+fn markMoved(ck: Checker, name: string) {
+        var i = len(ck.scopes) - 1
+        while (i >= 0) {
+            if (let some(l) = ck.scopes[i].get(name)) {
+                l.moved = true
+                return
+            }
+            i = i - 1
+        }
+}
+
+fn manualMoveSource(ck: Checker, e: Expr) -> string? {
+        match (e.kind) {
+            case ExprKind.Ident(name) -> {
+                if (let some(l) = lookup(ck, name)) {
+                    if (l.manual && !l.moved && !l.freed) {
+                        name
+                    } else {
+                        none
+                    }
+                } else {
+                    none
+                }
+            }
+            case _ -> none
+        }
+}
+
+fn consumeOwned(ck: Checker, e: Expr) {
+        removeSpan(ck.pendingOwnedCalls, e.span)
+}
+
+fn isFreshAllocation(ck: Checker, e: Expr) -> bool {
+        if (hasSpan(ck.pendingOwnedCalls, e.span)) {
+            return true
+        }
+        match (e.kind) {
+            case ExprKind.Call(callee, _) -> match (callee.kind) {
+                case ExprKind.Ident(name) -> {
+                    if (ck.resolved.types.has(name)) {
+                        if (let some(t) = ck.types.get(spanKey(e.span))) {
+                            match (t) {
+                                case Ty.Class(_, _) -> true
+                                case Ty.Struct(_, _) -> true
+                                case _ -> false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                }
+                case _ -> false
+            }
+            case _ -> false
+        }
+}
+
+fn checkManualArgs(ck: Checker, flags: List<bool>, args: List<CallArg>) {
+        var i = 0
+        while (i < len(args)) {
+            if (i >= len(flags) || !flags[i]) {
+                i = i + 1
+                continue
+            }
+            let a = args[i]
+            if (let some(name) = manualMoveSource(ck, a.value)) {
+                markMoved(ck, name)
+            } else if (isFreshAllocation(ck, a.value)) {
+                consumeOwned(ck, a.value)
+            } else {
+                errNote(ck, 
+                    a.span,
+                    "parameter #{(i + 1)} is `#[manualAlloc]` and takes ownership of its argument",
+                    "pass a `#[manualAlloc]` binding or a fresh allocation",
+                )
+            }
+            i = i + 1
+        }
+}
+
+fn captureMoved(ck: Checker) -> List<Map<string, MovedBits>> {
+        var out = emptyMovedList()
+        for (s in ck.scopes) {
+            var snap = emptyMapStrMoved()
+            for (k in s.keys()) {
+                snap[k] = MovedBits(s[k].moved, s[k].freed)
+            }
+            out.push(snap)
+        }
+        out
+}
+
+fn setMoved(ck: Checker, state: List<Map<string, MovedBits>>) {
+        var i = 0
+        while (i < len(ck.scopes) && i < len(state)) {
+            let scope = ck.scopes[i]
+            for (k in scope.keys()) {
+                if (let some(bits) = state[i].get(k)) {
+                    scope[k].moved = bits.moved
+                    scope[k].freed = bits.freed
+                }
+            }
+            i = i + 1
+        }
+}
+
+fn unionMoved(ck: Checker, a: List<Map<string, MovedBits>>, b: List<Map<string, MovedBits>>) {
+        var i = 0
+        while (i < len(a) && i < len(b)) {
+            let sa = a[i]
+            let sb = b[i]
+            for (k in sb.keys()) {
+                let bm = sb[k]
+                if (let some(am) = sa.get(k)) {
+                    let nm = MovedBits(am.moved || bm.moved, am.freed || bm.freed)
+                    sa[k] = nm
+                } else {
+                    sa[k] = MovedBits(bm.moved, bm.freed)
+                }
+            }
+            i = i + 1
+        }
+}
+
+fn markFreed(ck: Checker, name: string) {
+        var i = len(ck.scopes) - 1
+        while (i >= 0) {
+            if (let some(l) = ck.scopes[i].get(name)) {
+                l.freed = true
+                return
+            }
+            i = i - 1
+        }
+}
+
+fn lookup(ck: Checker, name: string) -> Local? {
+        var i = len(ck.scopes) - 1
+        while (i >= 0) {
+            if (let some(l) = ck.scopes[i].get(name)) {
+                return l
+            }
+            i = i - 1
+        }
+        none
+}
+
+fn err(ck: Checker, span: Span, msg: string) {
+        if (let some(code) = classifyMessage(msg)) {
+            ck.diags.emit(Diagnostic.errorAt(span, msg).withCode(code))
+        } else {
+            ck.diags.emit(Diagnostic.errorAt(span, msg))
+        }
+}
+
+fn errNote(ck: Checker, span: Span, msg: string, note: string) {
+        if (let some(code) = classifyMessage(msg)) {
+            ck.diags.emit(Diagnostic.errorAt(span, msg).withCode(code).note(note))
+        } else {
+            ck.diags.emit(Diagnostic.errorAt(span, msg).note(note))
+        }
+}
+
+fn okTypes(ck: Checker, want: Ty, got: Ty) -> bool {
+        if (got == Ty.Unknown || want == Ty.Unknown) {
+            return true
+        }
+        match (want) {
+            case Ty.Var(_) -> { return true }
+            case _ -> {}
+        }
+        if (tyEq(got, want)) {
+            return true
+        }
+        // `&T` reference parameters accept the bare value `T` by implicit
+        // borrow; a raw `*T` argument is NOT accepted.
+        match (want) {
+            case Ty.Ref(inner) -> {
+                if (okTypes(ck, inner, got)) {
+                    return true
+                }
+            }
+            case _ -> {}
+        }
+        // none -> T?
+        if (isNone(got) && isOption(want)) {
+            return true
+        }
+        if (isOption(want)) {
+            if (isOption(got)) {
+                let wi = innerOption(want)
+                let gi = innerOption(got)
+                if (let some(w) = wi) {
+                    if (let some(g) = gi) {
+                        return okTypes(ck, w, g)
+                    }
+                }
+            }
+            if (let some(w) = innerOption(want)) {
+                return okTypes(ck, w, got)
+            }
+        }
+        // A `Map` widens when its key or value types widen through the same
+        // option rules (e.g. a `Map<int, V>` literal satisfies a
+        // `Map<int?, V>` binding). Container covariance is otherwise rejected.
+        match (want) {
+            case Ty.Map(kw, vw) -> match (got) {
+                case Ty.Map(kg, vg) -> {
+                    var keyOpt = isOption(kw) || isOption(kg)
+                    var valOpt = isOption(vw) || isOption(vg)
+                    if ((keyOpt || valOpt) && okTypes(ck, kw, kg) && okTypes(ck, vw, vg)) {
+                        return true
+                    }
+                }
+                case _ -> {}
+            }
+            case _ -> {}
+        }
+        // class implements interface?
+        if (let some(gotn) = named(got)) {
+            if (let some(wantn) = named(want)) {
+                if (gotn != wantn) {
+                    if (implementsInterface(ck, gotn, wantn)) {
+                        return true
+                    }
+                    if (conformsTo(ck, got, want)) {
+                        return true
+                    }
+                }
+                // A subclass/descendant `got` is assignable to an ancestor.
+                match (want) {
+                    case Ty.Class(_, _) -> {
+                        if (isAncestor(ck, wantn, gotn)) {
+                            return true
+                        }
+                    }
+                    case Ty.Struct(_, _) -> {
+                        if (isAncestor(ck, wantn, gotn)) {
+                            return true
+                        }
+                    }
+                    case _ -> {}
+                }
+            }
+        }
+        // Function types: parameters are contravariant, result covariant.
+        match (got) {
+            case Ty.Fn(gp, gr) -> match (want) {
+                case Ty.Fn(wp, wr) -> {
+                    if (len(gp) != len(wp)) {
+                        return false
+                    }
+                    var i = 0
+                    while (i < len(gp)) {
+                        if (gp[i] == Ty.Unknown || wp[i] == Ty.Unknown) {
+                            i = i + 1
+                            continue
+                        }
+                        // contravariance: callee params may accept a wider type
+                        if (!okTypes(ck, gp[i], wp[i])) {
+                            return false
+                        }
+                        i = i + 1
+                    }
+                    if (gr == Ty.Unknown || wr == Ty.Unknown) {
+                        return true
+                    }
+                    return okTypes(ck, gr, wr)
+                }
+                case _ -> {}
+            }
+            case _ -> {}
+        }
+        false
+}
+
+fn checkAssignable(ck: Checker, want: Ty, got: Ty, span: Span, what: string) {
+        if (!okTypes(ck, want, got)) {
+            errNote(ck, 
+                span,
+                "type mismatch in {what}: expected `{bareName(want)}`, found `{bareName(got)}`",
+                "`{bareName(got)}` does not satisfy `{bareName(want)}`; use `as` for an explicit conversion",
+            )
+        }
+}
+
+fn checkAssignRhs(ck: Checker, want: Ty, got: Ty, value: Expr, span: Span, what: string) {
+        if (want == Ty.Byte) {
+            match (value.kind) {
+                case ExprKind.Lit(lit) -> {
+                    let fitsByte = match (lit) {
+                        case Lit.Int(v) -> v >= 0 && v <= 255
+                        case Lit.Char(c) -> (c as int) <= 0x7F
+                        case _ -> false
+                    }
+                    if (fitsByte) {
+                        return
+                    }
+                }
+                case _ -> {}
+            }
+        }
+        checkAssignable(ck, want, got, span, what)
+}
+
+fn guardRefUse(ck: Checker, ty: Ty, span: Span, whereStr: string) {
+        match (ty) {
+            case Ty.Ref(_) -> {
+                err(ck, span, "`&T` references are supported only as function parameter types ({whereStr})")
+            }
+            case _ -> {}
+        }
+}
+
+fn classTable(ck: Checker, name: string) -> ClassTable? {
+        if (let some(e) = ck.resolved.types.get(name)) {
+            match (e) {
+                case TypeTableEntry.Class(t) -> t
+                case TypeTableEntry.Struct(t) -> t
+                case _ -> none
+            }
+        } else {
+            none
+        }
+}
+
+fn substTy(ck: Checker, ty: Ty, args: Map<string, Ty>) -> Ty {
+        subst(ty, args)
+}
+
+fn typeKey(ck: Checker, ty: Ty) -> TypeKey? {
+        match (ty) {
+            case Ty.Class(n, a) -> typeKeyNamed(ck, n, a)
+            case Ty.Struct(n, a) -> typeKeyNamed(ck, n, a)
+            case Ty.Enum(n, a) -> typeKeyNamed(ck, n, a)
+            case Ty.Interface(n, _) -> TypeKey(n, emptyMapStrTy())
+            case _ -> none
+        }
+}
+
+fn typeKeyNamed(ck: Checker, n: string, a: List<Ty>) -> TypeKey {
+        var params = emptyStrList()
+        if (let some(e) = ck.resolved.types.get(n)) {
+            params = entryGenerics(e)
+        }
+        var map = emptyMapStrTy()
+        var i = 0
+        while (i < len(params)) {
+            if (i < len(a)) {
+                map[params[i]] = a[i]
+            } else {
+                map[params[i]] = Ty.Unknown
+            }
+            i = i + 1
+        }
+        TypeKey(n, map)
+}
+
+fn implementsInterface(ck: Checker, cls: string, iface: string) -> bool {
+        var pending = [cls]
+        var seen = emptyStrList()
+        while (len(pending) > 0) {
+            let name = pending[len(pending) - 1]
+            pending.pop()
+            if (listHasStr(seen, name)) {
+                continue
+            }
+            seen.push(name)
+            let table = classTable(ck, name)
+            if (let none = table) {
+                continue
+            }
+            if (let some(t) = table) {
+                var foundIface = false
+                for (i in t.implements) {
+                    if (let some(nm) = named(i)) {
+                        if (nm == iface) {
+                            foundIface = true
+                        }
+                    }
+                }
+                if (foundIface) {
+                    return true
+                }
+                if (let some(p) = t.extends) {
+                    if (let some(nm) = named(p)) {
+                        pending.push(nm)
+                    }
+                }
+            }
+        }
+        false
+}
+
+fn iterableElem(ck: Checker, ty: Ty) -> Ty? {
+        match (ty) {
+            case Ty.Interface(n, args) -> {
+                if (n == "Iterable") {
+                    if (len(args) > 0) {
+                        return args[0]
+                    } else {
+                        return Ty.Unknown
+                    }
+                } else {
+                    return none
+                }
+            }
+            case _ -> {}
+        }
+        if (let none = typeKey(ck, ty)) {
+            return none
+        }
+        match (typeKey(ck, ty)) {
+            case some(tk) -> {
+                var chain = [tk.name]
+                var seen = emptyStrList()
+                while (len(chain) > 0) {
+                    let cname = chain[len(chain) - 1]
+                    chain.pop()
+                    if (listHasStr(seen, cname)) {
+                        continue
+                    }
+                    seen.push(cname)
+                    match (classTable(ck, cname)) {
+                        case some(t) -> {
+                            for (i in t.implements) {
+                                match (i) {
+                                    case Ty.Interface(iname, iargs) -> {
+                                        if (iname == "Iterable") {
+                                            var el = Ty.Unknown
+                                            if (len(iargs) > 0) {
+                                                el = iargs[0]
+                                            }
+                                            return substTy(ck, el, tk.args)
+                                        }
+                                    }
+                                    case _ -> {}
+                                }
+                            }
+                            if (let some(p) = t.extends) {
+                                if (let some(nm) = named(p)) {
+                                    chain.push(nm)
+                                }
+                            }
+                        }
+                        case none -> {}
+                    }
+                }
+            }
+            case none -> {}
+        }
+        none
+}
+
+fn isAncestor(ck: Checker, anc: string, desc: string) -> bool {
+        var pending = [desc]
+        var seen = emptyStrList()
+        while (len(pending) > 0) {
+            let name = pending[len(pending) - 1]
+            pending.pop()
+            if (name == anc) {
+                return true
+            }
+            if (listHasStr(seen, name)) {
+                continue
+            }
+            seen.push(name)
+            if (let some(t) = classTable(ck, name)) {
+                if (let some(p) = t.extends) {
+                    if (let some(nm) = named(p)) {
+                        pending.push(nm)
+                    }
+                }
+            }
+        }
+        false
+}
+
+fn conformsTo(ck: Checker, got: Ty, want: Ty) -> bool {
+        match (named(got)) {
+            case some(gotn) -> {
+                match (named(want)) {
+                    case some(wantn) -> {
+                        if (wantn == gotn) {
+                            return true
+                        }
+                        let isIface = match (want) {
+                            case Ty.Interface(_, _) -> true
+                            case _ -> false
+                        }
+                        if (!isIface) {
+                            return false
+                        }
+                        implementsInterface(ck, gotn, wantn)
+                    }
+                    case none -> false
+                }
+            }
+            case none -> false
+        }
+}
+
+fn findField(ck: Checker, cls: string, name: string, args: Map<string, Ty>) -> FieldInfo? {
+        var chain = [cls]
+        var seen = emptyStrList()
+        while (len(chain) > 0) {
+            let cname = chain[len(chain) - 1]
+            chain.pop()
+            if (listHasStr(seen, cname)) {
+                continue
+            }
+            seen.push(cname)
+            match (classTable(ck, cname)) {
+                case some(t) -> {
+                    for (f in t.fields) {
+                        if (f.name == name) {
+                            return f
+                        }
+                    }
+                    for (f in t.consts) {
+                        if (f.name == name) {
+                            return f
+                        }
+                    }
+                    if (let some(p) = t.extends) {
+                        if (let some(nm) = named(p)) {
+                            chain.push(nm)
+                        }
+                    }
+                }
+                case none -> {}
+            }
+        }
+        let _ = args
+        none
+}
+
+fn findMethod(ck: Checker, cls: string, name: string) -> CallableInfo? {
+        var chain = [cls]
+        var seen = emptyStrList()
+        while (len(chain) > 0) {
+            let cname = chain[len(chain) - 1]
+            chain.pop()
+            if (listHasStr(seen, cname)) {
+                continue
+            }
+            seen.push(cname)
+            match (classTable(ck, cname)) {
+                case some(t) -> {
+                    for (m in t.methods) {
+                        if (m.name == name) {
+                            return m
+                        }
+                    }
+                    if (let some(p) = t.extends) {
+                        if (let some(nm) = named(p)) {
+                            chain.push(nm)
+                        }
+                    }
+                }
+                case none -> {}
+            }
+        }
+        none
+}
+
+fn findProperty(ck: Checker, cls: string, name: string) -> PropertyInfo? {
+        if (let some(t) = classTable(ck, cls)) {
+            for (p in t.properties) {
+                if (p.name == name) {
+                    return p
+                }
+            }
+        }
+        none
+}
+
+fn findNamedCtor(ck: Checker, cls: string, name: string) -> CtorInfo? {
+        if (let some(t) = classTable(ck, cls)) {
+            for (nc in t.namedCtors) {
+                if (nc.name == name) {
+                    return nc.ctor
+                }
+            }
+        }
+        none
+}
+
+fn initializedFields(ck: Checker, name: string) -> List<string> {
+        var members: List<ClassMember>? = none
+        for (item in ck.prog.items) {
+            match (item.kind) {
+                case ItemKind.Class(c) -> {
+                    if (c.name == name) {
+                        members = c.members
+                    }
+                }
+                case ItemKind.Struct(s) -> {
+                    if (s.name == name) {
+                        members = s.members
+                    }
+                }
+                case _ -> {}
+            }
+        }
+        var out = emptyStrList()
+        if (let some(ms) = members) {
+            for (m in ms) {
+                match (m) {
+                    case ClassMember.Field(name, _, init, _, isStatic, _, _, _) -> {
+                        if (let some(_) = init) {
+                            if (!isStatic) {
+                                out.push(name)
+                            }
+                        }
+                    }
+                    case _ -> {}
+                }
+            }
+        }
+        out
+}
+
+fn nearestExplicitPrimaryFieldCount(ck: Checker, name: string) -> FieldCount? {
+        var chain = [name]
+        var cur = name
+        var done = false
+        while (len(chain) < 64 && !done) {
+            let t = classTable(ck, cur)
+            let parent = none
+            if (let some(tb) = t) {
+                if (let some(e) = tb.extends) {
+                    if (let some(nm) = named(e)) {
+                        chain.push(nm)
+                        cur = nm
+                        continue
+                    }
+                }
+            }
+            let _ = parent
+            done = true
+        }
+        var rev = emptyStrList()
+        var c = len(chain) - 1
+        while (c >= 0) {
+            rev.push(chain[c])
+            c = c - 1
+        }
+        var found: FieldCount? = none
+        var count = 0
+        for (cname in rev) {
+            let t = classTable(ck, cname)
+            var own = 0
+            if (let some(tb) = t) {
+                for (f in tb.fields) {
+                    if (!f.isStatic) {
+                        own = own + 1
+                    }
+                }
+            }
+            if (let some(tb) = t) {
+                if (let some(_) = tb.ctor) {
+                    found = FieldCount(cname, count + own)
+                }
+            }
+            count = count + own
+        }
+        found
+}
+
+fn synthesizedCtorParamTys(ck: Checker, name: string) -> List<Ty> {
+        var out = emptyTys()
+        var cut = 0
+        if (let some(fc) = nearestExplicitPrimaryFieldCount(ck, name)) {
+            if (let some(t) = classTable(ck, fc.name)) {
+                if (let some(c) = t.ctor) {
+                    for (p in c.params) {
+                        out.push(p.ty)
+                    }
+                }
+            }
+            cut = fc.count
+        }
+        var chain = [name]
+        var cur = name
+        while (len(chain) < 64) {
+            if (let some(t) = classTable(ck, cur)) {
+                if (let some(e) = t.extends) {
+                    if (let some(nm) = named(e)) {
+                        chain.push(nm)
+                        cur = nm
+                        continue
+                    }
+                }
+            }
+            break
+        }
+        var rev = emptyStrList()
+        var c = len(chain) - 1
+        while (c >= 0) {
+            rev.push(chain[c])
+            c = c - 1
+        }
+        var count = 0
+        for (cname in rev) {
+            if (let some(t) = classTable(ck, cname)) {
+                var own = 0
+                for (f in t.fields) {
+                    if (!f.isStatic) {
+                        own = own + 1
+                    }
+                }
+                if (count >= cut) {
+                    let initialized = initializedFields(ck, cname)
+                    for (f in t.fields) {
+                        if (!f.isStatic && !listHasStr(initialized, f.name)) {
+                            out.push(f.ty)
+                        }
+                    }
+                }
+                count = count + own
+            }
+        }
+        out
+}
+
+fn consumeIntoOwned(ck: Checker, value: Expr, span: Span, what: string) {
+        if (let some(src) = manualMoveSource(ck, value)) {
+            markMoved(ck, src)
+        } else if (isFreshAllocation(ck, value)) {
+            consumeOwned(ck, value)
+        } else {
+            errNote(ck, 
+                span,
+                "{what} takes ownership of its value",
+                "assign a `#[manualAlloc]` binding or a fresh allocation",
+            )
+        }
+}
+
+fn resolvedFnTy(ck: Checker, te: TypeExpr, generics: List<string>) -> Ty {
+        // Resolve against the final module tables, so user-defined types and
+        // this module's generics are visible.
+        var g = copyStrList(generics)
+        if (let some(sty) = ck.selfTy) {
+            if (let some(gt) = typeKey(ck, sty)) {
+                for (k in gt.args.keys()) {
+                    if (!listHasStr(g, k)) {
+                        g.push(k)
+                    }
+                }
+            }
+        }
+        ck.resolved.resolveTy(te, instantiatedGenerics(ck, g), ck.diags)
+}
+
+fn instantiatedGenerics(ck: Checker, generics: List<string>) -> List<string> {
+        generics
+}
+
+fn resolveParamTy(ck: Checker, p: Param) -> Ty {
+        if (let some(te) = p.ty) {
+            var generics = copyStrList(ck.fnGenerics)
+            if (let some(sty) = ck.selfTy) {
+                if (let some(gt) = typeKey(ck, sty)) {
+                    for (k in gt.args.keys()) {
+                        generics.push(k)
+                    }
+                }
+            }
+            resolvedFnTy(ck, te, generics)
+        } else {
+            Ty.Unknown
+        }
+}
+
+fn checkOwnedTail(ck: Checker, e: Expr) {
+        if (ck.retManual) {
+            consumeOwned(ck, e)
+        } else if (removeSpan(ck.pendingOwnedCalls, e.span)) {
+            errNote(ck, 
+                e.span,
+                "result of a `#[manualAlloc]` function is owned by the caller",
+                "bind it with `#[manualAlloc] let`, pass it to an owned parameter, or return it",
+            )
+        }
+}
+
+fn checkReturnExpr(ck: Checker, got: Ty, span: Span) {
+        if (ck.retTy != Ty.Empty && got != Ty.Empty) {
+            checkAssignable(ck, ck.retTy, got, span, "return value")
+        }
+}
+
+fn bindPattern(ck: Checker, p: Pattern, ty: Ty, mutable: bool, span: Span) {
+        match (p) {
+            case Pattern.Wildcard -> {}
+            case Pattern.Binding(name, ann) -> {
+                // A pattern annotation like `let m: int?` is parsed into the
+                // pattern; it wins over the inferred value type and is checked
+                // against it.
+                if (let some(te) = ann) {
+                    let at = resolvedFnTy(ck, te, ck.fnGenerics)
+                    if (ty != Ty.Unknown) {
+                        checkAssignable(ck, at, ty, span, "binding")
+                    }
+                    declare(ck, name, at, mutable)
+                } else {
+                    declare(ck, name, ty, mutable)
+                }
+            }
+            case Pattern.Literal(_l) -> {}
+            case Pattern.Tuple(parts) -> {
+                match (ty) {
+                    case Ty.Tuple(tys) -> {
+                        var i = 0
+                        while (i < len(parts)) {
+                            let pt = if (i < len(tys)) { tys[i] } else { Ty.Unknown }
+                            bindPattern(ck, parts[i], pt, mutable, span)
+                            i = i + 1
+                        }
+                    }
+                    case _ -> {
+                        if (ty != Ty.Unknown) {
+                            err(ck, span, "tuple pattern does not match a tuple value")
+                        }
+                    }
+                }
+            }
+            case Pattern.Variant(path, payloads) -> {
+                // `some(v)` binds the payload against an option scrutinee.
+                if (len(path) == 1 && path[0] == "some" && isOption(ty)) {
+                    let inner = if (let some(x) = innerOption(ty)) { x } else { Ty.Unknown }
+                    if (len(payloads) != 1) {
+                        err(ck, span, "`some` pattern takes exactly one payload binding")
+                    } else {
+                        bindPattern(ck, payloads[0], inner, mutable, span)
+                    }
+                } else {
+                    // `Enum.Variant(p1, p2)` binding. If only the variant name
+                    // is given, the enum type is inferred from the value.
+                    var enumName = ""
+                    var variantName = ""
+                    var resolvedName = true
+                    if (len(path) == 2) {
+                        enumName = path[0]
+                        variantName = path[1]
+                        false
+                    } else if (len(path) == 1) {
+                        match (ty) {
+                            case Ty.Enum(en, _) -> {
+                                enumName = en
+                                variantName = path[0]
+                                false
+                            }
+                            case _ -> {
+                                if (ty != Ty.Unknown) {
+                                    err(ck, span, "enum variant pattern requires a value of enum type")
+                                }
+                                resolvedName = false
+                                false
+                            }
+                        }
+                    } else {
+                        resolvedName = false
+                    }
+                    if (resolvedName && ty != Ty.Unknown) {
+                        if (let some(entry) = ck.resolved.types.get(enumName)) {
+                            match (entry) {
+                                case TypeTableEntry.Enum(t) -> {
+                                    var variant: EnumVariantInfo? = none
+                                    for (v in t.variants) {
+                                        if (v.name == variantName) {
+                                            variant = v
+                                        }
+                                    }
+                                    if (let some(v) = variant) {
+                                        var i = 0
+                                        while (i < len(payloads)) {
+                                            let ft = if (i < len(v.fields)) { v.fields[i] } else { Ty.Unknown }
+                                            bindPattern(ck, payloads[i], ft, mutable, span)
+                                            i = i + 1
+                                        }
+                                    } else {
+                                        err(ck, span, "enum `{enumName}` has no variant `{variantName}`")
+                                    }
+                                }
+                                case _ -> {}
+                            }
+                        }
+                    }
+                }
+            }
+            case Pattern.Or(parts) -> {
+                for (part in parts) {
+                    bindPattern(ck, part, ty, mutable, span)
+                }
+            }
+        }
+}
+
+fn litTy(ck: Checker, lit: Lit) -> Ty {
+        match (lit) {
+            case Lit.Int(_) -> Ty.Int
+            case Lit.Float(_) -> Ty.Float
+            case Lit.String(_) -> Ty.String
+            case Lit.Char(_) -> Ty.Char
+            case Lit.Bool(_) -> Ty.Bool
+            case Lit.None -> Ty.None
+        }
+}
+
+fn identTy(ck: Checker, e: Expr, name: string) -> Ty {
+        if (let some(l) = lookup(ck, name)) {
+            if (l.freed) {
+                err(ck, e.span, "use of `{name}` after `free()`")
+            } else if (l.moved) {
+                errNote(ck, e.span, "use of `{name}` after it was moved", "a `#[manualAlloc]` value has a single owner; bind the new name and use that")
+            }
+            return l.ty
+        }
+        if (let some(fns) = ck.resolved.fns.get(name)) {
+            return fnTySig(ck, fns)
+        }
+        for (c in ck.resolved.consts) {
+            if (c.name == name) {
+                return c.ty
+            }
+        }
+        for (g in ck.resolved.globals) {
+            if (g.name == name) {
+                return g.ty
+            }
+        }
+        // Implicit receiver: a bare field/property/method name inside a
+        // class or struct body refers to `this.name`.
+        if (let some(st) = ck.selfTy) {
+            if (let some(tk) = typeKey(ck, st)) {
+                if (let some(f) = findField(ck, tk.name, name, tk.args)) {
+                    return subst(f.ty, tk.args)
+                }
+                if (let some(p) = findProperty(ck, tk.name, name)) {
+                    return p.ty
+                }
+                if (let some(m) = findMethod(ck, tk.name, name)) {
+                    var mps = emptyTyList()
+                    for (mp in m.params) {
+                        mps.push(mp.ty)
+                    }
+                    return Ty.Fn(mps, methodRetTy(ck, m, emptyMapStrTy()))
+                }
+            }
+        }
+        // Type name used as a constructor/static receiver.
+        if (let some(entry) = ck.resolved.types.get(name)) {
+            match (entry) {
+                case TypeTableEntry.Class(t) -> {
+                    return Ty.Class(t.name, tyVars(t.generics))
+                }
+                case TypeTableEntry.Struct(t) -> {
+                    return Ty.Struct(t.name, tyVars(t.generics))
+                }
+                case TypeTableEntry.Enum(t) -> {
+                    return Ty.Enum(t.name, tyVars(t.generics))
+                }
+                case TypeTableEntry.Interface(t) -> {
+                    return Ty.Interface(t.name, tyVars(t.generics))
+                }
+            }
+        }
+        errNote(ck, e.span, "use of undeclared name `{name}`", "names must be declared before use")
+        Ty.Unknown
+}
+
+fn superTy(ck: Checker, e: Expr) -> Ty {
+        if (let some(st) = ck.selfTy) {
+            if (let some(tk) = typeKey(ck, st)) {
+                if (let some(table) = classTable(ck, tk.name)) {
+                    if (let some(p) = table.extends) {
+                        return p
+                    }
+                    err(ck, e.span, "this class has no parent to call `super` on")
+                    return Ty.Unknown
+                }
+            }
+        }
+        err(ck, e.span, "`super` used outside of a class body")
+        Ty.Unknown
+}
+
+fn fnTySig(ck: Checker, fns: List<CallableInfo>) -> Ty {
+        if (len(fns) == 0) {
+            return Ty.Unknown
+        }
+        let f = fns[0]
+        var ps = emptyTyList()
+        for (p in f.params) {
+            ps.push(p.ty)
+        }
+        // An `async fn` used as a value is a function returning a future
+        // (`() -> R`), not the result `R` itself.
+        var ret = f.ret
+        if (f.isAsync && (len(f.generics) == 0)) {
+            ret = Ty.Fn(emptyTyList(), f.ret)
+        }
+        Ty.Fn(ps, ret)
+}
+
+fn methodRetTy(ck: Checker, m: CallableInfo, map: Map<string, Ty>) -> Ty {
+        var ret = subst(m.ret, map)
+        if (m.isAsync) {
+            ret = Ty.Fn(emptyTyList(), ret)
+        }
+        ret
+}
+
+fn genericFnTy(ck: Checker, e: Expr, name: string, typeArgs: List<TypeExpr>) -> Ty {
+        if (let none = ck.resolved.fns.get(name)) {
+            err(ck, e.span, "unknown generic function `{name}`")
+            return Ty.Unknown
+        }
+        var f: CallableInfo? = none
+        if (let some(fns) = ck.resolved.fns.get(name)) {
+            for (c in fns) {
+                if (!(c.span.start == 0 && c.span.end == 0)) {
+                    f = c
+                    break
+                }
+            }
+            if (let none = f) {
+                return fnTySig(ck, fns)
+            }
+        }
+        if (let some(ff) = f) {
+            // Instantiate the callee signature with the explicit type args.
+            var argsTyp = emptyTyList()
+            for (te in typeArgs) {
+                argsTyp.push(resolvedFnTy(ck, te, copyStrList(ck.fnGenerics)))
+            }
+            if (len(ff.generics) != len(argsTyp)) {
+                err(ck, e.span, "`{name}` takes {len(ff.generics)} type argument(s), found {len(argsTyp)}")
+                var fps = emptyTyList()
+                for (p in ff.params) {
+                    fps.push(p.ty)
+                }
+                return Ty.Fn(fps, ff.ret)
+            }
+            var map: Map<string, Ty> = emptyMapStrTy()
+            var gi = 0
+            while (gi < len(ff.generics)) {
+                map[ff.generics[gi]] = argsTyp[gi]
+                gi = gi + 1
+            }
+            var ps2 = emptyTyList()
+            for (p in ff.params) {
+                ps2.push(subst(p.ty, map))
+            }
+            var sret = subst(ff.ret, map)
+            // An `async fn` called with explicit type arguments returns a future
+            // (`() -> R`), exactly like the inferred-generic path.
+            if (ff.isAsync) {
+                sret = Ty.Fn(emptyTyList(), sret)
+            }
+            return Ty.Fn(ps2, sret)
+        }
+        Ty.Unknown
+}
+
+fn expectChainDepth(ck: Checker, e: Expr) -> int {
+        match (e.kind) {
+            case ExprKind.Call(callee, args) -> {
+                if (len(args) == 1 && !args[0].spread && isNoneStr(args[0].name)) {
+                    match (callee.kind) {
+                        case ExprKind.Ident(n) -> {
+                            if (n == "expect") {
+                                return 1
+                            }
+                        }
+                        case _ -> {}
+                    }
+                }
+                if (len(args) == 0) {
+                    match (callee.kind) {
+                        case ExprKind.Member(object, name) -> {
+                            if (name == "not") {
+                                let d = expectChainDepth(ck, object)
+                                if (d > 0) {
+                                    return d + 1
+                                }
+                            }
+                        }
+                        case _ -> {}
+                    }
+                }
+                0
+            }
+            case _ -> 0
+        }
+}
+
+fn expectSource(ck: Checker, e: Expr) -> Expr? {
+        match (e.kind) {
+            case ExprKind.Call(callee, args) -> {
+                if (len(args) == 1 && !args[0].spread && isNoneStr(args[0].name)) {
+                    match (callee.kind) {
+                        case ExprKind.Ident(n) -> {
+                            if (n == "expect") {
+                                return args[0].value
+                            }
+                        }
+                        case _ -> {}
+                    }
+                    return none
+                }
+                if (len(args) == 0) {
+                    match (callee.kind) {
+                        case ExprKind.Member(object, name) -> {
+                            if (name == "not") {
+                                return expectSource(ck, object)
+                            }
+                        }
+                        case _ -> {}
+                    }
+                }
+                none
+            }
+            case _ -> none
+        }
+}
+
+fn checkArgsTyped(ck: Checker, e: Expr, params: List<Ty>, args: List<CallArg>, got: Map<string, Ty>) {
+        var position = 0
+        let fixed = len(params)
+        for (a in args) {
+            if (!isNoneStr(a.name)) {
+                var an = ""
+                if (let some(s) = a.name) {
+                    an = s
+                }
+                errNote(ck, a.span, "named argument `" + an + "` is not supported for this call", "positional arguments are expected here")
+                position = position + 1
+                continue
+            }
+            if (a.spread) {
+                position = position + 1
+                continue
+            }
+            if (position < fixed) {
+                let want = params[position]
+                let gotTy = if (let some(t) = got.get(spanKey(a.value.span))) {
+                    t
+                } else {
+                    Ty.Unknown
+                }
+                checkAssignable(ck, want, gotTy, a.span, "argument")
+            } else {
+                err(ck, e.span, "too many arguments in call")
+            }
+            position = position + 1
+        }
+        if (position < fixed) {
+            err(ck, e.span, "expected {fixed} argument(s), found {position}")
+        }
+}
+
+fn checkMapIndex(ck: Checker, keyTy: Ty, indexTy: Ty, index: Expr, span: Span) {
+        if (indexTy == Ty.Unknown) {
+            return
+        }
+        if (keyTy == Ty.Byte) {
+            checkAssignRhs(ck, keyTy, indexTy, index, span, "map index")
+            return
+        }
+        if (!okTypes(ck, keyTy, indexTy)) {
+            err(ck, span, "map index must be a `{bareName(keyTy)}`")
+        }
+}
+
+fn checkComparison(ck: Checker, e: Expr, op: BinOp, lt: Ty, rt: Ty) {
+        if (lt == Ty.Unknown || rt == Ty.Unknown || hasVar(lt) || hasVar(rt)) {
+            return
+        }
+        let eqOnly = op == BinOp.Eq || op == BinOp.Ne
+        let scalar = (isNumeric(lt) && isNumeric(rt)) || (lt == Ty.Char && rt == Ty.Char)
+        if (scalar) {
+            return
+        }
+        let byteChar = (lt == Ty.Byte && rt == Ty.Char) || (lt == Ty.Char && rt == Ty.Byte)
+        if (byteChar) {
+            var charPart: Expr? = none
+            match (e.kind) {
+                case ExprKind.Binary(_op2, lhs, rhs) -> {
+                    if (lt == Ty.Byte) {
+                        charPart = rhs
+                    } else if (rt == Ty.Byte) {
+                        charPart = lhs
+                    } else {
+                        err(ck, e.span, "`byte` values only compare with `int`s or an ASCII `char` literal")
+                        return
+                    }
+                }
+                case _ -> {
+                    err(ck, e.span, "`byte` values only compare with `int`s or an ASCII `char` literal")
+                    return
+                }
+            }
+            if (let some(cp) = charPart) {
+                match (cp.kind) {
+                    case ExprKind.Lit(lit) -> {
+                        match (lit) {
+                            case Lit.Char(c) -> {
+                                if ((c as int) <= 0x7F) {
+                                    return
+                                }
+                                err(ck, e.span, "a non-ASCII char literal has no `byte` value: `{c}` (its bytes are multi-byte UTF-8)")
+                            }
+                            case _ -> {
+                                err(ck, e.span, "`byte` values only compare with `int`s or an ASCII `char` literal")
+                            }
+                        }
+                    }
+                    case _ -> {
+                        err(ck, e.span, "`byte` values only compare with `int`s or an ASCII `char` literal")
+                    }
+                }
+            }
+            return
+        }
+        if (eqOnly && tyEq(lt, rt)) {
+            return // identity/equality on identical types (strings, enums, ...)
+        }
+        if (tyEq(lt, rt)) {
+            err(ck, e.span, "operator `" + binOpName(op) + "` is not supported for `" + bareName(lt) + "` operands")
+        } else {
+            err(ck, e.span, "operator `" + binOpName(op) + "` requires comparable operands, found `" + bareName(lt) + "` and `" + bareName(rt) + "`")
+        }
+}
+
+fn checkCaptureBegin(ck: Checker, e: Expr, args: List<CallArg>) -> Ty {
+        if (!(len(args) == 0)) {
+            err(ck, e.span, "`captureBegin()` takes no arguments")
+            return Ty.Unknown
+        }
+        Ty.Empty
+}
+
+fn checkCaptureTake(ck: Checker, e: Expr, args: List<CallArg>) -> Ty {
+        if (!(len(args) == 0)) {
+            err(ck, e.span, "`captureTake()` takes no arguments")
+            return Ty.Unknown
+        }
+        Ty.Option(Ty.String)
+}
+
+fn checkMatchPattern(ck: Checker, p: Pattern, st: Ty, span: Span) {
+        let skip = match (st) {
+            case Ty.Unknown -> true
+            case Ty.Var(_) -> true
+            case _ -> false
+        }
+        if (skip) {
+            return
+        }
+        match (p) {
+            case Pattern.Wildcard -> {}
+            case Pattern.Binding(_, _) -> {}
+            case Pattern.Tuple(parts) -> {
+                match (st) {
+                    case Ty.Tuple(tys) -> {
+                        if (len(tys) != len(parts)) {
+                            errNote(ck, span, "a {len(parts)}-element tuple pattern cannot match a {len(tys)}-tuple", "tuple patterns must line up with the scrutinee's arity")
+                        } else {
+                            var i = 0
+                            while (i < len(parts)) {
+                                checkMatchPattern(ck, parts[i], tys[i], span)
+                                i = i + 1
+                            }
+                        }
+                    }
+                    case other -> {
+                        errNote(ck, span, "a tuple pattern cannot match a value of type `{bareName(other)}`", "tuple patterns require a tuple scrutinee")
+                    }
+                }
+            }
+            case Pattern.Or(alts) -> {
+                for (a in alts) {
+                    checkMatchPattern(ck, a, st, span)
+                }
+                var anyBinds = false
+                for (a in alts) {
+                    if (patternIntroducesBinding(a)) {
+                        anyBinds = true
+                    }
+                }
+                if (anyBinds) {
+                    errNote(ck, span, "an or-pattern alternative may not bind a name", "`a | b` joins patterns that only test values (literals, `_`, `some(_)`, `Tag(_)`)")
+                }
+            }
+            case Pattern.Literal(l) -> checkMatchLiteral(ck, l, st, span)
+            case Pattern.Variant(path, payloads) -> {
+                if (len(path) == 1 && path[0] == "some") {
+                    if (!isOption(st)) {
+                        errNote(ck, span, "`some` patterns require an option value, not `{bareName(st)}`", "match `none`/`some(v)` against an option scrutinee")
+                    } else {
+                        let inner = if (let some(x) = innerOption(st)) { x } else { Ty.Unknown }
+                        for (pl in payloads) {
+                            checkMatchPattern(ck, pl, inner, span)
+                        }
+                    }
+                    return
+                }
+                // A variant path on a non-enum, non-option scrutinee is a
+                // mismatch; enum variants are validated while binding.
+                let isEnumSt = match (st) {
+                    case Ty.Enum(_, _) -> true
+                    case _ -> false
+                }
+                if (!isOption(st) && !isEnumSt && len(path) >= 2) {
+                    err(ck, span, "variant pattern `" + joinStrs(path, ".") + "` cannot match a value of type `" + bareName(st) + "`")
+                }
+                if (isOption(st) && !(len(path) == 1 && path[0] == "some")) {
+                    err(ck, span, "patterns on an option value must be `some(v)`, `none`, or `_`")
+                }
+            }
+        }
+}
+
+fn checkMatchLiteral(ck: Checker, l: Lit, st: Ty, span: Span) {
+        var ok = false
+        match (st) {
+            case Ty.Int -> {
+                match (l) {
+                    case Lit.Int(_) -> ok = true
+                    case Lit.Float(_) -> ok = true
+                    case _ -> {}
+                }
+            }
+            case Ty.Float -> {
+                match (l) {
+                    case Lit.Int(_) -> ok = true
+                    case Lit.Float(_) -> ok = true
+                    case _ -> {}
+                }
+            }
+            case Ty.Byte -> {
+                match (l) {
+                    case Lit.Int(_) -> ok = true
+                    case Lit.Float(_) -> ok = true
+                    case Lit.Char(c) -> {
+                        if ((c as int) <= 0x7F) {
+                            ok = true
+                        }
+                    }
+                    case _ -> {}
+                }
+            }
+            case Ty.Char -> {
+                match (l) {
+                    case Lit.Char(_) -> ok = true
+                    case _ -> {}
+                }
+            }
+            case Ty.Bool -> {
+                match (l) {
+                    case Lit.Bool(_) -> ok = true
+                    case _ -> {}
+                }
+            }
+            case Ty.String -> {
+                match (l) {
+                    case Lit.String(parts) -> {
+                        ok = true
+                        for (pt in parts) {
+                            match (pt) {
+                                case StrPart.Expr(_) -> ok = false
+                                case _ -> {}
+                            }
+                        }
+                    }
+                    case _ -> {}
+                }
+            }
+            case _ -> {
+                if (isOption(st)) {
+                    match (l) {
+                        case Lit.None -> ok = true
+                        case _ -> {}
+                    }
+                }
+            }
+        }
+        if (ok) {
+            return
+        }
+        var hasInterp = false
+        match (l) {
+            case Lit.String(parts) -> {
+                for (pt in parts) {
+                    match (pt) {
+                        case StrPart.Expr(_) -> hasInterp = true
+                        case _ -> {}
+                    }
+                }
+            }
+            case _ -> {}
+        }
+        if (hasInterp) {
+            errNote(ck, span, "string match patterns may not interpolate", "compare a literal inside the arm body instead")
+            return
+        }
+        var what = ""
+        match (l) {
+            case Lit.Int(_) -> what = "an integer"
+            case Lit.Float(_) -> what = "a float"
+            case Lit.Bool(_) -> what = "`true`/`false`"
+            case Lit.Char(_) -> what = "a character literal"
+            case Lit.String(_) -> what = "a string literal"
+            case Lit.None -> what = "`none`"
+        }
+        errNote(ck, span, "{what} pattern cannot match a value of type `{bareName(st)}`", "match patterns must share the scrutinee's type")
+}
+
+fn castRelated(ck: Checker, fromTy: Ty, toTy: Ty) -> bool {
+        if (tyEq(fromTy, toTy)) {
+            return true
+        }
+if (isNumeric(fromTy) && isNumeric(toTy)) {
+                  return true
+              }
+              // A raw pointer and `int` are both single 64-bit words in the IR
+              // domain, and every container ABI body needs to move an object
+              // address between a `*T` value and a word slot (`list[5] = data`).
+              // Without this the port cannot express a single list/map/object
+              // runtime symbol; see PICKLE_AUDIT.md 17.1. Identity lowering in
+              // `convert`, so no trap representation is invented.
+              if (isPtr(fromTy) && toTy == Ty.Int) {
+                  return true
+              }
+              if (fromTy == Ty.Int && isPtr(toTy)) {
+                  return true
+              }
+              // A function value is also a single 64-bit word in the IR domain
+              // (the raw code address, the same word `IrConst::FuncAddr` bakes
+              // into registration calls). The GC engine keeps registered
+              // `deinit` finalizers as int words and casts them back to a
+              // callable only at invocation, so `int` and `fn` need the same
+              // word-move relation pointers have. Identity lowering in
+              // `convert`; no trap representation is invented.
+              if (isFnValue(fromTy) && toTy == Ty.Int) {
+                  return true
+              }
+              if (fromTy == Ty.Int && isFnValue(toTy)) {
+                  return true
+              }
+        // Unwrap option layers on either side.
+        if (let some(inner) = innerOption(fromTy)) {
+            if (castRelated(ck, inner, toTy)) {
+                return true
+            }
+        }
+        if (let some(inner) = innerOption(toTy)) {
+            if (castRelated(ck, fromTy, inner)) {
+                return true
+            }
+        }
+        // Same-kind structural/type relations.
+        var rel = false
+        match (fromTy) {
+            case Ty.Class(a, _) -> {
+                match (toTy) {
+                    case Ty.Class(b, _) -> rel = a == b || isAncestor(ck, a, b) || isAncestor(ck, b, a) || conformsTo(ck, fromTy, toTy) || conformsTo(ck, toTy, fromTy)
+                    case Ty.Interface(b, _) -> rel = implementsInterface(ck, a, b)
+                    case _ -> {}
+                }
+            }
+            case Ty.Struct(a, _) -> {
+                match (toTy) {
+                    case Ty.Struct(b, _) -> rel = a == b || isAncestor(ck, a, b) || isAncestor(ck, b, a) || conformsTo(ck, fromTy, toTy) || conformsTo(ck, toTy, fromTy)
+                    case Ty.Interface(b, _) -> rel = implementsInterface(ck, a, b)
+                    case _ -> {}
+                }
+            }
+            case Ty.Interface(a, _) -> {
+                match (toTy) {
+                    case Ty.Interface(b, _) -> rel = a == b || conformsTo(ck, fromTy, toTy) || conformsTo(ck, toTy, fromTy)
+                    case Ty.Class(b, _) -> rel = implementsInterface(ck, b, a)
+                    case Ty.Struct(b, _) -> rel = implementsInterface(ck, b, a)
+                    case _ -> {}
+                }
+            }
+            case Ty.Enum(a, _) -> {
+                match (toTy) {
+                    case Ty.Enum(b, _) -> rel = a == b
+                    case _ -> {}
+                }
+            }
+            case Ty.List(aa) -> {
+                match (toTy) {
+                    case Ty.List(bb) -> rel = castRelated(ck, aa, bb)
+                    case _ -> {}
+                }
+            }
+            case Ty.Range(aa) -> {
+                match (toTy) {
+                    case Ty.Range(bb) -> rel = castRelated(ck, aa, bb)
+                    case _ -> {}
+                }
+            }
+            case Ty.Map(ka, va) -> {
+                match (toTy) {
+                    case Ty.Map(kb, vb) -> rel = castRelated(ck, ka, kb) && castRelated(ck, va, vb)
+                    case _ -> {}
+                }
+            }
+            case Ty.Fn(pa, ra) -> {
+                match (toTy) {
+                    case Ty.Fn(pb, rb) -> {
+                        if (len(pa) != len(pb)) {
+                            rel = false
+                        } else {
+                            var ok2 = true
+                            var xi = 0
+                            while (xi < len(pa)) {
+                                if (!castRelated(ck, pa[xi], pb[xi])) {
+                                    ok2 = false
+                                }
+                                xi = xi + 1
+                            }
+                            rel = ok2 && castRelated(ck, ra, rb)
+                        }
+                    }
+                    case _ -> {}
+                }
+            }
+            case _ -> {}
+        }
+        rel
+}
+
