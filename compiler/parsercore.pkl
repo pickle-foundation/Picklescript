@@ -1,9 +1,10 @@
-module compiler.parsercore
+﻿module compiler.parsercore
 
 import * from compiler.ast
 import { Span, Diagnostic, DiagnosticSink } from compiler.diag
 import { LexedToken, StrLit, StrSeg, Tok, plainTok } from compiler.token
 import * from compiler.parserbag
+import * from compiler.parseutil
 
 // ==== parser core (free fns + Parser methods as free fns, receiver = pa) ====
 
@@ -21,503 +22,57 @@ fn isWildcardIdent(s: string) -> bool {
     s == "_"
 }
 
-fn minOf(a: int, b: int) -> int {
-    if (a < b) {
-        a
-    } else {
-        b
-    }
-}
 
-fn listCopy(l: List<string>) -> List<string> {
-    var out = emptyStrs()
-    for (x in l) {
-        out.push(x)
-    }
-    out
-}
 
-fn joinStrs(path: List<string>, sep: string) -> string {
-    var out = ""
-    var i = 0
-    while (i < len(path)) {
-        if (i > 0) {
-            out += sep
-        }
-        out += path[i]
-        i = i + 1
-    }
-    out
-}
 
-fn flattenBlockTail(block: Block) {
-    match (block.expr) {
-        case some(tail) -> {
-            block.stmts.push(Stmt.Expr(tail))
-            block.expr = none
-        }
-        case none -> {}
-    }
-}
 
-fn argBlockAt(e: Expr, args: List<CallArg>, i: int) -> Block? {
-    if (i < len(args)) {
-        return blockOf(args[i].value)
-    }
-    none
-}
 
-fn argAt(args: List<CallArg>, i: int) -> CallArg? {
-    if (i < len(args)) {
-        args[i]
-    } else {
-        none
-    }
-}
 
-fn lastArgAt(args: List<CallArg>) -> CallArg? {
-    if (len(args) > 0) {
-        args[len(args) - 1]
-    } else {
-        none
-    }
-}
 
-fn setFnVis(f: FnDecl, v: Visibility) {
-    f.visibility = v
-}
 
-fn callCalleeName(e: Expr) -> string {
-    match (e.kind) {
-        case ExprKind.Call(callee, _) -> match (callee.kind) {
-            case ExprKind.Ident(n) -> n
-            case _ -> ""
-        }
-        case _ -> ""
-    }
-}
 
-fn callParts(e: Expr) -> CallParts? {
-    match (e.kind) {
-        case ExprKind.Call(callee, args) -> match (callee.kind) {
-            case ExprKind.Ident(n) -> CallParts(n, args)
-            case _ -> none
-        }
-        case _ -> none
-    }
-}
 
-fn strLiteralOf(e: Expr) -> List<StrPart>? {
-    match (e.kind) {
-        case ExprKind.Lit(l) -> match (l) {
-            case Lit.String(parts) -> parts
-            case _ -> none
-        }
-        case _ -> none
-    }
-}
 
-fn blockOf(e: Expr) -> Block? {
-    match (e.kind) {
-        case ExprKind.Block(b) -> b
-        case _ -> none
-    }
-}
 
-fn stmtSpan(s: Stmt) -> Span {
-    match (s) {
-        case Stmt.Let(_, _, _, _, _, span) -> span
-        case Stmt.Const(_, _, _, span) -> span
-        case Stmt.Return(_, span) -> span
-        case Stmt.Break(span) -> span
-        case Stmt.Continue(span) -> span
-        case Stmt.While(_, _, span) -> span
-        case Stmt.For(_, _, span) -> span
-        case Stmt.Expr(e) -> e.span
-        case Stmt.Empty(span) -> span
-    }
-}
 
-fn contextualIdent(t: Tok) -> string? {
-    match (t) {
-        case Tok.Get -> "get"
-        case Tok.Set -> "set"
-        case Tok.Init -> "init"
-        case Tok.Deinit -> "deinit"
-        case Tok.Task -> "task"
-        case Tok.Channel -> "channel"
-        case Tok.Async -> "async"
-        case Tok.Constructor -> "constructor"
-        case Tok.Operator -> "operator"
-        case Tok.Property -> "property"
-        case Tok.Static -> "static"
-        case Tok.Override -> "override"
-        case Tok.Public -> "public"
-        case Tok.Private -> "private"
-        case Tok.Protected -> "protected"
-        case Tok.Extends -> "extends"
-        case Tok.Implements -> "implements"
-        case _ -> none
-    }
-}
 
-fn isSomeStr(o: string?) -> bool {
-    match (o) {
-        case some(_) -> true
-        case none -> false
-    }
-}
 
-fn optTokIs(o: Tok?, k: Tok) -> bool {
-    match (o) {
-        case some(t) -> t == k
-        case none -> false
-    }
-}
 
 fn startsItemToken(k: Tok) -> bool {
     k == Tok.Fn || k == Tok.Class || k == Tok.Struct || k == Tok.Enum || k == Tok.Interface || k == Tok.Const || k == Tok.Public || k == Tok.Private || k == Tok.Protected || k == Tok.Hash
 }
 
-fn isFieldSyntax(hasMods: bool, k: Tok) -> bool {
-    if (!hasMods) {
-        return false
-    }
-    match (k) {
-        case Tok.Let -> true
-        case Tok.Var -> true
-        case Tok.Ident(_) -> true
-        case _ -> false
-    }
-}
 
-fn memberFieldName(t: Tok) -> bool {
-    match (t) {
-        case Tok.Ident(_) -> true
-        case Tok.Get -> true
-        case Tok.Set -> true
-        case Tok.Init -> true
-        case Tok.Deinit -> true
-        case Tok.Task -> true
-        case Tok.Channel -> true
-        case Tok.Async -> true
-        case _ -> false
-    }
-}
 
-fn isOperatorSymbol(t: Tok) -> bool {
-    match (t) {
-        case Tok.Plus -> true
-        case Tok.Minus -> true
-        case Tok.Star -> true
-        case Tok.Slash -> true
-        case Tok.Percent -> true
-        case Tok.StarStar -> true
-        case Tok.EqEq -> true
-        case Tok.NotEq -> true
-        case Tok.Lt -> true
-        case Tok.Le -> true
-        case Tok.Gt -> true
-        case Tok.Ge -> true
-        case Tok.Shl -> true
-        case Tok.Shr -> true
-        case Tok.Amp -> true
-        case Tok.Pipe -> true
-        case Tok.Caret -> true
-        case Tok.LBracket -> true
-        case _ -> false
-    }
-}
 
-fn isIdentTok(k: Tok) -> bool {
-    match (k) {
-        case Tok.Ident(_) -> true
-        case _ -> false
-    }
-}
 
-fn hookKind(name: string) -> string? {
-    if (name == "beforeAll") {
-        "ba"
-    } else if (name == "beforeEach") {
-        "be"
-    } else if (name == "afterEach") {
-        "ae"
-    } else if (name == "afterAll") {
-        "aa"
-    } else {
-        none
-    }
-}
 
-fn isContAfter(prev: Tok) -> bool {
-    match (prev) {
-        case Tok.Plus -> true
-        case Tok.Minus -> true
-        case Tok.Star -> true
-        case Tok.Slash -> true
-        case Tok.Percent -> true
-        case Tok.StarStar -> true
-        case Tok.Shl -> true
-        case Tok.Shr -> true
-        case Tok.Amp -> true
-        case Tok.Pipe -> true
-        case Tok.Caret -> true
-        case Tok.AndAnd -> true
-        case Tok.OrOr -> true
-        case Tok.EqEq -> true
-        case Tok.NotEq -> true
-        case Tok.Lt -> true
-        case Tok.Le -> true
-        case Tok.Gt -> true
-        case Tok.Ge -> true
-        case Tok.Comma -> true
-        case Tok.Dot -> true
-        case Tok.QuestionDot -> true
-        case Tok.Arrow -> true
-        case Tok.FatArrow -> true
-        case Tok.Range -> true
-        case Tok.RangeIncl -> true
-        case Tok.QuestionQuestion -> true
-        case Tok.Question -> true
-        case Tok.QuestionColon -> true
-        case Tok.SendOp -> true
-        case Tok.LParen -> true
-        case Tok.LBracket -> true
-        case Tok.Assign -> true
-        case Tok.PlusEq -> true
-        case Tok.MinusEq -> true
-        case Tok.StarEq -> true
-        case Tok.SlashEq -> true
-        case Tok.PercentEq -> true
-        case Tok.ShlEq -> true
-        case Tok.ShrEq -> true
-        case Tok.AndEq -> true
-        case Tok.OrEq -> true
-        case Tok.XorEq -> true
-        case _ -> false
-    }
-}
 
-fn isContBefore(t: Tok) -> bool {
-    match (t) {
-        case Tok.Dot -> true
-        case Tok.QuestionDot -> true
-        case Tok.Plus -> true
-        case Tok.Minus -> true
-        case Tok.Star -> true
-        case Tok.Slash -> true
-        case Tok.Percent -> true
-        case Tok.StarStar -> true
-        case Tok.AndAnd -> true
-        case Tok.OrOr -> true
-        case Tok.EqEq -> true
-        case Tok.NotEq -> true
-        case Tok.Lt -> true
-        case Tok.Le -> true
-        case Tok.Gt -> true
-        case Tok.Ge -> true
-        case Tok.Shl -> true
-        case Tok.Shr -> true
-        case Tok.Amp -> true
-        case Tok.Pipe -> true
-        case Tok.Caret -> true
-        case Tok.Range -> true
-        case Tok.RangeIncl -> true
-        case Tok.Question -> true
-        case Tok.QuestionQuestion -> true
-        case Tok.QuestionColon -> true
-        case Tok.SendOp -> true
-        case _ -> false
-    }
-}
 
-fn suffStartsF(s: string?) -> bool {
-    match (s) {
-        case some(v) -> if (len(v) > 0) {
-            v[0] == ('f' as int)
-        } else {
-            false
-        }
-        case none -> false
-    }
-}
 
-fn binopInfo(t: Tok) -> BinopInfo? {
-    match (t) {
-        case Tok.OrOr -> BinopInfo(1, BinOp.Or)
-        case Tok.QuestionQuestion -> BinopInfo(1, BinOp.NullCoalesce)
-        case Tok.AndAnd -> BinopInfo(2, BinOp.And)
-        case Tok.Pipe -> BinopInfo(3, BinOp.BitOr)
-        case Tok.Caret -> BinopInfo(4, BinOp.BitXor)
-        case Tok.Amp -> BinopInfo(5, BinOp.BitAnd)
-        case Tok.EqEq -> BinopInfo(6, BinOp.Eq)
-        case Tok.NotEq -> BinopInfo(6, BinOp.Ne)
-        case Tok.Lt -> BinopInfo(6, BinOp.Lt)
-        case Tok.Le -> BinopInfo(6, BinOp.Le)
-        case Tok.Gt -> BinopInfo(6, BinOp.Gt)
-        case Tok.Ge -> BinopInfo(6, BinOp.Ge)
-        case Tok.In -> BinopInfo(6, BinOp.In)
-        case Tok.Shl -> BinopInfo(7, BinOp.Shl)
-        case Tok.Shr -> BinopInfo(7, BinOp.Shr)
-        case Tok.Plus -> BinopInfo(8, BinOp.Add)
-        case Tok.Minus -> BinopInfo(8, BinOp.Sub)
-        case Tok.Star -> BinopInfo(9, BinOp.Mul)
-        case Tok.Slash -> BinopInfo(9, BinOp.Div)
-        case Tok.Percent -> BinopInfo(9, BinOp.Mod)
-        case Tok.StarStar -> BinopInfo(10, BinOp.Pow)
-        case Tok.Range -> BinopInfo(0, BinOp.Range)
-        case Tok.RangeIncl -> BinopInfo(0, BinOp.RangeIncl)
-        case Tok.SendOp -> BinopInfo(0, BinOp.Send)
-        case _ -> none
-    }
-}
 
-fn assignOpTok(op: AssignOp) -> Tok {
-    match (op) {
-        case AssignOp.Assign -> Tok.Assign
-        case AssignOp.Add -> Tok.PlusEq
-        case AssignOp.Sub -> Tok.MinusEq
-        case AssignOp.Mul -> Tok.StarEq
-        case AssignOp.Div -> Tok.SlashEq
-        case AssignOp.Mod -> Tok.PercentEq
-        case AssignOp.Shl -> Tok.ShlEq
-        case AssignOp.Shr -> Tok.ShrEq
-        case AssignOp.BitAnd -> Tok.AndEq
-        case AssignOp.BitOr -> Tok.OrEq
-        case AssignOp.BitXor -> Tok.XorEq
-    }
-}
 
-fn describeTok(k: Tok) -> string {
-    match (k) {
-        case Tok.Ident(s) -> "identifier `" + s + "`"
-        case Tok.Number -> "number"
-        case Tok.Char(c) -> "character literal `" + strChar(c) + "`"
-        case Tok.Str(_) -> "string literal"
-        case Tok.Newline -> "end of line"
-        case Tok.Eof -> "end of file"
-        case _ -> "`" + punctTok(k) + "`"
-    }
-}
 
-fn strChar(c: char) -> string {
-    "{c}"
-}
 
-fn punctTok(k: Tok) -> string {
-    match (k) {
-        case Tok.LParen -> "("
-        case Tok.RParen -> ")"
-        case Tok.LBrace -> "\{"
-        case Tok.RBrace -> "}"
-        case Tok.LBracket -> "["
-        case Tok.RBracket -> "]"
-        case Tok.Comma -> ","
-        case Tok.Dot -> "."
-        case Tok.Colon -> ":"
-        case Tok.ColonColon -> "::"
-        case Tok.Semicolon -> ";"
-        case Tok.Arrow -> "->"
-        case Tok.FatArrow -> "=>"
-        case Tok.Assign -> "="
-        case Tok.PlusEq -> "+="
-        case Tok.MinusEq -> "-="
-        case Tok.StarEq -> "*="
-        case Tok.SlashEq -> "/="
-        case Tok.PercentEq -> "%="
-        case Tok.ShlEq -> "<<="
-        case Tok.ShrEq -> ">>="
-        case Tok.AndEq -> "&="
-        case Tok.OrEq -> "|="
-        case Tok.XorEq -> "^="
-        case Tok.Plus -> "+"
-        case Tok.Minus -> "-"
-        case Tok.Star -> "*"
-        case Tok.Slash -> "/"
-        case Tok.Percent -> "%"
-        case Tok.StarStar -> "**"
-        case Tok.Bang -> "!"
-        case Tok.Tilde -> "~"
-        case Tok.Amp -> "&"
-        case Tok.Pipe -> "|"
-        case Tok.Caret -> "^"
-        case Tok.Shl -> "<<"
-        case Tok.Shr -> ">>"
-        case Tok.EqEq -> "=="
-        case Tok.NotEq -> "!="
-        case Tok.Lt -> "<"
-        case Tok.Le -> "<="
-        case Tok.Gt -> ">"
-        case Tok.Ge -> ">="
-        case Tok.AndAnd -> "&&"
-        case Tok.OrOr -> "||"
-        case Tok.Question -> "?"
-        case Tok.QuestionDot -> "?."
-        case Tok.QuestionQuestion -> "??"
-        case Tok.QuestionColon -> "?:"
-        case Tok.Range -> ".."
-        case Tok.RangeIncl -> "..="
-        case Tok.SendOp -> "<-"
-        case Tok.Ellipsis -> "..."
-        case Tok.At -> "@"
-        case Tok.Hash -> "#"
-        case Tok.StarStar -> "**"
-        case _ -> "?"
-    }
-}
 
 fn dummySpan() -> Span {
     Span(0, 0)
 }
 
-fn dummyExpr() -> Expr {
-    Expr(Span(0, 0), ExprKind.Ident("x"))
-}
 
-fn dummyStmt() -> Stmt {
-    Stmt.Empty(Span(0, 0))
-}
 
-fn dummyType() -> TypeExpr {
-    TypeExpr(Span(0, 0), TypeExprKind.Infer)
-}
 
 fn dummyPattern() -> Pattern {
     Pattern.Wildcard
 }
 
-fn dummyFnBody() -> FnBody {
-    FnBody.Block(emptyBlock())
-}
 
-fn dummyFnDecl() -> FnDecl {
-    FnDecl("x", Span(0, 0), Visibility.Default, false, emptyGenericParams(), emptyParams(), none, none)
-}
 
-fn dummyMethodDecl() -> MethodDecl {
-    MethodDecl("x", Span(0, 0), Visibility.Default, false, false, false, false, none, emptyGenericParams(), emptyParams(), none, none)
-}
 
-fn dummyConstDecl() -> ConstDecl {
-   ConstDecl("x", Visibility.Default, none, dummyExpr(), Span(0, 0))
-   }
 
-fn dummyGlobalDecl() -> GlobalDecl {
-   GlobalDecl("x", Visibility.Default, none, dummyExpr(), Span(0, 0))
-   }
 
-fn dummyClassDecl() -> ClassDecl {
-    ClassDecl("x", Span(0, 0), Visibility.Default, emptyGenericParams(), none, emptyTypeExprs(), emptyProcMembers())
-}
 
-fn dummyEnumDecl() -> EnumDecl {
-    EnumDecl("x", Span(0, 0), Visibility.Default, emptyGenericParams(), emptyEnumVariants(), emptyTypeExprs())
-}
 
-fn dummyInterfaceDecl() -> InterfaceDecl {
-    InterfaceDecl("x", Span(0, 0), Visibility.Default, emptyGenericParams(), emptyTypeExprs(), emptyIfaceMembers())
-}
 
 fn dummyModuleDecl() -> ModuleDecl {
     ModuleDecl(emptyStrs(), Span(0, 0))
@@ -527,211 +82,36 @@ fn dummyImportDecl() -> ImportDecl {
     ImportDecl(false, emptyStrs(), ImportKind.Wildcard, Span(0, 0))
 }
 
-fn dummyItemKind() -> ItemKind {
-    ItemKind.Fn(dummyFnDecl())
-}
 
-fn dummyClassMember() -> ClassMember {
-    ClassMember.Init(emptyBlock())
-}
 
-fn dummyPropertyDecl() -> PropertyDecl {
-    PropertyDecl("x", Span(0, 0), Visibility.Default, none, none, none, false)
-}
 
 fn dummyProgram() -> Program {
     Program(none, emptyImportDecls(), emptyItems(), false)
 }
 
-fn emptyMapEntries() -> List<MapEntry> {
-    var l = [MapEntry(dummyExpr(), dummyExpr())]
-    l.pop()
-    l
-}
 
-fn emptyPatterns() -> List<Pattern> {
-    var l = [Pattern.Wildcard]
-    l.pop()
-    l
-}
 
-fn peek(pa: Parser) -> LexedToken {
-        pa.tokens[minOf(pa.pos, len(pa.tokens) - 1)]
-}
 
-fn peekKind(pa: Parser) -> Tok {
-        peek(pa).token.kind
-}
 
-fn peekAt(pa: Parser, ahead: int) -> Tok {
-        pa.tokens[minOf(pa.pos + ahead, len(pa.tokens) - 1)].token.kind
-}
 
-fn span(pa: Parser) -> Span {
-        peek(pa).token.span
-}
 
-fn prevSpan(pa: Parser) -> Span {
-        if (pa.pos == 0) {
-            span(pa)
-        } else {
-            pa.tokens[pa.pos - 1].token.span
-        }
-}
 
-fn advance(pa: Parser) -> LexedToken {
-        let t = peek(pa)
-        if (!(t.token.kind == Tok.Eof)) {
-            pa.pos = pa.pos + 1
-        }
-        t
-}
 
-fn kind(pa: Parser) -> Tok {
-        peekKind(pa)
-}
 
-fn bump(pa: Parser) -> Tok {
-        advance(pa).token.kind
-}
 
-fn at(pa: Parser, k: Tok) -> bool {
-        peekKind(pa) == k
-}
 
-fn eat(pa: Parser, k: Tok) -> bool {
-        if (at(pa, k)) {
-            bump(pa)
-            true
-        } else {
-            false
-        }
-}
 
-fn expect(pa: Parser, k: Tok) {
-        if (at(pa, k)) {
-            bump(pa)
-        } else {
-            errExpected(pa, k)
-            pa.failed = true
-            let _ = Tok.Eof
-        }
-}
 
-fn errExpected(pa: Parser, k: Tok) {
-        let sp = span(pa)
-        var expected = ""
-        if (k == Tok.Newline) {
-            expected = "end of line"
-        } else {
-            expected = "`" + punctTok(k) + "`"
-        }
-        errAt(pa, sp, "expected " + expected + ", found " + describeTok(kind(pa)))
-}
 
-fn errAt(pa: Parser, span: Span, msg: string) {
-        pa.diags.emit(Diagnostic.errorAt(span, msg).withCode("E0111"))
-}
 
-fn errHere(pa: Parser, msg: string) {
-        let sp = span(pa)
-        errAt(pa, sp, msg)
-        pa.failed = true
-}
 
-fn intLitValue(pa: Parser, ival: int?, text: string, span: Span) -> int {
-        if (let some(v) = ival) {
-            v
-        } else {
-            if (intLiteralOverflows(text)) {
-                pa.intLiteralOverflow = true
-            }
-            0
-        }
-}
 
-fn newlines(pa: Parser) {
-        while (at(pa, Tok.Newline)) {
-            bump(pa)
-        }
-}
 
-fn continuationAfter(pa: Parser, prev: Tok) {
-        if (isContAfter(prev)) {
-            newlines(pa)
-        }
-}
 
-fn nextBeginsContinuation(pa: Parser) -> bool {
-        if (lastSigWasRbrace(pa)) {
-            return false
-        }
-        match (peekNonNl(pa, 1)) {
-            case some(t) -> isContBefore(t)
-            case none -> false
-        }
-}
 
-fn lastSigWasRbrace(pa: Parser) -> bool {
-        var i = pa.pos
-        while (i > 0) {
-            i = i - 1
-            let k = pa.tokens[i].token.kind
-            if (k == Tok.Newline) {
-                continue
-            }
-            return k == Tok.RBrace
-        }
-        false
-}
 
-fn peekNonNl(pa: Parser, ahead: int) -> Tok? {
-        while (true) {
-            let t = peekAt(pa, ahead)
-            if (t == Tok.Newline) {
-                ahead = ahead + 1
-            } else if (t == Tok.Eof) {
-                return none
-            } else {
-                return t
-            }
-        }
-}
 
-fn expectStmtEnd(pa: Parser) {
-        // Optional `;` is tolerated as a statement separator.
-        while (at(pa, Tok.Semicolon)) {
-            bump(pa)
-        }
-        if (at(pa, Tok.Newline)) {
-            newlines(pa)
-        } else if (at(pa, Tok.RBrace) || at(pa, Tok.Eof)) {
-            // ok
-        } else {
-            let found = kind(pa)
-            errHere(pa, "expected end of line, found " + describeTok(found))
-            pa.failed = true
-        }
-}
 
-fn expectIdent(pa: Parser, what: string) -> string {
-        let k = kind(pa)
-        match (k) {
-            case Tok.Ident(s) -> {
-                bump(pa)
-                return s
-            }
-            case _ -> {
-                if (let some(ci) = contextualIdent(k)) {
-                    bump(pa)
-                    return ci
-                }
-                errAt(pa, span(pa), "expected identifier for " + what + ", found " + describeTok(k))
-                pa.failed = true
-                return ""
-            }
-        }
-}
 
 fn parseProgram(pa: Parser) -> Program {
         var modDecl: ModuleDecl? = none
@@ -968,33 +348,9 @@ fn startsItem(pa: Parser) -> bool {
         startsItemToken(kind(pa)) || isTestFnAhead(pa)
 }
 
-fn isTestFnAhead(pa: Parser) -> bool {
-        match (kind(pa)) {
-            case Tok.Ident(n) -> n == "test" && optTokIs(peekNonNl(pa, 1), Tok.Fn)
-            case _ -> false
-        }
-}
 
-fn isTestCallAhead(pa: Parser) -> bool {
-        match (kind(pa)) {
-            case Tok.Ident(n) -> (n == "test" || n == "it") && optTokIs(peekNonNl(pa, 1), Tok.LParen)
-            case _ -> false
-        }
-}
 
-fn isDescribeCallAhead(pa: Parser) -> bool {
-        match (kind(pa)) {
-            case Tok.Ident(n) -> n == "describe" && optTokIs(peekNonNl(pa, 1), Tok.LParen)
-            case _ -> false
-        }
-}
 
-fn isHookCallAhead(pa: Parser) -> bool {
-        match (kind(pa)) {
-            case Tok.Ident(n) -> (n == "beforeAll" || n == "afterAll" || n == "beforeEach" || n == "afterEach") && optTokIs(peekNonNl(pa, 1), Tok.LParen)
-            case _ -> false
-        }
-}
 
 fn parseTestCallItem(pa: Parser) -> ItemKind {
         let start = span(pa)
@@ -1026,41 +382,6 @@ fn parseTestCallItem(pa: Parser) -> ItemKind {
         ItemKind.Test(FnDecl(desc, span, Visibility.Default, false, emptyGenericParams(), emptyParams(), none, FnBody.Block(block)))
 }
 
-fn parseTestDescription(pa: Parser) -> string {
-        let start = span(pa)
-        let lit = match (kind(pa)) {
-            case Tok.Str(l) -> {
-                bump(pa)
-                l
-            }
-            case _ -> none
-        }
-        match (lit) {
-            case some(l) -> {
-                var out = ""
-                var interpolated = false
-                for (seg in l.segments) {
-                    match (seg) {
-                        case StrSeg.Text(text) -> {
-                            out += text
-                            let _ = true
-                        }
-                        case StrSeg.Expr(_) -> { interpolated = true }
-                    }
-                }
-                if (interpolated) {
-                    errAt(pa, start, "interpolation is not allowed in a test description")
-                    pa.failed = true
-                }
-                return out
-            }
-            case none -> {
-                errAt(pa, start, "test description must be a string literal, found " + describeTok(kind(pa)))
-                pa.failed = true
-                return ""
-            }
-        }
-}
 
 fn parseAttributes(pa: Parser) -> List<Attribute> {
         let out = emptyAttrs()
@@ -1321,153 +642,8 @@ fn parseHookItem(pa: Parser) -> ItemKind {
         ItemKind.Fn(FnDecl(name, span, Visibility.Default, false, emptyGenericParams(), emptyParams(), none, FnBody.Block(block)))
 }
 
-fn desugarDescribeBlock(pa: Parser, depth: int, path: List<string>, block: Block, out: List<Item>) {
-        for (stmt in block.stmts) {
-            let isExpr = match (stmt) {
-                case Stmt.Expr(e) -> e
-                case _ -> none
-            }
-            match (isExpr) {
-                case some(e) -> {
-                    let parts = callParts(e)
-                    match (parts) {
-                        case some(cc) -> {
-                            let callee = cc.callee
-                            let args = cc.args
-                            if (callee == "test" || callee == "it") {
-                                let desc = describeCallStr(pa, e, args, 0)
-                                if (pa.failed) {
-                                    return
-                                }
-                                let b = argBlockAt(e, args, 1)
-                                match (b) {
-                                    case some(bblk) -> {
-                                        var prefix = ""
-                                        if (len(path) > 0) {
-                                            prefix = joinStrs(path, " > ") + " > "
-                                        }
-                                        let full = prefix + desc
-                                        out.push(Item(emptyStrs(), emptyAttrs(), e.span, ItemKind.Test(FnDecl(full, e.span, Visibility.Default, false, emptyGenericParams(), emptyParams(), none, FnBody.Block(bblk)))))
-                                    }
-                                    case none -> {
-                                        errAt(pa, e.span, "`" + callee + "()` needs a `(\"description\", \{ ... \})` body")
-                                        pa.failed = true
-                                        return
-                                    }
-                                }
-                            } else if (callee == "describe") {
-                                let desc = describeCallStr(pa, e, args, 0)
-                                if (pa.failed) {
-                                    return
-                                }
-                                let b = argBlockAt(e, args, 1)
-                                match (b) {
-                                    case some(bblk) -> {
-                                        var nb = bblk
-                                        flattenBlockTail(nb)
-                                        let nested = emptyItems()
-                                        let npath = listCopy(path)
-                                        npath.push(desc)
-                                        desugarDescribeBlock(pa, 0, npath, nb, nested)
-                                        if (pa.failed) {
-                                            return
-                                        }
-                                        for (x in nested) {
-                                            out.push(x)
-                                        }
-                                    }
-                                    case none -> {
-                                        errAt(pa, e.span, "`describe()` needs a `(\"name\", \{ ... \})` body")
-                                        pa.failed = true
-                                        return
-                                    }
-                                }
-                            } else if (callee == "beforeAll" || callee == "beforeEach" || callee == "afterEach" || callee == "afterAll") {
-                                desugarHook(pa, e, args, path, out)
-                                if (pa.failed) {
-                                    return
-                                }
-                            } else {
-                                errAt(pa, e.span, "unsupported statement in a describe body: `" + callee + "(...)` (expected test/it/describe or a hook)")
-                                pa.failed = true
-                                return
-                            }
-                        }
-                        case none -> {
-                            errAt(pa, e.span, "expected `test(...)`, `it(...)`, `describe(...)` or a hook in a describe body")
-                            pa.failed = true
-                            return
-                        }
-                    }
-                }
-                case none -> {
-                    errAt(pa, stmtSpan(stmt), "expected `test(...)`, `it(...)`, `describe(...)` or a hook in a describe body")
-                    pa.failed = true
-                    return
-                }
-            }
-        }
-}
 
-fn desugarHook(pa: Parser, e: Expr, args: List<CallArg>, path: List<string>, out: List<Item>) {
-        let hook = callCalleeName(e)
-        let known = hookKind(hook)
-        match (known) {
-            case some(kind) -> {
-                let b = argBlockAt(e, args, 0)
-                match (b) {
-                    case some(bblk) -> {
-                        var name = "__pkl_hook_" + kind + "_"
-                        name += joinStrs(path, " > ")
-                        out.push(Item(emptyStrs(), emptyAttrs(), e.span, ItemKind.Fn(FnDecl(name, e.span, Visibility.Default, false, emptyGenericParams(), emptyParams(), none, FnBody.Block(bblk)))))
-                    }
-                    case none -> {
-                        errAt(pa, e.span, "`" + hook + "()` needs a `\{ ... \}` body block")
-                        pa.failed = true
-                        return
-                    }
-                }
-            }
-            case none -> {
-                errAt(pa, e.span, "unknown hook `" + hook + "`")
-                pa.failed = true
-            }
-        }
-}
 
-fn describeCallStr(pa: Parser, e: Expr, args: List<CallArg>, index: int) -> string {
-        let a = argAt(args, index)
-        match (a) {
-            case some(aa) -> {
-                match (strLiteralOf(aa.value)) {
-                    case some(segs) -> {
-                        var out = ""
-                        for (seg in segs) {
-                            match (seg) {
-                                case StrPart.Text(text) -> out += text
-                                case StrPart.Expr(_) -> {
-                                    errAt(pa, e.span, "interpolation is not allowed in a test description")
-                                    pa.failed = true
-                                    return ""
-                                }
-                            }
-                        }
-                        return out
-                    }
-                    case none -> {
-                        errAt(pa, e.span, "test description must be a string literal")
-                        pa.failed = true
-                        return ""
-                    }
-                }
-            }
-            case none -> {
-                errAt(pa, e.span, "test description must be a string literal")
-                pa.failed = true
-                return ""
-            }
-        }
-}
 
 fn parseFn(pa: Parser) -> FnDecl {
         let start = span(pa)
@@ -1517,51 +693,7 @@ fn parseOptionalReturnType(pa: Parser) -> TypeExpr? {
         none
 }
 
-fn expectFnName(pa: Parser) -> string {
-        let k = kind(pa)
-        match (k) {
-            case Tok.Ident(s) -> {
-                bump(pa)
-                return s
-            }
-            case _ -> {
-                if (let some(ci) = contextualIdent(k)) {
-                    bump(pa)
-                    return ci
-                }
-                errAt(pa, span(pa), "expected a function name, found " + describeTok(k))
-                pa.failed = true
-                return ""
-            }
-        }
-}
 
-fn parseGenericParams(pa: Parser) -> List<GenericParam> {
-        if (!at(pa, Tok.Lt)) {
-            return emptyGenericParams()
-        }
-        bump(pa)
-        let out = emptyGenericParams()
-        while (true) {
-            let name = expectIdent(pa, "type parameter")
-            if (pa.failed) {
-                return emptyGenericParams()
-            }
-            let span = prevSpan(pa)
-            out.push(GenericParam(name, span))
-            if (at(pa, Tok.Comma)) {
-                bump(pa)
-                newlines(pa)
-            } else {
-                break
-            }
-        }
-        consumeGt(pa, 1)
-        if (pa.failed) {
-            return emptyGenericParams()
-        }
-        out
-}
 
 fn parseParamList(pa: Parser) -> List<Param> {
         expect(pa, Tok.LParen)
@@ -1969,31 +1101,6 @@ fn parseForStmt(pa: Parser) -> Stmt {
         Stmt.For(header, body, span)
 }
 
-fn scanForHeaderIsIteration(pa: Parser) -> bool {
-        var depth = 0
-        var i = pa.pos
-        while (true) {
-            let t = pa.tokens[minOf(i, len(pa.tokens) - 1)].token.kind
-            if (t == Tok.LParen || t == Tok.LBracket || t == Tok.LBrace) {
-                depth = depth + 1
-            } else if (t == Tok.RParen || t == Tok.RBracket || t == Tok.RBrace) {
-                if (depth == 0) {
-                    break
-                }
-                depth = depth - 1
-            } else if (t == Tok.In) {
-                return true
-            } else if (t == Tok.Newline) {
-                if (depth == 0) {
-                    return false
-                }
-            } else if (t == Tok.Eof) {
-                return false
-            }
-            i = i + 1
-        }
-        false
-}
 
 fn parseConst(pa: Parser) -> ConstDecl {
         let start = span(pa)
@@ -2257,31 +1364,7 @@ fn parseTypeArgs(pa: Parser) -> List<TypeExpr> {
         args
 }
 
-fn splitShiftAsTwoGt(pa: Parser) {
-        if (!(kind(pa) == Tok.Shr)) {
-            return
-        }
-        let span = span(pa)
-        pa.tokens[pa.pos].token = Token(Tok.Gt, span)
-        pa.tokens.insert(pa.pos + 1, plainTok(Tok.Gt, span))
-}
 
-fn consumeGt(pa: Parser, n: int) {
-        var remaining = n
-        while (remaining > 0) {
-            let k = kind(pa)
-            if (k == Tok.Gt) {
-                bump(pa)
-                remaining = remaining - 1
-            } else if (k == Tok.Shr) {
-                splitShiftAsTwoGt(pa)
-            } else {
-                errHere(pa, "expected `>` or `>>`, found " + describeTok(k))
-                pa.failed = true
-                return
-            }
-        }
-}
 
 fn parsePattern(pa: Parser) -> Pattern {
         let p = parsePatternInner(pa)
@@ -2677,12 +1760,6 @@ fn parseCallArgsInternal(pa: Parser) -> List<CallArg> {
         args
 }
 
-fn peekIsNamedArg(pa: Parser) -> bool {
-        if (!isIdentTok(kind(pa))) {
-            return false
-        }
-        peekAt(pa, 1) == Tok.Colon
-}
 
 fn parsePrimary(pa: Parser) -> Expr {
         let start = span(pa)
@@ -2864,35 +1941,6 @@ fn parsePrimary(pa: Parser) -> Expr {
         }
 }
 
-fn looksLikeMapLiteral(pa: Parser) -> bool {
-        var depth = 0
-        var i = pa.pos + 1
-        while (true) {
-            let t = pa.tokens[minOf(i, len(pa.tokens) - 1)].token.kind
-            if (t == Tok.LBrace || t == Tok.LBracket || t == Tok.LParen) {
-                depth = depth + 1
-            } else if (t == Tok.RBrace) {
-                if (depth == 0) {
-                    break
-                }
-                depth = depth - 1
-            } else if (t == Tok.RBracket || t == Tok.RParen) {
-                depth = depth - 1
-            } else if (t == Tok.Eof) {
-                break
-            } else if (t == Tok.Newline) {
-                if (depth == 0) {
-                    return false
-                }
-            } else if (t == Tok.Colon) {
-                if (depth == 0) {
-                    return true
-                }
-            }
-            i = i + 1
-        }
-        false
-}
 
 fn parseMapLiteral(pa: Parser, start: Span) -> Expr {
         expect(pa, Tok.LBrace)
@@ -3137,71 +2185,8 @@ fn parseAsyncLambda(pa: Parser, start: Span) -> Expr {
         Expr(start.to(end), ExprKind.Lambda(params, none, false, FnBody.Block(bodyBlock)))
 }
 
-fn typeArgStart(pa: Parser, k: Tok) -> bool {
-        isIdentTok(k) || k == Tok.Star || k == Tok.Amp || k == Tok.Fn || k == Tok.LParen
-}
 
-fn genericCallFlavor(pa: Parser) -> GenericCallFlavor? {
-        var ix = pa.pos
-        if (!isIdentTok(pa.tokens[minOf(ix, len(pa.tokens) - 1)].token.kind)) {
-            return none
-        }
-        ix = ix + 1
-        if (!(pa.tokens[minOf(ix, len(pa.tokens) - 1)].token.kind == Tok.Lt)) {
-            return none
-        }
-        if (!typeArgStart(pa, pa.tokens[minOf(ix + 1, len(pa.tokens) - 1)].token.kind)) {
-            return none
-        }
-        var depth = 0
-        while (true) {
-            let t = pa.tokens[minOf(ix, len(pa.tokens) - 1)].token.kind
-            if (t == Tok.Lt) {
-                depth = depth + 1
-            } else if (t == Tok.Gt) {
-                if (depth < 1) {
-                    return none
-                }
-                depth = depth - 1
-                if (depth == 0) {
-                    return genericFlavorAfterClose(pa, ix)
-                }
-            } else if (t == Tok.Shr) {
-                if (depth < 2) {
-                    return none
-                }
-                depth = depth - 2
-                if (depth == 0) {
-                    return genericFlavorAfterClose(pa, ix)
-                }
-            } else if (t == Tok.Eof) {
-                return none
-            } else if (t == Tok.Newline) {
-                return none
-            } else if (t == Tok.Number || t == Tok.LBrace || t == Tok.RBrace || t == Tok.Semicolon) {
-                // No type argument list contains a literal, a block, or a
-                // statement end, so the bracket was never a generic.
-                return none
-            }
-            ix = ix + 1
-        }
-}
 
-fn genericFlavorAfterClose(pa: Parser, ix: int) -> GenericCallFlavor {
-        var j = ix + 1
-        while (pa.tokens[minOf(j, len(pa.tokens) - 1)].token.kind == Tok.Newline) {
-            j = j + 1
-        }
-        if (pa.tokens[minOf(j, len(pa.tokens) - 1)].token.kind == Tok.LParen) {
-            return GenericCallFlavor.Call
-        }
-        let a = pa.tokens[minOf(ix + 1, len(pa.tokens) - 1)].token.kind
-        if (isIdentTok(a) || a == Tok.Gt || a == Tok.Ge || a == Tok.Shr || a == Tok.Eof) {
-            GenericCallFlavor.None
-        } else {
-            GenericCallFlavor.Value
-        }
-}
 
 fn parseGenericCall(pa: Parser, start: Span) -> Expr {
         let name = expectIdent(pa, "function name")
