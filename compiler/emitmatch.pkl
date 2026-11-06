@@ -1,0 +1,306 @@
+// emitmatch - the match chain glue, carved walker-free out of emitcore.
+// emitcore's dispatcher owns the match prepass: it lowers the scrutinee, and
+// per arm creates the guard/body blocks in today's exact order, runs the
+// scope/bind work, lowers guards and arm bodies, and stores each arm's result
+// into the result slot. This module receives the prepared pieces (per-arm
+// condition, guard block, body block) and emits only the chain wiring: the
+// tag tests, point branches, panic on no-match, and the join tail. Block
+// content and wiring land in the same blocks as before; only the byte order
+// of instruction/block emission differs, which the 2026-10-19 policy permits.
+// Closure property (walker_scan.ps1 + design freeze): no member here calls
+// expr/expr1/stmt/stmt1, so emitcore imports emitmatch one-way and emitmatch
+// imports nothing from emitcore. The value-level machinery stays in
+// emitleaf/emitleaf2/emitprim/emitutil exactly as it is.
+module compiler.emitmatch
+import * from compiler.ast
+import { IrBlock, IrConst, IrFunc, IrGlobal, IrInstr, IrTerm, IrTy, emptyIrBlocks, emptyIrTys } from compiler.ir
+import { EnumTable, TypeTableEntry } from compiler.resolvebag
+import * from compiler.ty
+import * from compiler.emitutil
+import { Emitter } from compiler.emittypes
+import * from compiler.emitprim
+import * from compiler.emitreadsglobal
+import * from compiler.emitleaf
+import * from compiler.emitleaf2
+
+    /// The enum-tag `match` chain over prepared arms: tag equality routes each
+    /// arm; `cfs[i]`/`gBlocks[i]`/`bBlocks[i]` are the prepass results. Mirrors
+    /// `lower_enum_match_table`'s chain: tag tests in `cur`, branch to the
+    /// guard block, branch on the arm condition to the body block, join.
+fn lowerEnumMatchTable(em: Emitter, e: Expr, arms: List<MatchArm>, enumName: string, table: EnumTable, sSlot: int, resSlot: int?, cfs: List<int>, gBlocks: List<int>, bBlocks: List<int>, ends: List<int>) -> int? {
+        var sv = load(em, sSlot)
+        var tag = externCallT1(em, "pickle_enum_tag", [IrTy.Ptr], IrTy.Int, [sv])
+        var join = newBlock(em)
+        var cur = em.cur
+        var chainLive = true
+        var i = 0
+        for (arm in arms) {
+            var body = bBlocks[i]
+            var guardIn = gBlocks[i]
+            var cf = cfs[i]
+            var isCatchAll = false
+            match (arm.pattern) {
+                case Pattern.Wildcard -> isCatchAll = true
+                case Pattern.Binding(_, _) -> isCatchAll = true
+                case _ -> {}
+            }
+            if (isCatchAll) {
+                if (cf != -1) {
+                    if (chainLive) {
+                        em.cur = cur
+                        term(em, IrTerm.Branch(guardIn))
+                        cur = newBlock(em)
+                        em.cur = guardIn
+                        term(em, IrTerm.BranchIf(cf, body, cur))
+                    } else {
+                        em.cur = guardIn
+                        term(em, IrTerm.BranchIf(cf, body, join))
+                    }
+                    em.cur = ends[i]
+                    term(em, IrTerm.Branch(join))
+                } else {
+                    if (chainLive) {
+                        em.cur = cur
+                        term(em, IrTerm.Branch(body))
+                        chainLive = false
+                    }
+                }
+                em.cur = ends[i]
+                term(em, IrTerm.Branch(join))
+                i = i + 1
+                continue
+            }
+            match (arm.pattern) {
+                case Pattern.Variant(path, payloads) -> {
+                    var vname = ""
+                    var isPath = false
+                    if (len(path) == 2) {
+                        vname = path[1]
+                        isPath = true
+                    }
+                    if (len(path) == 1) {
+                        vname = path[0]
+                        isPath = true
+                    }
+                    if (!isPath) {
+                        bad(em, arm.span, "invalid enum variant pattern")
+                        return none
+                    }
+                    var vi = -1
+                    var vfound = false
+                    var vii = 0
+                    for (v in table.variants) {
+                        if (v.name == vname) {
+                            vi = vii
+                            vfound = true
+                            break
+                        }
+                        vii = vii + 1
+                    }
+                    if (!vfound) {
+                        bad(em, arm.span, "enum `" + enumName + "` has no variant `" + vname + "`")
+                        return none
+                    }
+                    if (chainLive) {
+                        em.cur = cur
+                        var viT = temp(em)
+                        instr(em, IrInstr.Const(viT, IrConst.Int(vi)))
+                        var c = temp(em)
+                        instr(em, IrInstr.BinOp(c, IrBinOp.Eq, tag, viT))
+                        var next = newBlock(em)
+                        term(em, IrTerm.BranchIf(c, guardIn, next))
+                        cur = next
+                    }
+                    em.cur = guardIn
+                    if (cf != -1) {
+                        var fall = join
+                        if (chainLive) {
+                            fall = cur
+                        }
+                        term(em, IrTerm.BranchIf(cf, body, fall))
+                    }
+                    em.cur = ends[i]
+                    term(em, IrTerm.Branch(join))
+                }
+                case Pattern.Or(alts) -> {
+                    if (chainLive) {
+                        em.cur = cur
+                    }
+                    var tagTest: int? = none
+                    for (alt in alts) {
+                        match (alt) {
+                            case Pattern.Variant(p, pl) -> {
+                                for (pla in pl) {
+                                    match (pla) {
+                                        case Pattern.Wildcard -> {}
+                                        case _ -> {
+                                            bad(em, arm.span, "enum or-pattern alternatives may only use `_` payloads")
+                                            return none
+                                        }
+                                    }
+                                }
+                                var ovn = ""
+                                var ois = false
+                                if (len(p) == 2) {
+                                    ovn = p[1]
+                                    ois = true
+                                }
+                                if (len(p) == 1) {
+                                    ovn = p[0]
+                                    ois = true
+                                }
+                                if (!ois) {
+                                    bad(em, arm.span, "invalid enum variant pattern")
+                                    return none
+                                }
+                                var ovi = -1
+                                var ofound = false
+                                var oi = 0
+                                for (v in table.variants) {
+                                    if (v.name == ovn) {
+                                        ovi = oi
+                                        ofound = true
+                                        break
+                                    }
+                                    oi = oi + 1
+                                }
+                                if (!ofound) {
+                                    bad(em, arm.span, "enum `" + enumName + "` has no variant `" + ovn + "`")
+                                    return none
+                                }
+                                var viT = constTemp(em, IrConst.Int(ovi))
+                                var c = temp(em)
+                                instr(em, IrInstr.BinOp(c, IrBinOp.Eq, tag, viT))
+                                if (let some(prev) = tagTest) {
+                                    tagTest = combineCond(em, false, prev, c)
+                                } else {
+                                    tagTest = c
+                                }
+                            }
+                            case _ -> {
+                                bad(em, arm.span, "enum or-pattern alternatives must be variant patterns")
+                                return none
+                            }
+                        }
+                    }
+                    if (let some(cv) = tagTest) {
+                        if (chainLive) {
+                            var next = newBlock(em)
+                            term(em, IrTerm.BranchIf(cv, guardIn, next))
+                            cur = next
+                        }
+                    } else {
+                        bad(em, arm.span, "an or-pattern has no alternatives")
+                        return none
+                    }
+                    em.cur = guardIn
+                    if (cf != -1) {
+                        var fall = join
+                        if (chainLive) {
+                            fall = cur
+                        }
+                        term(em, IrTerm.BranchIf(cf, body, fall))
+                    }
+                    em.cur = ends[i]
+                    term(em, IrTerm.Branch(join))
+                }
+                case _ -> {
+                    bad(em, arm.span, "this match pattern is not lowered yet")
+                    return none
+                }
+            }
+            i = i + 1
+        }
+        if (chainLive) {
+            em.cur = cur
+            panicNoMatchAt(em, e.span, sv)
+            term(em, IrTerm.Branch(join))
+        }
+        em.cur = join
+        if (let some(slot) = resSlot) {
+            return load(em, slot)
+        }
+        unitTemp(em)
+    }
+
+    /// The generic `match` chain over prepared arms: literal/test patterns go
+    /// through `patternTestCond`, bindings/wildcards fall through to the
+    /// prepared blocks. Mirrors `lower_generic_match`'s chain.
+fn lowerGenericMatch(em: Emitter, e: Expr, arms: List<MatchArm>, st: Ty, sSlot: int, resSlot: int?, cfs: List<int>, gBlocks: List<int>, bBlocks: List<int>, ends: List<int>) -> int? {
+        var join = newBlock(em)
+        var cur = em.cur
+        var chainLive = true
+        var i = 0
+        for (arm in arms) {
+            var body = bBlocks[i]
+            var guardIn = gBlocks[i]
+            var cf = cfs[i]
+            var testable: Pattern? = none
+            match (arm.pattern) {
+                case Pattern.Wildcard -> {}
+                case Pattern.Binding(_, _) -> {}
+                case other -> testable = other
+            }
+            if (let some(p) = testable) {
+                var condO: int? = none
+                if (chainLive) {
+                    em.cur = cur
+                    var sv = load(em, sSlot)
+                    condO = patternTestCond(em, p, st, sv, arm.span)
+                    if (let none = condO) {
+                        return none
+                    }
+                }
+                if (let some(cv) = condO) {
+                    var next = newBlock(em)
+                    term(em, IrTerm.BranchIf(cv, guardIn, next))
+                    cur = next
+                }
+                em.cur = guardIn
+                if (cf != -1) {
+                    var fall = join
+                    if (chainLive) {
+                        fall = cur
+                    }
+                    term(em, IrTerm.BranchIf(cf, body, fall))
+                }
+                em.cur = ends[i]
+                term(em, IrTerm.Branch(join))
+                i = i + 1
+                continue
+            }
+            if (cf != -1) {
+                if (chainLive) {
+                    em.cur = cur
+                    term(em, IrTerm.Branch(guardIn))
+                    cur = newBlock(em)
+                    em.cur = guardIn
+                    term(em, IrTerm.BranchIf(cf, body, cur))
+                } else {
+                    em.cur = guardIn
+                    term(em, IrTerm.BranchIf(cf, body, join))
+                }
+                em.cur = ends[i]
+                term(em, IrTerm.Branch(join))
+            } else {
+                if (chainLive) {
+                    em.cur = cur
+                    term(em, IrTerm.Branch(body))
+                    chainLive = false
+                }
+            }
+            em.cur = ends[i]
+            term(em, IrTerm.Branch(join))
+            i = i + 1
+        }
+        if (chainLive) {
+            em.cur = cur
+            externCallVoid(em, "pickle_panic_no_match", emptyIrTys(), emptyInts())
+            term(em, IrTerm.Branch(join))
+        }
+        em.cur = join
+        if (let some(slot) = resSlot) {
+            return load(em, slot)
+        }
+        unitTemp(em)
+    }

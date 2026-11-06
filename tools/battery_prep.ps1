@@ -71,7 +71,18 @@ function Invoke-Raw([string]$outPath, [string]$exe, [string[]]$argv) {
 # whose path string is exactly the relative import path of an already-loaded module
 # (compiler.resolve, compiler.front, cli.main) - it crashes or returns an error module.
 # The emitted bytes are identical either way, so one absolute spelling keeps this simple.
-$Targets = @("ast", "check", "diag", "emit", "error", "front", "ir", "lexer", "parser", "resolve", "token", "ty", "main")
+# 27 self targets: the carved compiler module layout plus cli/main. The old
+# 13-target list (ast..ty + main) predates the batch slices that split check,
+# parser, resolve and emit into their sub-modules; the seed-built tree has the
+# carved files, so the oracle + port phases follow the current layout.
+$Targets = @(
+    "ast", "checkbag", "checkcore", "checkutil", "diag",
+    "emit", "emitbody", "emitcore", "emitleaf2", "emitmatch",
+    "emitprim", "emitreadsglobal", "emittypes", "emitutil",
+    "error", "front", "ir", "lexer",
+    "parserbag", "parsercore", "parseutil", "resolvebag", "resolvecore",
+    "token", "ty", "main"
+)
 $gen2 = Join-Path $repoAbs "cli\gen2_run_one.pkl"
 
 function TargetPath([string]$t) {
@@ -85,18 +96,32 @@ $oraclesFrozen = (Test-Path -LiteralPath $oracleStamp) -and ((Get-Content -Liter
 if ($oraclesFrozen) {
     Write-Output "PREP oracles FROZEN (sources unchanged; Rust cli not used)"
 } else {
-    if (-not (Test-Path -LiteralPath $batteryCommonCli)) {
-        throw "PREP FAILED: oracle sources changed but no Rust cli at $batteryCommonCli to regenerate them. Restore the committed oracles (tools\diff\oracle.zip) or rebuild the Rust cli."
+    # Oracle generator: prefer the Rust cli; when it is absent (Rust retired to
+    # seed-only bootstrap) the pickled seed-built CLI (cli\main.pkl) regenerates
+    # the oracles. Seed-derived oracles share the port's emitter, so the IR/IRX
+    # byte-parity gates become weaker (self-compare) while the behavior gates
+    # (run/test goldens stay frozen) keep their full force.
+    $oracleGen = $batteryCommonCli
+    if (-not (Test-Path -LiteralPath $oracleGen)) {
+        $pickled = "tools\diff\port\pklc_cli.exe"
+        if (-not (Test-Path -LiteralPath $pickled)) {
+            throw "PREP FAILED: no oracle generator: no Rust cli at $batteryCommonCli and no pickled cli at $pickled. Restore the committed oracles (tools\diff\oracle.zip), rebuild the Rust cli, or run the selfhost settle to bake pklc_cli.exe."
+        }
+        $pickled = (Resolve-Path -LiteralPath $pickled).Path
+        Write-Output "PREP oracle generator = PICKLED SEED CLI ($pickled); oracles are seed-derived"
+        $oracleGen = $pickled
     }
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     foreach ($t in $Targets) {
         $src = TargetPath $t
-        Invoke-Raw "tools\diff\oracle\$t.pkl_gen.ir"  $batteryCommonCli @("ir", $src)
-        Invoke-Raw "tools\diff\oracle\$t.pkl_gen.irx" $batteryCommonCli @("irx", $src)
+        Invoke-Raw "tools\diff\oracle\$t.pkl_gen.ir"  $oracleGen @("ir", $src)
+        Invoke-Raw "tools\diff\oracle\$t.pkl_gen.irx" $oracleGen @("irx", $src)
     }
-    Invoke-Raw "tools\diff\oracle\gen2_run_one.pkl.ir"  $batteryCommonCli @("ir", $gen2)
-    Invoke-Raw "tools\diff\oracle\gen2_run_one.pkl.irx" $batteryCommonCli @("irx", $gen2)
-    Write-Output "PREP oracles (14 IR/IRX pairs, REGENERATED from Rust): $($sw.Elapsed.TotalSeconds.ToString('F1'))s"
+    Invoke-Raw "tools\diff\oracle\gen2_run_one.pkl.ir"  $oracleGen @("ir", $gen2)
+    Invoke-Raw "tools\diff\oracle\gen2_run_one.pkl.irx" $oracleGen @("irx", $gen2)
+    $genLabel = "Rust"
+    if ($oracleGen -ne $batteryCommonCli) { $genLabel = "PICKLED SEED CLI" }
+    Write-Output "PREP oracles (14 IR/IRX pairs, REGENERATED from $genLabel): $($sw.Elapsed.TotalSeconds.ToString('F1'))s"
 
     # GATE4 lex oracles. os_args_* is skipped: its assertions depend on argv, so it has
     # no meaningful standalone oracle and GATE4 treats a missing oracle as a skip.
@@ -105,7 +130,7 @@ if ($oraclesFrozen) {
     $lexCount = 0
     foreach ($f in $battery) {
         if ($f.BaseName.StartsWith("os_args")) { continue }
-        Invoke-Raw "tools\diff\oracle\$($f.BaseName).pkl.lex" $batteryCommonCli @("lex", (Join-Path $repoAbs "tests\pickle\$($f.Name)"))
+        Invoke-Raw "tools\diff\oracle\$($f.BaseName).pkl.lex" $oracleGen @("lex", (Join-Path $repoAbs "tests\pickle\$($f.Name)"))
         $lexCount++
     }
     Write-Output "PREP lex oracles ($lexCount, REGENERATED from Rust): $($sw.Elapsed.TotalSeconds.ToString('F1'))s"

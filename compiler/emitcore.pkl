@@ -20,6 +20,7 @@ import * from compiler.emitprim
 import * from compiler.emitreadsglobal
 import * from compiler.emitleaf
 import * from compiler.emitleaf2
+import * from compiler.emitmatch
 
 
     /// Record the initializer of a top-level `const`. Void so the arm of the
@@ -2654,9 +2655,14 @@ fn ifLetExpr(em: Emitter, e: Expr, pattern: Pattern, value: Expr, then: Block, e
     }
 
     /// Lower `match` over any scrutinee. Enum scrutinees use tag equality to
-    /// route each `Enum.Variant(..)`/or-pattern arm; everything else delegates
-    /// to `lower_generic_match`. A non-exhaustive chain panics at runtime.
-    /// Mirrors `match_expr` in emit.rs.
+    /// route each `Enum.Variant(..)`/or-pattern arm; everything else routes
+    /// through the generic chain. The dispatcher owns the scrutinee lowering,
+    /// the slot bookkeeping, and the per-arm content prepass: per arm it
+    /// creates the guard/body blocks in today's order, runs the scope/bind
+    /// work, lowers guards and arm bodies, and stores each arm's result. The
+    /// chain wiring lives in `compiler/emitmatch` (the prepared-arm consumer).
+    /// A non-exhaustive chain panics at runtime. Mirrors `match_expr` in
+    /// emit.rs.
 fn matchExpr(em: Emitter, e: Expr, scrutinee: Expr, arms: List<MatchArm>) -> int? {
         var st0 = tyOf(em, scrutinee.span)
         if (let none = st0) {
@@ -2672,46 +2678,49 @@ fn matchExpr(em: Emitter, e: Expr, scrutinee: Expr, arms: List<MatchArm>) -> int
             case Ty.Enum(_, _) -> isEnum = true
             case _ -> {}
         }
+        var sIrV = IrTy.Unit
         if (!isEnum) {
-            return lowerGenericMatch(em, e, scrutinee, arms, st)
-        }
-        var enumName = ""
-        match (st) {
-            case Ty.Enum(en, _) -> enumName = en
-            case _ -> {}
-        }
-        var tableO: EnumTable? = none
-        if (let some(entry) = em.resolved.types.get(enumName)) {
-            match (entry) {
-                case TypeTableEntry.Enum(t) -> tableO = t
-                case _ -> {}
+            var sIr = matchScrutineeIr(em, st)
+            if (let none = sIr) {
+                bad(em, e.span, "matching over `" + bareName(st) + "` values is not lowered yet")
+                return none
+            }
+            if (let some(x) = sIr) {
+                sIrV = x
             }
         }
-        if (let none = tableO) {
-            bad(em, e.span, "unknown enum type `" + enumName + "`")
-            return none
+        var enumName = ""
+        var table: EnumTable? = none
+        if (isEnum) {
+            match (st) {
+                case Ty.Enum(en, _) -> enumName = en
+                case _ -> {}
+            }
+            if (let some(entry) = em.resolved.types.get(enumName)) {
+                match (entry) {
+                    case TypeTableEntry.Enum(t) -> table = t
+                    case _ -> {}
+                }
+            }
+            if (let none = table) {
+                bad(em, e.span, "unknown enum type `" + enumName + "`")
+                return none
+            }
         }
-        if (let some(t) = tableO) {
-            return lowerEnumMatchTable(em, e, scrutinee, arms, enumName, t)
-        }
-        none
-    }
-
-    /// The enum-tag `match` lowering (Rust `match_expr` with the `ty_of` /
-    /// table lookup already resolved). The scrutinee lives in a `Ptr` slot;
-    /// arms branch on `pickle_enum_tag` equality, bind payloads, and join at
-    /// a common block.
-fn lowerEnumMatchTable(em: Emitter, e: Expr, scrutinee: Expr, arms: List<MatchArm>, enumName: string, table: EnumTable) -> int? {
-        var s = expr(em, scrutinee)
-        if (let none = s) {
+        var scrut = expr(em, scrutinee)
+        if (let none = scrut) {
             return none
         }
         var sV = 0
-        if (let some(x) = s) {
+        if (let some(x) = scrut) {
             sV = x
         }
         var sSlot = newSlot(em, IrTy.Ptr)
+        if (!isEnum) {
+            sSlot = newSlot(em, sIrV)
+        }
         instr(em, IrInstr.StoreSlot(sSlot, sV))
+        var entrance = em.cur
         var resTy = irty(em, e.span)
         var resSlot: int? = none
         if (matchResultNeedsSlot(resTy)) {
@@ -2721,32 +2730,54 @@ fn lowerEnumMatchTable(em: Emitter, e: Expr, scrutinee: Expr, arms: List<MatchAr
             }
             resSlot = newSlot(em, rt)
         }
-        var sv = load(em, sSlot)
-        var tag = externCallT1(em, "pickle_enum_tag", [IrTy.Ptr], IrTy.Int, [sv])
-        var join = newBlock(em)
-        var cur = em.cur
-        var chainLive = true
+        var cfs = emptyInts()
+        var gBlocks = emptyInts()
+        var bBlocks = emptyInts()
+        var ends = emptyInts()
+        if (!(matchPrepArms(em, arms, st, enumName, isEnum, sSlot, resSlot, table, cfs, gBlocks, bBlocks, ends))) {
+            return none
+        }
+        em.cur = entrance
+        if (isEnum) {
+            if (let some(tb) = table) {
+                return lowerEnumMatchTable(em, e, arms, enumName, tb, sSlot, resSlot, cfs, gBlocks, bBlocks, ends)
+            }
+            return none
+        }
+        return lowerGenericMatch(em, e, arms, st, sSlot, resSlot, cfs, gBlocks, bBlocks, ends)
+    }
+
+    /// The per-arm content prepass for `match`: for each arm create the guard
+    /// and body blocks (in `lower_*_match_table`'s exact order), switch into
+    /// the guard block, run the scope/bind sequence, lower the guard (when
+    /// present, folding any payload condition), then switch into the body
+    /// block, lower the arm body and store it into the result slot. Fills
+    /// `cfs` (per-arm precombined condition, none = unconditional),
+    /// `gBlocks`, and `bBlocks`; the chain wiring in emitmatch consumes them.
+fn matchPrepArms(em: Emitter, arms: List<MatchArm>, st: Ty, enumName: string, isEnum: bool, sSlot: int, resSlot: int?, table: EnumTable?, cfs: List<int>, gBlocks: List<int>, bBlocks: List<int>, ends: List<int>) -> bool {
         for (arm in arms) {
-            var body = newBlock(em)
+            var bBlock = newBlock(em)
             var guard = arm.guard
             var hasPayloadCond = false
-            match (arm.pattern) {
-                case Pattern.Variant(_, pl) -> {
-                    for (plp in pl) {
-                        var isPlSimple = false
-                        match (plp) {
-                            case Pattern.Wildcard -> isPlSimple = true
-                            case Pattern.Binding(_, _) -> isPlSimple = true
-                            case _ -> {}
-                        }
-                        if (!isPlSimple) {
-                            hasPayloadCond = true
+            if (isEnum) {
+                match (arm.pattern) {
+                    case Pattern.Variant(_, pl) -> {
+                        for (plp in pl) {
+                            var isPlSimple = false
+                            match (plp) {
+                                case Pattern.Wildcard -> isPlSimple = true
+                                case Pattern.Binding(_, _) -> isPlSimple = true
+                                case _ -> {}
+                            }
+                            if (!isPlSimple) {
+                                hasPayloadCond = true
+                            }
                         }
                     }
+                    case _ -> {}
                 }
-                case _ -> {}
             }
-            var guardIn = body
+            var guardIn = bBlock
             if (let some(_) = guard) {
                 guardIn = newBlock(em)
             } else {
@@ -2754,97 +2785,18 @@ fn lowerEnumMatchTable(em: Emitter, e: Expr, scrutinee: Expr, arms: List<MatchAr
                     guardIn = newBlock(em)
                 }
             }
-            var isCatchAll = false
-            var bindName: string? = none
-            match (arm.pattern) {
-                case Pattern.Wildcard -> isCatchAll = true
-                case Pattern.Binding(nm, _) -> {
-                    bindName = nm
-                    isCatchAll = true
-                }
-                case _ -> {}
-            }
-            if (isCatchAll) {
-                if (let some(g) = guard) {
-                    if (chainLive) {
-                        em.cur = cur
-                        term(em, IrTerm.Branch(guardIn))
-                        cur = newBlock(em)
-                        em.cur = guardIn
-                        pushScope(em)
-                        if (let some(nm) = bindName) {
-                            var slot = newSlot(em, IrTy.Ptr)
-                            var bv = load(em, sSlot)
-                            instr(em, IrInstr.StoreSlot(slot, bv))
-                            declare(em, nm, slot)
-                        }
-                        var cond = expr(em, g)
-                        if (let none = cond) {
-                            popScope(em)
-                            return none
-                        }
-                        var condV = 0
-                        if (let some(x) = cond) {
-                            condV = x
-                        }
-                        term(em, IrTerm.BranchIf(condV, body, cur))
-                        em.cur = body
-                        if (!(matchArmBody(em, arm.body, resSlot))) {
-                            popScope(em)
-                            return none
-                        }
-                        popScope(em)
-                        term(em, IrTerm.Branch(join))
-                    } else {
-                        em.cur = guardIn
-                        pushScope(em)
-                        if (let some(nm) = bindName) {
-                            var slot = newSlot(em, IrTy.Ptr)
-                            var bv = load(em, sSlot)
-                            instr(em, IrInstr.StoreSlot(slot, bv))
-                            declare(em, nm, slot)
-                        }
-                        var cond = expr(em, g)
-                        if (let none = cond) {
-                            popScope(em)
-                            return none
-                        }
-                        var condV = 0
-                        if (let some(x) = cond) {
-                            condV = x
-                        }
-                        term(em, IrTerm.BranchIf(condV, body, join))
-                        em.cur = body
-                        if (!(matchArmBody(em, arm.body, resSlot))) {
-                            popScope(em)
-                            return none
-                        }
-                        popScope(em)
-                        term(em, IrTerm.Branch(join))
+            var cf = -1
+            em.cur = guardIn
+            pushScope(em)
+                if (isEnum) {
+                    match (arm.pattern) {
+                        case Pattern.Wildcard -> {}
+                        case Pattern.Binding(nm, _) -> {
+                        var slot = newSlot(em, IrTy.Ptr)
+                        var bv = load(em, sSlot)
+                        instr(em, IrInstr.StoreSlot(slot, bv))
+                        declare(em, nm, slot)
                     }
-                    continue
-                }
-                if (chainLive) {
-                    em.cur = cur
-                    term(em, IrTerm.Branch(body))
-                    chainLive = false
-                }
-                em.cur = body
-                pushScope(em)
-                if (let some(nm) = bindName) {
-                    var slot = newSlot(em, IrTy.Ptr)
-                    var bv = load(em, sSlot)
-                    instr(em, IrInstr.StoreSlot(slot, bv))
-                    declare(em, nm, slot)
-                }
-                if (!(matchArmBody(em, arm.body, resSlot))) {
-                    popScope(em)
-                    return none
-                }
-                popScope(em)
-                term(em, IrTerm.Branch(join))
-            } else {
-                match (arm.pattern) {
                     case Pattern.Variant(path, payloads) -> {
                         var vname = ""
                         var isPath = false
@@ -2858,498 +2810,120 @@ fn lowerEnumMatchTable(em: Emitter, e: Expr, scrutinee: Expr, arms: List<MatchAr
                         }
                         if (!isPath) {
                             bad(em, arm.span, "invalid enum variant pattern")
-                            return none
+                            popScope(em)
+                            return false
                         }
                         var vi = -1
                         var vfound = false
                         var vii = 0
-                        for (v in table.variants) {
-                            if (v.name == vname) {
-                                vi = vii
-                                vfound = true
-                                break
+                        if (let some(tb) = table) {
+                            for (v in tb.variants) {
+                                if (v.name == vname) {
+                                    vi = vii
+                                    vfound = true
+                                    break
+                                }
+                                vii = vii + 1
                             }
-                            vii = vii + 1
                         }
                         if (!vfound) {
                             bad(em, arm.span, "enum `" + enumName + "` has no variant `" + vname + "`")
-                            return none
+                            popScope(em)
+                            return false
                         }
-                        if (chainLive) {
-                            em.cur = cur
-                            var viT = temp(em)
-                            instr(em, IrInstr.Const(viT, IrConst.Int(vi)))
-                            var c = temp(em)
-                            instr(em, IrInstr.BinOp(c, IrBinOp.Eq, tag, viT))
-                            var next = newBlock(em)
-                            term(em, IrTerm.BranchIf(c, guardIn, next))
-                            cur = next
+                        var payloadCond: int? = none
+                        if (let some(tb) = table) {
+                            payloadCond = bindEnumPayloads(em, arm.span, tb, vi, payloads, sSlot)
+                        } else {
+                            popScope(em)
+                            return false
                         }
-                        em.cur = guardIn
-                        pushScope(em)
-                        var payloadCond = bindEnumPayloads(em, arm.span, table, vi, payloads, sSlot)
                         if (let none = payloadCond) {
                             popScope(em)
-                            return none
+                            return false
                         }
-                        var cf = -1
                         if (let some(pc) = payloadCond) {
-                            cf = pc
-                        }
-                        if (let some(g) = guard) {
-                            var cond = expr(em, g)
-                            if (let none = cond) {
-                                popScope(em)
-                                return none
-                            }
-                            var condV = 0
-                            if (let some(x) = cond) {
-                                condV = x
-                            }
-                            if (cf == -1) {
-                                cf = condV
-                            } else {
-                                cf = combineCond(em, true, cf, condV)
+                            if (!(pc == -1)) {
+                                cf = pc
                             }
                         }
-                        if (!(cf == -1)) {
-                            var fall = join
-                            if (chainLive) {
-                                fall = cur
-                            }
-                            term(em, IrTerm.BranchIf(cf, body, fall))
-                            em.cur = body
-                        }
-                        if (!(matchArmBody(em, arm.body, resSlot))) {
-                            popScope(em)
-                            return none
-                        }
-                        popScope(em)
-                        term(em, IrTerm.Branch(join))
                     }
-                    case Pattern.Or(alts) -> {
-                        if (chainLive) {
-                            em.cur = cur
-                        }
-                        var tagTest: int? = none
-                        for (alt in alts) {
-                            match (alt) {
-                                case Pattern.Variant(p, pl) -> {
-                                    for (pla in pl) {
-                                        match (pla) {
-                                            case Pattern.Wildcard -> {}
-                                            case _ -> {
-                                                bad(em, arm.span, "enum or-pattern alternatives may only use `_` payloads")
-                                                return none
-                                            }
-                                        }
-                                    }
-                                    var ovn = ""
-                                    var ois = false
-                                    if (len(p) == 2) {
-                                        ovn = p[1]
-                                        ois = true
-                                    }
-                                    if (len(p) == 1) {
-                                        ovn = p[0]
-                                        ois = true
-                                    }
-                                    if (!ois) {
-                                        bad(em, arm.span, "invalid enum variant pattern")
-                                        return none
-                                    }
-                                    var ovi = -1
-                                    var ofound = false
-                                    var oi = 0
-                                    for (v in table.variants) {
-                                        if (v.name == ovn) {
-                                            ovi = oi
-                                            ofound = true
-                                            break
-                                        }
-                                        oi = oi + 1
-                                    }
-                                    if (!ofound) {
-                                        bad(em, arm.span, "enum `" + enumName + "` has no variant `" + ovn + "`")
-                                        return none
-                                    }
-                                    var viT = constTemp(em, IrConst.Int(ovi))
-                                    var c = temp(em)
-                                    instr(em, IrInstr.BinOp(c, IrBinOp.Eq, tag, viT))
-                                    if (let some(prev) = tagTest) {
-                                        tagTest = combineCond(em, false, prev, c)
-                                    } else {
-                                        tagTest = c
-                                    }
-                                }
-                                case _ -> {
-                                    bad(em, arm.span, "enum or-pattern alternatives must be variant patterns")
-                                    return none
-                                }
-                            }
-                        }
-                        var condV = 0
-                        if (let some(cv) = tagTest) {
-                            condV = cv
-                        } else {
-                            bad(em, arm.span, "an or-pattern has no alternatives")
-                            return none
-                        }
-                        if (chainLive) {
-                            var next = newBlock(em)
-                            term(em, IrTerm.BranchIf(condV, guardIn, next))
-                            cur = next
-                        }
-                        em.cur = guardIn
-                        pushScope(em)
-                        if (let some(g) = guard) {
-                            var cond = expr(em, g)
-                            if (let none = cond) {
-                                popScope(em)
-                                return none
-                            }
-                            var cv2 = 0
-                            if (let some(x) = cond) {
-                                cv2 = x
-                            }
-                            var fall = join
-                            if (chainLive) {
-                                fall = cur
-                            }
-                            term(em, IrTerm.BranchIf(cv2, body, fall))
-                            em.cur = body
-                        }
-                        if (!(matchArmBody(em, arm.body, resSlot))) {
-                            popScope(em)
-                            return none
-                        }
-                        popScope(em)
-                        term(em, IrTerm.Branch(join))
-                    }
+                    case Pattern.Or(_) -> {}
                     case _ -> {
                         bad(em, arm.span, "this match pattern is not lowered yet")
-                        return none
+                        popScope(em)
+                        return false
                     }
                 }
-            }
-        }
-        if (chainLive) {
-            em.cur = cur
-            panicNoMatchAt(em, e.span, sv)
-            term(em, IrTerm.Branch(join))
-        }
-        em.cur = join
-        if (let some(slot) = resSlot) {
-            return load(em, slot)
-        }
-        unitTemp(em)
-    }
-
-    /// Lower `match` over non-enum scrutinees: numeric scalars, `bool`,
-    /// `char`, `byte`, `string`, and options (`some(v)`/`none`). Literal
-    /// patterns become equality tests against the scrutinee slot; a
-    /// binding/wildcard arm catches everything that reaches it. A
-    /// non-exhaustive chain fails loudly at runtime. Mirrors
-    /// `lower_generic_match` in emit.rs.
-fn lowerGenericMatch(em: Emitter, e: Expr, scrutinee: Expr, arms: List<MatchArm>, st: Ty) -> int? {
-        var sIr = matchScrutineeIr(em, st)
-        if (let none = sIr) {
-            bad(em, e.span, "matching over `" + bareName(st) + "` values is not lowered yet")
-            return none
-        }
-        var sIrV = IrTy.Unit
-        if (let some(x) = sIr) {
-            sIrV = x
-        }
-        var s = expr(em, scrutinee)
-        if (let none = s) {
-            return none
-        }
-        var sV = 0
-        if (let some(x) = s) {
-            sV = x
-        }
-        var sSlot = newSlot(em, sIrV)
-        instr(em, IrInstr.StoreSlot(sSlot, sV))
-        var resTy = irty(em, e.span)
-        var resSlot: int? = none
-        if (matchResultNeedsSlot(resTy)) {
-            var rt = IrTy.Unit
-            if (let some(x) = resTy) {
-                rt = x
-            }
-            resSlot = newSlot(em, rt)
-        }
-        var join = newBlock(em)
-        var cur = em.cur
-        var chainLive = true
-for (arm in arms) {
-            var body = newBlock(em)
-            var guard = arm.guard
-            var guardIn = body
-            if (let some(_) = guard) {
-                guardIn = newBlock(em)
-            }
-            var testable: Pattern? = none
-            match (arm.pattern) {
-                case Pattern.Wildcard -> {}
-                case Pattern.Binding(_, _) -> {}
-                case other -> testable = other
-            }
-            if (let some(p) = testable) {
-                if (chainLive) {
-                    em.cur = cur
-                    var sv = load(em, sSlot)
-                    var cond = patternTestCond(em, p, st, sv, arm.span)
-                    if (let none = cond) {
-                        return none
-                    }
-                    var condV = 0
-                    if (let some(x) = cond) {
-                        condV = x
-                    }
-                    var next = newBlock(em)
-                    term(em, IrTerm.BranchIf(condV, guardIn, next))
-                    cur = next
-                }
-                em.cur = guardIn
-                pushScope(em)
+            } else {
                 var bv = load(em, sSlot)
                 if (!(bindMatchValue(em, arm.pattern, st, bv, arm.span))) {
                     popScope(em)
-                    return none
-                }
-                if (let some(g) = guard) {
-                    var cond = expr(em, g)
-                    if (let none = cond) {
-                        popScope(em)
-                        return none
-                    }
-                    var condV = 0
-                    if (let some(x) = cond) {
-                        condV = x
-                    }
-                    var fall = join
-                    if (chainLive) {
-                        fall = cur
-                    }
-                    term(em, IrTerm.BranchIf(condV, body, fall))
-                    em.cur = body
-                }
-                if (!(matchArmBody(em, arm.body, resSlot))) {
-                    popScope(em)
-                    return none
-                }
-                popScope(em)
-                term(em, IrTerm.Branch(join))
-                continue
-            }
-            if (let some(g) = guard) {
-                if (chainLive) {
-                    em.cur = cur
-                    term(em, IrTerm.Branch(guardIn))
-                    cur = newBlock(em)
-                    em.cur = guardIn
-                    pushScope(em)
-                    var bv = load(em, sSlot)
-                    if (!(bindMatchValue(em, arm.pattern, st, bv, arm.span))) {
-                        popScope(em)
-                        return none
-                    }
-                    var cond = expr(em, g)
-                    if (let none = cond) {
-                        popScope(em)
-                        return none
-                    }
-                    var condV = 0
-                    if (let some(x) = cond) {
-                        condV = x
-                    }
-                    term(em, IrTerm.BranchIf(condV, body, cur))
-                    em.cur = body
-                    if (!(matchArmBody(em, arm.body, resSlot))) {
-                        popScope(em)
-                        return none
-                    }
-                    popScope(em)
-                    term(em, IrTerm.Branch(join))
-                } else {
-                    em.cur = guardIn
-                    pushScope(em)
-                    var bv = load(em, sSlot)
-                    if (!(bindMatchValue(em, arm.pattern, st, bv, arm.span))) {
-                        popScope(em)
-                        return none
-                    }
-                    var cond = expr(em, g)
-                    if (let none = cond) {
-                        popScope(em)
-                        return none
-                    }
-                    var condV = 0
-                    if (let some(x) = cond) {
-                        condV = x
-                    }
-                    term(em, IrTerm.BranchIf(condV, body, join))
-                    em.cur = body
-                    if (!(matchArmBody(em, arm.body, resSlot))) {
-                        popScope(em)
-                        return none
-                    }
-                    popScope(em)
-                    term(em, IrTerm.Branch(join))
-                }
-                continue
-            }
-            if (chainLive) {
-                em.cur = cur
-                term(em, IrTerm.Branch(body))
-                chainLive = false
-            }
-            em.cur = body
-            pushScope(em)
-            var bv = load(em, sSlot)
-            if (!(bindMatchValue(em, arm.pattern, st, bv, arm.span))) {
-                popScope(em)
-                return none
-            }
-            if (!(matchArmBody(em, arm.body, resSlot))) {
-                popScope(em)
-                return none
-            }
-            popScope(em)
-            term(em, IrTerm.Branch(join))
-        }
-        if (chainLive) {
-            em.cur = cur
-            externCallVoid(em, "pickle_panic_no_match", emptyIrTys(), emptyInts())
-            term(em, IrTerm.Branch(join))
-        }
-        em.cur = join
-        if (let some(slot) = resSlot) {
-            return load(em, slot)
-        }
-        unitTemp(em)
-    }
-
-    /// The branch condition under which `p` matches the scrutinee value `a`
-    /// (already loaded): `none` tests absence; `some(payload)` tests presence
-    /// (recursing for nested payload patterns); tuple patterns AND each
-    /// element; `a | b` ORs alternatives; literal patterns test equality.
-    /// Mirrors `pattern_test_cond` in emit.rs.
-
-    /// The match condition contributed by tuple element `i` (read from the
-    /// tuple pointer `a`): bindings/wildcards are always true; a testable
-    /// nested pattern is unboxed to the element's IR domain and recursed.
-    /// Mirrors `tuple_part_cond` in emit.rs.
-
-    /// Build a constant in the scrutinee's domain for a literal pattern. A
-    /// float scrutinee widens integer literals; a byte scrutinee accepts
-    /// ASCII char literals. Mirrors `pattern_literal_temp` in emit.rs (the
-    /// float-to-int path uses a truncate-and-round-trip check because Pk
-    /// floats expose no `trunc`).
-
-
-    /// The IR domain a match scrutinee (`match`/`if let`) is kept in: scalars
-    /// as themselves, strings as `Str` foreign pointers, and every composite
-    /// (option/list/map/class/struct/enum/interface/tuple/range) as a managed
-    /// `Ptr`. Mirrors `match_scrutinee_ir` in emit.rs.
-
-    /// Bind the names an arm pattern introduces to the scrutinee value `v`
-    /// (already loaded, of type `st`) in the current block. Bindings declare
-    /// under `map_ty`; `some(v)` unboxes the present option; tuple patterns
-    /// unbox each element; or-patterns bind nothing (the checker only admits
-    /// name-free or-patterns); `_`/literals bind nothing. Mirrors
-    /// `bind_match_value` in emit.rs.
-
-    /// Bind a nested pattern to a value `v` of type `ty` already in IR form
-    /// (a `some` payload or a tuple element). Mirrors `bind_pattern_value`
-    /// in emit.rs.
-    /// Store an arm body's value into the match's result slot, lifting scalar
-    /// values when the slot is a `Ptr` (an option-typed result). Mirrors
-    /// `match_arm_body` in emit.rs.
-fn matchArmBody(em: Emitter, body: Expr, resSlot: int?) -> bool {
-        var bt = expr(em, body)
-        if (let none = bt) {
-            return false
-        }
-        var btv = 0
-        if (let some(x) = bt) {
-            btv = x
-        }
-        if (let some(slot) = resSlot) {
-            var isPtrSlot = false
-            if (slot < len(em.fslots)) {
-                if (irTyTag(em.fslots[slot]) == irTyTag(IrTy.Ptr)) {
-                    isPtrSlot = true
-                }
-            }
-            if (isPtrSlot) {
-                var btTy = Ty.Unknown
-                if (let some(t) = tyOf(em, body.span)) {
-                    btTy = t
-                }
-                var wv = optionWrap(em, btv, btTy, body.span)
-                if (let none = wv) {
                     return false
                 }
-                var wvv = 0
-                if (let some(x) = wv) {
-                    wvv = x
-                }
-                instr(em, IrInstr.StoreSlot(slot, wvv))
-            } else {
-                instr(em, IrInstr.StoreSlot(slot, btv))
             }
+            if (let some(g) = guard) {
+                var cond = expr(em, g)
+                if (let none = cond) {
+                    popScope(em)
+                    return false
+                }
+                var condV = 0
+                if (let some(x) = cond) {
+                    condV = x
+                }
+                if (cf == -1) {
+                    cf = condV
+                } else {
+                    cf = combineCond(em, true, cf, condV)
+                }
+            }
+            em.cur = bBlock
+            var bt = expr(em, arm.body)
+            if (let none = bt) {
+                popScope(em)
+                return false
+            }
+            var btv = 0
+            if (let some(x) = bt) {
+                btv = x
+            }
+            if (let some(slot) = resSlot) {
+                var isPtrSlot = false
+                if (slot < len(em.fslots)) {
+                    if (irTyTag(em.fslots[slot]) == irTyTag(IrTy.Ptr)) {
+                        isPtrSlot = true
+                    }
+                }
+                if (isPtrSlot) {
+                    var btTy = Ty.Unknown
+                    if (let some(t) = tyOf(em, arm.body.span)) {
+                        btTy = t
+                    }
+                    var wv = optionWrap(em, btv, btTy, arm.body.span)
+                    if (let none = wv) {
+                        popScope(em)
+                        return false
+                    }
+                    var wvv = 0
+                    if (let some(x) = wv) {
+                        wvv = x
+                    }
+                    instr(em, IrInstr.StoreSlot(slot, wvv))
+                } else {
+                    instr(em, IrInstr.StoreSlot(slot, btv))
+                }
+            }
+            popScope(em)
+            ends.push(em.cur)
+            cfs.push(cf)
+            gBlocks.push(guardIn)
+            bBlocks.push(bBlock)
         }
         true
     }
 
-    /// Bind the payload fields of variant `vi` of `table` into fresh slots for
-    /// `Color.Rgb(r, g, b)` patterns, and return the folded match condition
-    /// contributed by any nested (non-binding) payload patterns. A `-1`
-    /// return means no condition (every payload bound a name or `_`); `none`
-    /// reports an emission error. Fields are boxed in the object, so each is
-    /// unboxed to its element IR type; nested patterns bind the names they
-    /// introduce and contribute a condition. Mirrors `bind_enum_payloads` in
-    /// emit.rs.
-
-    /// The match condition for an enum variant pattern: the scrutinee value
-    /// `v` (of enum type `st`) must carry the variant's tag, and nested
-    /// payload conditions are folded in. Payload fields are read only inside a
-    /// block guarded by the tag equality, so a mismatched variant is never
-    /// dereferenced. Mirrors `enum_variant_cond` in emit.rs.
-
-    /// Fold the extra match conditions contributed by the nested (non-binding)
-    /// payload patterns of enum variant `vi`, whose object pointer sits in the
-    /// rooted slot `vSlot`. Binding names are declared separately by
-    /// `bindEnumPayloads`; a `-1` return means every payload was a name or
-    /// `_`. Mirrors `bind_enum_payload_cond` in emit.rs.
-
     // ---- calls ----
-
-    /// The first user (non-builtin, non-overloaded) callable for `name`.
-    /// Rust's `infos.iter().find(|c| !(c.span.file.0 == 0 && c.span.end == 0))`.
-
-    /// Is `callee` a general function-typed expression (as opposed to a plain
-    /// named user/ctor/builtin call, which has its own static paths)? Mirrors
-    /// `is_fn_dispatchable` in emit.rs.
-
-    /// The value argument of the outermost `expect(...)` in an assertion chain,
-    /// plus whether a `.not()` flips the expectation. Mirrors `peel_expect`.
-
-    /// The value argument of a positional-only one-arg expectation method, or
-    /// `none` after emitting a diagnostic. Mirrors `expect_single_arg`.
-
-    /// Reject any argument list for a zero-arg expectation method. Returns
-    /// `false` (after a diagnostic) when the list is non-empty.
-    /// Hash-identity or structural equality condition for `toBe`/`toEqual`.
-    /// Mirrors `expect_eq_cond`.
-
-    /// `int` -> `float` promotion (the IR `Itof`). Mirrors `float_cast`.
-
-    /// Promote `v` to `float` unless its IR type is already `Float`. Mirrors
-    /// `emit.rs::coerce_to_float`.
 
     /// `**`: integer operands stay integral (`pickle_int_pow`); a float on
     /// either side routes through `pickle_float_pow`, promoting the other
