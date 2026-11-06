@@ -18,6 +18,10 @@
 # runtime/*.pkl declares it with #[symbol("...")], which is the same convention
 # the string cluster landed with.
 #
+# The IRX generator is the legacy Rust cli when it exists, otherwise the seed-built
+# cli/main driver (refreshed through Invoke-BuildDriver), so this audit runs on a
+# Rust-free checkout too - the same fallback tools/battery_prep.ps1 uses.
+#
 # Usage: powershell -NoProfile -ExecutionPolicy Bypass -File tools\extern_surface.ps1
 #        powershell ... -File tools\extern_surface.ps1 -Shapes runtime
 #
@@ -28,6 +32,24 @@ param([ValidateSet("all", "battery", "examples", "runtime", "self")][string]$Sha
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "battery_common.ps1")
 $repoAbs = (Resolve-Path ".").Path
+
+# ---- IRX generator -----------------------------------------------------------
+# Prefer the legacy Rust cli (the historical oracle) when it is present; otherwise
+# use the seed-built cli/main driver. Invoke-BuildDriver refreshes that driver when
+# the tracked compiler sources or the seed change, so the audit never reads a stale
+# pklc_cli.exe. This is the same provider split as tools/battery_prep.ps1.
+$irxGen = $batteryCommonCli
+if (Test-Path -LiteralPath $irxGen) {
+    $irxGen = (Resolve-Path -LiteralPath $irxGen).Path
+    Write-Output "SURFACE irx generator = RUST CLI ($irxGen)"
+} else {
+    $pickled = "tools\diff\port\pklc_cli.exe"
+    if (-not (Invoke-BuildDriver "cli\main.pkl" $pickled)) {
+        throw "SURFACE FAILED: no irx generator: no Rust cli at $batteryCommonCli and no pickled cli at $pickled. Run tools\selfhost.ps1 -SeedOnly, or build the Rust cli."
+    }
+    $irxGen = (Resolve-Path -LiteralPath $pickled).Path
+    Write-Output "SURFACE irx generator = PICKLED CLI ($irxGen)"
+}
 
 $srcs = @()
 switch ($Shapes) {
@@ -60,7 +82,7 @@ foreach ($f in $srcs) {
     # is ever read. Drop to Continue for the call, exactly as Invoke-NativeQuiet does.
     $saved = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
-    $text = & $batteryCommonCli "irx" $f.FullName 2>&1 | Out-String
+    $text = & $irxGen "irx" $f.FullName 2>&1 | Out-String
     $code = $LASTEXITCODE
     $ErrorActionPreference = $saved
     if ($code -ne 0) { $failed += $f.FullName; continue }
