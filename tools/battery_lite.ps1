@@ -69,8 +69,11 @@ if (-not $rtlibCand) {
     exit 1
 }
 $pklcTest = "tools\diff\port\pklc_test.exe"
-if (-not (Test-Path -LiteralPath $pklcTest)) { Invoke-BuildDriver "cli\test.pkl" $pklcTest | Out-Null }
-if (-not (Test-Path -LiteralPath $pklcTest)) {
+# Invoke-BuildDriver is stamp-gated on the compiler/cli/stdlib tree, so this is
+# a no-op for an up-to-date driver and rebuilds it whenever any source changed.
+# Checking only for the exe (the old behavior) silently pinned a stale compiler
+# for every later run.
+if (-not (Invoke-BuildDriver "cli\test.pkl" $pklcTest)) {
     Write-Output "LITE PREP TEST DRIVER: BUILD FAILED"
     exit 1
 }
