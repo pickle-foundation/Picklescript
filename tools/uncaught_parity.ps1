@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
-Compares how an uncaught `throw` is reported by the native toolchain and by a
-self-host compiled executable.
+Checks how an uncaught `throw` is reported by a self-host compiled executable
+against frozen reference goldens (or the Rust JIT with -RustLink).
 
 .DESCRIPTION
 `tools/selfhost_probe.ps1` covers the case where a program succeeds: it runs
@@ -24,22 +24,31 @@ achieved by both sides being wrong in the same way:
   exit 0, stderr empty                              uncaught_none_clean
 
 .PARAMETER SelfhostLink
-Link with the self-hosted linker against the PICKLE runtime DIRECTORY
-(runtime, whose members are themselves pickle `#[symbol]` bodies) instead
-of `rustc` and a shim. This is the battery path and it runs with NO Rust cli:
-the selfhost linker (cli/selflink.pkl, AOT-built by the pickle seed)
-compiles+links each fixture, and the reference behaviour is read from FROZEN
-goldens (tools\diff\golden\uncaught\<stem>.{out,err,exit}, captured by
+Kept for compatibility; selfhost link is now the DEFAULT path. It links each
+fixture with the PICKLE runtime DIRECTORY (runtime, whose members are
+themselves pickle `#[symbol]` bodies) instead of `rustc` and a shim. This is
+the battery path and it runs with NO Rust cli: the selfhost linker
+(cli/selflink.pkl, AOT-built by the pickle seed) compiles+links each fixture,
+and the reference behaviour is read from FROZEN goldens
+(tools\diff\golden\uncaught\<stem>.{out,err,exit}, captured by
 tools\capture_goldens.ps1 from `pickle-cli run`). No cargo, no combined.lib, no
 Rust oracle in the loop.
+
+.PARAMETER RustLink
+Opt into the legacy Rust path: JIT oracle + `cargo`-built runtime + `rustc`
+shim link. Requires target\debug\pickle-cli.exe and the Rust toolchain.
 
 .PARAMETER Filter
 Only run fixtures whose name contains this substring.
 #>
 param(
     [switch]$SelfhostLink,
+    [switch]$RustLink,
     [string]$Filter = ""
 )
+
+# Selfhost link is the Rust-free default; -RustLink is the explicit opt-out.
+$SelfhostLink = -not $RustLink
 
 $ErrorActionPreference = "Continue"
 # UNPINNED: the port's shadow frames root reachable managed homes, so the
@@ -104,6 +113,7 @@ if ($SelfhostLink) {
     # Port selfhost linker: AOT-built by the pickle seed, links against the PICKLE
     # runtime DIRECTORY. No Rust cli, no rtlib.ar, no cargo.
     $slDriver = "tools\diff\port\pklc_selflink.exe"
+    New-Item -ItemType Directory -Force -Path "tools\diff\port" | Out-Null
     if (-not (Invoke-BuildDriver "cli\selflink.pkl" $slDriver)) {
         Write-Output "SELFHOST LINKER DRIVER BUILD FAILED: $slDriver"
         exit 1

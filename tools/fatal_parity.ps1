@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
-Byte-compares the fatal `pickle_panic_*` / `fatalMsg` paths between the JIT
-oracle and a self-host linked executable.
+Checks the fatal `pickle_panic_*` / `fatalMsg` paths on a self-host linked
+executable, byte-comparing against the JIT oracle when one is available.
 
 .DESCRIPTION
 `tools/selfhost_probe.ps1` requires a program to succeed; `tools/
@@ -22,9 +22,14 @@ Each pair is (self, oracle):
                                         and compare ported-in-JIT against
                                         ported-in-linked-image)
 
-All three channels - stdout, stderr, exit code - are captured byte for byte
-and must agree, and stderr must carry the pair's expected marker, so both
-sides being wrong in the same way cannot pass.
+The self side is Rust-free: it links `tests/tmp/<stem>.pkl` against the
+committed `tools\diff\rtlib.ar` with the ported build driver (pklc_build, or
+the committed seed). It must exit 1 and its stderr must start with the pair's
+marker, so a wrong panic body cannot pass.
+
+The oracle side is optional and only runs when a Rust CLI exists at
+`target\debug\pickle-cli.exe`. Then all three channels - stdout, stderr, exit
+code - are captured byte for byte and must agree as well.
 
 .PARAMETER Filter
 Only run pairs whose stem contains this substring.
@@ -40,8 +45,6 @@ $Temp = Join-Path $Env:TEMP "opencode\fatalparity"
 $Work = Join-Path $Temp "work"
 
 New-Item -ItemType Directory -Force -Path $Work | Out-Null
-
-if (-not (Test-Path $Cli)) { Write-Output "CLI NOT FOUND: $Cli (run: cargo build -p pickle-cli)"; exit 1 }
 
 function Invoke-Captured {
     param([string]$Exe, [string[]]$ExeArgs, [string]$WorkingDir, [string]$Tag)
@@ -82,9 +85,30 @@ function Show([byte[]]$b) {
     return (($b | ForEach-Object { if ($_ -ge 32 -and $_ -lt 127) { [char]$_ } else { "<0x{0:X2}>" -f $_ } }) -join '')
 }
 
-$Combined = @("$Env:TEMP\opencode\x64real\rarc\combined.lib", "$Env:TEMP\opencode\rarc\combined.lib") |
-    Where-Object { Test-Path $_ } | Select-Object -First 1
-if (-not $Combined) { Write-Output "COMBINED LIB NOT FOUND (rebuild via tools/build_combined_lib.ps1)"; exit 1 }
+# ---- Rust-free builder + archive selection -------------------------------------
+$lib = $null
+if (Test-Path -LiteralPath "$Root\tools\diff\rtlib.ar") {
+    $lib = "$Root\tools\diff\rtlib.ar"
+} else {
+    $lib = @("$Env:TEMP\opencode\x64real\rarc\combined.lib", "$Env:TEMP\opencode\rarc\combined.lib") |
+        Where-Object { Test-Path $_ } | Select-Object -First 1
+}
+if (-not $lib) {
+    Write-Output "SKIP: no tools\diff\rtlib.ar and no combined.lib"
+    exit 0
+}
+
+$builder = "$Root\tools\diff\port\pklc_build.exe"
+if (-not (Test-Path -LiteralPath $builder)) { $builder = "$Root\tools\diff\selfhost\seed.exe" }
+if (-not (Test-Path -LiteralPath $builder)) {
+    Write-Output "BUILD DRIVER NOT FOUND: $builder (run tools\selfhost.ps1, or use the committed seed)"
+    exit 1
+}
+
+$HaveOracle = Test-Path -LiteralPath $Cli
+if (-not $HaveOracle) {
+    Write-Output "FATAL PARITY: no Rust oracle at $Cli - checking self-hosted markers only"
+}
 
 # stem -> expected stderr marker (byte prefix, trailing newline excluded)
 $pairs = @(
@@ -110,55 +134,56 @@ $pairs = $pairs | Where-Object { $_.stem.Contains($Filter) }
 
 if (-not $pairs) { Write-Output "NO PAIRS MATCHED FILTER '$Filter'"; exit 1 }
 
-$pass = 0; $fail = 0
+$pass = 0; $fail = 0; $oraclePairs = 0
 
 foreach ($pr in $pairs) {
     $stem = $pr.stem
     $selfSrc  = Join-Path $Root "tests\tmp\$stem.pkl"
     $oracleSrc = Join-Path $Root "tests\tmp\${stem}_oracle.pkl"
     if (-not (Test-Path $selfSrc))  { Write-Output "FAIL $stem : missing $selfSrc"; $fail++; continue }
-    if (-not (Test-Path $oracleSrc)) { Write-Output "FAIL $stem : missing $oracleSrc"; $fail++; continue }
-
-    # ---- oracle: JIT, native panic bodies ----
-    $orc = Invoke-Captured -Exe $Cli -ExeArgs @("run", $oracleSrc) -WorkingDir $Root -Tag "orc_$stem"
-
-    # ---- self: source -> IR -> x64 -> COFF -> self-host link ----
-    $probe = Join-Path $Work $stem
-    New-Item -ItemType Directory -Force -Path $probe | Out-Null
-    $drv = & $Cli run cli\x64_real_run.pkl -- $selfSrc $probe 2>&1
-    if ($LASTEXITCODE -ne 0 -or (($drv -join "`n") -notmatch "X64REAL OK")) {
-        Write-Output "FAIL $stem : lowering failed"
-        Write-Output ($drv -join "`n")
+    if ($HaveOracle -and -not (Test-Path $oracleSrc)) {
+        Write-Output "FAIL $stem : missing $oracleSrc"
         $fail++
         continue
     }
-    $obj = Join-Path $probe "funcs.obj"
-    if (-not (Test-Path $obj)) { Write-Output "FAIL $stem : no funcs.obj"; $fail++; continue }
+
+    # ---- self: ported lower + link against the ported runtime archive ----
+    $probe = Join-Path $Work $stem
+    New-Item -ItemType Directory -Force -Path $probe | Out-Null
     $exe = Join-Path $probe "probe.exe"
-    $lk = & $Cli run compiler\linker.pkl -- $obj $Combined $exe 2>&1
-    if ($LASTEXITCODE -ne 0 -or (($lk -join "`n") -notmatch "LINKER WROTE")) {
-        Write-Output "FAIL $stem : selfhost link failed"
-        Write-Output ($lk -join "`n")
+    Remove-Item -LiteralPath $exe -ErrorAction SilentlyContinue
+    $build = Invoke-Captured -Exe $builder -ExeArgs @($selfSrc, $lib, $exe) -WorkingDir $Root -Tag "build_$stem"
+    if ($build.Exit -ne 0 -or -not (Test-Path $exe)) {
+        Write-Output "FAIL $stem : self-host build failed (exit $($build.Exit))"
+        Write-Output (Show $build.StdErr)
         $fail++
         continue
     }
     $self = Invoke-Captured -Exe $exe -ExeArgs @() -WorkingDir $Root -Tag "self_$stem"
 
     $problems = @()
-    if ($orc.Exit -ne 1) { $problems += "oracle should exit 1, got $($orc.Exit)" }
     if ($self.Exit -ne 1) { $problems += "self should exit 1, got $($self.Exit)" }
     $marker = [System.Text.Encoding]::UTF8.GetBytes($pr.marker)
-    if (-not (StartsWith $orc.StdErr $marker)) { $problems += "oracle stderr lacks marker: $(Show $orc.StdErr)" }
     if (-not (StartsWith $self.StdErr $marker)) { $problems += "self stderr lacks marker: $(Show $self.StdErr)" }
-    if (-not (Same-Bytes $orc.StdOut $self.StdOut)) {
-        $problems += "stdout differs:`n      oracle: $(Show $orc.StdOut)`n      self  : $(Show $self.StdOut)"
-    }
-    if (-not (Same-Bytes $orc.StdErr $self.StdErr)) {
-        $problems += "stderr differs:`n      oracle: $(Show $orc.StdErr)`n      self  : $(Show $self.StdErr)"
+
+    # ---- oracle: JIT, native panic bodies (Rust-enabled checkouts only) ----
+    $orc = $null
+    if ($HaveOracle) {
+        $orc = Invoke-Captured -Exe $Cli -ExeArgs @("run", $oracleSrc) -WorkingDir $Root -Tag "orc_$stem"
+        $oraclePairs++
+        if ($orc.Exit -ne 1) { $problems += "oracle should exit 1, got $($orc.Exit)" }
+        if (-not (StartsWith $orc.StdErr $marker)) { $problems += "oracle stderr lacks marker: $(Show $orc.StdErr)" }
+        if (-not (Same-Bytes $orc.StdOut $self.StdOut)) {
+            $problems += "stdout differs:`n      oracle: $(Show $orc.StdOut)`n      self  : $(Show $self.StdOut)"
+        }
+        if (-not (Same-Bytes $orc.StdErr $self.StdErr)) {
+            $problems += "stderr differs:`n      oracle: $(Show $orc.StdErr)`n      self  : $(Show $self.StdErr)"
+        }
     }
 
     if ($problems.Count -eq 0) {
-        Write-Output ("PASS {0,-24} exit=1 stdout={1}b stderr={2}b" -f $stem, $orc.StdOut.Length, $orc.StdErr.Length)
+        $via = if ($orc) { "oracle+self" } else { "self only" }
+        Write-Output ("PASS {0,-24} exit=1 stdout={1}b stderr={2}b ({3})" -f $stem, $self.StdOut.Length, $self.StdErr.Length, $via)
         $pass++
     } else {
         Write-Output "FAIL $stem"
@@ -168,6 +193,7 @@ foreach ($pr in $pairs) {
 }
 
 Write-Output ""
-Write-Output "FATAL PARITY: $pass passed, $fail failed (selfhost link)"
+$how = if ($oraclePairs -gt 0) { "selfhost link + $oraclePairs Rust oracle pair(s)" } else { "selfhost link, no Rust oracle" }
+Write-Output "FATAL PARITY: $pass passed, $fail failed ($how)"
 if ($fail -gt 0) { exit 1 }
 exit 0

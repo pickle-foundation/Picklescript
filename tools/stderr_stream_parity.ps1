@@ -14,16 +14,24 @@
 #
 # Two sides are compared, because either can regress:
 #   ported  - pklc_build output, nostd archive (the path that was broken)
-#   native  - the Rust JIT oracle
+#   native  - the Rust JIT oracle, when a Rust CLI happens to be built
 # A mismatch in either direction fails; both must agree channel for channel.
+# The native side is optional: on a Rust-free checkout the ported side is the
+# only oracle, and it still catches the fold this script exists for.
 #
 # Usage:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\stderr_stream_parity.ps1
-#   ... -SelfhostLink    link the fixture with compiler\linker.pkl instead
+#   ... -SelfhostLink    link the fixture with cli\selflink.pkl instead
+#
+# No Rust toolchain is required: the builder is the ported pklc_build (or the
+# committed seed) and the archive is the committed tools\diff\rtlib.ar.
 
 param(
     [switch]$SelfhostLink,
-    [int]$TimeoutMs = 120000
+    [int]$TimeoutMs = 120000,
+    # Selflink lowers every runtime/*.pkl member, so it needs minutes where a
+    # plain archive build needs seconds.
+    [int]$SelfLinkTimeoutMs = 1200000
 )
 
 $ErrorActionPreference = "Continue"
@@ -34,13 +42,6 @@ $fixture = "$Root\tests\stderrstream\stderrstream_main.pkl"
 if (-not (Test-Path -LiteralPath $fixture)) {
     Write-Output "STDERR-PARITY: FAIL (missing fixture $fixture)"
     exit 1
-}
-
-# One lib path, whichever this machine actually has.
-$lib = "$env:TEMP\opencode\rarc\combined.lib"
-if (-not $lib) {
-    Write-Output "STDERR-PARITY: SKIP (no combined.lib; run tools\build_combined_lib.ps1 first)"
-    exit 0
 }
 
 $work = Join-Path $env:TEMP "opencode\stderrstream"
@@ -67,25 +68,78 @@ function Assert-Channels([string]$tag, $r) {
 $fail = 0
 
 # ---- ported AOT build against the nostd archive ----
+#
+# Builders are chosen in Rust-free order:
+#   default       - tools\diff\port\pklc_build.exe (built by tools\selfhost.ps1),
+#                   else the committed seed, whose `<src> <archive> <out>`
+#                   contract is exactly build.pkl's.
+#   -SelfhostLink - tools\diff\port\pklc_selflink.exe, else a seed-built copy of
+#                   cli\selflink.pkl. It links against runtime/*.pkl through
+#                   compiler\linker.pkl instead of prebuilt archive members.
+#
+# The runtime library is the committed rtlib.ar when present (the Rust-free
+# path), falling back to a legacy combined.lib only on a Rust-enabled checkout.
 $portedExe = Join-Path $work "ported.exe"
-$builder = if ($SelfhostLink) { "$Root\tools\diff\port\pklc_run.exe" } else { "$Root\tools\diff\port\pklc_build.exe" }
-if (-not (Test-Path -LiteralPath $builder)) {
-    Write-Output "STDERR-PARITY: FAIL (no builder at $builder)"
-    exit 1
+$seed = "$Root\tools\diff\selfhost\seed.exe"
+$builder = $null
+$buildArgs = $null
+$buildTimeoutMs = $TimeoutMs
+
+if ($SelfhostLink) {
+    $builder = "$Root\tools\diff\port\pklc_selflink.exe"
+    if (-not (Test-Path -LiteralPath $builder)) {
+        if (-not (Test-Path -LiteralPath $seed)) {
+            Write-Output "STDERR-PARITY: FAIL (no pklc_selflink.exe and no committed seed)"
+            exit 1
+        }
+        if (-not (Test-Path -LiteralPath "$Root\tools\diff\rtlib.ar")) {
+            Write-Output "STDERR-PARITY: SKIP (cannot build selflink driver without rtlib.ar)"
+            exit 0
+        }
+        $builder = Join-Path $work "pklc_selflink.exe"
+        $db = Invoke-RawCapture -Exe $seed -Arguments "cli\selflink.pkl `"$Root\tools\diff\rtlib.ar`" `"$builder`"" -TimeoutMs $TimeoutMs
+        if ($db.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $builder)) {
+            Write-Output "STDERR-PARITY: FAIL (seed could not build cli\selflink.pkl: $($db.StdErrText))"
+            exit 1
+        }
+    }
+    $buildArgs = "`"$fixture`" `"$portedExe`""
+    $buildTimeoutMs = $SelfLinkTimeoutMs
+} else {
+    $lib = $null
+    if (Test-Path -LiteralPath "$Root\tools\diff\rtlib.ar") {
+        $lib = "$Root\tools\diff\rtlib.ar"
+    } elseif (Test-Path -LiteralPath "$env:TEMP\opencode\rarc\combined.lib") {
+        $lib = "$env:TEMP\opencode\rarc\combined.lib"
+    }
+    if (-not $lib) {
+        Write-Output "STDERR-PARITY: SKIP (no rtlib.ar and no combined.lib)"
+        exit 0
+    }
+    $builder = "$Root\tools\diff\port\pklc_build.exe"
+    if (-not (Test-Path -LiteralPath $builder)) { $builder = $seed }
+    if (-not (Test-Path -LiteralPath $builder)) {
+        Write-Output "STDERR-PARITY: FAIL (no pklc_build.exe and no committed seed)"
+        exit 1
+    }
+    $buildArgs = "`"$fixture`" `"$lib`" `"$portedExe`""
 }
-$b = Invoke-RawCapture -Exe $builder -Arguments "$fixture `"$lib`" `"$portedExe`"" -TimeoutMs $TimeoutMs
+
+$b = Invoke-RawCapture -Exe $builder -Arguments $buildArgs -TimeoutMs $buildTimeoutMs
 if ($b.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $portedExe)) {
     Write-Output "STDERR-PARITY: FAIL (ported build failed: $($b.StdErrText))"
     exit 1
 }
 if (-not (Assert-Channels "ported" (Invoke-RawCapture -Exe $portedExe -TimeoutMs $TimeoutMs))) { $fail++ }
 
-# ---- native oracle ----
+# ---- native oracle (optional; only on a Rust-enabled checkout) ----
 $nativeExe = Join-Path $work "native.exe"
+$nativeRan = $false
 $cli = "$Root\target\debug\pickle-cli.exe"
 if (Test-Path -LiteralPath $cli) {
     $n = Invoke-RawCapture -Exe $cli -Arguments "build `"$fixture`" -o `"$nativeExe`"" -TimeoutMs $TimeoutMs
     if ($n.ExitCode -eq 0 -and (Test-Path -LiteralPath $nativeExe)) {
+        $nativeRan = $true
         if (-not (Assert-Channels "native" (Invoke-RawCapture -Exe $nativeExe -TimeoutMs $TimeoutMs))) { $fail++ }
     } else {
         Write-Output "STDERR-PARITY: native build unavailable, skipping oracle side"
@@ -95,7 +149,8 @@ if (Test-Path -LiteralPath $cli) {
 }
 
 if ($fail -eq 0) {
-    Write-Output "STDERR-PARITY: PASS (ported + native both separate stdout/stderr)"
+    $sides = if ($nativeRan) { "ported + native" } else { "ported" }
+    Write-Output "STDERR-PARITY: PASS ($sides keeps stdout/stderr separate)"
     exit 0
 }
 Write-Output "STDERR-PARITY: FAIL ($fail side(s) folded a stream)"

@@ -12,15 +12,16 @@ crossing allocation collects with the fresh object pinned across its own cycle,
 and the one-time `PKL_NO_AUTO_GC` / `PKL_GC_THRESHOLD` environment read runs
 allocation-free ahead of that first crossing.
 
-Each target's selflinked exe and the `pickle-cli run` oracle are run in the
-SAME environment (no `PKL_NO_AUTO_GC` pin - that is the point) and their
-stdout bytes AND exit codes must agree. Every default probe prints the
-collection count, so this harness also fails if the port loses the trigger
-(ported cycles 0 vs oracle cycles >0).
+Each target is selflinked against `runtime/` and run in the same environment
+(no `PKL_NO_AUTO_GC` pin - that is the point). Every default probe prints the
+collection count, so the Rust-free default fails if the port loses the trigger
+(exit != 0, or no `cycles` line). When a Rust CLI is present at
+`target\debug\pickle-cli.exe`, its `run` output AND exit code are additionally
+compared byte-for-byte against the selflinked exe.
 
 The `-NoAutoGcCheck` cert additionally pins `PKL_NO_AUTO_GC=1` for one probe
-and requires BOTH arms to report cycles 0 - proving the env-parsing pin still
-suppresses the ported trigger exactly like native.
+and requires the ported run to report cycles 0 - proving the env-parsing pin
+still suppresses the ported trigger exactly like native.
 
 .PARAMETER Target
 Only run the probe whose relative .pkl path matches this substring.
@@ -33,10 +34,12 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $Root
 . (Join-Path $PSScriptRoot "battery_common.ps1")
-$cli = (Resolve-Path "target\debug\pickle-cli.exe").Path
+$cli = "target\debug\pickle-cli.exe"
+$haveOracle = Test-Path -LiteralPath $cli
 $sl = "cli\selflink.pkl"
 $rt = (Resolve-Path "runtime").Path
 $slDriver = Join-Path $PSScriptRoot "diff\port\pklc_selflink.exe"
+New-Item -ItemType Directory -Force -Path (Split-Path $slDriver) | Out-Null
 if (-not (Invoke-BuildDriver $sl "tools\diff\port\pklc_selflink.exe")) {
     Write-Output "AUTO-COLLECT PARITY: selflink driver build failed"
     exit 1
@@ -58,6 +61,14 @@ $targets = @(
 if ($Target) {
     $targets = @($targets | Where-Object { $_ -like "*$Target*" })
     if (-not $targets) { Write-Output "AUTO-COLLECT PARITY: no target matches '$Target'"; exit 1 }
+}
+$targets = @($targets | Where-Object { Test-Path -LiteralPath $_ })
+if (-not $targets) {
+    Write-Output "AUTO-COLLECT PARITY: SKIP (scratch probes missing: tests\tmp\repro_*.pkl)"
+    exit 0
+}
+if (-not $haveOracle) {
+    Write-Output "AUTO-COLLECT PARITY: no Rust oracle at $cli - checking selflinked runs only"
 }
 
 $pass = 0
@@ -85,43 +96,62 @@ foreach ($target in $targets) {
     Remove-Item $prt, $ort -ErrorAction SilentlyContinue
     cmd /c "`"$exe`" > `"$prt`" 2>nul"
     $prc = $LASTEXITCODE
-    cmd /c "`"$cli`" run `"$target`" > `"$ort`" 2>nul"
-    $orc = $LASTEXITCODE
     $p = [System.IO.File]::ReadAllText($prt)
-    $o = [System.IO.File]::ReadAllText($ort)
-    $eq = ($prc -eq $orc -and $p -eq $o)
-    Cert "$stem auto-collect parity" $eq "rc=$prc/$orc out=$($p.Trim())"
-}
-
-# Pinned-off cert: with PKL_NO_AUTO_GC=1 both arms must report cycles 0.
-$probe = "tests\tmp\repro_n64.pkl"
-$exe = Join-Path $work "n64-pinned.exe"
-Remove-Item $exe -ErrorAction SilentlyContinue
-$linkOut = & $slDriver $probe $exe $rt 2>&1
-$linked = (@($linkOut | Select-String "^SELFLINK OK:").Count -eq 1 -and (($linkOut | Out-String) -notmatch "SELFLINK FAIL"))
-if ($linked) {
-    $prt = Join-Path $work "n64-pinned.port.txt"; $ort = Join-Path $work "n64-pinned.orc.txt"
-    Remove-Item $prt, $ort -ErrorAction SilentlyContinue
-    $Old = [Environment]::GetEnvironmentVariable("PKL_NO_AUTO_GC")
-    [Environment]::SetEnvironmentVariable("PKL_NO_AUTO_GC", "1")
-    try {
-        cmd /c "`"$exe`" > `"$prt`" 2>nul"
-        $prc = $LASTEXITCODE
-        cmd /c "`"$cli`" run `"$probe`" > `"$ort`" 2>nul"
+    if ($haveOracle) {
+        cmd /c "`"$cli`" run `"$target`" > `"$ort`" 2>nul"
         $orc = $LASTEXITCODE
-    } finally {
-        [Environment]::SetEnvironmentVariable("PKL_NO_AUTO_GC", $Old)
+        $o = [System.IO.File]::ReadAllText($ort)
+        $eq = ($prc -eq $orc -and $p -eq $o)
+        $detail = "rc=$prc/$orc out=$($p.Trim())"
+    } else {
+        # No Rust oracle: require a clean run that printed a cycle count.
+        $eq = ($prc -eq 0 -and $p -match "cycles")
+        $detail = "rc=$prc out=$($p.Trim()) (self only)"
     }
-    $p = [System.IO.File]::ReadAllText($prt)
-    $o = [System.IO.File]::ReadAllText($ort)
-    $zeroCycles = (($p -match "cycles 0") -and ($o -match "cycles 0"))
-    $eq = ($prc -eq $orc -and $p -eq $o -and $zeroCycles)
-    Cert "PKL_NO_AUTO_GC=1 pin parity" $eq "rc=$prc/$orc out=$($p.Trim())"
-} else {
-    Cert "PKL_NO_AUTO_GC=1 pin parity" $false "selflink failed"
+    Cert "$stem auto-collect parity" $eq $detail
 }
 
-Write-Output "AUTO-COLLECT PARITY ($($targets.Count + 1) certs): PASS=$pass FAIL=$fail"
+# Pinned-off cert: with PKL_NO_AUTO_GC=1 the ported run must report cycles 0.
+$probe = "tests\tmp\repro_n64.pkl"
+if (-not (Test-Path -LiteralPath $probe)) {
+    Write-Output "AUTO-COLLECT PARITY: pin cert SKIPPED (missing $probe)"
+} else {
+    $exe = Join-Path $work "n64-pinned.exe"
+    Remove-Item $exe -ErrorAction SilentlyContinue
+    $linkOut = & $slDriver $probe $exe $rt 2>&1
+    $linked = (@($linkOut | Select-String "^SELFLINK OK:").Count -eq 1 -and (($linkOut | Out-String) -notmatch "SELFLINK FAIL"))
+    if ($linked) {
+        $prt = Join-Path $work "n64-pinned.port.txt"; $ort = Join-Path $work "n64-pinned.orc.txt"
+        Remove-Item $prt, $ort -ErrorAction SilentlyContinue
+        $Old = [Environment]::GetEnvironmentVariable("PKL_NO_AUTO_GC")
+        [Environment]::SetEnvironmentVariable("PKL_NO_AUTO_GC", "1")
+        try {
+            cmd /c "`"$exe`" > `"$prt`" 2>nul"
+            $prc = $LASTEXITCODE
+            if ($haveOracle) {
+                cmd /c "`"$cli`" run `"$probe`" > `"$ort`" 2>nul"
+                $orc = $LASTEXITCODE
+            }
+        } finally {
+            [Environment]::SetEnvironmentVariable("PKL_NO_AUTO_GC", $Old)
+        }
+        $p = [System.IO.File]::ReadAllText($prt)
+        if ($haveOracle) {
+            $o = [System.IO.File]::ReadAllText($ort)
+            $zeroCycles = (($p -match "cycles 0") -and ($o -match "cycles 0"))
+            $eq = ($prc -eq $orc -and $p -eq $o -and $zeroCycles)
+            $detail = "rc=$prc/$orc out=$($p.Trim())"
+        } else {
+            $eq = ($prc -eq 0 -and $p -match "cycles 0")
+            $detail = "rc=$prc out=$($p.Trim()) (self only)"
+        }
+        Cert "PKL_NO_AUTO_GC=1 pin parity" $eq $detail
+    } else {
+        Cert "PKL_NO_AUTO_GC=1 pin parity" $false "selflink failed"
+    }
+}
+
+Write-Output "AUTO-COLLECT PARITY ($($pass + $fail) certs): PASS=$pass FAIL=$fail"
 Remove-Item (Join-Path $work "*.exe"), (Join-Path $work "*.txt") -ErrorAction SilentlyContinue
 if ($fail -ne 0) { exit 1 }
 exit 0

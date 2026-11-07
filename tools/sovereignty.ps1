@@ -27,8 +27,14 @@ $goldenDir  = "tools\diff\sovereign-golden"
 $outDir     = "tools\diff\sovereign"
 $buildDrv   = "tools\diff\port\pklc_build.exe"
 $runDrv     = "tools\diff\port\pklc_run.exe"
-$combined   = "$env:TEMP\opencode\rarc\combined.lib"
-if (-not (Test-Path $combined)) { $combined = "" }
+$seed       = "tools\diff\selfhost\seed.exe"
+# Preference order: the committed pickle-built archive first (Rust-free), then
+# a legacy combined.lib on a Rust-enabled checkout.
+$archive    = "tools\diff\rtlib.ar"
+if (-not (Test-Path $archive)) {
+  $archive = "$env:TEMP\opencode\rarc\combined.lib"
+  if (-not (Test-Path $archive)) { $archive = "" }
+}
 
 function Write-Phase($t) { Write-Output ""; Write-Output "=== $t ===" }
 
@@ -52,12 +58,17 @@ if ($Recapture) {
 if (-not (Test-Path $goldenDir)) {
   throw "no goldens at $goldenDir - run once with -Recapture to freeze them"
 }
-if (-not $combined) { throw "no combined.lib - rebuild via tools\build_combined_lib.ps1" }
+if (-not $archive) { throw "no runtime archive: expected tools\diff\rtlib.ar (committed) or combined.lib" }
 
 Write-Phase "VERIFY (Rust FORBIDDEN: ported drivers are the only producers)"
 # Hard proof no Rust is on the path: these are the only executables invoked below.
 # Deliberately NOT used: $cli, irx-run, any target\debug binary.
-if (-not (Test-Path $buildDrv)) { throw "missing ported build driver $buildDrv" }
+if (-not (Test-Path $buildDrv)) {
+  if (-not (Test-Path $seed)) { throw "missing ported build driver $buildDrv and no committed seed at $seed" }
+  New-Item -ItemType Directory -Force -Path (Split-Path $buildDrv) | Out-Null
+  & $seed "cli\build.pkl" $archive $buildDrv 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0 -or -not (Test-Path $buildDrv)) { throw "seed could not build $buildDrv" }
+}
 
 New-Item -ItemType Directory -Path $outDir -Force | Out-Null
 $mains = @(Get-ChildItem "tests\pickle\*_main.pkl")
@@ -67,11 +78,11 @@ foreach ($m in $mains) {
   $n = $m.BaseName
   $gOut = "$goldenDir\$n.out"
   $gRc  = "$goldenDir\$n.rc"
-  if (-not (Test-Path $gOut)) { $missing++; Write-Output "MISSING GOLDEN $n"; continue }
+  if (-not (Test-Path $gOut) -or -not (Test-Path $gRc)) { $missing++; Write-Output "MISSING GOLDEN $n"; continue }
 
   $exe = Join-Path $outDir "$n.exe"
   # Ported AOT driver: source -> IR -> x64 -> COFF -> PE link -> .exe
-  $null = & $buildDrv $m.FullName $combined $exe 2>&1
+  $null = & $buildDrv $m.FullName $archive $exe 2>&1
   if ($LASTEXITCODE -ne 0 -or -not (Test-Path $exe)) {
     $fail++; $fails += "$n (build)"; Write-Output "SOVEREIGN FAIL $n : ported build failed"
     continue
@@ -104,14 +115,18 @@ Write-Output "rust binaries used in verify phase: 0 (oracle is frozen bytes)"
 # through shell32 that the build driver does not touch. Proves the PORTED RUN
 # path (not just the build path) is sovereign.
 Write-Phase "VERIFY 2 (ported RUN driver: compile -> link -> spawn, no Rust)"
+if (-not (Test-Path $runDrv) -and (Test-Path $seed)) {
+  New-Item -ItemType Directory -Force -Path (Split-Path $runDrv) | Out-Null
+  & $seed "cli\run.pkl" $archive $runDrv 2>&1 | Out-Null
+}
 if (Test-Path $runDrv) {
   $rok = 0; $rfail = 0; $rfails = @()
   foreach ($m in $mains) {
     $n = $m.BaseName
     $gOut = "$goldenDir\$n.out"
     $gRc  = "$goldenDir\$n.rc"
-    if (-not (Test-Path $gOut)) { continue }
-    $null = & $runDrv $m.FullName $combined 2>&1
+    if (-not (Test-Path $gOut) -or -not (Test-Path $gRc)) { continue }
+    $null = & $runDrv $m.FullName $archive 2>&1
     $rc = $LASTEXITCODE
     $p = ""
     if (Test-Path $gOut) { $p = [System.IO.File]::ReadAllText((Resolve-Path $gOut)) }
