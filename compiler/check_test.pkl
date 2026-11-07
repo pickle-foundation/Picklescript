@@ -437,3 +437,34 @@ test fn view_gates_arity_and_operand_type() {
     let msgs = checkSource("fn main() " + ob + " unsafe " + ob + "\n let l = [1] \n let s = " + q + "hi" + q + " \n let a = view(l) \n let b = view(s) \n " + cb + cb)
     expect(len(msgs)).toBe(0)
 }
+
+// ---- tuple element indexing ---------------------------------------------------
+//
+// `t[n]` lowers only for a constant in-range index, and the expression types as
+// the element at that position (it used to keep the whole tuple type and the
+// emitter bailed E0900).
+
+test fn tuple_index_is_constant_and_in_range() {
+    let ob = obrace()
+    let cb = cbrace()
+
+    // A runtime index cannot select a statically typed tuple slot.
+    let msgs = checkSource("fn main() " + ob + "\n let t = (1, 2) \n let i = 0 \n let x = t[i] \n " + cb)
+    expect(len(msgs)).toBe(1)
+    expect(countContaining(msgs, "tuple index must be an integer literal")).toBe(1)
+    expect(classifyMessage("tuple index must be an integer literal")).toBe("E0343")
+
+    // Constants are bounds-checked, including negated literals.
+    let msgs = checkSource("fn main() " + ob + "\n let t = (1, 2) \n let x = t[2] \n " + cb)
+    expect(len(msgs)).toBe(1)
+    expect(countContaining(msgs, "out of range")).toBe(1)
+    expect(classifyMessage("tuple index 2 is out of range for a 2-element tuple")).toBe("E0343")
+
+    let msgs = checkSource("fn main() " + ob + "\n let t = (1, 2) \n let x = t[-1] \n " + cb)
+    expect(len(msgs)).toBe(1)
+    expect(countContaining(msgs, "out of range")).toBe(1)
+
+    // In-range constants type as their element, including nested tuples.
+    let msgs = checkSource("fn main() " + ob + "\n let t = (1, (2, 3)) \n let a = t[0] \n let b = t[1][0] \n " + cb)
+    expect(len(msgs)).toBe(0)
+}

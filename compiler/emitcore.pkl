@@ -10,7 +10,7 @@ import { IrBlock, IrFunc, IrGlobal, IrModule, IrParam, IrTy, emptyIrBlocks, empt
 import { CallableInfo, ClassTable, CtorInfo, entryGenerics, EnumTable, FieldInfo, ParamInfo, PropertyInfo, ResolvedProgram, TypeTableEntry } from compiler.resolvebag
 
 import { collectExprTypes } from compiler.checkcore
-import { containsStr, isNoneStr, spanKey } from compiler.checkutil
+import { containsStr, isNoneStr, spanKey, constIntIndex } from compiler.checkutil
 import * from compiler.ty
 import { f64ToBits } from compiler.x64
 import * from compiler.emitutil
@@ -7340,6 +7340,22 @@ fn indexRead(em: Emitter, e: Expr, object: Expr, index: Expr) -> int? {
             }
         }
         if (!didList) {
+            if (let some(pt) = ot) {
+                match (pt) {
+                    case Ty.Tuple(parts) -> {
+                        return tupleIndexRead(em, e, object, index, parts)
+                    }
+                    case Ty.Ref(iner) -> {
+                        match (iner) {
+                            case Ty.Tuple(parts) -> {
+                                return tupleIndexRead(em, e, object, index, parts)
+                            }
+                            case _ -> {}
+                        }
+                    }
+                    case _ -> {}
+                }
+            }
             bad(em, e.span, "indexing this type is not lowered yet")
             return none
         }
@@ -7361,6 +7377,47 @@ fn indexRead(em: Emitter, e: Expr, object: Expr, index: Expr) -> int? {
         }
         none
     }
+
+    /// `t[i]` read on a `(A, B, ...)` tuple with a constant index. The checker
+    /// already rejects dynamic and out-of-range indexes, so the lookup here
+    /// always succeeds; the defensive bails keep the emitter honest if that
+    /// check ever loosens. Field access mirrors the match binder:
+    /// `pickle_tuple_field` yields the boxed slot and a scalar slot is unboxed.
+fn tupleIndexRead(em: Emitter, e: Expr, object: Expr, index: Expr, parts: List<Ty>) -> int? {
+        var i = 0
+        if (let some(v) = constIntIndex(index)) {
+            i = v
+        } else {
+            bad(em, e.span, "tuple index must be an integer literal")
+            return none
+        }
+        if (i < 0 || i >= len(parts)) {
+            bad(em, e.span, "tuple index is out of range")
+            return none
+        }
+        var rep = elemRep(em, parts[i], e.span)
+        if (let none = rep) {
+            return none
+        }
+        var repV = ElemRep.ptr()
+        if (let some(r) = rep) {
+            repV = r
+        }
+        var obj = expr(em, object)
+        if (let none = obj) {
+            return none
+        }
+        var objV = 0
+        if (let some(o) = obj) {
+            objV = o
+        }
+        var idx = constTemp(em, IrConst.Int(i))
+        var raw = externCallT1(em, "pickle_tuple_field", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [objV, idx])
+        if (repV.isPtr) {
+            return raw
+        }
+        externCallT1(em, repV.unboxSym, [IrTy.Ptr], repV.ir, [raw])
+}
 
     /// `m[k]` read for a `Map<K, V>` / scalar-keyed map. Absent keys yield the
     /// value type's default via the runtime's boxed get. Mirrors
