@@ -655,13 +655,7 @@ fn maybeRegisterClass(em: Emitter, name: string, members: List<ClassMember>, tab
         }
         var ctorFid = pushClassFunc(em, name + ".new", "pkl_" + name + "_new", FnSource.Ctor(table, inits, initBlocks, ctorDecl))
         em.ctorIds[cid] = ctorFid
-        var ctorParams = emptyTys()
-        if (let some(c) = table.ctor) {
-            for (p in c.params) {
-                ctorParams.push(p.ty)
-            }
-        }
-        em.srcParamTys[ctorFid] = ctorParams
+        em.srcParamTys[ctorFid] = ctorParamTys(em, table)
         for (m in members) {
             match (m) {
                 case ClassMember.Constructor(c) -> {
@@ -1967,15 +1961,6 @@ fn registerClassInstantiation(em: Emitter, name: string, args: List<Ty>, span: S
         var ctorSymbol = uniqSymbol(em, "pkl_" + name + "_new__" + suffix)
         var ctorFid = pushClassFunc(em, display + ".new", ctorSymbol, FnSource.Ctor(stable, inits, initBlocks, ctorDecl))
         em.ctorIds[cid] = ctorFid
-        var sps = emptyParamInfos()
-        if (let some(c) = stable.ctor) {
-            sps = c.params
-        }
-        var srctys = emptyTys()
-        for (p in sps) {
-            srctys.push(p.ty)
-        }
-        em.srcParamTys[ctorFid] = srctys
         em.instantonSubst[ctorFid] = map
         em.fidOwner[ctorFid] = cid
         em.fidGenerics[ctorFid] = table.generics
@@ -2042,6 +2027,9 @@ var m2 = seedCallableInfo()
             }
         }
         em.classes.push(ClassPlan(display, cid, none, stable))
+        // The instantiated plan must exist before the implicit-constructor
+        // parameter reconstruction can find its substituted fields.
+        em.srcParamTys[ctorFid] = ctorParamTys(em, stable)
         em.classInstByArgs[instKey(name, args)] = cid
         em.classInstSubst[cid] = map
         if (!(len(implements) == 0)) {
@@ -2213,6 +2201,44 @@ fn srcParamList(em: Emitter, fid: int) -> List<Ty> {
             p = v
         }
         p
+    }
+
+    /// Source parameter types of a class/struct constructor, including the
+    /// parameters an *implicit* constructor synthesizes from its uninitialised
+    /// fields. `table.ctor` only covers an explicitly declared primary
+    /// constructor, so recording `table.ctor` alone leaves `srcParamTys`
+    /// empty for the common `class P { var v: int }` shape - which made a
+    /// spread call see a zero-parameter target and reject every element.
+    /// Mirrors the parameter list `buildCtorBody` derives.
+fn ctorParamTys(em: Emitter, table: ClassTable) -> List<Ty> {
+        var out = emptyTys()
+        if (let some(c) = table.ctor) {
+            for (p in c.params) {
+                out.push(p.ty)
+            }
+            return out
+        }
+        var anc = nearestExplicitPrimaryAncestor(em, table.name)
+        if (let some(a) = anc) {
+            if (let some(t) = tableOf(em, a.name)) {
+                if (let some(c2) = t.ctor) {
+                    for (p in c2.params) {
+                        out.push(p.ty)
+                    }
+                }
+            }
+        }
+        var meta = synthesizedCtorParamMeta(em, table.name)
+        var ifields = allInstanceFields(em, table.name)
+        for (slot in meta.slots) {
+            if (slot < 0) {
+                continue
+            }
+            if (slot < len(ifields)) {
+                out.push(ifields[slot].ty)
+            }
+        }
+        out
     }
 
 fn callRetFor(em: Emitter, fid: int) -> Ty {

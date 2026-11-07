@@ -6342,6 +6342,13 @@ fn genericClassCall(em: Emitter, e: Expr, name: string, cls: ClassTable, typeArg
         if (let some(f2) = fO) {
             fid = f2
         }
+        // A spread in a generic constructor goes through the same runtime
+        // spread trampoline as a plain `TypeName(...)` call. The instantiated
+        // constructor is already a concrete function by this point, so the
+        // trampoline is keyed on its id like any other static target.
+        if (anySpread(args)) {
+            return spreadStaticCall(em, e, e.span, fid, srcParamList(em, fid), Ty.Class(name, argTys), none, args)
+        }
         // Mirror the plain class-constructor call: borrow `&T` reference
         // parameters, wrap optional parameters, and store the result.
         var fparams = em.irModule.funcs[fid].params
@@ -6459,8 +6466,97 @@ fn fnValueCallFrom(em: Emitter, e: Expr, fv: int, fty: Ty, args: List<CallArg>) 
         while (i < len(args)) {
             var a = args[i]
             if (a.spread) {
-                bad(em, a.span, "spread arguments are not lowered yet")
-                return none
+                // `f(...xs)`: the signature is known from the fn type, so the
+                // trailing parameters are filled from the list at runtime.
+                // Unlike a static target there is no trampoline to build; the
+                // elements are unboxed in place and passed to the indirect call.
+                var matchedList = false
+                var elemTy = Ty.Unknown
+                if (let some(t) = tyOf(em, a.value.span)) {
+                    match (t) {
+                        case Ty.List(inner) -> {
+                            matchedList = true
+                            elemTy = inner
+                        }
+                        case _ -> {}
+                    }
+                }
+                if (!matchedList) {
+                    bad(em, a.span, "a spread argument must be a `List`")
+                    return none
+                }
+                if (i > len(pty)) {
+                    bad(em, e.span, "too many arguments for this call")
+                    return none
+                }
+                var erepO = elemRep(em, elemTy, a.span)
+                if (let none = erepO) {
+                    return none
+                }
+                var erep = ElemRep.ptr()
+                if (let some(re) = erepO) {
+                    erep = re
+                }
+                var j = i
+                while (j < len(pty)) {
+                    var pre = elemRep(em, pty[j], a.span)
+                    if (let none = pre) {
+                        return none
+                    }
+                    var prev = ElemRep.ptr()
+                    if (let some(re) = pre) {
+                        prev = re
+                    }
+                    if (!elemRepSame(prev, erep)) {
+                        bad(em, e.span, "spreading over parameters with mixed element representations is not lowered yet")
+                        return none
+                    }
+                    j = j + 1
+                }
+                var spO = expr(em, a.value)
+                if (let none = spO) {
+                    return none
+                }
+                var spV = 0
+                if (let some(sv) = spO) {
+                    spV = sv
+                }
+                var n = externCallT1(em, "pickle_list_len", [IrTy.Ptr], IrTy.Int, [spV])
+                var r = intConst(em, len(pty) - i)
+                var ok = temp(em)
+                instr(em, IrInstr.BinOp(ok, IrBinOp.Eq, n, r))
+                var rOk = newBlock(em)
+                var rPanic = newBlock(em)
+                var join = newBlock(em)
+                term(em, IrTerm.BranchIf(ok, rOk, rPanic))
+                em.cur = rPanic
+                externCallVoid(em, "pickle_panic_arity_diff", emptyIrTys(), emptyInts())
+                term(em, IrTerm.Branch(join))
+                em.cur = rOk
+                var k = 0
+                while (k < len(pty) - i) {
+                    var idx = intConst(em, k)
+                    var raw = externCallT1(em, "pickle_list_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [spV, idx])
+                    var rep = elemRep(em, pty[i + k], a.span)
+                    if (let none = rep) {
+                        return none
+                    }
+                    var repV = ElemRep.ptr()
+                    if (let some(re) = rep) {
+                        repV = re
+                    }
+                    var val = raw
+                    if (!repV.isPtr) {
+                        val = externCallT1(em, repV.unboxSym, [IrTy.Ptr], repV.ir, [raw])
+                    }
+                    irParams.push(repV.ir)
+                    iargs.push(val)
+                    k = k + 1
+                }
+                term(em, IrTerm.Branch(join))
+                em.cur = join
+                i = i + 1
+                continue
             }
             var src: Ty? = none
             if (i < len(pty)) {

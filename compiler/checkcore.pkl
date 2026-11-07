@@ -1904,6 +1904,15 @@ fn checkFree(ck: Checker, e: Expr, name: string, args: List<CallArg>) -> Ty {
 fn checkArgs(ck: Checker, e: Expr, params: List<Ty>, args: List<CallArg>) {
         var position = 0
         let fixed = len(params)
+        // A spread contributes an unknown number of arguments, so the static
+        // arity comparisons below cannot decide the call. The emitter checks
+        // the real element count at runtime against the target's parameters.
+        var hasSpread = false
+        for (a in args) {
+            if (a.spread) {
+                hasSpread = true
+            }
+        }
         for (a in args) {
             if (!isNoneStr(a.name)) {
                 var an = ""
@@ -1926,11 +1935,13 @@ fn checkArgs(ck: Checker, e: Expr, params: List<Ty>, args: List<CallArg>) {
                 checkAssignable(ck, want, got, a.span, "argument")
             } else {
                 let _ = checkExpr(ck, a.value)
-                err(ck, e.span, "too many arguments in call")
+                if (!hasSpread) {
+                    err(ck, e.span, "too many arguments in call")
+                }
             }
             position = position + 1
         }
-        if (position < fixed) {
+        if (position < fixed && !hasSpread) {
             err(ck, e.span, "expected {fixed} argument(s), found {position}")
         }
 }
