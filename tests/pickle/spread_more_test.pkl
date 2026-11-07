@@ -236,3 +236,110 @@ test fn super_delegation_pointer_element_spread() {
     expect(d.name).toBe("nm")
     expect(d.extra).toBe("!")
 }
+
+// Mixed element representations (beyond Rust parity). A scalar list element is
+// already stored as its boxed pointer, which is exactly the value a managed
+// `Option<T>` parameter consumes (`some(v)` is that box for scalars), so a
+// `List<int>` may fill an `int?` slot while other slots stay plain `int`.
+// Rust's emitter rejects this shape as "mixed element representations".
+
+fn mixed_tail(a: int, b: int?) -> int {
+    match (b) {
+        case some(v) -> a + v
+        case none -> a
+    }
+}
+
+fn mixed_lead(a: int?, b: int) -> int {
+    match (a) {
+        case some(v) -> v + b
+        case none -> b
+    }
+}
+
+fn mixed_unwrap(v: int?, d: int) -> int {
+    match (v) {
+        case some(x) -> x
+        case none -> d
+    }
+}
+
+enum MixedPair {
+    Make(a: int, b: int?)
+    Solo(s: string)
+}
+
+class MixedBase {
+    var a: int
+    var b: int?
+
+    constructor(a: int, b: int?) {
+        this.a = a
+        this.b = b
+    }
+}
+
+class MixedChild extends MixedBase {
+    constructor(xs: List<int>) {
+        super(...xs)
+    }
+}
+
+class MixedImplicit {
+    var a: int
+    var b: int?
+}
+
+class MixedNamed {
+    var a: int
+    var b: int?
+
+    constructor(a: int, b: int?) {
+        this.a = a
+        this.b = b
+    }
+
+    constructor.from_list(xs: List<int>) {
+        this(...xs)
+    }
+}
+
+test fn static_call_spread_into_option_tail() {
+    var xs = [3, 4]
+    expect(mixed_tail(...xs)).toBe(7)
+}
+
+test fn static_call_spread_from_option_head() {
+    var xs = [5, 6]
+    expect(mixed_lead(...xs)).toBe(11)
+}
+
+test fn fn_value_spread_into_option_tail() {
+    var f: (int, int?) -> int = mixed_tail
+    var xs = [5, 6]
+    expect(f(...xs)).toBe(11)
+}
+
+test fn enum_ctor_spread_into_option_field() {
+    var xs = [5, 6]
+    match (MixedPair.Make(...xs)) {
+        case MixedPair.Make(a, b) -> expect(a + mixed_unwrap(b, 0)).toBe(11)
+        case MixedPair.Solo(_s) -> expect(false).toBe(true)
+    }
+}
+
+test fn implicit_ctor_spread_into_option_field() {
+    var p = MixedImplicit(...[7, 8])
+    expect(p.a + mixed_unwrap(p.b, 0)).toBe(15)
+}
+
+test fn named_ctor_delegation_spread_into_option_field() {
+    var n = MixedNamed.from_list([9, 10])
+    expect(n.a + mixed_unwrap(n.b, 0)).toBe(19)
+}
+
+test fn super_delegation_spread_into_option_field() {
+    var d = MixedChild([11, 12])
+    expect(d.a + mixed_unwrap(d.b, 0)).toBe(23)
+}
+

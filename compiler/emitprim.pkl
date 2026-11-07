@@ -307,6 +307,36 @@ case Ty.String | Ty.Option(_) | Ty.Class(_, _) | Ty.Struct(_, _) | Ty.Enum(_, _)
         }
     }
 
+    /// Whether a spread element with representation `src` can fill a parameter
+    /// of type `dstTy` whose representation is `dst` without a conversion step.
+    ///
+    /// Equal representations pass untouched. Scalar elements are stored in the
+    /// list as their boxed pointer, and that box is exactly what an
+    /// `Option<scalar>` parameter consumes (`some(v)` *is* the box for
+    /// scalars), so a scalar source may fill an option slot whose payload has
+    /// the same representation. That match is checked against `dstTy`, not just
+    /// `dst`, because the checker defers spread element typing to the runtime:
+    /// without it a `List<int>` spread into a plain `string` parameter would be
+    /// accepted and misread. Pointer elements into scalar parameters and
+    /// differing scalar families (e.g. `int` into `float`) still bail.
+fn elemRepCompatible(em: Emitter, src: ElemRep, dst: ElemRep, dstTy: Ty, span: Span) -> bool {
+        if (elemRepSame(src, dst)) {
+            return true
+        }
+        if (src.isPtr || !dst.isPtr) {
+            return false
+        }
+        match (dstTy) {
+            case Ty.Option(inner) -> {
+                if (let some(innerRep) = elemRep(em, inner, span)) {
+                    return elemRepSame(src, innerRep)
+                }
+                false
+            }
+            case _ -> false
+        }
+    }
+
 /// Intern a string into the module's string table, returning its id.
 fn internString(em: Emitter, s: string) -> int {
         if (let some(id) = em.strIds.get(s)) {
