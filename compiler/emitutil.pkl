@@ -124,6 +124,11 @@ enum FnSource {
     // properties are receiver-less), and setters take a `value` parameter,
     // over the resolved property signature.
     Property(table: ClassTable, pd: PropertyDecl, info: PropertyInfo, isSet: bool, isStatic: bool)
+    // A synthesized accessor for an interface property that an implementing
+    // class satisfies with a plain mutable field instead of a declared
+    // property. Slot 0 is `this`; setters take the field's declared type at
+    // slot 1. No AST is involved: the body is a direct field read/store.
+    FieldAccessor(cid: int, slot: int, ty: Ty, isSet: bool)
     // The synthesized static-field initializer: one assignment per static
     // field, evaluated once at program start. `None` means the field had no
     // initializer and is stored as its default (zero/null) value.
@@ -615,14 +620,22 @@ class GlobalInitResult {
     }
 }
 
-/// One interface member in declaration order: `(method name, method index)`.
+/// One interface dispatch slot in declaration order: `(member name, slot
+/// index)`. A method reserves one slot. A property reserves two adjacent
+/// slots, the getter first and the setter second, so `isProperty`/`isSet`
+/// distinguish them. Everything still funnels through the runtime's
+/// `pickle_class_add_iface_method` table, so properties need no new ABI.
 class IfaceMember {
     var name: string
     var index: int
+    var isProperty: bool
+    var isSet: bool
 
-    constructor(name: string, index: int) {
+    constructor(name: string, index: int, isProperty: bool, isSet: bool) {
         this.name = name
         this.index = index
+        this.isProperty = isProperty
+        this.isSet = isSet
     }
 }
 
@@ -1295,7 +1308,7 @@ fn emptyDispatchMap() -> Map<string, List<DispatchBranch>> {
 }
 
 fn seedIfaceMemberList() -> List<IfaceMember> {
-    var l = [IfaceMember("x", 0)]
+    var l = [IfaceMember("x", 0, false, false)]
     l.pop()
     l
 }
@@ -1361,7 +1374,7 @@ fn emptyPropertyEntries() -> List<PropertyEntry> {
 }
 
 fn emptyIfaceMemberList() -> List<IfaceMember> {
-    var l = [IfaceMember("x", 0)]
+    var l = [IfaceMember("x", 0, false, false)]
     l.pop()
     l
 }

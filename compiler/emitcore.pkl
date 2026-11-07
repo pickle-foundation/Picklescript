@@ -593,6 +593,25 @@ fn memberValue(em: Emitter, e: Expr, object: Expr, name: string) -> int? {
             bad(em, e.span, "method `" + name + "` of `" + classOfName(em, cc) + "` cannot be used as a value")
             return none
         }
+        var ift = Ty.Unknown
+        var hasIface = false
+        if (let some(pt) = ot) {
+            if (let some(_) = ifaceOf(pt)) {
+                ift = pt
+                hasIface = true
+            }
+        }
+        if (hasIface) {
+            var objI = expr(em, object)
+            if (let some(objI) = objI) {
+                var rtI = IrTy.Ptr
+                if (let some(r) = irty(em, e.span)) {
+                    rtI = r
+                }
+                return interfaceAccessorDispatch(em, e.span, ift, objI, name, false, Ty.Unknown, Ty.Unknown, none, rtI)
+            }
+            return none
+        }
         if (let some(tname) = exprKindIdentName(object)) {
             if (let some(cx) = em.classByName.get(tname)) {
                 if (let some(fid) = em.staticPropertyIds.get(tripleKey(str(cx), name, str(false)))) {
@@ -1728,6 +1747,83 @@ var ot = tyOf(em, object.span)
                 case Ty.Ptr(pr) -> o2 = pr
                 case _ -> o2 = tt
             }
+        }
+        var iftW = Ty.Unknown
+        var hasIfaceW = false
+        if (let some(oo) = o2) {
+            if (let some(_) = ifaceOf(oo)) {
+                iftW = oo
+                hasIfaceW = true
+            }
+        }
+        if (hasIfaceW) {
+            var ptyO = ifacePropertyTy(em, iftW, name)
+            if (let none = ptyO) {
+                bad(em, e.span, "`" + name + "` is not a property of this interface")
+                return none
+            }
+            var pty = Ty.Unknown
+            if (let some(p) = ptyO) {
+                pty = p
+            }
+            var objW = expr(em, object)
+            if (let none = objW) {
+                return none
+            }
+            var objWId = 0
+            if (let some(o) = objW) {
+                objWId = o
+            }
+            if (op != AssignOp.Assign) {
+                var getRet = IrTy.Ptr
+                if (let some(r) = mapTy(em, pty, e.span)) {
+                    getRet = r
+                }
+                var curW = interfaceAccessorDispatch(em, e.span, iftW, objWId, name, false, Ty.Unknown, Ty.Unknown, none, getRet)
+                if (let none = curW) {
+                    return none
+                }
+                var curId = 0
+                if (let some(c) = curW) {
+                    curId = c
+                }
+                var vW = expr(em, value)
+                if (let none = vW) {
+                    return none
+                }
+                var vWId = 0
+                if (let some(vv) = vW) {
+                    vWId = vv
+                }
+                var dstW = combineCompound(em, e.span, op, pty, curId, vWId, "property")
+                if (let none = dstW) {
+                    return none
+                }
+                var dstWId = 0
+                if (let some(d) = dstW) {
+                    dstWId = d
+                }
+                if (let none = interfaceAccessorDispatch(em, e.span, iftW, objWId, name, true, pty, pty, dstWId, IrTy.Unit)) {
+                    return none
+                }
+                return dstWId
+            }
+            var vW2 = expr(em, value)
+            if (let none = vW2) {
+                return none
+            }
+            var vWId2 = 0
+            if (let some(vv) = vW2) {
+                vWId2 = vv
+            }
+            var vSrc = Ty.Unknown
+            if (let some(t) = tyOf(em, value.span)) {
+                vSrc = t
+            }
+            if (let none = interfaceAccessorDispatch(em, e.span, iftW, objWId, name, true, pty, vSrc, vWId2, IrTy.Unit)) {
+                return none
+            }
+            return vWId2
         }
         var cidVal = -1
         if (let some(oo) = o2) {
@@ -6062,6 +6158,154 @@ fn interfaceDispatch(em: Emitter, e: Expr, span2: Span, ift: Ty, receiver: int, 
         out
     }
 
+
+    /// A zero value of IR type `t`, used on the no-implementation panic path.
+fn zeroForRet(em: Emitter, t: IrTy, span: Span) -> int? {
+        match (t) {
+            case IrTy.Unit -> unitTemp(em)
+            case IrTy.Ptr -> nullTemp(em)
+            case IrTy.Str -> nullTemp(em)
+            case _ -> zeroScalar(em, t, span)
+        }
+    }
+
+    /// Dispatch an interface property get/set to the receiving class's
+    /// accessor. Same compile-time `pickle_class_is` chain plus runtime
+    /// `pickle_iface_method` fallback as `interfaceDispatch`; properties simply
+    /// reserve a getter slot and a setter slot in the interface's member table.
+fn interfaceAccessorDispatch(em: Emitter, span2: Span, ift: Ty, receiver: int, name: string, isSet: bool, pty: Ty, valueSrcTy: Ty, value: int?, retTy: IrTy) -> int? {
+        var ifaceName = ""
+        var ifaceArgs = emptyTys()
+        var isIface = false
+        if (let some(ir) = ifaceOf(ift)) {
+            ifaceName = ir.name
+            ifaceArgs = ir.args
+            isIface = true
+        }
+        if (!isIface) {
+            bad(em, span2, "receiver type is not an interface")
+            return none
+        }
+        var ifaceId = 0
+        if (let some(id) = ifaceIdFor(em, ifaceName, ifaceArgs, span2)) {
+            ifaceId = id
+        } else {
+            return none
+        }
+        var idx = -1
+        var found = false
+        if (let some(ms) = em.ifaceMembers.get(ifaceId)) {
+            for (m in ms) {
+                if (m.isProperty && m.isSet == isSet && m.name == name) {
+                    idx = m.index
+                    found = true
+                    break
+                }
+            }
+        }
+        if (!found) {
+            bad(em, span2, "`" + ifaceName + "` has no property `" + name + "`")
+            return none
+        }
+        var packed = 0
+        if (isSet) {
+            if (let some(v) = value) {
+                packed = v
+            } else {
+                return none
+            }
+            var wantsPtr = false
+            if (let some(ir2) = mapTy(em, pty, span2)) {
+                if (irTyTag(ir2) == irTyTag(IrTy.Ptr)) {
+                    wantsPtr = true
+                }
+            }
+            if (wantsPtr) {
+                var wrapped = optionWrap(em, packed, valueSrcTy, span2)
+                if (let some(w) = wrapped) {
+                    packed = w
+                } else {
+                    return none
+                }
+            }
+        }
+        var branches = emptyIfaceDepths()
+        for (p in em.classes) {
+            if (!classImplementsIface(em, p.classId, ifaceId)) {
+                continue
+            }
+            if (let some(fid) = em.propertyIds.get(tripleKey(str(p.classId), name, str(isSet)))) {
+                var depth = len(ancestry(em, p.name))
+                branches.push(IfaceDepthBranch(depth, p.classId, fid))
+            }
+        }
+        if (len(branches) == 0) {
+            // Every implementer leaves this slot unregistered (for example a
+            // read-only field satisfying a writable interface property). The
+            // checker accepted the program, so panic the same way a missing
+            // runtime method-table entry does.
+            externCallVoid(em, "pickle_panic_no_iface_method", emptyIrTys(), emptyInts())
+            return zeroForRet(em, retTy, span2)
+        }
+        sortIfaceBranches(branches)
+        var dummy = Expr(span2, ExprKind.Ident(""))
+        var retSlot = newSlot(em, retTy)
+        var join = newBlock(em)
+        for (b in branches) {
+            var cb = newBlock(em)
+            var next = newBlock(em)
+            var dc = intConst(em, b.cid)
+            var hit = externCallT1(em, "pickle_class_is", [IrTy.Ptr, IrTy.Int], IrTy.Bool, [receiver, dc])
+            term(em, IrTerm.BranchIf(hit, cb, next))
+            em.cur = cb
+            var callArgs = emptyInts()
+            callArgs.push(receiver)
+            if (isSet) {
+                callArgs.push(packed)
+            }
+            var val = emitCallTo(em, b.fid, callArgs, dummy)
+            instr(em, IrInstr.StoreSlot(retSlot, val))
+            term(em, IrTerm.Branch(join))
+            em.cur = next
+        }
+        var iid = intConst(em, ifaceId)
+        var idxc = intConst(em, idx)
+        var fp = externCallT1(em, "pickle_iface_method", [IrTy.Ptr, IrTy.Int, IrTy.Int], IrTy.Int, [receiver, iid, idxc])
+        var isZeroO = cmpZero(em, fp, IrBinOp.Eq, false)
+        var isZero = -1
+        if (let some(z) = isZeroO) {
+            isZero = z
+        } else {
+            return none
+        }
+        var ok = newBlock(em)
+        var guard = newBlock(em)
+        term(em, IrTerm.BranchIf(isZero, guard, ok))
+        em.cur = guard
+        externCallVoid(em, "pickle_panic_no_iface_method", emptyIrTys(), emptyInts())
+        term(em, IrTerm.Branch(join))
+        em.cur = ok
+        var indParams = emptyIrTys()
+        indParams.push(IrTy.Ptr)
+        var indArgs = emptyInts()
+        indArgs.push(receiver)
+        if (isSet) {
+            var valueIr = IrTy.Ptr
+            if (let some(r) = mapTy(em, pty, span2)) {
+                valueIr = r
+            }
+            indParams.push(valueIr)
+            indArgs.push(packed)
+        }
+        var dst = temp(em)
+        instr(em, IrInstr.CallInd(dst, fp, indParams, retTy, indArgs))
+        instr(em, IrInstr.StoreSlot(retSlot, dst))
+        term(em, IrTerm.Branch(join))
+        em.cur = join
+        var out = temp(em)
+        instr(em, IrInstr.LoadSlot(out, retSlot))
+        out
+    }
 
     /// A zero-argument interface call against an already-lowered receiver,
     /// used by the `Iterable`/`Iterator` protocol surface in `for_in_protocol`.

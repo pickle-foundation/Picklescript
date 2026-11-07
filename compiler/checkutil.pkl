@@ -1008,6 +1008,61 @@ fn findMethod(ck: Checker, cls: string, name: string) -> CallableInfo? {
         none
 }
 
+/// The substituted type of interface property `name` reached from
+/// `iface<iargs>`, walking `extends`, or `none` when the chain declares no
+/// such property. Mirrors the property arm of the interface member lookup in
+/// `checkMember`.
+fn ifacePropertyTy(ck: Checker, iface: string, iargs: List<Ty>, name: string) -> Ty? {
+        var imap: Map<string, Ty> = emptyMapStrTy()
+        if (let some(entry) = ck.resolved.types.get(iface)) {
+            match (entry) {
+                case TypeTableEntry.Interface(it) -> {
+                    var ii = 0
+                    while (ii < len(it.generics)) {
+                        if (ii < len(iargs)) {
+                            imap[it.generics[ii]] = iargs[ii]
+                        } else {
+                            imap[it.generics[ii]] = Ty.Unknown
+                        }
+                        ii = ii + 1
+                    }
+                }
+                case _ -> {}
+            }
+        }
+        var chain = [iface]
+        var seen = emptyStrList()
+        while (len(chain) > 0) {
+            let iname = chain[len(chain) - 1]
+            chain.pop()
+            if (listHasStr(seen, iname)) {
+                continue
+            }
+            seen.push(iname)
+            if (let some(entry2) = ck.resolved.types.get(iname)) {
+                match (entry2) {
+                    case TypeTableEntry.Interface(ent) -> {
+                        for (mem in ent.members) {
+                            if (mem.name == name) {
+                                if (mem.isProperty) {
+                                    return subst(mem.ty, imap)
+                                }
+                                return none
+                            }
+                        }
+                        for (ext in ent.extends) {
+                            if (let some(n) = named(ext)) {
+                                chain.push(n)
+                            }
+                        }
+                    }
+                    case _ -> {}
+                }
+            }
+        }
+        none
+    }
+
 fn findProperty(ck: Checker, cls: string, name: string) -> PropertyInfo? {
         if (let some(t) = classTable(ck, cls)) {
             for (p in t.properties) {

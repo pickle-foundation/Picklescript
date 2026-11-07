@@ -314,6 +314,10 @@ case FnSource.MethodTrampoline(span, target, pts, rt, branches) -> {
                     em.owner = ownerFor(em, fid, table.name)
                     buildPropertyBody(em, table, pd, pinfo, isSet, isStatic)
                 }
+                case FnSource.FieldAccessor(cid, slot, ty, isSet) -> {
+                    em.owner = cid
+                    buildFieldAccessor(em, cid, slot, ty, isSet)
+                }
                 case FnSource.StaticInit(inits) -> buildStaticInit(em, inits)
                 case FnSource.GlobalsInit(inits) -> buildGlobalsInit(em, inits)
                 case FnSource.TestSetup -> {
@@ -1446,6 +1450,39 @@ fn buildPropertyBody(em: Emitter, table: ClassTable, pd: PropertyDecl, info: Pro
                 case PropertyAccessor.Block(b) -> {
                     emitBody(em, FnBody.Block(b))
                 }
+            }
+        }
+        tailCleanup(em)
+        true
+    }
+
+/// Synthesized accessor over a plain instance field, used to satisfy an
+/// interface property when the implementing class declares a field instead of
+/// a property. Slot 0 is `this`; the setter takes the field's declared type at
+/// slot 1. No AST is built: this is a direct `pickle_obj_slot_get/set`.
+fn buildFieldAccessor(em: Emitter, cid: int, slot: int, ty: Ty, isSet: bool) -> bool {
+        let _ = cid
+        var vIr = IrTy.Ptr
+        if (let some(r) = mapTy(em, ty, Span(0, 0))) {
+            vIr = r
+        }
+        em.fslots.push(IrTy.Ptr)
+        em.fparams.push(IrParam("this", IrTy.Ptr))
+        declare(em, "this", 0)
+        if (isSet) {
+            em.fslots.push(vIr)
+            em.fparams.push(IrParam("value", vIr))
+            declare(em, "value", 1)
+            em.fret = IrTy.Unit
+            var obj = load(em, 0)
+            var v = load(em, 1)
+            let _ = fieldAssign(em, Span(0, 0), AssignOp.Assign, obj, ty, slot, v, ty, false)
+            term(em, IrTerm.Return(none))
+        } else {
+            em.fret = vIr
+            var obj2 = load(em, 0)
+            if (let some(r) = fieldRead(em, Span(0, 0), obj2, ty, slot)) {
+                term(em, IrTerm.Return(r))
             }
         }
         tailCleanup(em)

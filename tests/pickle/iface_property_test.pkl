@@ -1,0 +1,252 @@
+// Interface property access. A property on an interface reserves two
+// dispatch slots (getter then setter). An implementing class satisfies them
+// either with a declared `property` or with a plain instance field, for which
+// the compiler synthesizes a direct slot accessor.
+
+interface Sized {
+    property size: int
+}
+
+interface Labelled {
+    property label: string
+}
+
+interface Boxed<T> {
+    property value: T
+}
+
+interface Maybe {
+    property slot: int?
+}
+
+// Field-backed: the compiler synthesizes get/set accessors over `size`.
+class FieldSized implements Sized {
+    var size: int
+
+    constructor(size: int) {
+        this.size = size
+    }
+}
+
+// Declared property backed by a private field, with a computed getter.
+class PropSized implements Sized {
+    var raw: int
+
+    constructor(raw: int) {
+        this.raw = raw
+    }
+
+    property size: int {
+        get { this.raw * 2 }
+        set { this.raw = value }
+    }
+}
+
+// Field-backed string property.
+class FieldNamed implements Labelled {
+    var label: string
+
+    constructor(label: string) {
+        this.label = label
+    }
+}
+
+// Field-backed generic property.
+class GenFieldBox<T> implements Boxed<T> {
+    var value: T
+}
+
+// Declared generic property.
+class GenPropBox<T> implements Boxed<T> {
+    var raw: T
+
+    property value: T {
+        get { this.raw }
+        set { this.raw = value }
+    }
+}
+
+// Option-typed interface property, field-backed.
+class MaybeBox implements Maybe {
+    var slot: int?
+
+    constructor(slot: int?) {
+        this.slot = slot
+    }
+}
+
+// Option-typed interface property, declared.
+class MaybeProp implements Maybe {
+    var raw: int?
+
+    constructor(raw: int?) {
+        this.raw = raw
+    }
+
+    property slot: int? {
+        get { this.raw }
+        set { this.raw = value }
+    }
+}
+
+// Subclass dispatch: `LeafSized` inherits `Sized` through `RootSized`.
+class RootSized implements Sized {
+    var size: int
+}
+
+class LeafSized extends RootSized implements Labelled {
+    var label: string
+}
+
+fn readSized(s: Sized) -> int {
+    s.size
+}
+
+fn writeSized(s: Sized, v: int) {
+    s.size = v
+}
+
+fn readLabelled(l: Labelled) -> string {
+    l.label
+}
+
+fn readBoxed<T>(b: Boxed<T>) -> T {
+    b.value
+}
+
+fn writeBoxed<T>(b: Boxed<T>, v: T) {
+    b.value = v
+}
+
+fn readMaybe(m: Maybe) -> int? {
+    m.slot
+}
+
+fn writeMaybe(m: Maybe, v: int?) {
+    m.slot = v
+}
+
+test fn field_backed_get() {
+    var s: Sized = FieldSized(5)
+    expect(s.size).toBe(5)
+}
+
+test fn field_backed_set() {
+    var s: Sized = FieldSized(1)
+    s.size = 9
+    expect(s.size).toBe(9)
+}
+
+test fn declared_property_get() {
+    var s: Sized = PropSized(3)
+    expect(s.size).toBe(6)
+}
+
+test fn declared_property_set() {
+    var s: Sized = PropSized(1)
+    s.size = 4
+    expect(s.size).toBe(8)
+}
+
+test fn field_backed_compound_add() {
+    var s: Sized = FieldSized(10)
+    s.size += 5
+    expect(s.size).toBe(15)
+}
+
+test fn declared_property_compound_add() {
+    var s: Sized = PropSized(2)
+    s.size += 3
+    expect(s.size).toBe(14)
+}
+
+test fn string_field_backed_property() {
+    var l: Labelled = FieldNamed("a")
+    expect(l.label).toBe("a")
+    l.label = "b"
+    expect(l.label).toBe("b")
+}
+
+test fn property_dispatch_across_implementations() {
+    var f: Sized = FieldSized(4)
+    var p: Sized = PropSized(4)
+    expect(readSized(f)).toBe(4)
+    expect(readSized(p)).toBe(8)
+}
+
+test fn property_write_through_interface_fn() {
+    var f: Sized = FieldSized(0)
+    var p: Sized = PropSized(0)
+    writeSized(f, 11)
+    writeSized(p, 11)
+    expect(f.size).toBe(11)
+    expect(p.size).toBe(22)
+}
+
+test fn generic_field_backed_property() {
+    var b: Boxed<int> = GenFieldBox<int>(6)
+    expect(b.value).toBe(6)
+    b.value = 7
+    expect(b.value).toBe(7)
+}
+
+test fn generic_declared_property() {
+    var b: Boxed<string> = GenPropBox<string>("x")
+    expect(b.value).toBe("x")
+    b.value = "y"
+    expect(b.value).toBe("y")
+}
+
+test fn generic_property_through_interface_fn() {
+    var b = GenFieldBox<int>(1)
+    writeBoxed<int>(b, 3)
+    expect(readBoxed<int>(b)).toBe(3)
+
+    var s = GenFieldBox<string>("a")
+    writeBoxed<string>(s, "b")
+    expect(readBoxed<string>(s)).toBe("b")
+}
+
+test fn option_field_backed_property() {
+    var m: Maybe = MaybeBox(none)
+    m.slot = 5
+    expect(m.slot is int).toBe(true)
+    expect(m.slot).toBe(5)
+}
+
+test fn option_property_set_none() {
+    var m: Maybe = MaybeBox(7)
+    m.slot = none
+    expect(m.slot).toBe(none)
+}
+
+test fn option_property_through_interface_fn() {
+    var m: Maybe = MaybeBox(none)
+    writeMaybe(m, 12)
+    expect(readMaybe(m) is int).toBe(true)
+    expect(readMaybe(m)).toBe(12)
+}
+
+test fn option_declared_property() {
+    var m: Maybe = MaybeProp(3)
+    expect(m.slot).toBe(3)
+    m.slot = 8
+    expect(m.slot).toBe(8)
+}
+
+test fn inherited_field_backed_property() {
+    var leaf: Sized = LeafSized(21, "leaf")
+    expect(leaf.size).toBe(21)
+    leaf.size = 22
+    expect(leaf.size).toBe(22)
+    var named: Labelled = LeafSized(1, "l")
+    expect(readLabelled(named)).toBe("l")
+}
+
+test fn interface_property_is_probe() {
+    var f = FieldSized(1)
+    expect(f is Sized).toBe(true)
+    var p: Sized = PropSized(2)
+    expect(p is Sized).toBe(true)
+    expect(readSized(p)).toBe(4)
+}

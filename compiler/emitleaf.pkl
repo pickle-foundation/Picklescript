@@ -422,6 +422,20 @@ fn ownInstanceFields(em: Emitter, name: string) -> List<FieldInfo> {
         }
     }
 
+    /// The nearest instance field named `name` in the ancestry of `name`
+    /// (base classes first), or `none` when no class declares it. Used to
+    /// synthesize interface-property accessors for field-backed properties.
+fn instanceFieldInfo(em: Emitter, cname: string, name: string) -> FieldInfo? {
+        for (a in ancestry(em, cname)) {
+            for (f in ownInstanceFields(em, a)) {
+                if (f.name == name) {
+                    return f
+                }
+            }
+        }
+        none
+    }
+
 fn collectInstanceInits(em: Emitter, name: string) -> List<SlotInit> {
         var out = emptySlotInits()
         var base = 0
@@ -505,8 +519,16 @@ fn ifaceIdFor(em: Emitter, name: string, args: List<Ty>, span: Span) -> int? {
                 var plan = emptyIfaceMemberList()
                 var mi = 0
                 for (m in t.members) {
-                    if (!m.isProperty) {
-                        plan.push(IfaceMember(m.name, mi))
+                    if (m.isProperty) {
+                        // A property reserves the getter slot then the setter
+                        // slot, so both dispatch through the same runtime
+                        // interface-method table.
+                        plan.push(IfaceMember(m.name, mi, true, false))
+                        mi = mi + 1
+                        plan.push(IfaceMember(m.name, mi, true, true))
+                        mi = mi + 1
+                    } else {
+                        plan.push(IfaceMember(m.name, mi, false, false))
                         mi = mi + 1
                     }
                 }
@@ -527,6 +549,71 @@ fn registerImplements(em: Emitter, cname: string, cid: int, ifaces: List<Ty>, sp
                     var members = em.ifaceMembers.get(id)
                     if (let some(ms) = members) {
                         for (m in ms) {
+                            if (m.isProperty) {
+                                var gotAny = false
+                                if (!m.isSet) {
+                                    if (let some(g) = em.propertyIds.get(tripleKey(str(cid), m.name, str(false)))) {
+                                        gotAny = true
+                                        slots.push(DispatchBranch(m.index, g))
+                                    }
+                                } else {
+                                    if (let some(s) = em.propertyIds.get(tripleKey(str(cid), m.name, str(true)))) {
+                                        gotAny = true
+                                        slots.push(DispatchBranch(m.index, s))
+                                    }
+                                }
+                                if (gotAny) {
+                                    continue
+                                }
+                                // A declared property with no matching accessor
+                                // (e.g. getter-only) must not be backed by a
+                                // same-named field: leave the slot unregistered
+                                // so a write panics at runtime. Check the
+                                // declaration, not `propertyIds`: the other
+                                // synthesized accessor for this same interface
+                                // property is already registered there.
+                                var declaredProp = false
+                                if (let some(dt) = tableOf(em, cname)) {
+                                    for (dp in dt.properties) {
+                                        if (dp.name == m.name) {
+                                            declaredProp = true
+                                        }
+                                    }
+                                }
+                                if (declaredProp) {
+                                    continue
+                                }
+                                // No declared accessor: a plain mutable field
+                                // satisfies the property. Synthesize the
+                                // accessor directly over the field slot.
+                                var fi = instanceFieldInfo(em, cname, m.name)
+                                if (let some(f) = fi) {
+                                    if (m.isSet && !f.mutable) {
+                                        // Read-only field: leave the setter
+                                        // slot unregistered. A write then hits
+                                        // the runtime no-slot panic instead of
+                                        // failing compilation.
+                                        continue
+                                    }
+                                    var slO = absInstanceFieldSlot(em, cname, m.name)
+                                    if (let some(sl) = slO) {
+                                        var stem = "pkl_" + sanitizeSymbol(cname) + "_" + m.name + "_iacc_"
+                                        if (m.isSet) {
+                                            stem = stem + "set"
+                                        } else {
+                                            stem = stem + "get"
+                                        }
+                                        var accFid = pushClassFunc(em, cname + "." + m.name + ".iface", uniqSymbol(em, stem), FnSource.FieldAccessor(cid, sl, f.ty, m.isSet))
+                                        if (m.isSet) {
+                                            propDef(em, cid, m.name, true, accFid)
+                                        } else {
+                                            propDef(em, cid, m.name, false, accFid)
+                                        }
+                                        slots.push(DispatchBranch(m.index, accFid))
+                                    }
+                                }
+                                continue
+                            }
                             if (let some(mr) = em.methodIds.get(pairKey(str(cid), m.name))) {
                                 if (mr.isStatic) {
                                     bad(em, span, "interface method `" + m.name + "` must be an instance method on `" + cname + "`")
