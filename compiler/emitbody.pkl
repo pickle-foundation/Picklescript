@@ -757,11 +757,23 @@ fn emitSuperChain(em: Emitter, ownerName: string, delegation: Expr) -> bool {
         if (let none = pt) {
             return bad(em, delegation.span, "`" + parent + "` is not a class")
         }
+        var ptable = seedClassTable()
+        if (let some(t) = pt) {
+            ptable = t
+        }
+        var ptypes = ctorParamTys(em, ptable)
+        var spreadAt = 0
+        while (spreadAt < len(args) && !args[spreadAt].spread) {
+            spreadAt = spreadAt + 1
+        }
+        var spread = spreadAt < len(args)
+        if (spread && spreadAt > len(ptypes)) {
+            return bad(em, delegation.span, "`super(...)` passes more argument(s) than `" + parent + "` expects")
+        }
         var vals = emptyCtorArgVals()
-        for (a in args) {
-            if (a.spread) {
-                return bad(em, a.span, "spread arguments are not lowered yet")
-            }
+        var ai = 0
+        while (ai < spreadAt) {
+            var a = args[ai]
             var vO = expr(em, a.value)
             if (let none = vO) {
                 return false
@@ -775,10 +787,87 @@ fn emitSuperChain(em: Emitter, ownerName: string, delegation: Expr) -> bool {
                 ty = t
             }
             vals.push(CtorArgVal(v, ty, a.value.span))
+            ai = ai + 1
         }
-        var ptable = seedClassTable()
-        if (let some(t) = pt) {
-            ptable = t
+        if (spread) {
+            var spArg = args[spreadAt]
+            var elemTy = Ty.Unknown
+            var matchedList = false
+            if (let some(t2) = tyOf(em, spArg.value.span)) {
+                match (t2) {
+                    case Ty.List(inner) -> {
+                        matchedList = true
+                        elemTy = inner
+                    }
+                    case _ -> {}
+                }
+            }
+            if (!matchedList) {
+                return bad(em, spArg.span, "a spread argument must be a `List`")
+            }
+            var erepO = elemRep(em, elemTy, spArg.span)
+            if (let none = erepO) {
+                return false
+            }
+            var erep = ElemRep.ptr()
+            if (let some(re) = erepO) {
+                erep = re
+            }
+            var j = spreadAt
+            while (j < len(ptypes)) {
+                var pre = elemRep(em, ptypes[j], spArg.span)
+                if (let none = pre) {
+                    return false
+                }
+                var prev = ElemRep.ptr()
+                if (let some(re) = pre) {
+                    prev = re
+                }
+                if (!elemRepSame(prev, erep)) {
+                    return bad(em, delegation.span, "spreading over parameters with mixed element representations is not lowered yet")
+                }
+                j = j + 1
+            }
+            var spO = expr(em, spArg.value)
+            if (let none = spO) {
+                return false
+            }
+            var spV = 0
+            if (let some(x) = spO) {
+                spV = x
+            }
+            var remaining = len(ptypes) - spreadAt
+            var gotLen = externCallT1(em, "pickle_list_len", [IrTy.Ptr], IrTy.Int, [spV])
+            var want = intConst(em, remaining)
+            var ok = temp(em)
+            instr(em, IrInstr.BinOp(ok, IrBinOp.Eq, gotLen, want))
+            var rOk = newBlock(em)
+            var rPanic = newBlock(em)
+            term(em, IrTerm.BranchIf(ok, rOk, rPanic))
+            em.cur = rPanic
+            externCallVoid(em, "pickle_panic_arity_diff", emptyIrTys(), emptyInts())
+            term(em, IrTerm.Unreachable)
+            em.cur = rOk
+            var k = 0
+            while (k < remaining) {
+                var idx = intConst(em, k)
+                var raw = externCallT1(em, "pickle_list_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [spV, idx])
+                var pt2 = ptypes[spreadAt + k]
+                var repO2 = elemRep(em, pt2, spArg.span)
+                if (let none = repO2) {
+                    return false
+                }
+                var rep2 = ElemRep.ptr()
+                if (let some(re) = repO2) {
+                    rep2 = re
+                }
+                var ev = raw
+                if (!rep2.isPtr) {
+                    ev = externCallT1(em, rep2.unboxSym, [IrTy.Ptr], rep2.ir, [raw])
+                }
+                vals.push(CtorArgVal(ev, pt2, spArg.span))
+                k = k + 1
+            }
         }
         emitCtorChain(em, parent, ptable, vals, delegation.span)
     }
@@ -880,9 +969,13 @@ fn emitCtorChain(em: Emitter, cname: string, ct: ClassTable, vals: List<CtorArgV
                 }
             }
             if (hasDel) {
-                if (!emitCtorBlockFrom(em, ctorDecl.body, 1)) {
-                    popScope(em)
-                    return false
+                // A body that is only `super(...)` puts it in the block tail,
+                // which `emitSuperChain` has already consumed.
+                if (len(ctorDecl.body.stmts) > 0) {
+                    if (!emitCtorBlockFrom(em, ctorDecl.body, 1)) {
+                        popScope(em)
+                        return false
+                    }
                 }
             } else {
                 if (!emitCtorBlock(em, ctorDecl.body)) {
@@ -1112,8 +1205,12 @@ fn buildCtorBody(em: Emitter, table: ClassTable, inits: List<SlotInit>, initBloc
                 if (!emitSuperChain(em, table.name, dg)) {
                     return false
                 }
-                if (!emitCtorBlockFrom(em, cd.body, 1)) {
-                    return false
+                // A body that is only `super(...)` puts it in the block tail,
+                // which `emitSuperChain` has already consumed.
+                if (len(cd.body.stmts) > 0) {
+                    if (!emitCtorBlockFrom(em, cd.body, 1)) {
+                        return false
+                    }
                 }
             } else {
                 if (!emitCtorBlock(em, cd.body)) {
@@ -1201,14 +1298,23 @@ fn buildNamedCtor(em: Emitter, table: ClassTable, cd: ConstructorDecl) -> bool {
         if (let some(p2) = primaryOpt) {
             primary = p2
         }
+        if (anySpread(args)) {
+            // The delegation target is a plain function returning the new
+            // instance, so the shared spread trampoline can drive it.
+            var pty = ctorParamTys(em, table)
+            var rt = Ty.Class(table.name, emptyTys())
+            var sv = spreadStaticCall(em, delegation, cd.span, primary, pty, rt, none, args)
+            if (let some(v) = sv) {
+                term(em, IrTerm.Return(v))
+                return true
+            }
+            return false
+        }
         var fparams = em.irModule.funcs[primary].params
         var argTemps = emptyInts()
         var ai = 0
         while (ai < len(args)) {
             var a = args[ai]
-            if (a.spread) {
-                return bad(em, a.span, "spread arguments are not lowered yet")
-            }
             var tO = expr(em, a.value)
             if (let none = tO) {
                 return false

@@ -373,25 +373,33 @@ fn namedCtorDelegation(body: Block) -> Expr? {
     res
 }
 
+/// Is `e` a `super(...)` call expression?
+fn superCallExpr(e: Expr) -> Expr? {
+    match (e.kind) {
+        case ExprKind.Call(callee, _) -> {
+            match (callee.kind) {
+                case ExprKind.Super -> e
+                case _ -> none
+            }
+        }
+        case _ -> none
+    }
+}
+
 /// The leading `super(...)` delegation expression of a primary-constructor
 /// body, when it is the first statement. The call's arguments are evaluated
 /// in the current function's scope and fed to the parent constructor.
 fn ctorSuperDelegation(body: Block) -> Expr? {
     if (len(body.stmts) == 0) {
-        return none
+        // A body that is only the delegation parses as a block tail, not a
+        // statement, so accept it there too.
+        return match (body.expr) {
+            case some(e) -> superCallExpr(e)
+            case none -> none
+        }
     }
     match (body.stmts[0]) {
-        case Stmt.Expr(e) -> {
-            match (e.kind) {
-                case ExprKind.Call(callee, _) -> {
-                    match (callee.kind) {
-                        case ExprKind.Super -> e
-                        case _ -> none
-                    }
-                }
-                case _ -> none
-            }
-        }
+        case Stmt.Expr(e) -> superCallExpr(e)
         case _ -> none
     }
 }
