@@ -7811,15 +7811,25 @@ fn forIn(em: Emitter, pattern: Pattern, sequence: Expr, body: Block, span: Span)
                                 return bad(em, span, "map entries pattern must bind exactly two names `(k, v)`")
                             }
                             var kname = ""
+                            var kbind = false
                             match (parts[0]) {
-                                case Pattern.Binding(nm, _) -> kname = nm
+                                case Pattern.Binding(nm, _) -> {
+                                    kname = nm
+                                    kbind = true
+                                }
+                                case Pattern.Wildcard -> {}
                                 case _ -> {
                                     return bad(em, span, "map entries sub-patterns must be plain names")
                                 }
                             }
                             var vname = ""
+                            var vbind = false
                             match (parts[1]) {
-                                case Pattern.Binding(nm, _) -> vname = nm
+                                case Pattern.Binding(nm, _) -> {
+                                    vname = nm
+                                    vbind = true
+                                }
+                                case Pattern.Wildcard -> {}
                                 case _ -> {
                                     return bad(em, span, "map entries sub-patterns must be plain names")
                                 }
@@ -7830,7 +7840,7 @@ fn forIn(em: Emitter, pattern: Pattern, sequence: Expr, body: Block, span: Span)
                             } else {
                                 return false
                             }
-                            return forInMapEntries(em, kname, vname, mapT, k, v, body, span)
+                            return forInMapEntries(em, kname, kbind, vname, vbind, mapT, k, v, body, span)
                         }
                         case _ -> {}
                     }
@@ -7843,8 +7853,13 @@ fn forIn(em: Emitter, pattern: Pattern, sequence: Expr, body: Block, span: Span)
             match (ot) {
                 case Ty.String -> {
                     var nm = ""
+                    var nbind = false
                     match (pattern) {
-                        case Pattern.Binding(nm2, _) -> nm = nm2
+                        case Pattern.Binding(nm2, _) -> {
+                            nm = nm2
+                            nbind = true
+                        }
+                        case Pattern.Wildcard -> {}
                         case _ -> {
                             return bad(em, span, "iteration patterns other than a binding are not lowered yet")
                         }
@@ -7855,7 +7870,7 @@ fn forIn(em: Emitter, pattern: Pattern, sequence: Expr, body: Block, span: Span)
                     } else {
                         return false
                     }
-                    return forInString(em, nm, seqT, body)
+                    return forInString(em, nm, nbind, seqT, body)
                 }
                 case Ty.List(inner) -> {
                     var elemT = inner
@@ -7881,6 +7896,7 @@ fn forIn(em: Emitter, pattern: Pattern, sequence: Expr, body: Block, span: Span)
                     var isBind = false
                     match (pattern) {
                         case Pattern.Binding(_, _) -> isBind = true
+                        case Pattern.Wildcard -> isBind = true
                         case _ -> {}
                     }
                     if (!isBind) {
@@ -8072,6 +8088,7 @@ fn forInValues(em: Emitter, pattern: Pattern, seqT: int, elem: Ty, body: Block, 
         instr(em, IrInstr.StoreSlot(elemSlot, v))
         match (pattern) {
             case Pattern.Binding(nm, _) -> declare(em, nm, elemSlot)
+            case Pattern.Wildcard -> {}
             case Pattern.Tuple(_) -> {
                 var ev = load(em, elemSlot)
                 if (!(bindMatchValue(em, pattern, elem, ev, span))) {
@@ -8109,7 +8126,7 @@ fn forInValues(em: Emitter, pattern: Pattern, seqT: int, elem: Ty, body: Block, 
     /// `for ((k, v) in m)`: bind key and value per trip from lockstep
     /// `pickle_map_keys` / `pickle_map_values` snapshots, unboxing keys and
     /// values per their `ElemRep`. Mirrors `for_in_map_entries` in emit.rs.
-fn forInMapEntries(em: Emitter, kname: string, vname: string, mapT: int, kty: Ty, vty: Ty, body: Block, span: Span) -> bool {
+fn forInMapEntries(em: Emitter, kname: string, kbind: bool, vname: string, vbind: bool, mapT: int, kty: Ty, vty: Ty, body: Block, span: Span) -> bool {
         var vrpo = elemRep(em, vty, span)
         if (let none = vrpo) {
             return false
@@ -8173,7 +8190,9 @@ fn forInMapEntries(em: Emitter, kname: string, vname: string, mapT: int, kty: Ty
         }
         var kSlot = newSlot(em, kIr)
         instr(em, IrInstr.StoreSlot(kSlot, k))
-        declare(em, kname, kSlot)
+        if (kbind) {
+            declare(em, kname, kSlot)
+        }
         var vraw = externCallT1(em, "pickle_list_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [valsL2, i])
         var v = vraw
         if (!(vrep.isPtr)) {
@@ -8181,7 +8200,9 @@ fn forInMapEntries(em: Emitter, kname: string, vname: string, mapT: int, kty: Ty
         }
         var vSlot = newSlot(em, vIr)
         instr(em, IrInstr.StoreSlot(vSlot, v))
-        declare(em, vname, vSlot)
+        if (vbind) {
+            declare(em, vname, vSlot)
+        }
         if (!(blockBodyOnly(em, body))) {
             popScope(em)
             em.loops.pop()
@@ -8205,7 +8226,7 @@ fn forInMapEntries(em: Emitter, kname: string, vname: string, mapT: int, kty: Ty
     /// `for (x in s)` over a string: iterates byte indices, binding the raw
     /// 0..=255 byte from `pickle_str_get` as a `byte` (`int` ABI). Mirrors
     /// `for_in_string` in emit.rs.
-fn forInString(em: Emitter, name: string, seqT: int, body: Block) -> bool {
+fn forInString(em: Emitter, name: string, nbind: bool, seqT: int, body: Block) -> bool {
         var seqSlot = newSlot(em, IrTy.Ptr)
         var idxSlot = newSlot(em, IrTy.Int)
         var lenSlot = newSlot(em, IrTy.Int)
@@ -8236,7 +8257,9 @@ fn forInString(em: Emitter, name: string, seqT: int, body: Block) -> bool {
         var v = externCallT1(em, "pickle_str_get", [IrTy.Ptr, IrTy.Int], IrTy.Int, [seqL2, curI])
         var elemSlot = newSlot(em, IrTy.Int)
         instr(em, IrInstr.StoreSlot(elemSlot, v))
-        declare(em, name, elemSlot)
+        if (nbind) {
+            declare(em, name, elemSlot)
+        }
         if (!(blockBodyOnly(em, body))) {
             popScope(em)
             em.loops.pop()
@@ -8324,6 +8347,7 @@ fn forInProtocol(em: Emitter, pattern: Pattern, elem: Ty, seqT: int, body: Block
         instr(em, IrInstr.StoreSlot(elemSlot, v))
         match (pattern) {
             case Pattern.Binding(nm, _) -> declare(em, nm, elemSlot)
+            case Pattern.Wildcard -> {}
             case Pattern.Tuple(_) -> {
                 var ev = load(em, elemSlot)
                 if (!(bindMatchValue(em, pattern, elem, ev, span))) {

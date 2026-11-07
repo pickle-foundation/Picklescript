@@ -1,0 +1,187 @@
+// Iteration wildcards: `for (_ in seq)` and `for ((_, v) in map)` /
+// `for ((k, _) in map)`. Rust bails on non-binding iteration patterns; the
+// port lowers `_` by skipping the binding while keeping the same loop shape.
+
+class WildRangeSeq implements Iterable<int> {
+    var lo: int
+    var hi: int
+
+    fn iterator() -> Iterator<int> {
+        return WildRangeIter(this, lo)
+    }
+}
+
+class WildRangeIter implements Iterator<int> {
+    var seq: WildRangeSeq
+    var cur: int
+
+    fn next() -> int? {
+        if (cur >= seq.hi) {
+            return none
+        }
+        let v = cur
+        cur = cur + 1
+        return v
+    }
+}
+
+test fn wildcard_counts_list_elements() {
+    var xs = [10, 20, 30, 40]
+    var n = 0
+    for (_ in xs) {
+        n = n + 1
+    }
+    expect(n).toBe(4)
+}
+
+test fn wildcard_counts_range() {
+    var n = 0
+    for (_ in 2..7) {
+        n = n + 1
+    }
+    expect(n).toBe(5)
+}
+
+test fn wildcard_counts_stored_range() {
+    let r = 0..4
+    var n = 0
+    for (_ in r) {
+        n = n + 1
+    }
+    expect(n).toBe(4)
+}
+
+test fn wildcard_counts_string_bytes() {
+    var n = 0
+    for (_ in "abcde") {
+        n = n + 1
+    }
+    expect(n).toBe(5)
+}
+
+test fn wildcard_counts_map_values() {
+    var m = {"a": 1, "b": 2, "c": 3}
+    var n = 0
+    for (_ in m) {
+        n = n + 1
+    }
+    expect(n).toBe(3)
+}
+
+test fn wildcard_map_entries_bind_value() {
+    var m = {"a": 1, "b": 2, "c": 3}
+    var total = 0
+    for ((_, v) in m) {
+        total = total + v
+    }
+    expect(total).toBe(6)
+}
+
+test fn wildcard_map_entries_bind_key() {
+    var m = {1: "a", 2: "b", 3: "c"}
+    var total = 0
+    for ((k, _) in m) {
+        total = total + k
+    }
+    expect(total).toBe(6)
+}
+
+test fn wildcard_map_entries_bind_neither() {
+    var m = {"a": 1, "b": 2}
+    var n = 0
+    for ((_, _) in m) {
+        n = n + 1
+    }
+    expect(n).toBe(2)
+}
+
+test fn wildcard_list_break() {
+    var xs = [1, 2, 3, 4, 5]
+    var n = 0
+    for (_ in xs) {
+        n = n + 1
+        if (n == 2) {
+            break
+        }
+    }
+    expect(n).toBe(2)
+}
+
+test fn wildcard_list_continue_skips_body() {
+    var xs = [1, 2, 3, 4, 5, 6]
+    var seen = 0
+    var kept = 0
+    for (_ in xs) {
+        seen = seen + 1
+        if (seen % 2 == 0) {
+            continue
+        }
+        kept = kept + 1
+    }
+    expect(seen).toBe(6)
+    expect(kept).toBe(3)
+}
+
+test fn wildcard_protocol_iterable() {
+    var n = 0
+    for (_ in WildRangeSeq(1, 4)) {
+        n = n + 1
+    }
+    expect(n).toBe(3)
+}
+
+test fn wildcard_protocol_break() {
+    var n = 0
+    for (_ in WildRangeSeq(0, 10)) {
+        n = n + 1
+        if (n == 3) {
+            break
+        }
+    }
+    expect(n).toBe(3)
+}
+
+test fn wildcard_tuple_element_still_binds_other_side() {
+    var pairs = [(1, 10), (2, 20), (3, 30)]
+    var total = 0
+    for ((_, b) in pairs) {
+        total = total + b
+    }
+    expect(total).toBe(60)
+}
+
+test fn wildcard_nested_loops() {
+    var n = 0
+    for (_ in [1, 2]) {
+        for (_ in 0..3) {
+            n = n + 1
+        }
+    }
+    expect(n).toBe(6)
+}
+
+test fn wildcard_empty_sequences_do_not_enter_body() {
+    var n = 0
+    for (_ in "") {
+        n = n + 1
+    }
+    for (_ in 3..3) {
+        n = n + 1
+    }
+    for (_ in WildRangeSeq(4, 4)) {
+        n = n + 1
+    }
+    expect(n).toBe(0)
+}
+
+test fn wildcard_mixed_with_binding_loops() {
+    var xs = [4, 5, 6]
+    var total = 0
+    for (x in xs) {
+        total = total + x
+    }
+    for (_ in xs) {
+        total = total + 1
+    }
+    expect(total).toBe(18)
+}
