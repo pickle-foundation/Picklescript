@@ -1,0 +1,173 @@
+// Instance properties on generic classes and structs. Each instantiation must
+// register its own getter/setter with the type parameter substituted, and the
+// accessor bodies must see `this` as the concrete instantiation.
+
+class Box<T> {
+    var raw: T
+
+    property value: T {
+        get { this.raw }
+        set { this.raw = value }
+    }
+}
+
+class Wrap<T> {
+    var raw: T
+
+    property constant: int {
+        get { 7 }
+        set { let _ = value }
+    }
+
+    property text: string {
+        get { "wrapped" }
+    }
+}
+
+struct Cell<T> {
+    var raw: T
+
+    property value: T {
+        get { this.raw }
+        set { this.raw = value }
+    }
+}
+
+class Item {
+    var n: int
+
+    constructor(n: int) {
+        this.n = n
+    }
+}
+
+class Counter<T> {
+    var raw: int
+    var tag: T
+
+    property value: int {
+        get { this.raw }
+        set { this.raw = value }
+    }
+
+    fn bump() -> int {
+        this.value = this.value + 1
+        this.value
+    }
+}
+
+// The method is declared before the property, so the method body is lowered
+// before either accessor has a body of its own.
+class Early<T> {
+    var raw: int
+
+    fn bump() -> int {
+        this.value = this.value + 1
+        this.value
+    }
+
+    property value: int {
+        get { this.raw }
+        set { this.raw = value }
+    }
+}
+
+test fn generic_property_get_int() {
+    var b = Box<int>(7)
+    expect(b.value).toBe(7)
+}
+
+test fn generic_property_set_int() {
+    var b = Box<int>(1)
+    b.value = 42
+    expect(b.value).toBe(42)
+}
+
+test fn generic_property_get_string() {
+    var b = Box<string>("hi")
+    expect(b.value).toBe("hi")
+}
+
+test fn generic_property_set_string() {
+    var b = Box<string>("a")
+    b.value = "b"
+    expect(b.value).toBe("b")
+}
+
+test fn generic_property_instantiations_are_independent() {
+    var i = Box<int>(1)
+    var s = Box<string>("x")
+    i.value = 9
+    expect(i.value).toBe(9)
+    expect(s.value).toBe("x")
+}
+
+test fn generic_property_computed_getter() {
+    var w = Wrap<int>(3)
+    expect(w.constant).toBe(7)
+    expect(w.text).toBe("wrapped")
+}
+
+test fn generic_property_setter_without_field_write() {
+    var w = Wrap<int>(3)
+    w.constant = 100
+    expect(w.constant).toBe(7)
+}
+
+test fn generic_property_managed_value() {
+    var b = Box<Item>(Item(3))
+    expect(b.value.n).toBe(3)
+    b.value = Item(8)
+    expect(b.value.n).toBe(8)
+}
+
+test fn generic_struct_property_get_set() {
+    var c = Cell<int>(5)
+    expect(c.value).toBe(5)
+    c.value = 11
+    expect(c.value).toBe(11)
+}
+
+test fn generic_property_compound_assign() {
+    var b = Box<int>(10)
+    b.value += 5
+    expect(b.value).toBe(15)
+    b.value *= 2
+    expect(b.value).toBe(30)
+}
+
+test fn generic_property_compound_assign_string() {
+    var b = Box<string>("a")
+    b.value += "b"
+    expect(b.value).toBe("ab")
+}
+
+test fn generic_property_from_method() {
+    var c = Counter<int>(0, 9)
+    expect(c.bump()).toBe(1)
+    expect(c.bump()).toBe(2)
+    expect(c.value).toBe(2)
+}
+
+test fn generic_property_from_early_method() {
+    var e = Early<string>(0)
+    expect(e.bump()).toBe(1)
+    expect(e.value).toBe(1)
+}
+
+fn read_boxed<T>(b: Box<T>) -> T {
+    b.value
+}
+
+fn write_boxed<T>(b: Box<T>, v: T) {
+    b.value = v
+}
+
+test fn generic_property_from_generic_fn() {
+    var b = Box<int>(3)
+    write_boxed<int>(b, 7)
+    expect(read_boxed<int>(b)).toBe(7)
+    var s = Box<string>("x")
+    write_boxed<string>(s, "y")
+    expect(read_boxed<string>(s)).toBe("y")
+}

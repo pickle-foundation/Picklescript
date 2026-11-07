@@ -1780,6 +1780,36 @@ if (cidVal < 0) {
 // `obj.prop = value` dispatches the property's setter.
         var fidO = em.propertyIds.get(tripleKey(str(cidVal), name, str(true)))
         if (let some(fid) = fidO) {
+            // A generic instantiation's accessors are registered lazily while
+            // this call site is being lowered, so their bodies -- and hence
+            // their `params` -- may not exist yet. Fall back to the declared
+            // property type, exactly like the other lazy-fid call paths.
+            var ptyTy = propertyTyOf(em, classOfName(em, cidVal), name)
+            var havePty = false
+            if (let some(pi) = propertyInfoAt(em, cidVal, name)) {
+                ptyTy = pi.ty
+                havePty = true
+            } else {
+                match (ptyTy) {
+                    case Ty.Unknown -> {}
+                    case _ -> havePty = true
+                }
+            }
+            var setterParamPtr = false
+            var setterParams = em.irModule.funcs[fid].params
+            if (len(setterParams) > 1) {
+                if (irTyTag(setterParams[1].ty) == irTyTag(IrTy.Ptr)) {
+                    setterParamPtr = true
+                }
+            } else {
+                if (havePty) {
+                    if (let some(ir) = mapTy(em, ptyTy, e.span)) {
+                        if (irTyTag(ir) == irTyTag(IrTy.Ptr)) {
+                            setterParamPtr = true
+                        }
+                    }
+                }
+            }
             if (op != AssignOp.Assign) {
                 // `obj.prop op= value`: read through the getter, combine,
                 // call the setter with the result.
@@ -1800,7 +1830,6 @@ if (cidVal < 0) {
                 if (let some(o) = obj) {
                     objId = o
                 }
-                var ptyTy = propertyTyOf(em, classOfName(em, cidVal), name)
                 var curO = callMethod(em, e, getFid, emptyCallArgs(), objId)
                 if (let none = curO) {
                     return none
@@ -1826,7 +1855,7 @@ if (cidVal < 0) {
                     dst = d
                 }
                 var packed = dst
-                if (irTyTag(em.irModule.funcs[fid].params[1].ty) == irTyTag(IrTy.Ptr)) {
+                if (setterParamPtr) {
                     var w = optionWrap(em, dst, ptyTy, value.span)
                     if (let none = w) {
                         return none
@@ -1864,7 +1893,7 @@ if (cidVal < 0) {
                 vt = t
             }
             var packed = vId
-            if (irTyTag(em.irModule.funcs[fid].params[1].ty) == irTyTag(IrTy.Ptr)) {
+            if (setterParamPtr) {
                 var w = optionWrap(em, vId, vt, value.span)
                 if (let none = w) {
                     return none

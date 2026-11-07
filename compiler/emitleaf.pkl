@@ -1871,22 +1871,28 @@ fn registerClassInstantiation(em: Emitter, name: string, args: List<Ty>, span: S
             bad(em, span, "`" + name + "` uses `deinit`, which is not lowered yet for generic classes/structs")
             return none
         }
-        var hasProp = false
+        // Instance properties are lowered per instantiation below. A static
+        // property needs per-instantiation static storage, so it stays under
+        // the static-state bail.
+        var hasStaticProp = false
         for (m in ms) {
             match (m) {
-                case ClassMember.Property(_) -> hasProp = true
+                case ClassMember.Property(pd) -> {
+                    if (pd.isStatic) {
+                        hasStaticProp = true
+                    }
+                }
                 case _ -> {}
             }
-        }
-        if (hasProp) {
-            bad(em, span, "`" + name + "` uses properties, which are not lowered yet for generic classes/structs")
-            return none
         }
         var hasStatic = !(len(table.consts) == 0)
         for (f in table.fields) {
             if (f.isStatic) {
                 hasStatic = true
             }
+        }
+        if (hasStaticProp) {
+            hasStatic = true
         }
         if (hasStatic) {
             bad(em, span, "`" + name + "` uses static state, which is not lowered yet for generic classes/structs")
@@ -1934,6 +1940,10 @@ fn registerClassInstantiation(em: Emitter, name: string, args: List<Ty>, span: S
             }
             stabMethods.push(CallableInfo(m.name, m.span, m.visibility, m.isAsync, m.isStatic, m.isOverride, m.isAbstract, m.operator, m.generics, nps, subst(m.ret, map)))
         }
+        var stabProps = emptyPropertyInfos()
+        for (p in table.properties) {
+            stabProps.push(PropertyInfo(p.name, p.visibility, p.isStatic, subst(p.ty, map), p.hasGet, p.hasSet, p.span))
+        }
         var stabCtor: CtorInfo? = none
         if (let some(c) = table.ctor) {
             var nps2 = emptyParamInfos()
@@ -1942,7 +1952,7 @@ fn registerClassInstantiation(em: Emitter, name: string, args: List<Ty>, span: S
             }
             stabCtor = CtorInfo(c.span, c.visibility, nps2)
         }
-        var stable = ClassTable(display, table.span, table.visibility, table.generics, none, emptyTys(), stabFields, stabMethods, emptyPropertyInfos(), stabCtor, emptyNamedCtorInfos(), emptyFieldInfos())
+        var stable = ClassTable(display, table.span, table.visibility, table.generics, none, emptyTys(), stabFields, stabMethods, stabProps, stabCtor, emptyNamedCtorInfos(), emptyFieldInfos())
         var ctorDecl: ConstructorDecl? = none
         for (m in ms) {
             match (m) {
@@ -2022,6 +2032,37 @@ var m2 = seedCallableInfo()
                     em.instantonSubst[mid] = map
                     em.fidOwner[mid] = cid
                     em.fidGenerics[mid] = table.generics
+                }
+                case ClassMember.Property(pd) -> {
+                    if (pd.isStatic) {
+                        continue
+                    }
+                    var pinfo: PropertyInfo? = none
+                    for (pp in stable.properties) {
+                        if (pp.name == pd.name) {
+                            pinfo = pp
+                        }
+                    }
+                    if (let none = pinfo) {
+                        continue
+                    }
+                    if (let some(pinf) = pinfo) {
+                        var stem = "pkl_" + name + "_" + pd.name + "_" + suffix + "_"
+                        if (pinf.hasGet) {
+                            var gfid = pushClassFunc(em, display + "." + pd.name + ".get", uniqSymbol(em, stem + "get"), FnSource.Property(stable, pd, pinf, false, false))
+                            propDef(em, cid, pd.name, false, gfid)
+                            em.instantonSubst[gfid] = map
+                            em.fidOwner[gfid] = cid
+                            em.fidGenerics[gfid] = table.generics
+                        }
+                        if (pinf.hasSet) {
+                            var sfid = pushClassFunc(em, display + "." + pd.name + ".set", uniqSymbol(em, stem + "set"), FnSource.Property(stable, pd, pinf, true, false))
+                            propDef(em, cid, pd.name, true, sfid)
+                            em.instantonSubst[sfid] = map
+                            em.fidOwner[sfid] = cid
+                            em.fidGenerics[sfid] = table.generics
+                        }
+                    }
                 }
                 case _ -> {}
             }
