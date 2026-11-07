@@ -1437,9 +1437,36 @@ fn expectNoArgs(em: Emitter, e: Expr, method: string, args: List<CallArg>) -> bo
         false
     }
 
+/// Lift a non-managed scalar temp into the boxed representation that
+/// `pickle_expect_obj_eq` compares against a managed operand. Mirrors the
+/// boxing `optionWrap` performs, but keyed by IR type because `expectEqCond`
+/// only sees lowered types.
+fn boxForObjEq(em: Emitter, v: int, it: IrTy) -> int {
+        match (it) {
+            case IrTy.Int -> externCallT1(em, "pickle_box_i64", [IrTy.Int], IrTy.Ptr, [v])
+            case IrTy.Float -> externCallT1(em, "pickle_box_f64", [IrTy.Float], IrTy.Ptr, [v])
+            case IrTy.Bool -> externCallT1(em, "pickle_box_bool", [IrTy.Bool], IrTy.Ptr, [v])
+            case IrTy.Char -> externCallT1(em, "pickle_box_char", [IrTy.Char], IrTy.Ptr, [v])
+            case _ -> v
+        }
+    }
+
 fn expectEqCond(em: Emitter, v: int, it: IrTy, w: int, wit: IrTy, negated: bool, span: Span) -> int? {
         if (managedIr(it) || managedIr(wit)) {
-            var res = externCallT1(em, "pickle_expect_obj_eq", [IrTy.Ptr, IrTy.Ptr], IrTy.Int, [v, w])
+            // `pickle_expect_obj_eq` takes two managed pointers. When one side
+            // is a raw scalar (e.g. `expect(someInt).toBe(5)` where the value
+            // is `int?`, or an option-typed property read against a literal)
+            // it has to be boxed first; passing the integer straight through
+            // dereferences it as a pointer.
+            var vv = v
+            var ww = w
+            if (!managedIr(it)) {
+                vv = boxForObjEq(em, v, it)
+            }
+            if (!managedIr(wit)) {
+                ww = boxForObjEq(em, w, wit)
+            }
+            var res = externCallT1(em, "pickle_expect_obj_eq", [IrTy.Ptr, IrTy.Ptr], IrTy.Int, [vv, ww])
             return cmpZero(em, res, IrBinOp.Ne, negated)
         }
         var vf = v
