@@ -4997,12 +4997,11 @@ fn positionalArgs(em: Emitter, e: Expr, name: string, args: List<CallArg>, param
     /// object whose tag is the variant index and whose fields are the boxed
     /// args. Mirrors `enum_ctor` in emit.rs.
 fn enumCtor(em: Emitter, e: Expr, t: EnumTable, name: string, args: List<CallArg>) -> int? {
-        for (a in args) {
-            if (a.spread) {
-                bad(em, e.span, "spread arguments are not lowered yet")
-                return none
-            }
+        var spreadAt = 0
+        while (spreadAt < len(args) && !args[spreadAt].spread) {
+            spreadAt = spreadAt + 1
         }
+        var spread = spreadAt < len(args)
         var vi = -1
         var ftypes = emptyTys()
         var found = false
@@ -5021,7 +5020,12 @@ fn enumCtor(em: Emitter, e: Expr, t: EnumTable, name: string, args: List<CallArg
             return none
         }
         var n = len(ftypes)
-        if (!(len(args) == n)) {
+        if (spread) {
+            if (spreadAt > n) {
+                bad(em, e.span, "`" + name + "` takes " + str(n) + " argument(s), got more")
+                return none
+            }
+        } else if (!(len(args) == n)) {
             bad(em, e.span, "`" + name + "` takes " + str(n) + " argument(s), got " + str(len(args)))
             return none
         }
@@ -5031,7 +5035,8 @@ fn enumCtor(em: Emitter, e: Expr, t: EnumTable, name: string, args: List<CallArg
         instr(em, IrInstr.Const(count, IrConst.Int(n)))
         var obj = externCallT1(em, "pickle_enum_new", [IrTy.Int, IrTy.Int], IrTy.Ptr, [tag, count])
         var i2 = 0
-        for (a in args) {
+        while (i2 < spreadAt) {
+            var a = args[i2]
             var ft = ftypes[i2]
             var rp = elemRep(em, ft, e.span)
             if (let some(rep) = rp) {
@@ -5061,6 +5066,81 @@ fn enumCtor(em: Emitter, e: Expr, t: EnumTable, name: string, args: List<CallArg
                 return none
             }
             i2 = i2 + 1
+        }
+        if (spread) {
+            var spArg = args[spreadAt]
+            var elemTy = Ty.Unknown
+            var matchedList = false
+            if (let some(t2) = tyOf(em, spArg.value.span)) {
+                match (t2) {
+                    case Ty.List(inner) -> {
+                        matchedList = true
+                        elemTy = inner
+                    }
+                    case _ -> {}
+                }
+            }
+            if (!matchedList) {
+                bad(em, spArg.span, "a spread argument must be a `List`")
+                return none
+            }
+            var erepO = elemRep(em, elemTy, spArg.span)
+            if (let none = erepO) {
+                return none
+            }
+            var erep = ElemRep.ptr()
+            if (let some(re) = erepO) {
+                erep = re
+            }
+            var j = spreadAt
+            while (j < n) {
+                var pre = elemRep(em, ftypes[j], spArg.span)
+                if (let none = pre) {
+                    return none
+                }
+                var prev = ElemRep.ptr()
+                if (let some(re) = pre) {
+                    prev = re
+                }
+                if (!elemRepSame(prev, erep)) {
+                    bad(em, e.span, "spreading over parameters with mixed element representations is not lowered yet")
+                    return none
+                }
+                j = j + 1
+            }
+            var sp = expr(em, spArg.value)
+            if (let none = sp) {
+                return none
+            }
+            var spV = 0
+            if (let some(sv) = sp) {
+                spV = sv
+            }
+            var missing = n - spreadAt
+            var gotLen = externCallT1(em, "pickle_list_len", [IrTy.Ptr], IrTy.Int, [spV])
+            var want = intConst(em, missing)
+            var ok = temp(em)
+            instr(em, IrInstr.BinOp(ok, IrBinOp.Eq, gotLen, want))
+            var rOk = newBlock(em)
+            var rPanic = newBlock(em)
+            var join = newBlock(em)
+            term(em, IrTerm.BranchIf(ok, rOk, rPanic))
+            em.cur = rPanic
+            externCallVoid(em, "pickle_panic_arity_diff", emptyIrTys(), emptyInts())
+            term(em, IrTerm.Branch(join))
+            em.cur = rOk
+            var k = 0
+            while (k < missing) {
+                var idx = intConst(em, k)
+                var raw = externCallT1(em, "pickle_list_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [spV, idx])
+                // List elements are already boxed/pointer-shaped exactly like
+                // enum payload fields, so the raw element can be stored as-is.
+                var fi = intConst(em, spreadAt + k)
+                externCallVoid(em, "pickle_enum_set_field", [IrTy.Ptr, IrTy.Int, IrTy.Ptr], [obj, fi, raw])
+                k = k + 1
+            }
+            term(em, IrTerm.Branch(join))
+            em.cur = join
         }
         obj
     }
@@ -5092,8 +5172,11 @@ fn methodCall1(em: Emitter, e: Expr, object: Expr, name: string, args: List<Call
                 var ncO = em.namedCtorIds.get(pairKey(str(cid), name))
                 if (let some(fid) = ncO) {
                     if (anySpread(args)) {
-                        bad(em, e.span, "spreading into a named constructor is not lowered yet")
-                        return none
+                        // A named constructor is a plain function returning the
+                        // instance, so the shared spread trampoline works as-is.
+                        var pty = srcParamList(em, fid)
+                        var rt = Ty.Class(tname, emptyTys())
+                        return spreadStaticCall(em, e, e.span, fid, pty, rt, none, args)
                     }
                     return callMethod(em, e, fid, args, none)
                 }

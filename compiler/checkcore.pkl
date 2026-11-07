@@ -1950,11 +1950,32 @@ fn inferGenericCall(ck: Checker, e: Expr, f: CallableInfo, args: List<CallArg>) 
         var map: Map<string, Ty> = emptyMapStrTy()
         var got: Map<string, Ty> = emptyMapStrTy()
         var position = 0
+        var spreadDone = false
         for (a in args) {
             let t = checkExpr(ck, a.value)
             got[spanKey(a.value.span)] = t
-            if (isNoneStr(a.name) && !a.spread) {
-                if (position < len(f.params)) {
+            if (isNoneStr(a.name)) {
+                if (a.spread) {
+                    // A spread supplies every remaining parameter from one
+                    // list: infer each from the list's element type.
+                    var elem = Ty.Unknown
+                    var isList = false
+                    match (t) {
+                        case Ty.List(inner) -> {
+                            elem = inner
+                            isList = true
+                        }
+                        case _ -> {}
+                    }
+                    if (isList && !spreadDone) {
+                        var j = position
+                        while (j < len(f.params)) {
+                            inferFrom(f.params[j].ty, elem, map)
+                            j = j + 1
+                        }
+                        spreadDone = true
+                    }
+                } else if (position < len(f.params)) {
                     inferFrom(f.params[position].ty, t, map)
                 }
             }

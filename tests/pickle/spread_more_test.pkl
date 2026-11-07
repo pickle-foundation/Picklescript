@@ -1,0 +1,130 @@
+// Spread arguments beyond plain constructors: enum variant constructors,
+// named constructors, and generic-function type-argument inference. Each
+// shape fills the remaining parameters from one homogeneous list.
+
+enum Trio {
+    One(v: int)
+    Sum(a: int, b: int)
+    Tag(s: string)
+}
+
+class NamedBox2 {
+    var x: int
+    var y: int
+
+    constructor(x: int, y: int) {
+        this.x = x
+        this.y = y
+    }
+
+    constructor.side(n: int) {
+        this(n, n)
+    }
+
+    constructor.pair(a: int, b: int) {
+        this(a, b)
+    }
+}
+
+fn three<T>(a: T, b: T, c: T) -> T {
+    a
+}
+
+fn second<T>(a: T, b: T) -> T {
+    b
+}
+
+fn keep_b<A, B>(a: A, b: B) -> B {
+    b
+}
+
+fn list_len<T>(xs: List<T>) -> int {
+    len(xs)
+}
+
+fn enum_first(e: Trio) -> int {
+    match (e) {
+        case Trio.One(v) -> v
+        case Trio.Sum(a, _b) -> a
+        case Trio.Tag(_s) -> 0 - 1
+    }
+}
+
+fn enum_second(e: Trio) -> int {
+    match (e) {
+        case Trio.One(v) -> v
+        case Trio.Sum(_a, b) -> b
+        case Trio.Tag(_s) -> 0 - 1
+    }
+}
+
+fn enum_tag(e: Trio) -> string {
+    match (e) {
+        case Trio.One(_v) -> "one"
+        case Trio.Sum(_a, _b) -> "sum"
+        case Trio.Tag(s) -> s
+    }
+}
+
+test fn enum_ctor_all_spread() {
+    var xs = [4, 5]
+    var e = Trio.Sum(...xs)
+    expect(enum_first(e)).toBe(4)
+    expect(enum_second(e)).toBe(5)
+}
+
+test fn enum_ctor_leading_arg_then_spread() {
+    var e = Trio.Sum(7, ...[8])
+    expect(enum_first(e)).toBe(7)
+    expect(enum_second(e)).toBe(8)
+}
+
+test fn enum_ctor_pointer_element_spread() {
+    var e = Trio.Tag(...["tagged"])
+    expect(enum_tag(e)).toBe("tagged")
+}
+
+test fn enum_ctor_single_field_spread() {
+    var e = Trio.One(...[9])
+    expect(enum_first(e)).toBe(9)
+}
+
+test fn named_ctor_all_spread() {
+    var b = NamedBox2.side(...[6])
+    expect(b.x).toBe(6)
+    expect(b.y).toBe(6)
+}
+
+test fn named_ctor_two_param_spread() {
+    var b = NamedBox2.pair(...[2, 3])
+    expect(b.x).toBe(2)
+    expect(b.y).toBe(3)
+}
+
+test fn named_ctor_leading_arg_then_spread() {
+    var b = NamedBox2.pair(9, ...[4])
+    expect(b.x).toBe(9)
+    expect(b.y).toBe(4)
+}
+
+test fn generic_fn_infers_from_spread() {
+    var xs = [1, 2, 3]
+    expect(three(...xs)).toBe(1)
+}
+
+test fn generic_fn_infers_from_leading_and_spread() {
+    expect(second(9, ...[5])).toBe(5)
+}
+
+test fn generic_fn_infers_two_type_params() {
+    expect(keep_b(1, ...["s"])).toBe("s")
+}
+
+test fn generic_fn_infers_pointer_type() {
+    expect(second("a", ...["b"])).toBe("b")
+}
+
+test fn generic_fn_infers_from_nested_list_spread() {
+    var ls: List<List<int>> = [[1, 2]]
+    expect(list_len(...ls)).toBe(2)
+}

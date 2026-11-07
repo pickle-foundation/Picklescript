@@ -1855,8 +1855,29 @@ fn inferGenericFnArgs(em: Emitter, span: Span, info: CallableInfo, args: List<Ca
         while (i < len(args)) {
             var a = args[i]
             if (a.spread) {
-                bad(em, a.span, "spread arguments are not lowered yet")
-                return none
+                // A spread supplies every remaining parameter from one list, so
+                // each of those parameters is inferred from the element type.
+                var elem = Ty.Unknown
+                var isList = false
+                if (let some(t) = tyOf(em, a.value.span)) {
+                    match (t) {
+                        case Ty.List(inner) -> {
+                            elem = inner
+                            isList = true
+                        }
+                        case _ -> {}
+                    }
+                }
+                if (!isList) {
+                    bad(em, a.span, "a spread argument must be a `List`")
+                    return none
+                }
+                var j = i
+                while (j < len(info.params)) {
+                    inferFrom(info.params[j].ty, elem, map)
+                    j = j + 1
+                }
+                break
             }
             if (let none = a.name) {
                 if (i < len(info.params)) {
