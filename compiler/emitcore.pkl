@@ -5566,6 +5566,14 @@ var k = expr(em, args[0].value)
                             }
                             return externCallT1(em, "pickle_map_len", [IrTy.Ptr], IrTy.Int, [obj])
                         }
+                        case "isEmpty" -> {
+                            if (!(len(args) == 0)) {
+                                bad(em, e.span, "`isEmpty` takes no arguments")
+                                return none
+                            }
+                            var lv = externCallT1(em, "pickle_map_len", [IrTy.Ptr], IrTy.Int, [obj])
+                            return cmpZero(em, lv, IrBinOp.Eq, false)
+                        }
                         case _ -> {
                             bad(em, e.span, "`" + name + "` method on `Map` is not lowered yet")
                             return none
@@ -6385,7 +6393,8 @@ fn interfaceZeroArgCall(em: Emitter, span2: Span, ift: Ty, rec: int, name: strin
     }
 
     /// `xs.push(v)` and `xs.pop()` for `List<T>` receivers. Mirrors
-    /// `list_method_call` in emit.rs.
+    /// `list_method_call` in emit.rs. `contains`, `len`, and `isEmpty` are
+    /// read-only, so they also read through an immutable `&List` borrow.
 fn listMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List<CallArg>) -> int? {
         var elem = Ty.Unknown
         var isList = false
@@ -6415,7 +6424,7 @@ fn listMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List<C
         }
         // Only the read-only methods read through an immutable borrow; the
         // mutators would write through `&List`, so they keep bailing.
-        if (isBorrowed && name != "contains" && name != "len") {
+        if (isBorrowed && name != "contains" && name != "len" && name != "isEmpty") {
             bad(em, e.span, "`" + name + "` mutates a `List` through an immutable reference (`&List`)")
             return none
         }
@@ -6529,6 +6538,14 @@ fn listMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List<C
                     }
                     return externCallT1(em, "pickle_list_len", [IrTy.Ptr], IrTy.Int, [obj])
                 }
+                case "isEmpty" -> {
+                    if (!(len(args) == 0)) {
+                        bad(em, e.span, "`isEmpty` takes no arguments")
+                        return none
+                    }
+                    var lv = externCallT1(em, "pickle_list_len", [IrTy.Ptr], IrTy.Int, [obj])
+                    return cmpZero(em, lv, IrBinOp.Eq, false)
+                }
                 case "contains" -> {
                     if (!(len(args) == 1)) {
                         bad(em, e.span, "`contains` takes one argument")
@@ -6617,9 +6634,11 @@ fn streamMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List
     }
 
     /// Lower a `string` method call. `len` is the method form of `len(s)`
-    /// (byte length) and `contains` the method form of `sub in s`; both read
-    /// through an immutable `&string` borrow. Mirrors nothing in Rust - its
-    /// member table has no `string` arm - so these are beyond parity.
+    /// (byte length) and `contains` the method form of `sub in s`; `startsWith`
+    /// and `endsWith` are byte prefix/suffix predicates, and `isEmpty` is
+    /// `len(s) == 0`. All of them read through an immutable `&string` borrow.
+    /// Mirrors nothing in Rust - its member table has no `string` arm - so
+    /// these are beyond parity.
 fn stringMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List<CallArg>) -> int? {
         var isStr = false
         var isBorrowed = false
@@ -6668,6 +6687,47 @@ fn stringMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List
                         return externCallT1(em, "pickle_str_contains", [IrTy.Str, IrTy.Str], IrTy.Bool, [obj, needle])
                     }
                     return none
+                }
+                case "startsWith" -> {
+                    if (!(len(args) == 1)) {
+                        bad(em, e.span, "`startsWith` takes one argument")
+                        return none
+                    }
+                    var prefix = expr(em, args[0].value)
+                    if (let some(prefix) = prefix) {
+                        if (isBorrowed) {
+                            return externCallT1(em, "pickle_str_starts_with", [IrTy.Ptr, IrTy.Str], IrTy.Bool, [obj, prefix])
+                        }
+                        return externCallT1(em, "pickle_str_starts_with", [IrTy.Str, IrTy.Str], IrTy.Bool, [obj, prefix])
+                    }
+                    return none
+                }
+                case "endsWith" -> {
+                    if (!(len(args) == 1)) {
+                        bad(em, e.span, "`endsWith` takes one argument")
+                        return none
+                    }
+                    var suffix = expr(em, args[0].value)
+                    if (let some(suffix) = suffix) {
+                        if (isBorrowed) {
+                            return externCallT1(em, "pickle_str_ends_with", [IrTy.Ptr, IrTy.Str], IrTy.Bool, [obj, suffix])
+                        }
+                        return externCallT1(em, "pickle_str_ends_with", [IrTy.Str, IrTy.Str], IrTy.Bool, [obj, suffix])
+                    }
+                    return none
+                }
+                case "isEmpty" -> {
+                    if (!(len(args) == 0)) {
+                        bad(em, e.span, "`isEmpty` takes no arguments")
+                        return none
+                    }
+                    var lv = 0
+                    if (isBorrowed) {
+                        lv = externCallT1(em, "pickle_str_len", [IrTy.Ptr], IrTy.Int, [obj])
+                    } else {
+                        lv = externCallT1(em, "pickle_str_len", [IrTy.Str], IrTy.Int, [obj])
+                    }
+                    return cmpZero(em, lv, IrBinOp.Eq, false)
                 }
                 case _ -> {
                     bad(em, e.span, "`" + name + "` method on `string` is not lowered yet")
