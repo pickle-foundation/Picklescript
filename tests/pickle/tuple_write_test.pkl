@@ -1,0 +1,98 @@
+// Tuple element writes: `t[i] = v` and `t[i] op= v` with a constant index.
+// The checker types the target as the element and bounds-checks the constant;
+// the emitter stores through `pickle_tuple_set_field`, boxing scalar slots.
+// Rust bails on all tuple indexing, so this is beyond parity.
+
+class Point {
+    var x: int
+    var y: int
+}
+
+fn set_first(t: (int, int), v: int) {
+    t[0] = v
+}
+
+test fn writes_int_element() {
+    var t = (1, 2)
+    t[0] = 9
+    expect(t[0]).toBe(9)
+    expect(t[1]).toBe(2)
+}
+
+test fn writes_float_bool_char() {
+    var t = (1.5, true, 'a')
+    t[0] = 2.5
+    t[1] = false
+    t[2] = 'z'
+    expect(t[0]).toBe(2.5)
+    expect(t[1]).toBe(false)
+    expect(t[2]).toBe('z')
+}
+
+test fn writes_string_element() {
+    var t = ("a", "b")
+    t[1] = "changed"
+    expect(t[0]).toBe("a")
+    expect(t[1]).toBe("changed")
+}
+
+test fn writes_class_element() {
+    var t = (Point(1, 2), Point(3, 4))
+    t[0] = Point(9, 9)
+    expect(t[0].x).toBe(9)
+    expect(t[1].x).toBe(3)
+}
+
+test fn writes_nested_tuple_element() {
+    var t = ((1, 2), (3, 4))
+    t[0] = (7, 8)
+    expect(t[0][0]).toBe(7)
+    expect(t[0][1]).toBe(8)
+}
+
+test fn writes_tuple_in_list() {
+    var xs = [(1, 2), (3, 4)]
+    xs[0][1] = 9
+    expect(xs[0][0]).toBe(1)
+    expect(xs[0][1]).toBe(9)
+    expect(xs[1][1]).toBe(4)
+}
+
+test fn compound_int_element() {
+    var t = (10, 20)
+    t[0] += 5
+    t[1] *= 2
+    expect(t[0]).toBe(15)
+    expect(t[1]).toBe(40)
+}
+
+test fn compound_string_element() {
+    var t = ("ab", "cd")
+    t[0] += "ef"
+    expect(t[0]).toBe("abef")
+    expect(t[1]).toBe("cd")
+}
+
+test fn write_through_function_param() {
+    var t = (1, 2)
+    set_first(t, 5)
+    expect(t[0]).toBe(5)
+    expect(t[1]).toBe(2)
+}
+
+test fn writes_option_element() {
+    var o: int? = 1
+    var t = (o, 2)
+    t[0] = 5
+    expect(t[0] ?? 0).toBe(5)
+}
+
+test fn repeated_writes_are_stable() {
+    var t = (0, 0, 0)
+    var i = 0
+    while (i < 3) {
+        t[1] = t[1] + i
+        i = i + 1
+    }
+    expect(t[1]).toBe(3)
+}

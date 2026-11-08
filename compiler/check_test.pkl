@@ -468,3 +468,30 @@ test fn tuple_index_is_constant_and_in_range() {
     let msgs = checkSource("fn main() " + ob + "\n let t = (1, (2, 3)) \n let a = t[0] \n let b = t[1][0] \n " + cb)
     expect(len(msgs)).toBe(0)
 }
+
+// ---- tuple element writes ----------------------------------------------------
+//
+// `t[n] = v` uses the same constant/in-range rule as the read path: the target
+// types as the element and the RHS is checked against it.
+
+test fn tuple_write_is_constant_and_in_range() {
+    let ob = obrace()
+    let cb = cbrace()
+    let q = quote()
+
+    let msgs = checkSource("fn main() " + ob + "\n var t = (1, 2) \n t[0] = 9 \n " + cb)
+    expect(len(msgs)).toBe(0)
+
+    let msgs = checkSource("fn main() " + ob + "\n var t = (1, 2) \n let i = 0 \n t[i] = 9 \n " + cb)
+    expect(len(msgs)).toBe(1)
+    expect(countContaining(msgs, "tuple index must be an integer literal")).toBe(1)
+    expect(classifyMessage("tuple index must be an integer literal")).toBe("E0343")
+
+    let msgs = checkSource("fn main() " + ob + "\n var t = (1, 2) \n t[2] = 9 \n " + cb)
+    expect(len(msgs)).toBe(1)
+    expect(countContaining(msgs, "out of range")).toBe(1)
+
+    let msgs = checkSource("fn main() " + ob + "\n var t = (1, 2) \n t[0] = " + q + "x" + q + " \n " + cb)
+    expect(len(msgs)).toBe(1)
+    expect(countContaining(msgs, "type mismatch")).toBe(1)
+}

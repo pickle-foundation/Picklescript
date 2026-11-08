@@ -2040,6 +2040,9 @@ fn indexAssign(em: Emitter, e: Expr, op: AssignOp, object: Expr, index: Expr, va
                 case Ty.Map(k, v) -> {
                     return mapIndexAssign(em, op, object, index, value, k, v)
                 }
+                case Ty.Tuple(parts) -> {
+                    return tupleIndexAssign(em, e, op, object, index, value, parts)
+                }
                 case _ -> {}
             }
         }
@@ -7443,6 +7446,108 @@ fn tupleIndexRead(em: Emitter, e: Expr, object: Expr, index: Expr, parts: List<T
             return raw
         }
         externCallT1(em, repV.unboxSym, [IrTy.Ptr], repV.ir, [raw])
+}
+
+    /// `t[i] = v` / `t[i] op= v` on a `(A, B, ...)` tuple with a constant index.
+    /// The checker already rejects dynamic and out-of-range indexes, so the
+    /// lookup here always succeeds; the defensive bails keep the emitter honest
+    /// if that check ever loosens. The slot is boxed, so a scalar value is boxed
+    /// on the way in exactly as `tupleIndexRead` unboxes it on the way out.
+fn tupleIndexAssign(em: Emitter, e: Expr, op: AssignOp, object: Expr, index: Expr, value: Expr, parts: List<Ty>) -> int? {
+        var i = 0
+        if (let some(v) = constIntIndex(index)) {
+            i = v
+        } else {
+            bad(em, e.span, "tuple index must be an integer literal")
+            return none
+        }
+        if (i < 0 || i >= len(parts)) {
+            bad(em, e.span, "tuple index {i} is out of range for a {len(parts)}-element tuple")
+            return none
+        }
+        var elem = parts[i]
+        var repO = elemRep(em, elem, e.span)
+        if (let none = repO) {
+            return none
+        }
+        var rep = ElemRep.ptr()
+        if (let some(r) = repO) {
+            rep = r
+        }
+        var objO = expr(em, object)
+        if (let none = objO) {
+            return none
+        }
+        var obj = 0
+        if (let some(v) = objO) {
+            obj = v
+        }
+        var idx = constTemp(em, IrConst.Int(i))
+        if (op == AssignOp.Assign) {
+            var vO = expr(em, value)
+            if (let none = vO) {
+                return none
+            }
+            var v = 0
+            if (let some(vv) = vO) {
+                v = vv
+            }
+            var vt = elem
+            if (let some(t) = tyOf(em, value.span)) {
+                vt = t
+            }
+            var packedO = packForPointerBoundary(em, rep, v, vt, e.span)
+            if (let none = packedO) {
+                return none
+            }
+            var packed = 0
+            if (let some(p) = packedO) {
+                packed = p
+            }
+            var boxedO = boxForStore(em, rep, packed, elemIr(elem))
+            if (let none = boxedO) {
+                return none
+            }
+            var boxed = 0
+            if (let some(b) = boxedO) {
+                boxed = b
+            }
+            externCallVoid(em, "pickle_tuple_set_field", [IrTy.Ptr, IrTy.Int, IrTy.Ptr], [obj, idx, boxed])
+            return v
+        }
+        // Read-modify-write: unbox the current slot (a pointer element is
+        // already in its ABI shape), combine, then box the result back.
+        var cur = externCallT1(em, "pickle_tuple_field", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [obj, idx])
+        var curV = cur
+        if (!(rep.isPtr)) {
+            curV = externCallT1(em, rep.unboxSym, [IrTy.Ptr], rep.ir, [cur])
+        }
+        var vO = expr(em, value)
+        if (let none = vO) {
+            return none
+        }
+        var v = 0
+        if (let some(vv) = vO) {
+            v = vv
+        }
+        var dstO = combineCompound(em, e.span, op, elem, curV, v, "tuple element")
+        if (let none = dstO) {
+            return none
+        }
+        var dst = 0
+        if (let some(d) = dstO) {
+            dst = d
+        }
+        var boxedO = boxForStore(em, rep, dst, elemIr(elem))
+        if (let none = boxedO) {
+            return none
+        }
+        var boxed = 0
+        if (let some(b) = boxedO) {
+            boxed = b
+        }
+        externCallVoid(em, "pickle_tuple_set_field", [IrTy.Ptr, IrTy.Int, IrTy.Ptr], [obj, idx, boxed])
+        dst
 }
 
     /// `m[k]` read for a `Map<K, V>` / scalar-keyed map. Absent keys yield the

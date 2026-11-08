@@ -2800,12 +2800,30 @@ fn checkAssign(ck: Checker, e: Expr, target: Expr, value: Expr) -> Ty {
                             checkMapIndex(ck, k, itIdx, index, target.span)
                         }
                     }
+                    case Ty.Tuple(items) -> {
+                        // A tuple slot is statically typed, so the index must be a
+                        // constant literal (same rule as the read path).
+                        if (let some(i) = constIntIndex(index)) {
+                            if (i < 0 || i >= len(items)) {
+                                err(ck, target.span, "tuple index {i} is out of range for a {len(items)}-element tuple")
+                            }
+                        } else {
+                            err(ck, target.span, "tuple index must be an integer literal")
+                        }
+                    }
                     case _ -> {}
                 }
                 var elemTy = Ty.Unknown
                 match (otIdx) {
                     case Ty.List(inner) -> elemTy = inner
                     case Ty.Map(_, v) -> elemTy = v
+                    case Ty.Tuple(items) -> {
+                        if (let some(i) = constIntIndex(index)) {
+                            if (i >= 0 && i < len(items)) {
+                                elemTy = items[i]
+                            }
+                        }
+                    }
                     case Ty.String -> elemTy = Ty.Byte
                     case Ty.Ptr(inner) -> {
                         if (itIdx != Ty.Unknown && itIdx != Ty.Int) {
@@ -2835,7 +2853,7 @@ fn checkAssign(ck: Checker, e: Expr, target: Expr, value: Expr) -> Ty {
                         elemTy = Ty.Unknown
                     }
                     case _ -> {
-                        err(ck, target.span, "index assignment target must be a List, Map, string, or pointer")
+                        err(ck, target.span, "index assignment target must be a List, Map, string, pointer, or tuple")
                         elemTy = Ty.Unknown
                     }
                 }
