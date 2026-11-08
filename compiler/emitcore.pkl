@@ -4337,6 +4337,24 @@ case "print" | "println" -> {
                         case Ty.List(_) -> { return externCallT1(em, "pickle_list_len", [IrTy.Ptr], IrTy.Int, [t]) }
                         case Ty.Range(_) -> { return externCallT1(em, "pickle_list_len", [IrTy.Ptr], IrTy.Int, [t]) }
                         case Ty.Map(_, _) -> { return externCallT1(em, "pickle_map_len", [IrTy.Ptr], IrTy.Int, [t]) }
+                        // A tuple's length is its static arity, so it folds to a
+                        // constant; the argument is still evaluated above for its
+                        // side effects.
+                        case Ty.Tuple(items) -> { return intConst(em, len(items)) }
+                        // An immutable `&T` borrow reads through the referent,
+                        // exactly like `indexRead` does: the value is already the
+                        // managed pointer, so `pickle_str_len`/`pickle_list_len`/
+                        // `pickle_map_len` take it unchanged.
+                        case Ty.Ref(iner) -> {
+                            match (iner) {
+                                case Ty.String -> { return externCallT1(em, "pickle_str_len", [IrTy.Ptr], IrTy.Int, [t]) }
+                                case Ty.List(_) -> { return externCallT1(em, "pickle_list_len", [IrTy.Ptr], IrTy.Int, [t]) }
+                                case Ty.Range(_) -> { return externCallT1(em, "pickle_list_len", [IrTy.Ptr], IrTy.Int, [t]) }
+                                case Ty.Map(_, _) -> { return externCallT1(em, "pickle_map_len", [IrTy.Ptr], IrTy.Int, [t]) }
+                                case Ty.Tuple(items) -> { return intConst(em, len(items)) }
+                                case _ -> {}
+                            }
+                        }
                         case _ -> {}
                     }
                 }
