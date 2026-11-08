@@ -202,6 +202,46 @@ fn abiListPop(list: *int) -> *int {
     }
 }
 
+/// A fresh list holding the `[start, end)` span of `list`.
+///
+/// BEYOND PARITY - `runtime/src/list.rs` has no slice. Both bounds are clamped
+/// to `[0, len]` (negative indices clamp to 0, over-long ones to `len`), and
+/// `end < start` yields an empty list, so the call is total. The copy is
+/// shallow: element payloads are copied as-is, which is exactly what a
+/// `List<T>` copy means at the ABI. Read-only, so it also accepts an immutable
+/// `&List` receiver.
+#[symbol("pickle_list_slice")]
+fn abiListSlice(list: *int, start: int, end: int) -> *int {
+    unsafe {
+        var n = list[LEN_WORD]
+        var a = start
+        if (a < 0) {
+            a = 0
+        }
+        if (a > n) {
+            a = n
+        }
+        var b = end
+        if (b < 0) {
+            b = 0
+        }
+        if (b > n) {
+            b = n
+        }
+        if (b < a) {
+            b = a
+        }
+        var out = listNew(b - a)
+        var data = list[DATA_WORD] as *int
+        var i = a
+        while (i < b) {
+            abiListPush(out, data[i] as *int)
+            i = i + 1
+        }
+        return out
+    }
+}
+
 /// Remove the element at `index`, shifting the tail left; returns the element.
 /// Mirrors `pickle_list_remove`; its out-of-bounds panic is the documented GAP above.
 #[symbol("pickle_list_remove")]

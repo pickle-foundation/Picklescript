@@ -4,7 +4,7 @@ module runtime.abi_list_test
 /// implementations directly (not the `#[symbol]` slots) so the suite pins the logic
 /// itself; `tests/pickle/abi_box_main.pkl` covers the C ABI wiring separately.
 
-import { listNew, requireCapacity, abiListNew, abiListLen, abiListGet, abiListSet, abiListPush, abiListPop, abiListRemove, abiListInsert, abiListSort, abiListClear, abiListReverse, abiRange } from runtime.abi_list
+import { listNew, requireCapacity, abiListNew, abiListLen, abiListGet, abiListSet, abiListPush, abiListPop, abiListRemove, abiListInsert, abiListSort, abiListClear, abiListReverse, abiListSlice, abiRange } from runtime.abi_list
 import { abiBoxI64, abiUnboxI64 } from runtime.abi_box
 import { abiStrCmp } from runtime.abi_string
 
@@ -360,4 +360,56 @@ test fn reverse_only_touches_the_live_prefix() {
     expect(at(l, 0)).toBe(3)
     expect(at(l, 1)).toBe(2)
     expect(at(l, 2)).toBe(1)
+}
+
+test fn slice_copies_the_requested_span() {
+    var l = listNew(0)
+    abiListPush(l, abiBoxI64(10))
+    abiListPush(l, abiBoxI64(20))
+    abiListPush(l, abiBoxI64(30))
+    abiListPush(l, abiBoxI64(40))
+    let s = abiListSlice(l, 1, 3)
+    expect(abiListLen(s)).toBe(2)
+    expect(at(s, 0)).toBe(20)
+    expect(at(s, 1)).toBe(30)
+    // The source is untouched.
+    expect(abiListLen(l)).toBe(4)
+}
+
+test fn slice_clamps_both_bounds() {
+    var l = listNew(0)
+    abiListPush(l, abiBoxI64(1))
+    abiListPush(l, abiBoxI64(2))
+    abiListPush(l, abiBoxI64(3))
+    let s = abiListSlice(l, 0 - 5, 99)
+    expect(abiListLen(s)).toBe(3)
+    expect(at(s, 0)).toBe(1)
+    expect(at(s, 2)).toBe(3)
+    let t = abiListSlice(l, 2, 1)
+    expect(abiListLen(t)).toBe(0)
+    let u = abiListSlice(l, 1, 1)
+    expect(abiListLen(u)).toBe(0)
+}
+
+test fn slice_of_empty_and_beyond_the_end_is_empty() {
+    var empty = listNew(0)
+    expect(abiListLen(abiListSlice(empty, 0, 0))).toBe(0)
+    expect(abiListLen(abiListSlice(empty, 0, 4))).toBe(0)
+    var l = listNew(0)
+    abiListPush(l, abiBoxI64(5))
+    expect(abiListLen(abiListSlice(l, 1, 2))).toBe(0)
+    expect(abiListLen(abiListSlice(l, 9, 12))).toBe(0)
+}
+
+test fn slice_is_a_fresh_list() {
+    var l = listNew(0)
+    abiListPush(l, abiBoxI64(1))
+    abiListPush(l, abiBoxI64(2))
+    let s = abiListSlice(l, 0, 2)
+    expect((s as int) == (l as int)).toBe(false)
+    abiListPush(s, abiBoxI64(3))
+    expect(abiListLen(s)).toBe(3)
+    expect(abiListLen(l)).toBe(2)
+    abiListSet(l, 0, abiBoxI64(9))
+    expect(at(s, 0)).toBe(1)
 }

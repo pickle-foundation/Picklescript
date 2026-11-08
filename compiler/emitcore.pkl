@@ -6433,8 +6433,9 @@ fn interfaceZeroArgCall(em: Emitter, span2: Span, ift: Ty, rec: int, name: strin
     }
 
     /// `xs.push(v)` and `xs.pop()` for `List<T>` receivers. Mirrors
-    /// `list_method_call` in emit.rs. `contains`, `indexOf`, `len`, and `isEmpty`
-    /// are read-only, so they also read through an immutable `&List` borrow.
+    /// `list_method_call` in emit.rs. `contains`, `indexOf`, `len`, `isEmpty`
+    /// and `slice` are read-only, so they also read through an immutable
+    /// `&List` borrow.
 fn listMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List<CallArg>) -> int? {
         var elem = Ty.Unknown
         var isList = false
@@ -6464,7 +6465,7 @@ fn listMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List<C
         }
         // Only the read-only methods read through an immutable borrow; the
         // mutators would write through `&List`, so they keep bailing.
-        if (isBorrowed && name != "contains" && name != "indexOf" && name != "len" && name != "isEmpty") {
+        if (isBorrowed && name != "contains" && name != "indexOf" && name != "len" && name != "isEmpty" && name != "slice") {
             bad(em, e.span, "`" + name + "` mutates a `List` through an immutable reference (`&List`)")
             return none
         }
@@ -6647,6 +6648,21 @@ fn listMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List<C
                     }
                     externCallVoid(em, "pickle_list_reverse", [IrTy.Ptr], [obj])
                     return unitTemp(em)
+                }
+                case "slice" -> {
+                    if (!(len(args) == 2)) {
+                        bad(em, e.span, "`slice` takes a start and an end index")
+                        return none
+                    }
+                    var start = expr(em, args[0].value)
+                    if (let some(start) = start) {
+                        var end = expr(em, args[1].value)
+                        if (let some(end) = end) {
+                            return externCallT1(em, "pickle_list_slice", [IrTy.Ptr, IrTy.Int, IrTy.Int], IrTy.Ptr, [obj, start, end])
+                        }
+                        return none
+                    }
+                    return none
                 }
                 case _ -> {
                     bad(em, e.span, "`" + name + "` method on `List` is not lowered yet")
