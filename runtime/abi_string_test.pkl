@@ -1,6 +1,6 @@
 module runtime.abi_string_test
 
-import { wordsFor, abiStrLen, abiStrConcat, abiStrCmp, abiStrGet, abiStrSet, abiStrFromBool, abiStrFromByte, abiStrFromChar, abiStrToBytes, abiStrFromList, abiStrStartsWith, abiStrEndsWith, abiStrIndexOf, abiStrTrim, isScalar, utf8Len, leadByte } from runtime.abi_string
+import { wordsFor, abiStrLen, abiStrConcat, abiStrCmp, abiStrGet, abiStrSet, abiStrFromBool, abiStrFromByte, abiStrFromChar, abiStrToBytes, abiStrFromList, abiStrStartsWith, abiStrEndsWith, abiStrIndexOf, abiStrTrim, abiStrToUpper, abiStrToLower, isScalar, utf8Len, leadByte } from runtime.abi_string
 import { abiListNew, abiListLen, abiListGet, abiListPush } from runtime.abi_list
 import { abiBoxI64, abiUnboxI64 } from runtime.abi_box
 
@@ -350,4 +350,61 @@ test fn str_trim_leaves_multibyte_content_alone() {
     let t = abiStrTrim(x)
     expect(abiStrLen(t)).toBe(4)
     expect(abiStrCmp(t, body)).toBe(0)
+}
+
+test fn str_to_upper_maps_ascii_lowercase() {
+    // "hello" -> "HELLO"
+    let x = abiStrConcat(bytes3(104, 101, 108), bytes2(108, 111))
+    expect(abiStrCmp(abiStrToUpper(x), abiStrConcat(bytes3(72, 69, 76), bytes2(76, 79)))).toBe(0)
+}
+
+test fn str_to_upper_leaves_non_letters_and_multibyte_alone() {
+    // "a1 Z<e-acute>!" -> "A1 Z<e-acute>!"
+    let tail = abiStrConcat(bytes2(90, 195), bytes2(169, 33))
+    let x = abiStrConcat(bytes3(97, 49, 32), tail)
+    let want = abiStrConcat(bytes3(65, 49, 32), tail)
+    let u = abiStrToUpper(x)
+    expect(abiStrLen(u)).toBe(7)
+    expect(abiStrCmp(u, want)).toBe(0)
+}
+
+test fn str_to_lower_maps_ascii_uppercase() {
+    // "HeLLo" -> "hello"
+    let x = abiStrConcat(bytes3(72, 101, 76), bytes2(76, 111))
+    expect(abiStrCmp(abiStrToLower(x), abiStrConcat(bytes3(104, 101, 108), bytes2(108, 111)))).toBe(0)
+}
+
+test fn str_to_lower_leaves_non_letters_and_multibyte_alone() {
+    // "A1 z<e-acute>!" -> "a1 z<e-acute>!"
+    let tail = abiStrConcat(bytes2(122, 195), bytes2(169, 33))
+    let x = abiStrConcat(bytes3(65, 49, 32), tail)
+    let want = abiStrConcat(bytes3(97, 49, 32), tail)
+    let l = abiStrToLower(x)
+    expect(abiStrLen(l)).toBe(7)
+    expect(abiStrCmp(l, want)).toBe(0)
+}
+
+test fn str_case_mapping_of_empty_is_empty() {
+    let empty = abiStrFromList(abiListNew(0))
+    expect(abiStrLen(abiStrToUpper(empty))).toBe(0)
+    expect(abiStrLen(abiStrToLower(empty))).toBe(0)
+}
+
+test fn str_case_mapping_returns_a_fresh_string() {
+    // Even when nothing changes, the result is a new object, so mutating it
+    // cannot alias the receiver.
+    let x = bytes2(97, 98)
+    expect((abiStrToUpper(x) as int) == (x as int)).toBe(false)
+    expect((abiStrToLower(x) as int) == (x as int)).toBe(false)
+    let upper = bytes2(65, 66)
+    expect((abiStrToUpper(upper) as int) == (upper as int)).toBe(false)
+}
+
+test fn str_case_mapping_is_idempotent() {
+    // "aB" -> "AB" -> "AB"; "aB" -> "ab" -> "ab"
+    let x = bytes2(97, 66)
+    let up = abiStrToUpper(x)
+    expect(abiStrCmp(abiStrToUpper(up), up)).toBe(0)
+    let low = abiStrToLower(x)
+    expect(abiStrCmp(abiStrToLower(low), low)).toBe(0)
 }
