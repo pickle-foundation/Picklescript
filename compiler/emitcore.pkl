@@ -1067,7 +1067,7 @@ case BinOp.Range | BinOp.RangeIncl -> {
                     return externCallT1(em, "pickle_str_concat", [IrTy.Str, IrTy.Str], IrTy.Str, [aId, bId])
                 }
             }
-            case BinOp.Eq | BinOp.Ne -> {
+            case BinOp.Eq | BinOp.Ne | BinOp.Lt | BinOp.Le | BinOp.Gt | BinOp.Ge -> {
                 if (bothStr) {
                     var a = expr(em, lhs)
                     if (let none = a) {
@@ -1085,18 +1085,16 @@ case BinOp.Range | BinOp.RangeIncl -> {
                     if (let some(v) = b) {
                         bId = v
                     }
+                    // `pickle_str_cmp` yields -1/0/1, so every comparison op is
+                    // that result compared with zero (`==`/`!=` included).
                     var cmp = externCallT1(em, "pickle_str_cmp", [IrTy.Str, IrTy.Str], IrTy.Int, [aId, bId])
                     var zero = temp(em)
                     instr(em, IrInstr.Const(zero, IrConst.Int(0)))
                     var dst = temp(em)
-                    var eqOp = IrBinOp.Eq
-                    if (op == BinOp.Ne) {
-                        eqOp = IrBinOp.Ne
-                    }
-                    instr(em, IrInstr.BinOp(dst, eqOp, cmp, zero))
+                    instr(em, IrInstr.BinOp(dst, binaryOpcode(op), cmp, zero))
                     return dst
                 }
-                if (bothEnum) {
+                if ((op == BinOp.Eq || op == BinOp.Ne) && bothEnum) {
                     var a = expr(em, lhs)
                     if (let none = a) {
                         return none
@@ -5557,6 +5555,14 @@ var k = expr(em, args[0].value)
         if (let some(pt) = ot) {
             match (pt) {
                 case Ty.List(_) -> isList = true
+                // A read-only `List` method reads through an immutable `&List`
+                // borrow; the value is already the managed pointer.
+                case Ty.Ref(inner) -> {
+                    match (inner) {
+                        case Ty.List(_) -> isList = true
+                        case _ -> {}
+                    }
+                }
                 case _ -> {}
             }
         }
@@ -6342,17 +6348,34 @@ fn interfaceZeroArgCall(em: Emitter, span2: Span, ift: Ty, rec: int, name: strin
 fn listMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List<CallArg>) -> int? {
         var elem = Ty.Unknown
         var isList = false
+        var isBorrowed = false
         if (let some(pt) = tyOf(em, object.span)) {
             match (pt) {
                 case Ty.List(inner) -> {
                     elem = inner
                     isList = true
                 }
+                case Ty.Ref(inner) -> {
+                    match (inner) {
+                        case Ty.List(li) -> {
+                            elem = li
+                            isList = true
+                            isBorrowed = true
+                        }
+                        case _ -> {}
+                    }
+                }
                 case _ -> {}
             }
         }
         if (!isList) {
             bad(em, e.span, "receiver is not a `List`")
+            return none
+        }
+        // Only the read-only method reads through an immutable borrow; the
+        // mutators would write through `&List`, so they keep bailing.
+        if (isBorrowed && name != "contains") {
+            bad(em, e.span, "`" + name + "` mutates a `List` through an immutable reference (`&List`)")
             return none
         }
         var obj = expr(em, object)
@@ -6455,6 +6478,29 @@ fn listMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List<C
                     if (let some(kind) = kv) {
                         externCallVoid(em, "pickle_list_sort", [IrTy.Ptr, IrTy.Int], [obj, kind])
                         return unitTemp(em)
+                    }
+                    return none
+                }
+                case "contains" -> {
+                    if (!(len(args) == 1)) {
+                        bad(em, e.span, "`contains` takes one argument")
+                        return none
+                    }
+                    var rp = elemRep(em, elem, e.span)
+                    if (let some(rep) = rp) {
+                        var v = expr(em, args[0].value)
+                        if (let some(v) = v) {
+                            var vt = elem
+                            if (let some(t) = tyOf(em, args[0].value.span)) {
+                                vt = t
+                            }
+                            var key = packMapKey(em, rep, v, vt, args[0].value.span)
+                            if (let some(k) = key) {
+                                return externCallT1(em, "pickle_list_contains", [IrTy.Ptr, IrTy.Ptr], IrTy.Bool, [obj, k])
+                            }
+                            return none
+                        }
+                        return none
                     }
                     return none
                 }

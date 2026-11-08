@@ -495,3 +495,49 @@ test fn tuple_write_is_constant_and_in_range() {
     expect(len(msgs)).toBe(1)
     expect(countContaining(msgs, "type mismatch")).toBe(1)
 }
+
+// ---- string ordering ---------------------------------------------------------
+//
+// String comparisons are byte-lexicographic; `==`/`!=` were already allowed,
+// and `<`/`<=`/`>`/`>=` now type-check on two `string` operands.
+
+test fn string_ordering_is_supported() {
+    let ob = obrace()
+    let cb = cbrace()
+    let q = quote()
+
+    let msgs = checkSource("fn main() " + ob + "\n let a = " + q + "a" + q + " \n let b = " + q + "b" + q + " \n println(a < b) \n " + cb)
+    expect(len(msgs)).toBe(0)
+
+    let msgs = checkSource("fn main() " + ob + "\n println(" + q + "a" + q + " >= " + q + "b" + q + ") \n " + cb)
+    expect(len(msgs)).toBe(0)
+
+    let msgs = checkSource("fn main() " + ob + "\n println(" + q + "a" + q + " < 1) \n " + cb)
+    expect(len(msgs)).toBe(1)
+    expect(countContaining(msgs, "requires comparable operands")).toBe(1)
+}
+
+// ---- `List.contains` ---------------------------------------------------------
+//
+// `contains` is typed as `fn(T) -> bool` from the receiver's element type, so
+// the argument is checked like any other call argument.
+
+test fn list_contains_is_typed_by_element() {
+    let ob = obrace()
+    let cb = cbrace()
+    let q = quote()
+
+    let msgs = checkSource("fn main() " + ob + "\n let xs = [1, 2] \n println(xs.contains(1)) \n " + cb)
+    expect(len(msgs)).toBe(0)
+
+    let msgs = checkSource("fn main() " + ob + "\n let xs = [" + q + "a" + q + "] \n println(xs.contains(" + q + "a" + q + ")) \n " + cb)
+    expect(len(msgs)).toBe(0)
+
+    let msgs = checkSource("fn main() " + ob + "\n let xs = [1, 2] \n println(xs.contains(" + q + "a" + q + ")) \n " + cb)
+    expect(len(msgs)).toBe(1)
+    expect(countContaining(msgs, "type mismatch in argument")).toBe(1)
+
+    let msgs = checkSource("fn main() " + ob + "\n let xs = [1, 2] \n println(xs.contains()) \n " + cb)
+    expect(len(msgs)).toBe(1)
+    expect(countContaining(msgs, "argument(s)")).toBe(1)
+}
