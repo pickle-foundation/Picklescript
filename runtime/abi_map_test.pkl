@@ -10,7 +10,7 @@ module runtime.abi_map_test
 /// constants all reproduce the standard algorithm. `0xCBF29CE484222325` is written as
 /// `(0 - 0x340D631B7BDDDCDB)` because Pickle rejects literals above `i64::MAX`.
 
-import { abiMapNew, abiMapSet, abiMapGet, abiMapGetBoxed, abiMapHas, abiMapRemove } from runtime.abi_map
+import { abiMapNew, abiMapSet, abiMapGet, abiMapGetBoxed, abiMapHas, abiMapRemove, abiMapMerge } from runtime.abi_map
 import { abiMapLen, abiMapKeys, abiMapValues, keyHash, keyEq, deepHash, mapNew, entriesCount, needsGrow, isLiveKey, occupiedCount } from runtime.abi_map
 import { LEN_WORD, CAP_WORD, ENTRIES_WORD, GOLDEN, CYCLIC_HASH } from runtime.abi_map
 import { abiBoxI64, abiUnboxI64, abiBoxBool, newBox } from runtime.abi_box
@@ -663,4 +663,80 @@ test fn an_empty_map_answers_every_query() {
     expect(abiListLen(abiMapKeys(m))).toBe(0)
     expect(abiListLen(abiMapValues(m))).toBe(0)
     expect(abiUnboxI64(abiMapGetBoxed(m, mkAlpha(), abiBoxI64(42)))).toBe(42)
+}
+
+test fn merge_inserts_the_other_maps_entries() {
+    var a = abiMapNew(0)
+    abiMapSet(a, mkAlpha(), abiBoxI64(1))
+    var b = abiMapNew(0)
+    abiMapSet(b, mkBeta(), abiBoxI64(2))
+    abiMapMerge(a, b)
+    expect(abiMapLen(a)).toBe(2)
+    expect(abiUnboxI64(abiMapGet(a, mkAlpha()))).toBe(1)
+    expect(abiUnboxI64(abiMapGet(a, mkBeta()))).toBe(2)
+    // The right-hand map is untouched.
+    expect(abiMapLen(b)).toBe(1)
+    expect(abiMapHas(b, mkAlpha())).toBe(false)
+}
+
+test fn merge_lets_the_right_hand_map_win_collisions() {
+    var a = abiMapNew(0)
+    abiMapSet(a, mkAlpha(), abiBoxI64(1))
+    var b = abiMapNew(0)
+    abiMapSet(b, mkAlpha(), abiBoxI64(9))
+    abiMapMerge(a, b)
+    expect(abiMapLen(a)).toBe(1)
+    expect(abiUnboxI64(abiMapGet(a, mkAlpha()))).toBe(9)
+}
+
+test fn merge_with_an_empty_side_changes_only_the_non_empty_one() {
+    var a = abiMapNew(0)
+    abiMapSet(a, mkAlpha(), abiBoxI64(1))
+    abiMapMerge(a, abiMapNew(0))
+    expect(abiMapLen(a)).toBe(1)
+    expect(abiUnboxI64(abiMapGet(a, mkAlpha()))).toBe(1)
+
+    var into = abiMapNew(0)
+    var b = abiMapNew(0)
+    abiMapSet(b, mkBeta(), abiBoxI64(2))
+    abiMapMerge(into, b)
+    expect(abiMapLen(into)).toBe(1)
+    expect(abiUnboxI64(abiMapGet(into, mkBeta()))).toBe(2)
+}
+
+test fn merge_into_itself_is_a_no_op() {
+    var a = abiMapNew(0)
+    abiMapSet(a, mkAlpha(), abiBoxI64(1))
+    abiMapSet(a, mkBeta(), abiBoxI64(2))
+    abiMapMerge(a, a)
+    expect(abiMapLen(a)).toBe(2)
+    expect(abiUnboxI64(abiMapGet(a, mkAlpha()))).toBe(1)
+    expect(abiUnboxI64(abiMapGet(a, mkBeta()))).toBe(2)
+}
+
+test fn merge_skips_tombstones() {
+    var b = abiMapNew(0)
+    abiMapSet(b, mkAlpha(), abiBoxI64(1))
+    abiMapSet(b, mkBeta(), abiBoxI64(2))
+    abiMapRemove(b, mkAlpha())
+    var a = abiMapNew(0)
+    abiMapMerge(a, b)
+    expect(abiMapLen(a)).toBe(1)
+    expect(abiMapHas(a, mkAlpha())).toBe(false)
+    expect(abiUnboxI64(abiMapGet(a, mkBeta()))).toBe(2)
+}
+
+test fn merge_grows_the_destination_as_needed() {
+    // Enough entries to force at least one rehash in a fresh destination table.
+    var b = abiMapNew(0)
+    var i = 0
+    while (i < 40) {
+        abiMapSet(b, abiBoxI64(i), abiBoxI64(i * 2))
+        i = i + 1
+    }
+    var a = abiMapNew(0)
+    abiMapMerge(a, b)
+    expect(abiMapLen(a)).toBe(40)
+    expect(abiUnboxI64(abiMapGet(a, abiBoxI64(0)))).toBe(0)
+    expect(abiUnboxI64(abiMapGet(a, abiBoxI64(39)))).toBe(78)
 }

@@ -5480,8 +5480,8 @@ bad(em, e.span, "`" + classOfName(em, cc) + "` has no method `" + name + "`")
                 }
                 var obj = expr(em, object)
                 if (let some(obj) = obj) {
-                    if (mapBorrowed && name == "remove") {
-                        bad(em, e.span, "`remove` mutates a `Map` through an immutable reference (`&Map`)")
+                    if (mapBorrowed && (name == "remove" || name == "merge")) {
+                        bad(em, e.span, "`" + name + "` mutates a `Map` through an immutable reference (`&Map`)")
                         return none
                     }
                     match (name) {
@@ -5613,6 +5613,18 @@ var k = expr(em, args[0].value)
                             }
                             var lv = externCallT1(em, "pickle_map_len", [IrTy.Ptr], IrTy.Int, [obj])
                             return cmpZero(em, lv, IrBinOp.Eq, false)
+                        }
+                        case "merge" -> {
+                            if (!(len(args) == 1)) {
+                                bad(em, e.span, "`merge` takes one argument (another map)")
+                                return none
+                            }
+                            var other = expr(em, args[0].value)
+                            if (let some(other) = other) {
+                                externCallVoid(em, "pickle_map_merge", [IrTy.Ptr, IrTy.Ptr], [obj, other])
+                                return unitTemp(em)
+                            }
+                            return none
                         }
                         case _ -> {
                             bad(em, e.span, "`" + name + "` method on `Map` is not lowered yet")

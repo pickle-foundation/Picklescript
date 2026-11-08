@@ -848,3 +848,28 @@ fn abiMapKeys(map: *int) -> *int {
 fn abiMapValues(map: *int) -> *int {
     return mapSnapshot(map, false)
 }
+
+/// Merge every live entry of `other` into `map`; `other` wins collisions.
+///
+/// BEYOND PARITY - `runtime/src/map.rs` has no merge; native code spells it as a
+/// loop of `insert`. The walk is over `other`'s entry table directly - the same
+/// live-slot test `mapSnapshot`/`rehash` use - so no key list is allocated and
+/// no second hash lookup is needed to fetch each value. Keys and values are
+/// copied as pointers, so this is a shallow merge and `other` is left untouched.
+/// Merging a map into itself is a no-op: every key already exists, so no entry
+/// is added and no growth is triggered.
+#[symbol("pickle_map_merge")]
+fn abiMapMerge(map: *int, other: *int) {
+    unsafe {
+        var cap = other[CAP_WORD]
+        var entries = other[ENTRIES_WORD] as *int
+        var i = 0
+        while (i < cap) {
+            var k = entries[i * 2]
+            if (isLiveKey(k)) {
+                mapSet(map, k as *int, entries[i * 2 + 1] as *int)
+            }
+            i = i + 1
+        }
+    }
+}
