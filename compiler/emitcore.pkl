@@ -5445,6 +5445,7 @@ bad(em, e.span, "`" + classOfName(em, cc) + "` has no method `" + name + "`")
             return none
         }
         var isMap = false
+        var mapBorrowed = false
         var mapK = Ty.Unknown
         var mapV = Ty.Unknown
         if (let some(pt) = ot) {
@@ -5453,6 +5454,19 @@ bad(em, e.span, "`" + classOfName(em, cc) + "` has no method `" + name + "`")
                     mapK = k
                     mapV = v
                     isMap = true
+                }
+                // Read-only `Map` methods read through an immutable `&Map`
+                // borrow; the value is already the managed pointer.
+                case Ty.Ref(inner) -> {
+                    match (inner) {
+                        case Ty.Map(k, v) -> {
+                            mapK = k
+                            mapV = v
+                            isMap = true
+                            mapBorrowed = true
+                        }
+                        case _ -> {}
+                    }
                 }
                 case _ -> {}
             }
@@ -5466,6 +5480,10 @@ bad(em, e.span, "`" + classOfName(em, cc) + "` has no method `" + name + "`")
                 }
                 var obj = expr(em, object)
                 if (let some(obj) = obj) {
+                    if (mapBorrowed && name == "remove") {
+                        bad(em, e.span, "`remove` mutates a `Map` through an immutable reference (`&Map`)")
+                        return none
+                    }
                     match (name) {
                         case "has" -> {
                             if (!(len(args) == 1)) {
@@ -5541,6 +5559,13 @@ var k = expr(em, args[0].value)
                             }
                             return externCallT1(em, "pickle_map_values", [IrTy.Ptr], IrTy.Ptr, [obj])
                         }
+                        case "len" -> {
+                            if (!(len(args) == 0)) {
+                                bad(em, e.span, "`len` takes no arguments")
+                                return none
+                            }
+                            return externCallT1(em, "pickle_map_len", [IrTy.Ptr], IrTy.Int, [obj])
+                        }
                         case _ -> {
                             bad(em, e.span, "`" + name + "` method on `Map` is not lowered yet")
                             return none
@@ -5578,6 +5603,22 @@ var k = expr(em, args[0].value)
         }
         if (isStream) {
             return streamMethodCall(em, e, object, name, args)
+        }
+        var isString = false
+        if (let some(pt) = ot) {
+            match (pt) {
+                case Ty.String -> isString = true
+                case Ty.Ref(inner) -> {
+                    match (inner) {
+                        case Ty.String -> isString = true
+                        case _ -> {}
+                    }
+                }
+                case _ -> {}
+            }
+        }
+        if (isString) {
+            return stringMethodCall(em, e, object, name, args)
         }
         bad(em, e.span, "method calls on this type are not lowered yet")
         none
@@ -6372,9 +6413,9 @@ fn listMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List<C
             bad(em, e.span, "receiver is not a `List`")
             return none
         }
-        // Only the read-only method reads through an immutable borrow; the
+        // Only the read-only methods read through an immutable borrow; the
         // mutators would write through `&List`, so they keep bailing.
-        if (isBorrowed && name != "contains") {
+        if (isBorrowed && name != "contains" && name != "len") {
             bad(em, e.span, "`" + name + "` mutates a `List` through an immutable reference (`&List`)")
             return none
         }
@@ -6481,6 +6522,13 @@ fn listMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List<C
                     }
                     return none
                 }
+                case "len" -> {
+                    if (!(len(args) == 0)) {
+                        bad(em, e.span, "`len` takes no arguments")
+                        return none
+                    }
+                    return externCallT1(em, "pickle_list_len", [IrTy.Ptr], IrTy.Int, [obj])
+                }
                 case "contains" -> {
                     if (!(len(args) == 1)) {
                         bad(em, e.span, "`contains` takes one argument")
@@ -6561,6 +6609,68 @@ fn streamMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List
                 }
                 case _ -> {
                     bad(em, e.span, "`" + name + "` method on `Stream` is not lowered yet")
+                    return none
+                }
+            }
+        }
+        none
+    }
+
+    /// Lower a `string` method call. `len` is the method form of `len(s)`
+    /// (byte length) and `contains` the method form of `sub in s`; both read
+    /// through an immutable `&string` borrow. Mirrors nothing in Rust - its
+    /// member table has no `string` arm - so these are beyond parity.
+fn stringMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List<CallArg>) -> int? {
+        var isStr = false
+        var isBorrowed = false
+        if (let some(pt) = tyOf(em, object.span)) {
+            match (pt) {
+                case Ty.String -> isStr = true
+                case Ty.Ref(inner) -> {
+                    match (inner) {
+                        case Ty.String -> {
+                            isStr = true
+                            isBorrowed = true
+                        }
+                        case _ -> {}
+                    }
+                }
+                case _ -> {}
+            }
+        }
+        if (!isStr) {
+            bad(em, e.span, "receiver is not a `string`")
+            return none
+        }
+        var obj = expr(em, object)
+        if (let some(obj) = obj) {
+            match (name) {
+                case "len" -> {
+                    if (!(len(args) == 0)) {
+                        bad(em, e.span, "`len` takes no arguments")
+                        return none
+                    }
+                    if (isBorrowed) {
+                        return externCallT1(em, "pickle_str_len", [IrTy.Ptr], IrTy.Int, [obj])
+                    }
+                    return externCallT1(em, "pickle_str_len", [IrTy.Str], IrTy.Int, [obj])
+                }
+                case "contains" -> {
+                    if (!(len(args) == 1)) {
+                        bad(em, e.span, "`contains` takes one argument")
+                        return none
+                    }
+                    var needle = expr(em, args[0].value)
+                    if (let some(needle) = needle) {
+                        if (isBorrowed) {
+                            return externCallT1(em, "pickle_str_contains", [IrTy.Ptr, IrTy.Str], IrTy.Bool, [obj, needle])
+                        }
+                        return externCallT1(em, "pickle_str_contains", [IrTy.Str, IrTy.Str], IrTy.Bool, [obj, needle])
+                    }
+                    return none
+                }
+                case _ -> {
+                    bad(em, e.span, "`" + name + "` method on `string` is not lowered yet")
                     return none
                 }
             }
