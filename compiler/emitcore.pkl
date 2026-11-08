@@ -6393,8 +6393,8 @@ fn interfaceZeroArgCall(em: Emitter, span2: Span, ift: Ty, rec: int, name: strin
     }
 
     /// `xs.push(v)` and `xs.pop()` for `List<T>` receivers. Mirrors
-    /// `list_method_call` in emit.rs. `contains`, `len`, and `isEmpty` are
-    /// read-only, so they also read through an immutable `&List` borrow.
+    /// `list_method_call` in emit.rs. `contains`, `indexOf`, `len`, and `isEmpty`
+    /// are read-only, so they also read through an immutable `&List` borrow.
 fn listMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List<CallArg>) -> int? {
         var elem = Ty.Unknown
         var isList = false
@@ -6424,7 +6424,7 @@ fn listMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List<C
         }
         // Only the read-only methods read through an immutable borrow; the
         // mutators would write through `&List`, so they keep bailing.
-        if (isBorrowed && name != "contains" && name != "len" && name != "isEmpty") {
+        if (isBorrowed && name != "contains" && name != "indexOf" && name != "len" && name != "isEmpty") {
             bad(em, e.span, "`" + name + "` mutates a `List` through an immutable reference (`&List`)")
             return none
         }
@@ -6568,6 +6568,45 @@ fn listMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List<C
                         return none
                     }
                     return none
+                }
+                case "indexOf" -> {
+                    if (!(len(args) == 1)) {
+                        bad(em, e.span, "`indexOf` takes one argument")
+                        return none
+                    }
+                    var rp = elemRep(em, elem, e.span)
+                    if (let some(rep) = rp) {
+                        var v = expr(em, args[0].value)
+                        if (let some(v) = v) {
+                            var vt = elem
+                            if (let some(t) = tyOf(em, args[0].value.span)) {
+                                vt = t
+                            }
+                            var key = packMapKey(em, rep, v, vt, args[0].value.span)
+                            if (let some(k) = key) {
+                                return externCallT1(em, "pickle_list_index_of", [IrTy.Ptr, IrTy.Ptr], IrTy.Ptr, [obj, k])
+                            }
+                            return none
+                        }
+                        return none
+                    }
+                    return none
+                }
+                case "clear" -> {
+                    if (!(len(args) == 0)) {
+                        bad(em, e.span, "`clear` takes no arguments")
+                        return none
+                    }
+                    externCallVoid(em, "pickle_list_clear", [IrTy.Ptr], [obj])
+                    return unitTemp(em)
+                }
+                case "reverse" -> {
+                    if (!(len(args) == 0)) {
+                        bad(em, e.span, "`reverse` takes no arguments")
+                        return none
+                    }
+                    externCallVoid(em, "pickle_list_reverse", [IrTy.Ptr], [obj])
+                    return unitTemp(em)
                 }
                 case _ -> {
                     bad(em, e.span, "`" + name + "` method on `List` is not lowered yet")

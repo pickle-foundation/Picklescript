@@ -286,6 +286,40 @@ fn abiListSort(list: *int, kind: int) {
     }
 }
 
+/// Drop every element, keeping the allocated span. Beyond Rust parity: the native
+/// runtime has no `pickle_list_clear`, so this is a port-only symbol. Resetting the
+/// length is enough because every read is bounds-checked against it; the old slots stay
+/// reachable only through the next `push`.
+#[symbol("pickle_list_clear")]
+fn abiListClear(list: *int) {
+    unsafe {
+        list[LEN_WORD] = 0
+    }
+}
+
+/// Reverse the live prefix in place. Beyond Rust parity: no native
+/// `pickle_list_reverse` exists. Swaps from both ends toward the middle, so an odd
+/// length leaves the centre element untouched and the element pointers never move.
+#[symbol("pickle_list_reverse")]
+fn abiListReverse(list: *int) {
+    unsafe {
+        var n = list[LEN_WORD]
+        if (n < 2) {
+            return
+        }
+        var data = list[DATA_WORD] as *int
+        var i = 0
+        var j = n - 1
+        while (i < j) {
+            var tmp = data[i]
+            data[i] = data[j]
+            data[j] = tmp
+            i = i + 1
+            j = j - 1
+        }
+    }
+}
+
 /// Build a `List<int>` from `[start, end)` stepping by `step`.
 /// Mirrors `pickle_range`: a zero step yields an empty list, a positive step walks while
 /// `v < end`, a negative step while `v > end`, and every element is a boxed `int`.

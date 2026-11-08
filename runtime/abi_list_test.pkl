@@ -4,7 +4,7 @@ module runtime.abi_list_test
 /// implementations directly (not the `#[symbol]` slots) so the suite pins the logic
 /// itself; `tests/pickle/abi_box_main.pkl` covers the C ABI wiring separately.
 
-import { listNew, requireCapacity, abiListNew, abiListLen, abiListGet, abiListSet, abiListPush, abiListPop, abiListRemove, abiListInsert, abiListSort, abiRange } from runtime.abi_list
+import { listNew, requireCapacity, abiListNew, abiListLen, abiListGet, abiListSet, abiListPush, abiListPop, abiListRemove, abiListInsert, abiListSort, abiListClear, abiListReverse, abiRange } from runtime.abi_list
 import { abiBoxI64, abiUnboxI64 } from runtime.abi_box
 import { abiStrCmp } from runtime.abi_string
 
@@ -289,4 +289,75 @@ test fn abi_entry_point_builds_a_usable_list() {
     abiListPush(l, abiBoxI64(1234))
     expect(abiListLen(l)).toBe(1)
     expect(at(l, 0)).toBe(1234)
+}
+
+test fn clear_drops_the_length_but_keeps_the_span_usable() {
+    var l = listNew(0)
+    abiListPush(l, abiBoxI64(1))
+    abiListPush(l, abiBoxI64(2))
+    abiListPush(l, abiBoxI64(3))
+    abiListClear(l)
+    expect(abiListLen(l)).toBe(0)
+    expect(abiListGet(l, 0) as int).toBe(0)
+    abiListPush(l, abiBoxI64(9))
+    expect(abiListLen(l)).toBe(1)
+    expect(at(l, 0)).toBe(9)
+}
+
+test fn clear_on_an_empty_list_is_a_no_op() {
+    var l = listNew(0)
+    abiListClear(l)
+    expect(abiListLen(l)).toBe(0)
+}
+
+test fn reverse_flips_the_live_prefix_in_place() {
+    var l = listNew(0)
+    abiListPush(l, abiBoxI64(10))
+    abiListPush(l, abiBoxI64(20))
+    abiListPush(l, abiBoxI64(30))
+    abiListPush(l, abiBoxI64(40))
+    abiListReverse(l)
+    expect(abiListLen(l)).toBe(4)
+    expect(at(l, 0)).toBe(40)
+    expect(at(l, 1)).toBe(30)
+    expect(at(l, 2)).toBe(20)
+    expect(at(l, 3)).toBe(10)
+}
+
+test fn reverse_leaves_an_odd_middle_element_alone() {
+    var l = listNew(0)
+    abiListPush(l, abiBoxI64(1))
+    abiListPush(l, abiBoxI64(2))
+    abiListPush(l, abiBoxI64(3))
+    abiListReverse(l)
+    expect(at(l, 0)).toBe(3)
+    expect(at(l, 1)).toBe(2)
+    expect(at(l, 2)).toBe(1)
+}
+
+test fn reverse_handles_empty_and_single_element_lists() {
+    var empty = listNew(0)
+    abiListReverse(empty)
+    expect(abiListLen(empty)).toBe(0)
+    var one = listNew(0)
+    abiListPush(one, abiBoxI64(7))
+    abiListReverse(one)
+    expect(abiListLen(one)).toBe(1)
+    expect(at(one, 0)).toBe(7)
+}
+
+test fn reverse_only_touches_the_live_prefix() {
+    var l = listNew(0)
+    abiListPush(l, abiBoxI64(1))
+    abiListPush(l, abiBoxI64(2))
+    abiListPush(l, abiBoxI64(3))
+    abiListPush(l, abiBoxI64(4))
+    abiListPush(l, abiBoxI64(5))
+    abiListPop(l)
+    abiListPop(l)
+    abiListReverse(l)
+    expect(abiListLen(l)).toBe(3)
+    expect(at(l, 0)).toBe(3)
+    expect(at(l, 1)).toBe(2)
+    expect(at(l, 2)).toBe(1)
 }

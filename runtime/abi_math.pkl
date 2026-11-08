@@ -29,7 +29,7 @@ module runtime.abi_math
 /// same structural equality map keys use (`pickle_list_contains` mirrors the
 /// native `value_eq`, which is `key_eq`), and `abiStrContains` is a byte-run
 /// scan over the string payload, matching `strings.rs::string_contains`.
-import { pow2, f64Bits, abiF64FromBits } from runtime.abi_box
+import { pow2, f64Bits, abiF64FromBits, abiBoxI64 } from runtime.abi_box
 import { keyEq } from runtime.abi_map
 import { abiStrLen, byteAt } from runtime.abi_string
 import { LEN_WORD, DATA_WORD } from runtime.abi_list
@@ -300,6 +300,27 @@ fn abiListContains(list: *int, value: *int) -> bool {
         }
     }
     return false
+}
+
+/// Index of the first element structurally equal to `value`, boxed, or the null
+/// pointer when absent. Beyond Rust parity: the native runtime only has
+/// `pickle_list_contains`, so this is a port-only symbol. The boxed `int` result is
+/// exactly the `int?` representation the compiler already uses (`pickle_box_i64` /
+/// `pickle_unbox_i64`), so `xs.indexOf(v)` lowers without any extra wrapping.
+#[symbol("pickle_list_index_of")]
+fn abiListIndexOf(list: *int, value: *int) -> *int {
+    unsafe {
+        var n = list[LEN_WORD]
+        var data = list[DATA_WORD] as *int
+        var i = 0
+        while (i < n) {
+            if (keyEq(data[i] as *int, value)) {
+                return abiBoxI64(i)
+            }
+            i = i + 1
+        }
+    }
+    return 0 as *int
 }
 
 /// Whether the bytes of `needle` occur as a contiguous run in `hay`. An empty
