@@ -6673,11 +6673,11 @@ fn streamMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List
     }
 
     /// Lower a `string` method call. `len` is the method form of `len(s)`
-    /// (byte length) and `contains` the method form of `sub in s`; `startsWith`
-    /// and `endsWith` are byte prefix/suffix predicates, and `isEmpty` is
-    /// `len(s) == 0`. All of them read through an immutable `&string` borrow.
-    /// Mirrors nothing in Rust - its member table has no `string` arm - so
-    /// these are beyond parity.
+    /// (byte length) and `contains` the method form of `sub in s`; `indexOf`
+    /// returns the first byte offset as `int?`; `startsWith` and `endsWith` are
+    /// byte prefix/suffix predicates, and `isEmpty` is `len(s) == 0`. All of
+    /// them read through an immutable `&string` borrow. Mirrors nothing in Rust
+    /// - its member table has no `string` arm - so these are beyond parity.
 fn stringMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List<CallArg>) -> int? {
         var isStr = false
         var isBorrowed = false
@@ -6724,6 +6724,20 @@ fn stringMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List
                             return externCallT1(em, "pickle_str_contains", [IrTy.Ptr, IrTy.Str], IrTy.Bool, [obj, needle])
                         }
                         return externCallT1(em, "pickle_str_contains", [IrTy.Str, IrTy.Str], IrTy.Bool, [obj, needle])
+                    }
+                    return none
+                }
+                case "indexOf" -> {
+                    if (!(len(args) == 1)) {
+                        bad(em, e.span, "`indexOf` takes one argument")
+                        return none
+                    }
+                    var needle = expr(em, args[0].value)
+                    if (let some(needle) = needle) {
+                        if (isBorrowed) {
+                            return externCallT1(em, "pickle_str_index_of", [IrTy.Ptr, IrTy.Str], IrTy.Ptr, [obj, needle])
+                        }
+                        return externCallT1(em, "pickle_str_index_of", [IrTy.Str, IrTy.Str], IrTy.Ptr, [obj, needle])
                     }
                     return none
                 }

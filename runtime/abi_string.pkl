@@ -259,6 +259,46 @@ fn abiStrEndsWith(s: *int, suffix: *int) -> bool {
     return true
 }
 
+/// Whether the bytes of `needle` occur as a contiguous run starting at `off`.
+/// The scan primitive `abiStrIndexOf` builds on.
+fn strMatchAt(hay: *int, off: int, needle: *int, nn: int) -> bool {
+    var j = 0
+    while (j < nn) {
+        if (byteAt(hay, off + j) != byteAt(needle, j)) {
+            return false
+        }
+        j = j + 1
+    }
+    return true
+}
+
+/// Byte offset of the first occurrence of `needle` in `s`, boxed, or the null
+/// pointer when absent.
+///
+/// BEYOND PARITY - `runtime/src/strings.rs` only exposes `pickle_str_contains`,
+/// so this symbol exists only in the port. The scan is the same raw UTF-8 byte
+/// run `contains` uses, so a multi-byte needle matches only on a code-point
+/// boundary. An empty needle is found at offset 0. The boxed `int` result is the
+/// compiler's `int?` representation (`pickle_box_i64`/`pickle_unbox_i64`), so
+/// `s.indexOf(sub)` lowers with no extra wrapping.
+#[symbol("pickle_str_index_of")]
+fn abiStrIndexOf(s: *int, needle: *int) -> *int {
+    var sn = abiStrLen(s)
+    var nn = abiStrLen(needle)
+    if (nn > sn) {
+        return 0 as *int
+    }
+    var last = sn - nn
+    var i = 0
+    while (i <= last) {
+        if (strMatchAt(s, i, needle, nn)) {
+            return abiBoxI64(i)
+        }
+        i = i + 1
+    }
+    return 0 as *int
+}
+
 /// Decimal text for an `i64`. Mirrors `strings.rs::int64_to_string`.
 ///
 /// The reference takes the magnitude `unsigned_abs`, so `i64::MIN` is formatted
