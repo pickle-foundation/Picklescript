@@ -1,6 +1,6 @@
 module runtime.abi_string_test
 
-import { wordsFor, abiStrLen, abiStrConcat, abiStrCmp, abiStrGet, abiStrSet, abiStrFromBool, abiStrFromByte, abiStrFromChar, abiStrToBytes, abiStrFromList, abiStrStartsWith, abiStrEndsWith, abiStrIndexOf, isScalar, utf8Len, leadByte } from runtime.abi_string
+import { wordsFor, abiStrLen, abiStrConcat, abiStrCmp, abiStrGet, abiStrSet, abiStrFromBool, abiStrFromByte, abiStrFromChar, abiStrToBytes, abiStrFromList, abiStrStartsWith, abiStrEndsWith, abiStrIndexOf, abiStrTrim, isScalar, utf8Len, leadByte } from runtime.abi_string
 import { abiListNew, abiListLen, abiListGet, abiListPush } from runtime.abi_list
 import { abiBoxI64, abiUnboxI64 } from runtime.abi_box
 
@@ -309,4 +309,45 @@ test fn str_index_of_is_byte_exact() {
     expect(abiUnboxI64(abiStrIndexOf(e, bytes1(195)))).toBe(0)
     expect(abiUnboxI64(abiStrIndexOf(e, bytes1(169)))).toBe(1)
     expect(abiStrIndexOf(e, bytes2(169, 195)) as int).toBe(0)
+}
+
+test fn str_trim_strips_ascii_whitespace_on_both_ends() {
+    // "  hi  "
+    let padded = abiStrConcat(bytes2(32, 32), abiStrConcat(bytes2(104, 105), bytes2(32, 32)))
+    expect(abiStrCmp(abiStrTrim(padded), bytes2(104, 105))).toBe(0)
+    // "\t\nhi\r": tab, LF and CR are all in the set.
+    let ctl = abiStrConcat(bytes2(9, 10), abiStrConcat(bytes2(104, 105), bytes1(13)))
+    expect(abiStrCmp(abiStrTrim(ctl), bytes2(104, 105))).toBe(0)
+}
+
+test fn str_trim_keeps_interior_whitespace() {
+    // " a b "
+    let x = abiStrConcat(bytes1(32), abiStrConcat(bytes3(97, 32, 98), bytes1(32)))
+    let t = abiStrTrim(x)
+    expect(abiStrLen(t)).toBe(3)
+    expect(abiStrCmp(t, bytes3(97, 32, 98))).toBe(0)
+}
+
+test fn str_trim_of_all_whitespace_is_empty() {
+    // " \t\n\r"
+    let x = abiStrConcat(bytes2(32, 9), bytes2(10, 13))
+    expect(abiStrLen(abiStrTrim(x))).toBe(0)
+}
+
+test fn str_trim_without_whitespace_returns_the_receiver() {
+    let x = bytes2(104, 105)
+    expect(abiStrCmp(abiStrTrim(x), x)).toBe(0)
+    // Nothing to strip: the body returns `s` rather than allocating a copy.
+    expect((abiStrTrim(x) as int) == (x as int)).toBe(true)
+}
+
+test fn str_trim_leaves_multibyte_content_alone() {
+    // NBSP (C2 A0) is not ASCII whitespace, so "  <nbsp>e-acute  " trims to
+    // "<nbsp>e-acute" without splitting either multibyte sequence.
+    let pad = bytes2(32, 32)
+    let body = abiStrConcat(bytes2(194, 160), bytes2(195, 169))
+    let x = abiStrConcat(pad, abiStrConcat(body, pad))
+    let t = abiStrTrim(x)
+    expect(abiStrLen(t)).toBe(4)
+    expect(abiStrCmp(t, body)).toBe(0)
 }

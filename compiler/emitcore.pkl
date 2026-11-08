@@ -6715,9 +6715,10 @@ fn streamMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List
     /// Lower a `string` method call. `len` is the method form of `len(s)`
     /// (byte length) and `contains` the method form of `sub in s`; `indexOf`
     /// returns the first byte offset as `int?`; `startsWith` and `endsWith` are
-    /// byte prefix/suffix predicates, and `isEmpty` is `len(s) == 0`. All of
-    /// them read through an immutable `&string` borrow. Mirrors nothing in Rust
-    /// - its member table has no `string` arm - so these are beyond parity.
+    /// byte prefix/suffix predicates, `isEmpty` is `len(s) == 0`, and `trim`
+    /// strips the ASCII whitespace set `compiler.front` uses. All of them read
+    /// through an immutable `&string` borrow. Mirrors nothing in Rust - its
+    /// member table has no `string` arm - so these are beyond parity.
 fn stringMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List<CallArg>) -> int? {
         var isStr = false
         var isBorrowed = false
@@ -6821,6 +6822,16 @@ fn stringMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List
                         lv = externCallT1(em, "pickle_str_len", [IrTy.Str], IrTy.Int, [obj])
                     }
                     return cmpZero(em, lv, IrBinOp.Eq, false)
+                }
+                case "trim" -> {
+                    if (!(len(args) == 0)) {
+                        bad(em, e.span, "`trim` takes no arguments")
+                        return none
+                    }
+                    if (isBorrowed) {
+                        return externCallT1(em, "pickle_str_trim", [IrTy.Ptr], IrTy.Str, [obj])
+                    }
+                    return externCallT1(em, "pickle_str_trim", [IrTy.Str], IrTy.Str, [obj])
                 }
                 case _ -> {
                     bad(em, e.span, "`" + name + "` method on `string` is not lowered yet")

@@ -299,6 +299,49 @@ fn abiStrIndexOf(s: *int, needle: *int) -> *int {
     return 0 as *int
 }
 
+/// Copy `s` without leading/trailing ASCII whitespace (space, tab, LF, CR).
+///
+/// BEYOND PARITY - `runtime/src/strings.rs` has no trim. The whitespace set is
+/// the one `compiler.front`'s `stringTrim` helper already uses, so the language
+/// member and the compiler's own source tooling agree. The scan is over raw
+/// UTF-8 bytes and stops at the first non-whitespace byte, so a multi-byte
+/// scalar is never split: only the four single-byte ASCII whitespace bytes are
+/// stripped. A string with nothing to strip is returned unchanged.
+#[symbol("pickle_str_trim")]
+fn abiStrTrim(s: *int) -> *int {
+    unsafe {
+        var n = abiStrLen(s)
+        var start = 0
+        while (start < n) {
+            var c = byteAt(s, start)
+            if (c == 32 || c == 9 || c == 10 || c == 13) {
+                start = start + 1
+            } else {
+                break
+            }
+        }
+        var end = n
+        while (end > start) {
+            var c = byteAt(s, end - 1)
+            if (c == 32 || c == 9 || c == 10 || c == 13) {
+                end = end - 1
+            } else {
+                break
+            }
+        }
+        if (start == 0 && end == n) {
+            return s
+        }
+        var out = newStr(end - start)
+        var i = start
+        while (i < end) {
+            byteInto(out, i - start, byteAt(s, i))
+            i = i + 1
+        }
+        return out
+    }
+}
+
 /// Decimal text for an `i64`. Mirrors `strings.rs::int64_to_string`.
 ///
 /// The reference takes the magnitude `unsigned_abs`, so `i64::MIN` is formatted
