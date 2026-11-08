@@ -16,10 +16,19 @@
 # and driver artifact upkeep are tooling concerns (selfhost.ps1), also outside
 # the behavior lane.
 #
-# Expected warm wall: ~15 min at 6 workers.
+# Expected warm wall: ~15 min at 6 workers (more workers help on a wide box:
+# this repo's dev machine has 16 logical cores, so `-Workers 10` is safe).
+#
+# -SkipRuntime drops LITE GATE10. It is an explicit opt-in for a slice that
+# provably cannot change runtime codegen (e.g. a lowering arm that previously
+# bailed, so no passing program reaches it). GATE7 still runs. The full gate is
+# still the bar before a push/milestone; this only shortens the inner loop.
+# The prep step is stamp-gated, so a second run with no source change skips the
+# driver rebuild entirely.
 
 param(
-    [int]$Workers = -1
+    [int]$Workers = -1,
+    [switch]$SkipRuntime
 )
 
 . (Join-Path $PSScriptRoot "battery_common.ps1")
@@ -94,38 +103,42 @@ foreach ($pt in @(Get-ChildItem "compiler\*_test.pkl")) {
     }
 }
 $g7r = Invoke-LiteShards $g7items (Join-Path $gdir "lite_g7.spec") (Join-Path $gdir "lite_g7res")
-Write-Output "LITE GATE7 COMPILER SUITE: PASS=$($g7r.ok) FAIL=$($g7r.fail)"
+Write-Output "LITE GATE7 COMPILER SUITE: PASS=$($g7r.ok) FAIL=$($g7r.fail) [$($sw.Elapsed.TotalMinutes.ToString('F2')) min]"
 if ($g7r.fail -ne 0) {
     $failed = $true
     $g7r.lines | Where-Object { $_.StartsWith("FAIL") } | ForEach-Object { Write-Output $_ }
 }
 
 # LITE GATE10: the runtime suite, 0 failures required.
-$g10items = @()
-foreach ($f in @(Get-ChildItem "runtime\*_test.pkl")) {
-    $g10items += [pscustomobject]@{
-        gate = "LITE-GATE10"; tag = $f.BaseName
-        kind = "result"; exitOnly = $false
-        exe = $pklcTestAbs; argv = @($f.FullName, $rtlibAbs)
-        capture = (Join-Path $gdir ("lite_g10_" + $f.BaseName + ".txt"))
-        budget = 180
-    }
-}
-$g10r = Invoke-LiteShards $g10items (Join-Path $gdir "lite_g10.spec") (Join-Path $gdir "lite_g10res")
-$g10pass = 0; $g10fail = 0
-foreach ($f in @(Get-ChildItem "runtime\*_test.pkl")) {
-    $cap = Join-Path $gdir ("lite_g10_" + $f.BaseName + ".txt")
-    foreach ($l in (Get-Content -LiteralPath $cap -ErrorAction SilentlyContinue | Select-String "test result:")) {
-        if ($l.Line -match "test result: (\d+) passed; (\d+) failed") {
-            $g10pass += [int]$matches[1]
-            $g10fail += [int]$matches[2]
+if ($SkipRuntime) {
+    Write-Output "LITE GATE10 RUNTIME SUITE: SKIPPED (-SkipRuntime)"
+} else {
+    $g10items = @()
+    foreach ($f in @(Get-ChildItem "runtime\*_test.pkl")) {
+        $g10items += [pscustomobject]@{
+            gate = "LITE-GATE10"; tag = $f.BaseName
+            kind = "result"; exitOnly = $false
+            exe = $pklcTestAbs; argv = @($f.FullName, $rtlibAbs)
+            capture = (Join-Path $gdir ("lite_g10_" + $f.BaseName + ".txt"))
+            budget = 180
         }
     }
-}
-Write-Output "LITE GATE10 RUNTIME SUITE (pass=$g10pass fail=$g10fail): PASS=$($g10r.fail -eq 0 -and $g10fail -eq 0)"
-if ($g10r.fail -ne 0 -or $g10fail -ne 0) {
-    $failed = $true
-    $g10r.lines | Where-Object { $_.StartsWith("FAIL") } | ForEach-Object { Write-Output $_ }
+    $g10r = Invoke-LiteShards $g10items (Join-Path $gdir "lite_g10.spec") (Join-Path $gdir "lite_g10res")
+    $g10pass = 0; $g10fail = 0
+    foreach ($f in @(Get-ChildItem "runtime\*_test.pkl")) {
+        $cap = Join-Path $gdir ("lite_g10_" + $f.BaseName + ".txt")
+        foreach ($l in (Get-Content -LiteralPath $cap -ErrorAction SilentlyContinue | Select-String "test result:")) {
+            if ($l.Line -match "test result: (\d+) passed; (\d+) failed") {
+                $g10pass += [int]$matches[1]
+                $g10fail += [int]$matches[2]
+            }
+        }
+    }
+    Write-Output "LITE GATE10 RUNTIME SUITE (pass=$g10pass fail=$g10fail): PASS=$($g10r.fail -eq 0 -and $g10fail -eq 0) [$($sw.Elapsed.TotalMinutes.ToString('F2')) min]"
+    if ($g10r.fail -ne 0 -or $g10fail -ne 0) {
+        $failed = $true
+        $g10r.lines | Where-Object { $_.StartsWith("FAIL") } | ForEach-Object { Write-Output $_ }
+    }
 }
 
 $elapsed = $sw.Elapsed.TotalMinutes.ToString('F2')
