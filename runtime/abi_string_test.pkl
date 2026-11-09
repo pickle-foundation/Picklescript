@@ -1,6 +1,6 @@
 module runtime.abi_string_test
 
-import { wordsFor, abiStrLen, abiStrConcat, abiStrCmp, abiStrGet, abiStrSet, abiStrFromBool, abiStrFromByte, abiStrFromChar, abiStrToBytes, abiStrFromList, abiStrStartsWith, abiStrEndsWith, abiStrIndexOf, abiStrTrim, abiStrToUpper, abiStrToLower, isScalar, utf8Len, leadByte } from runtime.abi_string
+import { wordsFor, abiStrLen, abiStrConcat, abiStrCmp, abiStrGet, abiStrSet, abiStrFromBool, abiStrFromByte, abiStrFromChar, abiStrToBytes, abiStrFromList, abiStrStartsWith, abiStrEndsWith, abiStrIndexOf, abiStrTrim, abiStrToUpper, abiStrToLower, abiStrSubstring, isScalar, utf8Len, leadByte } from runtime.abi_string
 import { abiListNew, abiListLen, abiListGet, abiListPush } from runtime.abi_list
 import { abiBoxI64, abiUnboxI64 } from runtime.abi_box
 
@@ -407,4 +407,44 @@ test fn str_case_mapping_is_idempotent() {
     expect(abiStrCmp(abiStrToUpper(up), up)).toBe(0)
     let low = abiStrToLower(x)
     expect(abiStrCmp(abiStrToLower(low), low)).toBe(0)
+}
+
+test fn str_substring_extracts_a_byte_span() {
+    // "hello"[1, 4) = "ell"
+    let x = abiStrConcat(bytes3(104, 101, 108), bytes2(108, 111))
+    expect(abiStrCmp(abiStrSubstring(x, 1, 4), bytes3(101, 108, 108))).toBe(0)
+}
+
+test fn str_substring_clamps_both_bounds() {
+    // "hello"
+    let x = abiStrConcat(bytes3(104, 101, 108), bytes2(108, 111))
+    // Negative start clamps to 0, over-long end clamps to len.
+    expect(abiStrCmp(abiStrSubstring(x, 0 - 5, 2), bytes2(104, 101))).toBe(0)
+    expect(abiStrCmp(abiStrSubstring(x, 3, 99), bytes2(108, 111))).toBe(0)
+    // Empty and inverted spans are empty.
+    expect(abiStrLen(abiStrSubstring(x, 2, 2))).toBe(0)
+    expect(abiStrLen(abiStrSubstring(x, 4, 2))).toBe(0)
+    // A start past the end clamps too.
+    expect(abiStrLen(abiStrSubstring(x, 99, 100))).toBe(0)
+}
+
+test fn str_substring_of_empty_is_empty() {
+    let empty = abiStrFromList(abiListNew(0))
+    expect(abiStrLen(abiStrSubstring(empty, 0, 0))).toBe(0)
+    expect(abiStrLen(abiStrSubstring(empty, 3, 7))).toBe(0)
+}
+
+test fn str_substring_full_span_is_a_fresh_copy() {
+    let x = bytes2(97, 98)
+    let whole = abiStrSubstring(x, 0, 2)
+    expect(abiStrCmp(whole, x)).toBe(0)
+    expect((whole as int) == (x as int)).toBe(false)
+}
+
+test fn str_substring_uses_byte_offsets() {
+    // "a<e-acute>" is 61 C3 A9; [1, 3) is the two-byte scalar.
+    let x = abiStrConcat(bytes1(97), bytes2(195, 169))
+    let tail = abiStrSubstring(x, 1, 3)
+    expect(abiStrLen(tail)).toBe(2)
+    expect(abiStrCmp(tail, bytes2(195, 169))).toBe(0)
 }

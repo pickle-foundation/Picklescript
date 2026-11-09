@@ -393,6 +393,47 @@ fn abiStrToLower(s: *int) -> *int {
     }
 }
 
+/// Copy the `[start, end)` byte span of `s`.
+///
+/// BEYOND PARITY - `runtime/src/strings.rs` has no substring. The bounds follow
+/// `List.slice` exactly: both clamp to `[0, len]` (negatives to 0, over-long to
+/// `len`) and `end < start` yields an empty string, so the call is total.
+/// Offsets are BYTE offsets - the same unit `s.indexOf` returns - so
+/// `s.substring(i, i + needle.len())` extracts a match. A span that splits a
+/// multi-byte scalar copies the raw bytes, so the result is not guaranteed to
+/// be valid UTF-8; callers working with non-ASCII text must slice on scalar
+/// boundaries. Always returns a fresh string.
+#[symbol("pickle_str_substring")]
+fn abiStrSubstring(s: *int, start: int, end: int) -> *int {
+    unsafe {
+        var n = abiStrLen(s)
+        var a = start
+        if (a < 0) {
+            a = 0
+        }
+        if (a > n) {
+            a = n
+        }
+        var b = end
+        if (b < 0) {
+            b = 0
+        }
+        if (b > n) {
+            b = n
+        }
+        if (b < a) {
+            b = a
+        }
+        var out = newStr(b - a)
+        var i = a
+        while (i < b) {
+            byteInto(out, i - a, byteAt(s, i))
+            i = i + 1
+        }
+        return out
+    }
+}
+
 /// Decimal text for an `i64`. Mirrors `strings.rs::int64_to_string`.
 ///
 /// The reference takes the magnitude `unsigned_abs`, so `i64::MIN` is formatted
