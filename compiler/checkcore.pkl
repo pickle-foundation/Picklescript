@@ -1636,10 +1636,10 @@ fn checkCall(ck: Checker, e: Expr, callee: Expr, args: List<CallArg>) -> Ty {
         match (ct) {
             case Ty.Fn(params, ret) -> {
                 checkArgs(ck, e, params, args)
-                // `Option<T>.map`/`flatMap`: the placeholder result type from
-                // `checkMember` is refined to `Option` of the callback's
-                // (already checked) return type. `flatMap` requires that
-                // return to already be an option.
+                // `Option<T>.map`/`flatMap` and `List<T>.map`: the placeholder
+                // result type from `checkMember` is refined to the container of
+                // the callback's (already checked) return type. `flatMap`
+                // requires that return to already be an option.
                 var outRet = ret
                 if (isMember) {
                     let fmName = match (callee.kind) {
@@ -1652,6 +1652,7 @@ fn checkCall(ck: Checker, e: Expr, callee: Expr, args: List<CallArg>) -> Ty {
                             case _ -> callee
                         }
                         var recvOpt = false
+                        var recvList = false
                         if (let some(rot) = ck.types.get(spanKey(fmObj.span))) {
                             var base = rot
                             match (rot) {
@@ -1661,8 +1662,12 @@ fn checkCall(ck: Checker, e: Expr, callee: Expr, args: List<CallArg>) -> Ty {
                             if (let some(_oi) = innerOption(base)) {
                                 recvOpt = true
                             }
+                            match (base) {
+                                case Ty.List(_) -> recvList = true
+                                case _ -> {}
+                            }
                         }
-                        if (recvOpt && len(args) == 1 && !args[0].spread) {
+                        if ((recvOpt || recvList) && len(args) == 1 && !args[0].spread) {
                             if (let some(lt) = ck.types.get(spanKey(args[0].value.span))) {
                                 var lret = Ty.Unknown
                                 var isFnTy = false
@@ -1675,7 +1680,11 @@ fn checkCall(ck: Checker, e: Expr, callee: Expr, args: List<CallArg>) -> Ty {
                                 }
                                 if (isFnTy) {
                                     if (fmName == "map") {
-                                        outRet = Ty.Option(lret)
+                                        if (recvList) {
+                                            outRet = Ty.List(lret)
+                                        } else {
+                                            outRet = Ty.Option(lret)
+                                        }
                                     } else if (lret == Ty.None) {
                                         outRet = Ty.Option(Ty.Unknown)
                                     } else if (let some(_ui) = innerOption(lret)) {
@@ -2284,6 +2293,15 @@ fn checkMember(ck: Checker, e: Expr, object: Expr, name: string) -> Ty {
                 if (name == "join") {
                     err(ck, e.span, "`join` needs a `List<string>` (got `List<{bareName(inner)}>`)")
                     return Ty.Unknown
+                }
+                // `map`/`filter` transform every element; `map`'s result type
+                // depends on the callback, so `checkCall` refines the
+                // placeholder `List<?>` once the argument is checked.
+                if (name == "map") {
+                    return Ty.Fn([Ty.Fn([inner], Ty.Unknown)], Ty.List(Ty.Unknown))
+                }
+                if (name == "filter") {
+                    return Ty.Fn([Ty.Fn([inner], Ty.Bool)], Ty.List(inner))
                 }
                 err(ck, e.span, "no member `{name}` on `List<{bareName(inner)}>`")
                 return Ty.Unknown
