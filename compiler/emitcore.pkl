@@ -7048,8 +7048,165 @@ fn optionMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List
             }
             return optExpect(em, e, object, args[0].value, inner)
         }
+        if (name == "map" || name == "flatMap") {
+            if (!(len(args) == 1)) {
+                bad(em, e.span, "`" + name + "` takes one function argument")
+                return none
+            }
+            return optMapCall(em, e, object, name, args[0].value, inner)
+        }
         bad(em, e.span, "`" + name + "` method on an `Option` is not lowered yet")
         none
+    }
+
+    /// `x.map(f)` / `x.flatMap(f)`: when `x` is present, call the closure `f`
+    /// with the unwrapped payload and lift the result back to an option;
+    /// otherwise the result is `none`. `map` boxes a scalar callback result,
+    /// while `flatMap`'s callback already returns an option pointer. The
+    /// receiver and the callback are evaluated eagerly, in that order.
+fn optMapCall(em: Emitter, e: Expr, object: Expr, name: string, f: Expr, inner: Ty) -> int? {
+        var fty0 = tyOf(em, f.span)
+        if (let none = fty0) {
+            bad(em, f.span, "`" + name + "` needs a function argument")
+            return none
+        }
+        var fty = Ty.Unknown
+        if (let some(t) = fty0) {
+            fty = t
+        }
+        var prt = Ty.Unknown
+        var pty = emptyTys()
+        var isFn = false
+        match (fty) {
+            case Ty.Fn(pts, r) -> {
+                pty = pts
+                prt = r
+                isFn = true
+            }
+            case _ -> {}
+        }
+        if (!isFn || len(pty) != 1) {
+            bad(em, f.span, "`" + name + "` needs a one-argument function")
+            return none
+        }
+        if (name == "flatMap") {
+            if (let none = innerOption(prt)) {
+                bad(em, f.span, "`flatMap` needs a callback returning an option")
+                return none
+            }
+        }
+        var resSlot = newSlot(em, IrTy.Ptr)
+        var a0 = expr(em, object)
+        if (let none = a0) {
+            return none
+        }
+        var a = 0
+        if (let some(v) = a0) {
+            a = v
+        }
+        var fv0 = expr(em, f)
+        if (let none = fv0) {
+            return none
+        }
+        var fv = 0
+        if (let some(v) = fv0) {
+            fv = v
+        }
+        var present0 = optIsPresent(em, a)
+        if (let none = present0) {
+            return none
+        }
+        var present = 0
+        if (let some(p) = present0) {
+            present = p
+        }
+        var someId = newBlock(em)
+        var noneId = newBlock(em)
+        var join = newBlock(em)
+        term(em, IrTerm.BranchIf(present, someId, noneId))
+        em.cur = noneId
+        var nul = nullTemp(em)
+        if (let none = nul) {
+            return none
+        }
+        var nullV = 0
+        if (let some(n) = nul) {
+            nullV = n
+        }
+        instr(em, IrInstr.StoreSlot(resSlot, nullV))
+        term(em, IrTerm.Branch(join))
+        em.cur = someId
+        var payload0 = optResolve(em, a, inner, e.span)
+        if (let none = payload0) {
+            return none
+        }
+        var payload = 0
+        if (let some(v) = payload0) {
+            payload = v
+        }
+        // Pass the payload to the callback: a scalar `&T` parameter borrows a
+        // temporary slot, everything else passes by value.
+        var argIr = IrTy.Ptr
+        var argV = payload
+        var borrowScalar = false
+        match (pty[0]) {
+            case Ty.Ref(ri) -> {
+                if (let some(sir) = scalarIr(ri)) {
+                    var box = newSlot(em, sir)
+                    instr(em, IrInstr.StoreSlot(box, payload))
+                    var addr = temp(em)
+                    instr(em, IrInstr.LocalAddr(addr, box))
+                    argV = addr
+                    borrowScalar = true
+                }
+            }
+            case _ -> {}
+        }
+        if (!borrowScalar) {
+            var mir = mapTy(em, pty[0], e.span)
+            if (let some(ir) = mir) {
+                argIr = ir
+            }
+        }
+        var zero = intConst(em, 0)
+        var addrBoxed = externCallT1(em, "pickle_obj_slot_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [fv, zero])
+        var fnAddr = externCallT1(em, "pickle_unbox_i64", [IrTy.Ptr], IrTy.Int, [addrBoxed])
+        var irRet0 = mapTy(em, prt, e.span)
+        if (let none = irRet0) {
+            return none
+        }
+        var irRet = IrTy.Ptr
+        if (let some(ir) = irRet0) {
+            irRet = ir
+        }
+        var dst = temp(em)
+        instr(em, IrInstr.CallInd(dst, fnAddr, [IrTy.Ptr, argIr], irRet, [fv, argV]))
+        var outV = dst
+        if (name == "map") {
+            if (prt == Ty.None) {
+                // The callback returns no value (its tail is `none`), so the
+                // result is always the absent option.
+                var n2 = nullTemp(em)
+                if (let none = n2) {
+                    return none
+                }
+                if (let some(n) = n2) {
+                    outV = n
+                }
+            } else {
+                var w0 = optionWrap(em, dst, prt, e.span)
+                if (let none = w0) {
+                    return none
+                }
+                if (let some(w) = w0) {
+                    outV = w
+                }
+            }
+        }
+        instr(em, IrInstr.StoreSlot(resSlot, outV))
+        term(em, IrTerm.Branch(join))
+        em.cur = join
+        load(em, resSlot)
     }
 
     /// `x.unwrapOr(d)`: the payload of `x`, or `d` when `x` is `none`.

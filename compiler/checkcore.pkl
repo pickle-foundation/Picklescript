@@ -1636,7 +1636,60 @@ fn checkCall(ck: Checker, e: Expr, callee: Expr, args: List<CallArg>) -> Ty {
         match (ct) {
             case Ty.Fn(params, ret) -> {
                 checkArgs(ck, e, params, args)
-                ret
+                // `Option<T>.map`/`flatMap`: the placeholder result type from
+                // `checkMember` is refined to `Option` of the callback's
+                // (already checked) return type. `flatMap` requires that
+                // return to already be an option.
+                var outRet = ret
+                if (isMember) {
+                    let fmName = match (callee.kind) {
+                        case ExprKind.Member(_, n) -> n
+                        case _ -> ""
+                    }
+                    if (fmName == "map" || fmName == "flatMap") {
+                        let fmObj = match (callee.kind) {
+                            case ExprKind.Member(o, _) -> o
+                            case _ -> callee
+                        }
+                        var recvOpt = false
+                        if (let some(rot) = ck.types.get(spanKey(fmObj.span))) {
+                            var base = rot
+                            match (rot) {
+                                case Ty.Ref(ri) -> base = ri
+                                case _ -> {}
+                            }
+                            if (let some(_oi) = innerOption(base)) {
+                                recvOpt = true
+                            }
+                        }
+                        if (recvOpt && len(args) == 1 && !args[0].spread) {
+                            if (let some(lt) = ck.types.get(spanKey(args[0].value.span))) {
+                                var lret = Ty.Unknown
+                                var isFnTy = false
+                                match (lt) {
+                                    case Ty.Fn(_, lr) -> {
+                                        lret = lr
+                                        isFnTy = true
+                                    }
+                                    case _ -> {}
+                                }
+                                if (isFnTy) {
+                                    if (fmName == "map") {
+                                        outRet = Ty.Option(lret)
+                                    } else if (lret == Ty.None) {
+                                        outRet = Ty.Option(Ty.Unknown)
+                                    } else if (let some(_ui) = innerOption(lret)) {
+                                        outRet = lret
+                                    } else {
+                                        err(ck, e.span, "`flatMap` needs a callback returning an option, found `{bareName(lret)}`")
+                                        outRet = Ty.Unknown
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                outRet
             }
             case Ty.Unknown -> Ty.Unknown
             case _ -> {
@@ -2318,6 +2371,9 @@ fn checkMember(ck: Checker, e: Expr, object: Expr, name: string) -> Ty {
                 // Member forms of the option operators: `isSome`/`isNone` read
                 // presence, `unwrap` is `x?`, `unwrapOr` is `x ?? d`, and
                 // `expect` is `unwrap` with a caller-supplied fatal message.
+                // `map`/`flatMap` transform the payload; their result type
+                // depends on the callback, so `checkCall` refines the
+                // placeholder `Option<?>` once the argument is checked.
                 if (name == "isSome") {
                     return Ty.Fn(emptyTyList(), Ty.Bool)
                 }
@@ -2333,7 +2389,13 @@ fn checkMember(ck: Checker, e: Expr, object: Expr, name: string) -> Ty {
                 if (name == "expect") {
                     return Ty.Fn([Ty.String], inner)
                 }
-                err(ck, e.span, "no member `{name}` on `{bareName(inner)}?` (members are `isSome`, `isNone`, `unwrap`, `unwrapOr`, `expect`)")
+                if (name == "map") {
+                    return Ty.Fn([Ty.Fn([inner], Ty.Unknown)], Ty.Option(Ty.Unknown))
+                }
+                if (name == "flatMap") {
+                    return Ty.Fn([Ty.Fn([inner], Ty.Unknown)], Ty.Option(Ty.Unknown))
+                }
+                err(ck, e.span, "no member `{name}` on `{bareName(inner)}?` (members are `isSome`, `isNone`, `unwrap`, `unwrapOr`, `expect`, `map`, `flatMap`)")
                 return Ty.Unknown
             }
             case Ty.Stream -> {
