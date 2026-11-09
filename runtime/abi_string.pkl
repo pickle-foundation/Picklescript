@@ -434,6 +434,54 @@ fn abiStrSubstring(s: *int, start: int, end: int) -> *int {
     }
 }
 
+/// Join a `List<string>` with `sep` between elements.
+///
+/// BEYOND PARITY - `runtime/src/strings.rs` has no join. The body measures every
+/// element and the separators first, allocates exactly once, then copies the
+/// bytes, so the result is one fresh string. An empty list yields an empty
+/// string, a single element is copied without a separator, and an empty
+/// separator simply concatenates. Elements are copied as raw bytes, so any
+/// multi-byte scalars survive intact.
+#[symbol("pickle_list_join")]
+fn abiListJoin(list: *int, sep: *int) -> *int {
+    unsafe {
+        var n = abiListLen(list)
+        var sn = abiStrLen(sep)
+        var total = 0
+        var i = 0
+        while (i < n) {
+            total = total + abiStrLen(abiListGet(list, i))
+            if (i > 0) {
+                total = total + sn
+            }
+            i = i + 1
+        }
+        var out = newStr(total)
+        var pos = 0
+        var j = 0
+        while (j < n) {
+            if (j > 0) {
+                var k = 0
+                while (k < sn) {
+                    byteInto(out, pos, byteAt(sep, k))
+                    pos = pos + 1
+                    k = k + 1
+                }
+            }
+            var s = abiListGet(list, j)
+            var ln = abiStrLen(s)
+            var m = 0
+            while (m < ln) {
+                byteInto(out, pos, byteAt(s, m))
+                pos = pos + 1
+                m = m + 1
+            }
+            j = j + 1
+        }
+        return out
+    }
+}
+
 /// Decimal text for an `i64`. Mirrors `strings.rs::int64_to_string`.
 ///
 /// The reference takes the magnitude `unsigned_abs`, so `i64::MIN` is formatted

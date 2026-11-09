@@ -1,6 +1,6 @@
 module runtime.abi_string_test
 
-import { wordsFor, abiStrLen, abiStrConcat, abiStrCmp, abiStrGet, abiStrSet, abiStrFromBool, abiStrFromByte, abiStrFromChar, abiStrToBytes, abiStrFromList, abiStrStartsWith, abiStrEndsWith, abiStrIndexOf, abiStrTrim, abiStrToUpper, abiStrToLower, abiStrSubstring, isScalar, utf8Len, leadByte } from runtime.abi_string
+import { wordsFor, abiStrLen, abiStrConcat, abiStrCmp, abiStrGet, abiStrSet, abiStrFromBool, abiStrFromByte, abiStrFromChar, abiStrToBytes, abiStrFromList, abiStrStartsWith, abiStrEndsWith, abiStrIndexOf, abiStrTrim, abiStrToUpper, abiStrToLower, abiStrSubstring, abiListJoin, isScalar, utf8Len, leadByte } from runtime.abi_string
 import { abiListNew, abiListLen, abiListGet, abiListPush } from runtime.abi_list
 import { abiBoxI64, abiUnboxI64 } from runtime.abi_box
 
@@ -447,4 +447,57 @@ test fn str_substring_uses_byte_offsets() {
     let tail = abiStrSubstring(x, 1, 3)
     expect(abiStrLen(tail)).toBe(2)
     expect(abiStrCmp(tail, bytes2(195, 169))).toBe(0)
+}
+
+fn strList(items: List<*int>) -> *int {
+    var l = abiListNew(0)
+    for (it in items) {
+        abiListPush(l, it)
+    }
+    return l
+}
+
+test fn list_join_of_an_empty_list_is_empty() {
+    let empty = abiListNew(0)
+    let sep = bytes1(44)
+    expect(abiStrLen(abiListJoin(empty, sep))).toBe(0)
+}
+
+test fn list_join_inserts_the_separator() {
+    // ["a", "b", "c"] joined with "," = "a,b,c"
+    let l = strList([bytes1(97), bytes1(98), bytes1(99)])
+    let j = abiListJoin(l, bytes1(44))
+    expect(abiStrLen(j)).toBe(5)
+    expect(abiStrCmp(j, abiStrConcat(bytes3(97, 44, 98), bytes2(44, 99)))).toBe(0)
+}
+
+test fn list_join_of_one_element_has_no_separator() {
+    let l = strList([bytes2(104, 105)])
+    let j = abiListJoin(l, bytes1(44))
+    expect(abiStrCmp(j, bytes2(104, 105))).toBe(0)
+    // A fresh string, not the element itself.
+    expect((j as int) == (abiListGet(l, 0) as int)).toBe(false)
+}
+
+test fn list_join_with_an_empty_separator_concatenates() {
+    let l = strList([bytes1(97), bytes1(98), bytes1(99)])
+    let empty = abiStrFromList(abiListNew(0))
+    expect(abiStrCmp(abiListJoin(l, empty), bytes3(97, 98, 99))).toBe(0)
+}
+
+test fn list_join_keeps_empty_elements() {
+    // ["", ""] joined with "," = ","
+    let empty = abiStrFromList(abiListNew(0))
+    let l = strList([empty, empty])
+    let j = abiListJoin(l, bytes1(44))
+    expect(abiStrLen(j)).toBe(1)
+    expect(abiStrCmp(j, bytes1(44))).toBe(0)
+}
+
+test fn list_join_copies_multibyte_elements_and_separator() {
+    // "<e-acute>|<u-umlaut>" = C3 A9 7C C3 BC
+    let l = strList([bytes2(195, 169), bytes2(195, 188)])
+    let j = abiListJoin(l, bytes1(124))
+    expect(abiStrLen(j)).toBe(5)
+    expect(abiStrCmp(j, abiStrConcat(bytes2(195, 169), abiStrConcat(bytes1(124), bytes2(195, 188))))).toBe(0)
 }
