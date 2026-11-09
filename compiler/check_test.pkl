@@ -809,3 +809,90 @@ test fn list_join_is_typed_as_string() {
     expect(len(msgs)).toBe(1)
     expect(countContaining(msgs, "`join` needs a `List<string>`")).toBe(1)
 }
+
+test fn string_split_replace_chars_are_typed() {
+    let ob = obrace()
+    let cb = cbrace()
+    let q = quote()
+
+    // `split` returns `List<string>`, so it indexes and reports `len`.
+    let msgs = checkSource("fn main() " + ob + "\n let ps = " + q + "a,b" + q + ".split(" + q + "," + q + ") \n println(ps.len()) \n println(ps[0]) \n " + cb)
+    expect(len(msgs)).toBe(0)
+
+    // `replace` returns `string`; `chars` returns `List<string>`.
+    let msgs = checkSource("fn main() " + ob + "\n println(" + q + "a-b" + q + ".replace(" + q + "-" + q + ", " + q + "+" + q + ").len()) \n println(" + q + "abc" + q + ".chars().len()) \n " + cb)
+    expect(len(msgs)).toBe(0)
+
+    // Arity.
+    let msgs = checkSource("fn main() " + ob + "\n println(" + q + "a" + q + ".split()) \n " + cb)
+    expect(len(msgs)).toBe(1)
+    expect(countContaining(msgs, "argument(s)")).toBe(1)
+
+    let msgs = checkSource("fn main() " + ob + "\n println(" + q + "a" + q + ".replace(" + q + "," + q + ")) \n " + cb)
+    expect(len(msgs)).toBe(1)
+    expect(countContaining(msgs, "argument(s)")).toBe(1)
+
+    let msgs = checkSource("fn main() " + ob + "\n println(" + q + "a" + q + ".chars(1)) \n " + cb)
+    expect(len(msgs)).toBe(1)
+    expect(countContaining(msgs, "too many arguments")).toBe(1)
+
+    // Argument types.
+    let msgs = checkSource("fn main() " + ob + "\n println(" + q + "a" + q + ".split(1)) \n " + cb)
+    expect(len(msgs)).toBe(1)
+    expect(countContaining(msgs, "type mismatch in argument")).toBe(1)
+
+    let msgs = checkSource("fn main() " + ob + "\n println(" + q + "a" + q + ".replace(1, " + q + "x" + q + ")) \n " + cb)
+    expect(len(msgs)).toBe(1)
+    expect(countContaining(msgs, "type mismatch in argument")).toBe(1)
+}
+
+test fn map_entries_is_typed_as_pairs() {
+    let ob = obrace()
+    let cb = cbrace()
+    let q = quote()
+
+    // `entries` is a `List<(K, V)>` of the map's key and value types.
+    let msgs = checkSource("fn main() " + ob + "\n let m = " + ob + q + "a" + q + ": 1" + cb + " \n let es: List<(string, int)> = m.entries() \n println(es.len()) \n " + cb)
+    expect(len(msgs)).toBe(0)
+
+    // The pairs destructure in a `for` header.
+    let msgs = checkSource("fn main() " + ob + "\n let m = " + ob + q + "a" + q + ": 1" + cb + " \n for ((k, v) in m.entries()) " + ob + "\n println(k) \n println(v) \n " + cb + " \n " + cb)
+    expect(len(msgs)).toBe(0)
+
+    // `entries` takes no arguments.
+    let msgs = checkSource("fn main() " + ob + "\n let m = " + ob + q + "a" + q + ": 1" + cb + " \n println(m.entries(1)) \n " + cb)
+    expect(len(msgs)).toBe(1)
+    expect(countContaining(msgs, "too many arguments")).toBe(1)
+}
+
+test fn option_members_are_typed() {
+    let ob = obrace()
+    let cb = cbrace()
+    let q = quote()
+
+    // `isSome`/`isNone` are `bool`, `unwrap`/`unwrapOr`/`expect` return the payload.
+    let msgs = checkSource("fn main() " + ob + "\n let o: int? = 5 \n println(o.isSome()) \n println(o.isNone()) \n println(o.unwrap()) \n println(o.unwrapOr(0)) \n println(o.expect(" + q + "boom" + q + ")) \n " + cb)
+    expect(len(msgs)).toBe(0)
+
+    // Arity.
+    let msgs = checkSource("fn main() " + ob + "\n let o: int? = 5 \n println(o.unwrapOr()) \n " + cb)
+    expect(len(msgs)).toBe(1)
+    expect(countContaining(msgs, "argument(s)")).toBe(1)
+
+    let msgs = checkSource("fn main() " + ob + "\n let o: int? = 5 \n println(o.expect()) \n " + cb)
+    expect(len(msgs)).toBe(1)
+    expect(countContaining(msgs, "argument(s)")).toBe(1)
+
+    let msgs = checkSource("fn main() " + ob + "\n let o: int? = 5 \n println(o.isSome(1)) \n " + cb)
+    expect(len(msgs)).toBe(1)
+    expect(countContaining(msgs, "too many arguments")).toBe(1)
+
+    // Argument types.
+    let msgs = checkSource("fn main() " + ob + "\n let o: int? = 5 \n println(o.unwrapOr(" + q + "x" + q + ")) \n " + cb)
+    expect(len(msgs)).toBe(1)
+    expect(countContaining(msgs, "type mismatch in argument")).toBe(1)
+
+    let msgs = checkSource("fn main() " + ob + "\n let o: int? = 5 \n println(o.expect(1)) \n " + cb)
+    expect(len(msgs)).toBe(1)
+    expect(countContaining(msgs, "type mismatch in argument")).toBe(1)
+}

@@ -1,6 +1,6 @@
 module runtime.abi_string_test
 
-import { wordsFor, abiStrLen, abiStrConcat, abiStrCmp, abiStrGet, abiStrSet, abiStrFromBool, abiStrFromByte, abiStrFromChar, abiStrToBytes, abiStrFromList, abiStrStartsWith, abiStrEndsWith, abiStrIndexOf, abiStrTrim, abiStrToUpper, abiStrToLower, abiStrSubstring, abiListJoin, isScalar, utf8Len, leadByte } from runtime.abi_string
+import { wordsFor, abiStrLen, abiStrConcat, abiStrCmp, abiStrGet, abiStrSet, abiStrFromBool, abiStrFromByte, abiStrFromChar, abiStrToBytes, abiStrFromList, abiStrStartsWith, abiStrEndsWith, abiStrIndexOf, abiStrTrim, abiStrToUpper, abiStrToLower, abiStrSubstring, abiStrSplit, abiStrReplace, abiStrChars, abiListJoin, isScalar, utf8Len, leadByte } from runtime.abi_string
 import { abiListNew, abiListLen, abiListGet, abiListPush } from runtime.abi_list
 import { abiBoxI64, abiUnboxI64 } from runtime.abi_box
 
@@ -500,4 +500,138 @@ test fn list_join_copies_multibyte_elements_and_separator() {
     let j = abiListJoin(l, bytes1(124))
     expect(abiStrLen(j)).toBe(5)
     expect(abiStrCmp(j, abiStrConcat(bytes2(195, 169), abiStrConcat(bytes1(124), bytes2(195, 188))))).toBe(0)
+}
+
+fn fieldAt(l: *int, i: int) -> *int {
+    return abiListGet(l, i)
+}
+
+test fn str_split_returns_the_fields() {
+    // "a,b,c" split on ","
+    let s = abiStrConcat(abiStrConcat(bytes2(97, 44), bytes2(98, 44)), bytes1(99))
+    let f = abiStrSplit(s, bytes1(44))
+    expect(abiListLen(f)).toBe(3)
+    expect(abiStrCmp(fieldAt(f, 0), bytes1(97))).toBe(0)
+    expect(abiStrCmp(fieldAt(f, 1), bytes1(98))).toBe(0)
+    expect(abiStrCmp(fieldAt(f, 2), bytes1(99))).toBe(0)
+}
+
+test fn str_split_keeps_empty_fields() {
+    // ",a,," has four fields: "", "a", "", ""
+    let s = abiStrConcat(bytes2(44, 97), bytes2(44, 44))
+    let f = abiStrSplit(s, bytes1(44))
+    expect(abiListLen(f)).toBe(4)
+    expect(abiStrLen(fieldAt(f, 0))).toBe(0)
+    expect(abiStrCmp(fieldAt(f, 1), bytes1(97))).toBe(0)
+    expect(abiStrLen(fieldAt(f, 2))).toBe(0)
+    expect(abiStrLen(fieldAt(f, 3))).toBe(0)
+}
+
+test fn str_split_without_a_match_is_the_whole_string() {
+    let f = abiStrSplit(bytes3(97, 98, 99), bytes1(44))
+    expect(abiListLen(f)).toBe(1)
+    expect(abiStrCmp(fieldAt(f, 0), bytes3(97, 98, 99))).toBe(0)
+}
+
+test fn str_split_of_empty_is_one_empty_field() {
+    let empty = abiStrFromList(abiListNew(0))
+    let f = abiStrSplit(empty, bytes1(44))
+    expect(abiListLen(f)).toBe(1)
+    expect(abiStrLen(fieldAt(f, 0))).toBe(0)
+}
+
+test fn str_split_with_empty_separator_is_the_whole_string() {
+    let f = abiStrSplit(bytes3(97, 98, 99), abiStrFromList(abiListNew(0)))
+    expect(abiListLen(f)).toBe(1)
+    expect(abiStrCmp(fieldAt(f, 0), bytes3(97, 98, 99))).toBe(0)
+}
+
+test fn str_split_matches_do_not_overlap() {
+    // "aaa" split on "aa" is ["", "a"]
+    let f = abiStrSplit(bytes3(97, 97, 97), bytes2(97, 97))
+    expect(abiListLen(f)).toBe(2)
+    expect(abiStrLen(fieldAt(f, 0))).toBe(0)
+    expect(abiStrCmp(fieldAt(f, 1), bytes1(97))).toBe(0)
+}
+
+test fn str_split_keeps_multibyte_fields_intact() {
+    // "<e-acute>,<u-umlaut>"
+    let s = abiStrConcat(bytes2(195, 169), abiStrConcat(bytes1(44), bytes2(195, 188)))
+    let f = abiStrSplit(s, bytes1(44))
+    expect(abiListLen(f)).toBe(2)
+    expect(abiStrCmp(fieldAt(f, 0), bytes2(195, 169))).toBe(0)
+    expect(abiStrCmp(fieldAt(f, 1), bytes2(195, 188))).toBe(0)
+}
+
+test fn str_replace_replaces_every_match() {
+    // "a-b-c" -> "a+b+c"
+    let s = abiStrConcat(abiStrConcat(bytes2(97, 45), bytes2(98, 45)), bytes1(99))
+    let r = abiStrReplace(s, bytes1(45), bytes1(43))
+    expect(abiStrLen(r)).toBe(5)
+    expect(abiStrCmp(r, abiStrConcat(abiStrConcat(bytes2(97, 43), bytes2(98, 43)), bytes1(99)))).toBe(0)
+}
+
+test fn str_replace_without_a_match_is_a_fresh_copy() {
+    let s = bytes3(97, 98, 99)
+    let r = abiStrReplace(s, bytes1(120), bytes1(121))
+    expect(abiStrCmp(r, s)).toBe(0)
+    expect((r as int) == (s as int)).toBe(false)
+}
+
+test fn str_replace_handles_longer_and_empty_replacements() {
+    // "a.b" -> "a::b"
+    let s = bytes3(97, 46, 98)
+    let r = abiStrReplace(s, bytes1(46), bytes2(58, 58))
+    expect(abiStrCmp(r, abiStrConcat(bytes2(97, 58), bytes2(58, 98)))).toBe(0)
+    // "abc" -> "ac"
+    let d = abiStrReplace(bytes3(97, 98, 99), bytes1(98), abiStrFromList(abiListNew(0)))
+    expect(abiStrCmp(d, bytes2(97, 99))).toBe(0)
+}
+
+test fn str_replace_with_empty_from_is_unchanged() {
+    let s = bytes3(97, 98, 99)
+    let r = abiStrReplace(s, abiStrFromList(abiListNew(0)), bytes1(88))
+    expect(abiStrCmp(r, s)).toBe(0)
+    expect((r as int) == (s as int)).toBe(false)
+}
+
+test fn str_replace_matches_do_not_overlap() {
+    // "aaa" replacing "aa" with "b" is "ba"
+    let r = abiStrReplace(bytes3(97, 97, 97), bytes2(97, 97), bytes1(98))
+    expect(abiStrCmp(r, bytes2(98, 97))).toBe(0)
+}
+
+test fn str_chars_splits_ascii() {
+    let c = abiStrChars(bytes3(97, 98, 99))
+    expect(abiListLen(c)).toBe(3)
+    expect(abiStrCmp(fieldAt(c, 0), bytes1(97))).toBe(0)
+    expect(abiStrCmp(fieldAt(c, 2), bytes1(99))).toBe(0)
+}
+
+test fn str_chars_keeps_multibyte_scalars_whole() {
+    // "a<e-acute>" -> "a", C3 A9
+    let c = abiStrChars(abiStrConcat(bytes1(97), bytes2(195, 169)))
+    expect(abiListLen(c)).toBe(2)
+    expect(abiStrCmp(fieldAt(c, 0), bytes1(97))).toBe(0)
+    expect(abiStrLen(fieldAt(c, 1))).toBe(2)
+    expect(abiStrCmp(fieldAt(c, 1), bytes2(195, 169))).toBe(0)
+}
+
+test fn str_chars_of_empty_is_empty() {
+    let c = abiStrChars(abiStrFromList(abiListNew(0)))
+    expect(abiListLen(c)).toBe(0)
+}
+
+test fn str_chars_treats_a_lone_continuation_byte_as_one_element() {
+    let c = abiStrChars(bytes1(169))
+    expect(abiListLen(c)).toBe(1)
+    expect(abiStrLen(fieldAt(c, 0))).toBe(1)
+    expect(abiStrCmp(fieldAt(c, 0), bytes1(169))).toBe(0)
+}
+
+test fn str_chars_clamps_a_truncated_sequence() {
+    // A two-byte lead with no continuation still makes progress.
+    let c = abiStrChars(bytes1(195))
+    expect(abiListLen(c)).toBe(1)
+    expect(abiStrLen(fieldAt(c, 0))).toBe(1)
 }

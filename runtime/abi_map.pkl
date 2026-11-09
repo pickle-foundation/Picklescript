@@ -70,6 +70,7 @@ import { HEADER, MAP_LEN_OFF, MAP_CAP_OFF, MAP_ENTRIES_OFF, MAP_OBJECT_SIZE } fr
 import { LIST_LEN_OFF, LIST_DATA_OFF, ENUM_TAG_OFF, ENUM_FIELDS_OFF, TUPLE_LEN_OFF } from runtime.layout
 import { boxBits } from runtime.abi_box
 import { abiListNew, abiListPush } from runtime.abi_list
+import { abiTupleNew, abiTupleSetField } from runtime.abi_tuple
 import { abiStrCmp, byteAt } from runtime.abi_string
 // The map object and its entry array both come from `alloc(int, n)`, so the
 // raw-allocation slots must travel with them. See `abi_raw.pkl`.
@@ -849,8 +850,41 @@ fn abiMapValues(map: *int) -> *int {
     return mapSnapshot(map, false)
 }
 
-/// Merge every live entry of `other` into `map`; `other` wins collisions.
+/// All live entries as a fresh `List<(K, V)>` of two-field tuples.
 ///
+/// BEYOND PARITY - `runtime/src/map.rs` has no entries; native code pairs the
+/// `keys`/`values` snapshots. The walk is over the entry table directly, using
+/// the same live-slot test `mapSnapshot`/`rehash` use, and each pair is a fresh
+/// two-field tuple whose fields are the stored pointers - the snapshot is
+/// shallow and unordered (entry-table order, which depends on hashing and
+/// insertion history). A stored `none` key surfaces as the null pointer, the
+/// representation the compiler's `T?` expects, exactly as `keys` does.
+#[symbol("pickle_map_entries")]
+fn abiMapEntries(map: *int) -> *int {
+    unsafe {
+        var l = abiListNew(0)
+        var cap = map[CAP_WORD]
+        var entries = map[ENTRIES_WORD] as *int
+        var i = 0
+        while (i < cap) {
+            var k = entries[i * 2]
+            if (isLiveKey(k)) {
+                var pair = abiTupleNew(2)
+                var key = k as *int
+                if (k == KEY_NONE) {
+                    key = 0 as *int
+                }
+                abiTupleSetField(pair, 0, key)
+                abiTupleSetField(pair, 1, entries[i * 2 + 1] as *int)
+                abiListPush(l, pair)
+            }
+            i = i + 1
+        }
+        return l
+    }
+}
+
+/// Merge every live entry of `other` into `map`; `other` wins collisions.///
 /// BEYOND PARITY - `runtime/src/map.rs` has no merge; native code spells it as a
 /// loop of `insert`. The walk is over `other`'s entry table directly - the same
 /// live-slot test `mapSnapshot`/`rehash` use - so no key list is allocated and

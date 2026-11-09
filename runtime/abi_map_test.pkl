@@ -10,9 +10,10 @@ module runtime.abi_map_test
 /// constants all reproduce the standard algorithm. `0xCBF29CE484222325` is written as
 /// `(0 - 0x340D631B7BDDDCDB)` because Pickle rejects literals above `i64::MAX`.
 
-import { abiMapNew, abiMapSet, abiMapGet, abiMapGetBoxed, abiMapHas, abiMapRemove, abiMapMerge } from runtime.abi_map
+import { abiMapNew, abiMapSet, abiMapGet, abiMapGetBoxed, abiMapHas, abiMapRemove, abiMapMerge, abiMapEntries } from runtime.abi_map
 import { abiMapLen, abiMapKeys, abiMapValues, keyHash, keyEq, deepHash, mapNew, entriesCount, needsGrow, isLiveKey, occupiedCount } from runtime.abi_map
 import { LEN_WORD, CAP_WORD, ENTRIES_WORD, GOLDEN, CYCLIC_HASH } from runtime.abi_map
+import { abiTupleField } from runtime.abi_tuple
 import { abiBoxI64, abiUnboxI64, abiBoxBool, newBox } from runtime.abi_box
 import { abiListLen, abiListGet, abiListPush, listNew } from runtime.abi_list
 import { abiStrFromI64, abiStrLen, newStr, byteInto } from runtime.abi_string
@@ -739,4 +740,60 @@ test fn merge_grows_the_destination_as_needed() {
     expect(abiMapLen(a)).toBe(40)
     expect(abiUnboxI64(abiMapGet(a, abiBoxI64(0)))).toBe(0)
     expect(abiUnboxI64(abiMapGet(a, abiBoxI64(39)))).toBe(78)
+}
+
+test fn entries_of_empty_map_is_empty() {
+    let l = abiMapEntries(abiMapNew(0))
+    expect(abiListLen(l)).toBe(0)
+}
+
+test fn entries_pairs_keys_with_values() {
+    var m = abiMapNew(0)
+    abiMapSet(m, mkAlpha(), abiBoxI64(1))
+    abiMapSet(m, mkBeta(), abiBoxI64(2))
+    let es = abiMapEntries(m)
+    expect(abiListLen(es)).toBe(2)
+    var i = 0
+    var sum = 0
+    while (i < abiListLen(es)) {
+        let pair = abiListGet(es, i)
+        let k = abiTupleField(pair, 0)
+        let v = abiTupleField(pair, 1)
+        sum = sum + abiUnboxI64(v)
+        // Each pair's key still resolves to the same value in the map.
+        expect(abiUnboxI64(abiMapGet(m, k))).toBe(abiUnboxI64(v))
+        i = i + 1
+    }
+    expect(sum).toBe(3)
+}
+
+test fn entries_are_shallow_pairs() {
+    let k = mkAlpha()
+    var m = abiMapNew(0)
+    abiMapSet(m, k, abiBoxI64(7))
+    let es = abiMapEntries(m)
+    let pair = abiListGet(es, 0)
+    expect((abiTupleField(pair, 0) as int) == (k as int)).toBe(true)
+    expect(abiUnboxI64(abiTupleField(pair, 1))).toBe(7)
+}
+
+test fn entries_surface_a_none_key_as_null() {
+    var m = abiMapNew(0)
+    abiMapSet(m, 0 as *int, abiBoxI64(9))
+    let es = abiMapEntries(m)
+    expect(abiListLen(es)).toBe(1)
+    let pair = abiListGet(es, 0)
+    expect(abiTupleField(pair, 0) as int).toBe(0)
+    expect(abiUnboxI64(abiTupleField(pair, 1))).toBe(9)
+}
+
+test fn entries_cover_every_live_slot_after_removal() {
+    var m = abiMapNew(0)
+    abiMapSet(m, mkAlpha(), abiBoxI64(1))
+    abiMapSet(m, mkBeta(), abiBoxI64(2))
+    abiMapRemove(m, mkAlpha())
+    let es = abiMapEntries(m)
+    expect(abiListLen(es)).toBe(1)
+    let pair = abiListGet(es, 0)
+    expect(abiUnboxI64(abiTupleField(pair, 1))).toBe(2)
 }

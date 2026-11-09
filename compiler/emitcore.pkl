@@ -5599,6 +5599,13 @@ var k = expr(em, args[0].value)
                             }
                             return externCallT1(em, "pickle_map_values", [IrTy.Ptr], IrTy.Ptr, [obj])
                         }
+                        case "entries" -> {
+                            if (!(len(args) == 0)) {
+                                bad(em, e.span, "`entries` takes no arguments")
+                                return none
+                            }
+                            return externCallT1(em, "pickle_map_entries", [IrTy.Ptr], IrTy.Ptr, [obj])
+                        }
                         case "len" -> {
                             if (!(len(args) == 0)) {
                                 bad(em, e.span, "`len` takes no arguments")
@@ -5679,6 +5686,31 @@ var k = expr(em, args[0].value)
         }
         if (isString) {
             return stringMethodCall(em, e, object, name, args)
+        }
+        var isOpt = false
+        var optInner = Ty.Unknown
+        if (let some(pt) = ot) {
+            match (pt) {
+                case Ty.Option(inner) -> {
+                    isOpt = true
+                    optInner = inner
+                }
+                // A read-only option method reads through an immutable
+                // `&T?` borrow; the value is already the managed pointer.
+                case Ty.Ref(inner) -> {
+                    match (inner) {
+                        case Ty.Option(oi) -> {
+                            isOpt = true
+                            optInner = oi
+                        }
+                        case _ -> {}
+                    }
+                }
+                case _ -> {}
+            }
+        }
+        if (isOpt) {
+            return optionMethodCall(em, e, object, name, args, optInner)
         }
         bad(em, e.span, "method calls on this type are not lowered yet")
         none
@@ -6915,6 +6947,48 @@ fn stringMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List
                     }
                     return none
                 }
+                case "split" -> {
+                    if (!(len(args) == 1)) {
+                        bad(em, e.span, "`split` takes one separator argument")
+                        return none
+                    }
+                    var sep = expr(em, args[0].value)
+                    if (let some(sep) = sep) {
+                        if (isBorrowed) {
+                            return externCallT1(em, "pickle_str_split", [IrTy.Ptr, IrTy.Str], IrTy.Ptr, [obj, sep])
+                        }
+                        return externCallT1(em, "pickle_str_split", [IrTy.Str, IrTy.Str], IrTy.Ptr, [obj, sep])
+                    }
+                    return none
+                }
+                case "replace" -> {
+                    if (!(len(args) == 2)) {
+                        bad(em, e.span, "`replace` takes a `from` and a `to` string")
+                        return none
+                    }
+                    var needle = expr(em, args[0].value)
+                    if (let some(needle) = needle) {
+                        var repl = expr(em, args[1].value)
+                        if (let some(repl) = repl) {
+                            if (isBorrowed) {
+                                return externCallT1(em, "pickle_str_replace", [IrTy.Ptr, IrTy.Str, IrTy.Str], IrTy.Str, [obj, needle, repl])
+                            }
+                            return externCallT1(em, "pickle_str_replace", [IrTy.Str, IrTy.Str, IrTy.Str], IrTy.Str, [obj, needle, repl])
+                        }
+                        return none
+                    }
+                    return none
+                }
+                case "chars" -> {
+                    if (!(len(args) == 0)) {
+                        bad(em, e.span, "`chars` takes no arguments")
+                        return none
+                    }
+                    if (isBorrowed) {
+                        return externCallT1(em, "pickle_str_chars", [IrTy.Ptr], IrTy.Ptr, [obj])
+                    }
+                    return externCallT1(em, "pickle_str_chars", [IrTy.Str], IrTy.Ptr, [obj])
+                }
                 case _ -> {
                     bad(em, e.span, "`" + name + "` method on `string` is not lowered yet")
                     return none
@@ -6922,6 +6996,167 @@ fn stringMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List
             }
         }
         none
+    }
+
+    /// Builtin members on an `Option<T>` receiver: `isSome`, `isNone`,
+    /// `unwrap`, `unwrapOr`, `expect`.
+    ///
+    /// The runtime representation of `T?` is a nullable managed pointer, so
+    /// presence is a null test and the payload is the pointer itself (scalars
+    /// are boxed). `unwrap` reuses the `x?` lowering; `unwrapOr` and `expect`
+    /// evaluate their argument eagerly, matching native argument evaluation,
+    /// and only use it on the absent branch.
+fn optionMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List<CallArg>, inner: Ty) -> int? {
+        if (name == "isSome" || name == "isNone") {
+            if (!(len(args) == 0)) {
+                bad(em, e.span, "`" + name + "` takes no arguments")
+                return none
+            }
+            var o = expr(em, object)
+            if (let some(o) = o) {
+                if (name == "isSome") {
+                    return optIsPresent(em, o)
+                }
+                var nul = nullTemp(em)
+                if (let some(nul) = nul) {
+                    var dst = temp(em)
+                    instr(em, IrInstr.BinOp(dst, IrBinOp.Eq, o, nul))
+                    return dst
+                }
+                return none
+            }
+            return none
+        }
+        if (name == "unwrap") {
+            if (!(len(args) == 0)) {
+                bad(em, e.span, "`unwrap` takes no arguments")
+                return none
+            }
+            return optUnwrap(em, e, object)
+        }
+        if (name == "unwrapOr") {
+            if (!(len(args) == 1)) {
+                bad(em, e.span, "`unwrapOr` takes one default value")
+                return none
+            }
+            return optUnwrapOr(em, e, object, args[0].value, inner)
+        }
+        if (name == "expect") {
+            if (!(len(args) == 1)) {
+                bad(em, e.span, "`expect` takes one message argument")
+                return none
+            }
+            return optExpect(em, e, object, args[0].value, inner)
+        }
+        bad(em, e.span, "`" + name + "` method on an `Option` is not lowered yet")
+        none
+    }
+
+    /// `x.unwrapOr(d)`: the payload of `x`, or `d` when `x` is `none`.
+fn optUnwrapOr(em: Emitter, e: Expr, object: Expr, def: Expr, inner: Ty) -> int? {
+        var resIr0 = mapTy(em, inner, e.span)
+        if (let none = resIr0) {
+            return none
+        }
+        var resIr = IrTy.Unit
+        if (let some(x) = resIr0) {
+            resIr = x
+        }
+        var resSlot = newSlot(em, resIr)
+        var a0 = expr(em, object)
+        if (let none = a0) {
+            return none
+        }
+        var a = 0
+        if (let some(v) = a0) {
+            a = v
+        }
+        var d0 = expr(em, def)
+        if (let none = d0) {
+            return none
+        }
+        var d = 0
+        if (let some(v) = d0) {
+            d = v
+        }
+        var present0 = optIsPresent(em, a)
+        if (let none = present0) {
+            return none
+        }
+        var present = 0
+        if (let some(p) = present0) {
+            present = p
+        }
+        var someId = newBlock(em)
+        var noneId = newBlock(em)
+        var join = newBlock(em)
+        term(em, IrTerm.BranchIf(present, someId, noneId))
+        em.cur = noneId
+        instr(em, IrInstr.StoreSlot(resSlot, d))
+        term(em, IrTerm.Branch(join))
+        em.cur = someId
+        var v = optResolve(em, a, inner, e.span)
+        if (let some(v) = v) {
+            instr(em, IrInstr.StoreSlot(resSlot, v))
+            term(em, IrTerm.Branch(join))
+            em.cur = join
+            return load(em, resSlot)
+        }
+        return none
+    }
+
+    /// `x.expect(msg)`: the payload of `x`, or a fatal panic carrying `msg`
+    /// when `x` is `none`.
+fn optExpect(em: Emitter, e: Expr, object: Expr, msg: Expr, inner: Ty) -> int? {
+        var resIr0 = mapTy(em, inner, e.span)
+        if (let none = resIr0) {
+            return none
+        }
+        var resIr = IrTy.Unit
+        if (let some(x) = resIr0) {
+            resIr = x
+        }
+        var resSlot = newSlot(em, resIr)
+        var a0 = expr(em, object)
+        if (let none = a0) {
+            return none
+        }
+        var a = 0
+        if (let some(v) = a0) {
+            a = v
+        }
+        var m0 = expr(em, msg)
+        if (let none = m0) {
+            return none
+        }
+        var m = 0
+        if (let some(v) = m0) {
+            m = v
+        }
+        var present0 = optIsPresent(em, a)
+        if (let none = present0) {
+            return none
+        }
+        var present = 0
+        if (let some(p) = present0) {
+            present = p
+        }
+        var someId = newBlock(em)
+        var noneId = newBlock(em)
+        var join = newBlock(em)
+        term(em, IrTerm.BranchIf(present, someId, noneId))
+        em.cur = noneId
+        externCallVoid(em, "pickle_panic_none_expect", [IrTy.Str], [m])
+        term(em, IrTerm.Branch(join))
+        em.cur = someId
+        var v = optResolve(em, a, inner, e.span)
+        if (let some(v) = v) {
+            instr(em, IrInstr.StoreSlot(resSlot, v))
+            term(em, IrTerm.Branch(join))
+            em.cur = join
+            return load(em, resSlot)
+        }
+        return none
     }
 
     /// Whether a registered class (or one of its ancestors) directly declared

@@ -482,6 +482,145 @@ fn abiListJoin(list: *int, sep: *int) -> *int {
     }
 }
 
+/// Split `s` on every non-overlapping occurrence of `sep`.
+///
+/// BEYOND PARITY - `runtime/src/strings.rs` has no split. The scan is the same
+/// raw byte run `contains`/`indexOf` use, left to right, and matches do not
+/// overlap (`"aaa".split("aa")` is `["", "a"]`). The field list always has at
+/// least one element: no match yields the whole string, a leading/trailing
+/// separator yields an empty leading/trailing field, and an empty `s` yields
+/// `[""]`. An empty separator has no split point, so it yields `[s]` - a total
+/// rule chosen over the native `str::split("")` char walk, which has no
+/// byte-offset meaning here.
+#[symbol("pickle_str_split")]
+fn abiStrSplit(s: *int, sep: *int) -> *int {
+    unsafe {
+        var n = abiStrLen(s)
+        var sn = abiStrLen(sep)
+        var out = abiListNew(0)
+        if (sn == 0) {
+            abiListPush(out, abiStrSubstring(s, 0, n))
+            return out
+        }
+        var start = 0
+        var i = 0
+        var last = n - sn
+        while (i <= last) {
+            if (strMatchAt(s, i, sep, sn)) {
+                abiListPush(out, abiStrSubstring(s, start, i))
+                i = i + sn
+                start = i
+            } else {
+                i = i + 1
+            }
+        }
+        abiListPush(out, abiStrSubstring(s, start, n))
+        return out
+    }
+}
+
+/// Replace every non-overlapping occurrence of `needle` in `s` with `repl`.
+///
+/// BEYOND PARITY - `runtime/src/strings.rs` has no replace. The scan is left to
+/// right and non-overlapping, so `"aaa".replace("aa", "b")` is `"ba"`. The body
+/// counts the matches first, allocates the exact result length, then copies -
+/// one fresh string, no growth loop. An empty `needle` has no match, so the
+/// result is a fresh copy of `s` (rather than the infinite insertion native
+/// `str::replace` avoids by matching empty runs).
+#[symbol("pickle_str_replace")]
+fn abiStrReplace(s: *int, needle: *int, repl: *int) -> *int {
+    unsafe {
+        var n = abiStrLen(s)
+        var fl = abiStrLen(needle)
+        if (fl == 0) {
+            return abiStrSubstring(s, 0, n)
+        }
+        var tl = abiStrLen(repl)
+        var count = 0
+        var i = 0
+        var last = n - fl
+        while (i <= last) {
+            if (strMatchAt(s, i, needle, fl)) {
+                count = count + 1
+                i = i + fl
+            } else {
+                i = i + 1
+            }
+        }
+        if (count == 0) {
+            return abiStrSubstring(s, 0, n)
+        }
+        var out = newStr(n - count * fl + count * tl)
+        var pos = 0
+        var src = 0
+        var j = 0
+        while (j <= last) {
+            if (strMatchAt(s, j, needle, fl)) {
+                var a = src
+                while (a < j) {
+                    byteInto(out, pos, byteAt(s, a))
+                    pos = pos + 1
+                    a = a + 1
+                }
+                var k = 0
+                while (k < tl) {
+                    byteInto(out, pos, byteAt(repl, k))
+                    pos = pos + 1
+                    k = k + 1
+                }
+                j = j + fl
+                src = j
+            } else {
+                j = j + 1
+            }
+        }
+        var m = src
+        while (m < n) {
+            byteInto(out, pos, byteAt(s, m))
+            pos = pos + 1
+            m = m + 1
+        }
+        return out
+    }
+}
+
+/// Split `s` into one string per UTF-8 scalar.
+///
+/// BEYOND PARITY - `runtime/src/strings.rs` has no chars. The walk reads a lead
+/// byte, derives the sequence length from its prefix (`0xxxxxxx`, `110xxxxx`,
+/// `1110xxxx`, `11110xxx`), and clamps it to the remaining bytes, so the loop
+/// always advances. A continuation byte or an over-long lead byte that does not
+/// fit is therefore its own one-byte element instead of a stall - the result is
+/// a partition of the input bytes, valid UTF-8 or not. An empty `s` yields an
+/// empty list.
+#[symbol("pickle_str_chars")]
+fn abiStrChars(s: *int) -> *int {
+    unsafe {
+        var n = abiStrLen(s)
+        var out = abiListNew(0)
+        var i = 0
+        while (i < n) {
+            var b = byteAt(s, i)
+            var k = 1
+            if (b >= 192 && b < 224) {
+                k = 2
+            }
+            if (b >= 224 && b < 240) {
+                k = 3
+            }
+            if (b >= 240 && b < 248) {
+                k = 4
+            }
+            if (i + k > n) {
+                k = n - i
+            }
+            abiListPush(out, abiStrSubstring(s, i, i + k))
+            i = i + k
+        }
+        return out
+    }
+}
+
 /// Decimal text for an `i64`. Mirrors `strings.rs::int64_to_string`.
 ///
 /// The reference takes the magnitude `unsigned_abs`, so `i64::MIN` is formatted
