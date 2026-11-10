@@ -6588,7 +6588,7 @@ fn listMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List<C
         }
         // Only the read-only methods read through an immutable borrow; the
         // mutators would write through `&List`, so they keep bailing.
-        if (isBorrowed && name != "contains" && name != "indexOf" && name != "len" && name != "isEmpty" && name != "slice" && name != "join" && name != "map" && name != "filter" && name != "any" && name != "all" && name != "find" && name != "count") {
+        if (isBorrowed && name != "contains" && name != "indexOf" && name != "len" && name != "isEmpty" && name != "slice" && name != "join" && name != "map" && name != "filter" && name != "any" && name != "all" && name != "find" && name != "count" && name != "take" && name != "skip" && name != "first" && name != "last") {
             bad(em, e.span, "`" + name + "` mutates a `List` through an immutable reference (`&List`)")
             return none
         }
@@ -6843,6 +6843,43 @@ fn listMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List<C
                         return none
                     }
                     return listQueryCall(em, e, obj, "count", args[0].value, elem)
+                }
+                case "take" -> {
+                    if (!(len(args) == 1)) {
+                        bad(em, e.span, "`take` takes one count argument")
+                        return none
+                    }
+                    var n = expr(em, args[0].value)
+                    if (let some(n) = n) {
+                        return externCallT1(em, "pickle_list_slice", [IrTy.Ptr, IrTy.Int, IrTy.Int], IrTy.Ptr, [obj, intConst(em, 0), n])
+                    }
+                    return none
+                }
+                case "skip" -> {
+                    if (!(len(args) == 1)) {
+                        bad(em, e.span, "`skip` takes one count argument")
+                        return none
+                    }
+                    var n = expr(em, args[0].value)
+                    if (let some(n) = n) {
+                        var total = externCallT1(em, "pickle_list_len", [IrTy.Ptr], IrTy.Int, [obj])
+                        return externCallT1(em, "pickle_list_slice", [IrTy.Ptr, IrTy.Int, IrTy.Int], IrTy.Ptr, [obj, n, total])
+                    }
+                    return none
+                }
+                case "first" -> {
+                    if (!(len(args) == 0)) {
+                        bad(em, e.span, "`first` takes no arguments")
+                        return none
+                    }
+                    return externCallT1(em, "pickle_list_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [obj, intConst(em, 0)])
+                }
+                case "last" -> {
+                    if (!(len(args) == 0)) {
+                        bad(em, e.span, "`last` takes no arguments")
+                        return none
+                    }
+                    return externCallT1(em, "pickle_list_last", [IrTy.Ptr], IrTy.Ptr, [obj])
                 }
                 case _ -> {
                     bad(em, e.span, "`" + name + "` method on `List` is not lowered yet")
