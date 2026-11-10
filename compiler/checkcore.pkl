@@ -1291,6 +1291,9 @@ fn checkCall(ck: Checker, e: Expr, callee: Expr, args: List<CallArg>) -> Ty {
             if (bn == "str") {
                 return checkStr(ck, e, args)
             }
+            if (bn == "format") {
+                return checkFormat(ck, e, args)
+            }
             if (bn == "range") {
                 return checkRange(ck, e, args)
             }
@@ -3233,6 +3236,56 @@ fn checkStr(ck: Checker, e: Expr, args: List<CallArg>) -> Ty {
                 Ty.Unknown
             }
         }
+}
+
+/// `format(template, args...)`: the first argument is a `string` template with
+/// `%s` placeholders (and `%%` for a literal percent); every later argument is
+/// stringified at the call site and spliced in, in order. The variadic tail is
+/// why this is a builtin rather than a declared function: user-defined rest
+/// parameters are still a parity bail.
+fn checkFormat(ck: Checker, e: Expr, args: List<CallArg>) -> Ty {
+        if (len(args) < 1) {
+            err(ck, e.span, "`format(template, args...)` takes a template and optional arguments")
+            return Ty.Unknown
+        }
+        var badShape = false
+        for (a in args) {
+            if (!isNoneStr(a.name) || a.spread) {
+                badShape = true
+            }
+        }
+        if (badShape) {
+            err(ck, e.span, "`format` takes only plain positional arguments")
+            for (a in args) {
+                let _ = checkExpr(ck, a.value)
+            }
+            return Ty.Unknown
+        }
+        let t0 = checkExpr(ck, args[0].value)
+        if (!(t0 == Ty.String || t0 == Ty.Unknown)) {
+            err(ck, args[0].value.span, "`format` requires a `string` template")
+        }
+        var i = 1
+        while (i < len(args)) {
+            let at = checkExpr(ck, args[i].value)
+            match (at) {
+                case Ty.Int -> {}
+                case Ty.Float -> {}
+                case Ty.Bool -> {}
+                case Ty.Char -> {}
+                case Ty.Byte -> {}
+                case Ty.String -> {}
+                case Ty.Unknown -> {}
+                case Ty.List(inner) -> {
+                    if (!(inner == Ty.Byte)) {
+                        err(ck, args[i].value.span, "`format` cannot stringify `{bareName(at)}`")
+                    }
+                }
+                case _ -> err(ck, args[i].value.span, "`format` cannot stringify `{bareName(at)}`")
+            }
+            i = i + 1
+        }
+        Ty.String
 }
 
 fn checkBytes(ck: Checker, e: Expr, args: List<CallArg>) -> Ty {

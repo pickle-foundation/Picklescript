@@ -1,6 +1,6 @@
 module runtime.abi_string_test
 
-import { wordsFor, abiStrLen, abiStrConcat, abiStrCmp, abiStrGet, abiStrSet, abiStrFromBool, abiStrFromByte, abiStrFromChar, abiStrToBytes, abiStrFromList, abiStrStartsWith, abiStrEndsWith, abiStrIndexOf, abiStrTrim, abiStrToUpper, abiStrToLower, abiStrSubstring, abiStrSplit, abiStrReplace, abiStrChars, abiListJoin, isScalar, utf8Len, leadByte } from runtime.abi_string
+import { wordsFor, abiStrLen, abiStrConcat, abiStrCmp, abiStrGet, abiStrSet, abiStrFromBool, abiStrFromByte, abiStrFromChar, abiStrToBytes, abiStrFromList, abiStrStartsWith, abiStrEndsWith, abiStrIndexOf, abiStrTrim, abiStrToUpper, abiStrToLower, abiStrSubstring, abiStrSplit, abiStrReplace, abiStrChars, abiStrFormat, abiListJoin, isScalar, utf8Len, leadByte } from runtime.abi_string
 import { abiListNew, abiListLen, abiListGet, abiListPush } from runtime.abi_list
 import { abiBoxI64, abiUnboxI64 } from runtime.abi_box
 
@@ -25,6 +25,10 @@ fn bytes2(a: int, b: int) -> *int {
 
 fn bytes3(a: int, b: int, c: int) -> *int {
     return abiStrConcat(bytes2(a, b), abiStrFromByte(c))
+}
+
+fn bytes4(a: int, b: int, c: int, d: int) -> *int {
+    return abiStrConcat(bytes2(a, b), bytes2(c, d))
 }
 
 test fn wordsFor_rounds_up_to_whole_words() {
@@ -634,4 +638,53 @@ test fn str_chars_clamps_a_truncated_sequence() {
     let c = abiStrChars(bytes1(195))
     expect(abiListLen(c)).toBe(1)
     expect(abiStrLen(fieldAt(c, 0))).toBe(1)
+}
+
+test fn str_format_substitutes_one_slot() {
+    // "a%s" with ["b"] = "ab"
+    let f = abiStrFormat(bytes3(97, 37, 115), strList([bytes1(98)]))
+    expect(abiStrCmp(f, bytes2(97, 98))).toBe(0)
+}
+
+test fn str_format_joins_multiple_slots() {
+    // "%s%s" with ["a", "b"] = "ab"
+    let f = abiStrFormat(bytes4(37, 115, 37, 115), strList([bytes1(97), bytes1(98)]))
+    expect(abiStrCmp(f, bytes2(97, 98))).toBe(0)
+}
+
+test fn str_format_keeps_text_around_slots() {
+    // "a%sb" with ["-"] = "a-b"
+    let f = abiStrFormat(bytes4(97, 37, 115, 98), strList([bytes1(45)]))
+    expect(abiStrCmp(f, bytes3(97, 45, 98))).toBe(0)
+}
+
+test fn str_format_escapes_a_percent() {
+    // "100%%" = "100%"
+    let t = abiStrConcat(bytes3(49, 48, 48), bytes2(37, 37))
+    let f = abiStrFormat(t, abiListNew(0))
+    expect(abiStrCmp(f, bytes4(49, 48, 48, 37))).toBe(0)
+}
+
+test fn str_format_copies_unknown_percent_sequences() {
+    // "%x" is not a slot, so it survives unchanged.
+    let f = abiStrFormat(bytes2(37, 120), abiListNew(0))
+    expect(abiStrCmp(f, bytes2(37, 120))).toBe(0)
+}
+
+test fn str_format_leaves_missing_slots_literal() {
+    // "%s%s" with ["a"] = "a%s"
+    let f = abiStrFormat(bytes4(37, 115, 37, 115), strList([bytes1(97)]))
+    expect(abiStrCmp(f, bytes3(97, 37, 115))).toBe(0)
+    expect(abiStrLen(f)).toBe(3)
+}
+
+test fn str_format_ignores_extra_parts() {
+    // "%s" with ["a", "b"] = "a"
+    let f = abiStrFormat(bytes2(37, 115), strList([bytes1(97), bytes1(98)]))
+    expect(abiStrCmp(f, bytes1(97))).toBe(0)
+}
+
+test fn str_format_of_a_template_without_slots_copies_it() {
+    let f = abiStrFormat(bytes2(104, 105), strList([bytes1(97)]))
+    expect(abiStrCmp(f, bytes2(104, 105))).toBe(0)
 }

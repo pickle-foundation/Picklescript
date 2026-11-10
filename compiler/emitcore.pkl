@@ -330,6 +330,47 @@ case Lit.None -> {
         }
     }
 
+    /// Stringify one `format` argument into a fresh `string` temp. Mirrors the
+    /// scalar conversions `str(x)` and string interpolation use, plus
+    /// `List<byte>` through `pickle_str_from_list`. `string` passes through
+    /// unchanged. Any other type is a diagnostic (`format` is total for the
+    /// scalar kinds and byte lists only).
+fn formatArgStr(em: Emitter, e: Expr) -> int? {
+        var v = -1
+        if (let some(vv) = expr(em, e)) {
+            v = vv
+        } else {
+            return none
+        }
+        var isByteList = false
+        if (let some(gt) = tyOf(em, e.span)) {
+            match (gt) {
+                case Ty.List(inner) -> {
+                    match (inner) {
+                        case Ty.Byte -> isByteList = true
+                        case _ -> {}
+                    }
+                }
+                case _ -> {}
+            }
+        }
+        if (isByteList) {
+            return externCallT1(em, "pickle_str_from_list", [IrTy.Ptr], IrTy.Str, [v])
+        }
+        if (let some(iv) = irty(em, e.span)) {
+            match (iv) {
+                case IrTy.Int -> { return externCallT1(em, "pickle_str_from_i64", [IrTy.Int], IrTy.Str, [v]) }
+                case IrTy.Float -> { return externCallT1(em, "pickle_str_from_f64", [IrTy.Float], IrTy.Str, [v]) }
+                case IrTy.Bool -> { return externCallT1(em, "pickle_str_from_bool", [IrTy.Bool], IrTy.Str, [v]) }
+                case IrTy.Char -> { return externCallT1(em, "pickle_str_from_char", [IrTy.Char], IrTy.Str, [v]) }
+                case IrTy.Str -> { return v }
+                case _ -> {}
+            }
+        }
+        bad(em, e.span, "`format` cannot stringify this argument type")
+        none
+    }
+
     // ---- expression hub ----
 
     /// The expression lowering hub (mirror of `expr` in emit.rs). Kinds whose
@@ -4563,6 +4604,44 @@ case "print" | "println" -> {
                 term(em, IrTerm.Branch(join))
                 em.cur = join
                 return load(em, resSlot)
+            }
+            case "format" -> {
+                if (len(args) < 1) {
+                    bad(em, e.span, "`format(template, args...)` takes a template and optional arguments")
+                    return none
+                }
+                var shaped = false
+                for (a in args) {
+                    if (a.spread) {
+                        shaped = true
+                    }
+                    if (let some(_) = a.name) {
+                        shaped = true
+                    }
+                }
+                if (shaped) {
+                    bad(em, e.span, "`format` takes only plain positional arguments")
+                    return none
+                }
+                var tpl = -1
+                if (let some(tv) = expr(em, args[0].value)) {
+                    tpl = tv
+                } else {
+                    return none
+                }
+                var cap = intConst(em, len(args) - 1)
+                var parts = externCallT1(em, "pickle_list_new", [IrTy.Int], IrTy.Ptr, [cap])
+                var ai = 1
+                while (ai < len(args)) {
+                    var sv = formatArgStr(em, args[ai].value)
+                    if (let some(s) = sv) {
+                        externCallVoid(em, "pickle_list_push", [IrTy.Ptr, IrTy.Ptr], [parts, s])
+                    } else {
+                        return none
+                    }
+                    ai = ai + 1
+                }
+                return externCallT1(em, "pickle_str_format", [IrTy.Ptr, IrTy.Ptr], IrTy.Str, [tpl, parts])
             }
             case "str" -> {
                 if (!(len(args) == 1)) {

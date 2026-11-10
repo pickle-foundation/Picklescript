@@ -963,3 +963,78 @@ fn abiStrCmp(a: *int, b: *int) -> int {
         return 1
     }
 }
+
+/// Substitute `%s` placeholders in `template` with the elements of `parts`, in
+/// order, producing one fresh string.
+///
+/// BEYOND PARITY - `runtime/src/strings.rs` has no format. The compiler
+/// stringifies every argument first (through the same `pickle_str_from_*`
+/// helpers interpolation uses) and passes a `List<string>`, so this body only
+/// has to splice text and parts.
+///
+/// Placeholder rules, chosen to stay total and byte-oriented:
+///   * `%s` consumes the next part. With no part left, the two bytes are copied
+///     literally, so `format("%s%s", "a")` is `"a%s"` rather than a panic.
+///   * `%%` emits one `%`.
+///   * Any other `%` (including a trailing one) is copied verbatim, so a lone
+///     percent never swallows the next byte.
+///   * Extra parts past the last placeholder are ignored.
+///
+/// The template is a RUNTIME string, so it is not subject to string-literal
+/// interpolation; callers write `format("x = %s", x)`. A literal `%` is `%%`.
+///
+/// The scan splits the template into text runs and part strings, pushes them in
+/// order onto a segment list, and reuses `abiListJoin` with an empty separator,
+/// so the result is measured and allocated exactly once. `newStr(0)` supplies
+/// the empty separator - a `""` literal here would route back through the body
+/// being defined (see TRAP 3 on `abiStrFromBytes`).
+#[symbol("pickle_str_format")]
+fn abiStrFormat(template: *int, parts: *int) -> *int {
+    unsafe {
+        var tn = abiStrLen(template)
+        var pn = abiListLen(parts)
+        var segs = abiListNew(0)
+        var start = 0
+        var i = 0
+        var pi = 0
+        while (i < tn) {
+            if (byteAt(template, i) == 37) {
+                var pct = false
+                var slot = false
+                if (i + 1 < tn) {
+                    var nb = byteAt(template, i + 1)
+                    if (nb == 37) {
+                        pct = true
+                    }
+                    if (nb == 115) {
+                        slot = true
+                    }
+                }
+                if (pct) {
+                    if (i > start) {
+                        abiListPush(segs, abiStrSubstring(template, start, i))
+                    }
+                    abiListPush(segs, abiStrSubstring(template, i, i + 1))
+                    i = i + 2
+                    start = i
+                    continue
+                }
+                if (slot && pi < pn) {
+                    if (i > start) {
+                        abiListPush(segs, abiStrSubstring(template, start, i))
+                    }
+                    abiListPush(segs, abiListGet(parts, pi))
+                    pi = pi + 1
+                    i = i + 2
+                    start = i
+                    continue
+                }
+            }
+            i = i + 1
+        }
+        if (tn > start) {
+            abiListPush(segs, abiStrSubstring(template, start, tn))
+        }
+        return abiListJoin(segs, newStr(0))
+    }
+}
