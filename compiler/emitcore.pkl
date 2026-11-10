@@ -6588,7 +6588,7 @@ fn listMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List<C
         }
         // Only the read-only methods read through an immutable borrow; the
         // mutators would write through `&List`, so they keep bailing.
-        if (isBorrowed && name != "contains" && name != "indexOf" && name != "len" && name != "isEmpty" && name != "slice" && name != "join" && name != "map" && name != "filter") {
+        if (isBorrowed && name != "contains" && name != "indexOf" && name != "len" && name != "isEmpty" && name != "slice" && name != "join" && name != "map" && name != "filter" && name != "any" && name != "all" && name != "find" && name != "count") {
             bad(em, e.span, "`" + name + "` mutates a `List` through an immutable reference (`&List`)")
             return none
         }
@@ -6816,6 +6816,34 @@ fn listMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List<C
                     }
                     return listMapFilterCall(em, e, obj, "filter", args[0].value, elem)
                 }
+                case "any" -> {
+                    if (!(len(args) == 1)) {
+                        bad(em, e.span, "`any` takes one function argument")
+                        return none
+                    }
+                    return listQueryCall(em, e, obj, "any", args[0].value, elem)
+                }
+                case "all" -> {
+                    if (!(len(args) == 1)) {
+                        bad(em, e.span, "`all` takes one function argument")
+                        return none
+                    }
+                    return listQueryCall(em, e, obj, "all", args[0].value, elem)
+                }
+                case "find" -> {
+                    if (!(len(args) == 1)) {
+                        bad(em, e.span, "`find` takes one function argument")
+                        return none
+                    }
+                    return listQueryCall(em, e, obj, "find", args[0].value, elem)
+                }
+                case "count" -> {
+                    if (!(len(args) == 1)) {
+                        bad(em, e.span, "`count` takes one function argument")
+                        return none
+                    }
+                    return listQueryCall(em, e, obj, "count", args[0].value, elem)
+                }
                 case _ -> {
                     bad(em, e.span, "`" + name + "` method on `List` is not lowered yet")
                     return none
@@ -6948,6 +6976,149 @@ fn listMapFilterCall(em: Emitter, e: Expr, obj: int, name: string, f: Expr, elem
         term(em, IrTerm.Branch(condId))
         em.cur = endId
         out
+    }
+
+    /// `xs.any(f)` / `xs.all(f)` / `xs.find(f)` / `xs.count(f)`: walk the
+    /// receiver by index and call the predicate per element. `any` stops at the
+    /// first true, `all` at the first false, `find` returns the first matching
+    /// element as an option (the stored pointer already has option shape), and
+    /// `count` tallies matches over the whole list. Read-only, like `map`.
+fn listQueryCall(em: Emitter, e: Expr, obj: int, name: string, f: Expr, elem: Ty) -> int? {
+        var fty0 = tyOf(em, f.span)
+        if (let none = fty0) {
+            bad(em, f.span, "`" + name + "` needs a function argument")
+            return none
+        }
+        var fty = Ty.Unknown
+        if (let some(t) = fty0) {
+            fty = t
+        }
+        var prt = Ty.Unknown
+        var isFn = false
+        match (fty) {
+            case Ty.Fn(_, r) -> {
+                prt = r
+                isFn = true
+            }
+            case _ -> {}
+        }
+        if (!isFn) {
+            bad(em, f.span, "`" + name + "` needs a one-argument function")
+            return none
+        }
+        if (prt != Ty.Bool) {
+            bad(em, f.span, "`" + name + "` needs a callback returning `bool`, found `" + bareName(prt) + "`")
+            return none
+        }
+        var rp = elemRep(em, elem, e.span)
+        if (let none = rp) {
+            return none
+        }
+        var rep = ElemRep.ptr()
+        if (let some(r) = rp) {
+            rep = r
+        }
+        var fv0 = expr(em, f)
+        if (let none = fv0) {
+            return none
+        }
+        var fv = 0
+        if (let some(v) = fv0) {
+            fv = v
+        }
+        var cap = externCallT1(em, "pickle_list_len", [IrTy.Ptr], IrTy.Int, [obj])
+        var idxSlot = newSlot(em, IrTy.Int)
+        var lenSlot = newSlot(em, IrTy.Int)
+        var zero = temp(em)
+        instr(em, IrInstr.Const(zero, IrConst.Int(0)))
+        instr(em, IrInstr.StoreSlot(idxSlot, zero))
+        instr(em, IrInstr.StoreSlot(lenSlot, cap))
+        var isFind = name == "find"
+        var isCount = name == "count"
+        var resTy = IrTy.Bool
+        if (isFind) {
+            resTy = IrTy.Ptr
+        }
+        if (isCount) {
+            resTy = IrTy.Int
+        }
+        var resSlot = newSlot(em, resTy)
+        var init = boolConst(em, name == "all")
+        if (isFind) {
+            var nul = nullTemp(em)
+            if (let none = nul) {
+                return none
+            }
+            if (let some(n) = nul) {
+                init = n
+            }
+        }
+        if (isCount) {
+            init = intConst(em, 0)
+        }
+        instr(em, IrInstr.StoreSlot(resSlot, init))
+        var condId = newBlock(em)
+        var bodyId = newBlock(em)
+        var hitId = newBlock(em)
+        var nextId = newBlock(em)
+        var endId = newBlock(em)
+        term(em, IrTerm.Branch(condId))
+        em.cur = condId
+        var curT = load(em, idxSlot)
+        var endL = load(em, lenSlot)
+        var cmp = temp(em)
+        instr(em, IrInstr.BinOp(cmp, IrBinOp.Lt, curT, endL))
+        term(em, IrTerm.BranchIf(cmp, bodyId, endId))
+        em.cur = bodyId
+        var curI = load(em, idxSlot)
+        var raw = externCallT1(em, "pickle_list_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [obj, curI])
+        var argIr = IrTy.Ptr
+        var argV = raw
+        if (!rep.isPtr) {
+            argV = externCallT1(em, rep.unboxSym, [IrTy.Ptr], rep.ir, [raw])
+            argIr = rep.ir
+        }
+        var zero2 = intConst(em, 0)
+        var addrBoxed = externCallT1(em, "pickle_obj_slot_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [fv, zero2])
+        var fnAddr = externCallT1(em, "pickle_unbox_i64", [IrTy.Ptr], IrTy.Int, [addrBoxed])
+        var dst = temp(em)
+        instr(em, IrInstr.CallInd(dst, fnAddr, [IrTy.Ptr, argIr], IrTy.Bool, [fv, argV]))
+        if (isCount) {
+            term(em, IrTerm.BranchIf(dst, hitId, nextId))
+            em.cur = hitId
+            var acc = load(em, resSlot)
+            var one = intConst(em, 1)
+            var sum = temp(em)
+            instr(em, IrInstr.BinOp(sum, IrBinOp.Add, acc, one))
+            instr(em, IrInstr.StoreSlot(resSlot, sum))
+            term(em, IrTerm.Branch(nextId))
+        } else if (isFind) {
+            term(em, IrTerm.BranchIf(dst, hitId, nextId))
+            em.cur = hitId
+            instr(em, IrInstr.StoreSlot(resSlot, raw))
+            term(em, IrTerm.Branch(endId))
+        } else if (name == "any") {
+            term(em, IrTerm.BranchIf(dst, hitId, nextId))
+            em.cur = hitId
+            var t1 = boolConst(em, true)
+            instr(em, IrInstr.StoreSlot(resSlot, t1))
+            term(em, IrTerm.Branch(endId))
+        } else {
+            term(em, IrTerm.BranchIf(dst, nextId, hitId))
+            em.cur = hitId
+            var f1 = boolConst(em, false)
+            instr(em, IrInstr.StoreSlot(resSlot, f1))
+            term(em, IrTerm.Branch(endId))
+        }
+        em.cur = nextId
+        var c = load(em, idxSlot)
+        var one2 = intConst(em, 1)
+        var nxt = temp(em)
+        instr(em, IrInstr.BinOp(nxt, IrBinOp.Add, c, one2))
+        instr(em, IrInstr.StoreSlot(idxSlot, nxt))
+        term(em, IrTerm.Branch(condId))
+        em.cur = endId
+        load(em, resSlot)
     }
 
     /// Comparison kind for `pickle_list_sort`: 0 = int/byte/char/bool boxed
