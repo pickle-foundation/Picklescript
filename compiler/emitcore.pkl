@@ -6588,7 +6588,7 @@ fn listMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List<C
         }
         // Only the read-only methods read through an immutable borrow; the
         // mutators would write through `&List`, so they keep bailing.
-        if (isBorrowed && name != "contains" && name != "indexOf" && name != "len" && name != "isEmpty" && name != "slice" && name != "join" && name != "map" && name != "filter" && name != "any" && name != "all" && name != "find" && name != "count" && name != "take" && name != "skip" && name != "first" && name != "last") {
+        if (isBorrowed && name != "contains" && name != "indexOf" && name != "len" && name != "isEmpty" && name != "slice" && name != "join" && name != "map" && name != "filter" && name != "any" && name != "all" && name != "find" && name != "count" && name != "take" && name != "skip" && name != "first" && name != "last" && name != "enumerate" && name != "zip") {
             bad(em, e.span, "`" + name + "` mutates a `List` through an immutable reference (`&List`)")
             return none
         }
@@ -6881,6 +6881,20 @@ fn listMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List<C
                     }
                     return externCallT1(em, "pickle_list_last", [IrTy.Ptr], IrTy.Ptr, [obj])
                 }
+                case "enumerate" -> {
+                    if (!(len(args) == 0)) {
+                        bad(em, e.span, "`enumerate` takes no arguments")
+                        return none
+                    }
+                    return listEnumerateCall(em, e, obj)
+                }
+                case "zip" -> {
+                    if (!(len(args) == 1)) {
+                        bad(em, e.span, "`zip` takes one list argument")
+                        return none
+                    }
+                    return listZipCall(em, e, obj, args[0].value)
+                }
                 case _ -> {
                     bad(em, e.span, "`" + name + "` method on `List` is not lowered yet")
                     return none
@@ -7156,6 +7170,110 @@ fn listQueryCall(em: Emitter, e: Expr, obj: int, name: string, f: Expr, elem: Ty
         term(em, IrTerm.Branch(condId))
         em.cur = endId
         load(em, resSlot)
+    }
+
+    /// `xs.enumerate()`: pair each element with its index, returning a fresh
+    /// `List<(int, T)>`. The index is boxed and the element pointer is stored
+    /// as-is, so scalar elements keep their boxed form.
+fn listEnumerateCall(em: Emitter, e: Expr, obj: int) -> int? {
+        var cap = externCallT1(em, "pickle_list_len", [IrTy.Ptr], IrTy.Int, [obj])
+        var out = externCallT1(em, "pickle_list_new", [IrTy.Int], IrTy.Ptr, [cap])
+        var idxSlot = newSlot(em, IrTy.Int)
+        var lenSlot = newSlot(em, IrTy.Int)
+        var zero = temp(em)
+        instr(em, IrInstr.Const(zero, IrConst.Int(0)))
+        instr(em, IrInstr.StoreSlot(idxSlot, zero))
+        instr(em, IrInstr.StoreSlot(lenSlot, cap))
+        var condId = newBlock(em)
+        var bodyId = newBlock(em)
+        var nextId = newBlock(em)
+        var endId = newBlock(em)
+        term(em, IrTerm.Branch(condId))
+        em.cur = condId
+        var curT = load(em, idxSlot)
+        var endL = load(em, lenSlot)
+        var cmp = temp(em)
+        instr(em, IrInstr.BinOp(cmp, IrBinOp.Lt, curT, endL))
+        term(em, IrTerm.BranchIf(cmp, bodyId, endId))
+        em.cur = bodyId
+        var curI = load(em, idxSlot)
+        var raw = externCallT1(em, "pickle_list_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [obj, curI])
+        var tv = externCallT1(em, "pickle_tuple_new", [IrTy.Int], IrTy.Ptr, [intConst(em, 2)])
+        var boxed = externCallT1(em, "pickle_box_i64", [IrTy.Int], IrTy.Ptr, [curI])
+        externCallVoid(em, "pickle_tuple_set_field", [IrTy.Ptr, IrTy.Int, IrTy.Ptr], [tv, intConst(em, 0), boxed])
+        externCallVoid(em, "pickle_tuple_set_field", [IrTy.Ptr, IrTy.Int, IrTy.Ptr], [tv, intConst(em, 1), raw])
+        externCallVoid(em, "pickle_list_push", [IrTy.Ptr, IrTy.Ptr], [out, tv])
+        term(em, IrTerm.Branch(nextId))
+        em.cur = nextId
+        var c = load(em, idxSlot)
+        var one = intConst(em, 1)
+        var nxt = temp(em)
+        instr(em, IrInstr.BinOp(nxt, IrBinOp.Add, c, one))
+        instr(em, IrInstr.StoreSlot(idxSlot, nxt))
+        term(em, IrTerm.Branch(condId))
+        em.cur = endId
+        out
+    }
+
+    /// `xs.zip(other)`: pair elements by index, stopping at the shorter list,
+    /// returning a fresh `List<(T, T)>`. Both receivers are `List<T>`; the
+    /// checker requires the same element type on both sides.
+fn listZipCall(em: Emitter, e: Expr, obj: int, other: Expr) -> int? {
+        var ov0 = expr(em, other)
+        if (let none = ov0) {
+            return none
+        }
+        var ov = 0
+        if (let some(v) = ov0) {
+            ov = v
+        }
+        var capA = externCallT1(em, "pickle_list_len", [IrTy.Ptr], IrTy.Int, [obj])
+        var capB = externCallT1(em, "pickle_list_len", [IrTy.Ptr], IrTy.Int, [ov])
+        var out = externCallT1(em, "pickle_list_new", [IrTy.Int], IrTy.Ptr, [intConst(em, 0)])
+        var idxSlot = newSlot(em, IrTy.Int)
+        var lenASlot = newSlot(em, IrTy.Int)
+        var lenBSlot = newSlot(em, IrTy.Int)
+        var zero = temp(em)
+        instr(em, IrInstr.Const(zero, IrConst.Int(0)))
+        instr(em, IrInstr.StoreSlot(idxSlot, zero))
+        instr(em, IrInstr.StoreSlot(lenASlot, capA))
+        instr(em, IrInstr.StoreSlot(lenBSlot, capB))
+        var condId = newBlock(em)
+        var checkId = newBlock(em)
+        var bodyId = newBlock(em)
+        var nextId = newBlock(em)
+        var endId = newBlock(em)
+        term(em, IrTerm.Branch(condId))
+        em.cur = condId
+        var i0 = load(em, idxSlot)
+        var la = load(em, lenASlot)
+        var c0 = temp(em)
+        instr(em, IrInstr.BinOp(c0, IrBinOp.Lt, i0, la))
+        term(em, IrTerm.BranchIf(c0, checkId, endId))
+        em.cur = checkId
+        var i1 = load(em, idxSlot)
+        var lb = load(em, lenBSlot)
+        var c1 = temp(em)
+        instr(em, IrInstr.BinOp(c1, IrBinOp.Lt, i1, lb))
+        term(em, IrTerm.BranchIf(c1, bodyId, endId))
+        em.cur = bodyId
+        var curI = load(em, idxSlot)
+        var rawA = externCallT1(em, "pickle_list_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [obj, curI])
+        var rawB = externCallT1(em, "pickle_list_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [ov, curI])
+        var tv = externCallT1(em, "pickle_tuple_new", [IrTy.Int], IrTy.Ptr, [intConst(em, 2)])
+        externCallVoid(em, "pickle_tuple_set_field", [IrTy.Ptr, IrTy.Int, IrTy.Ptr], [tv, intConst(em, 0), rawA])
+        externCallVoid(em, "pickle_tuple_set_field", [IrTy.Ptr, IrTy.Int, IrTy.Ptr], [tv, intConst(em, 1), rawB])
+        externCallVoid(em, "pickle_list_push", [IrTy.Ptr, IrTy.Ptr], [out, tv])
+        term(em, IrTerm.Branch(nextId))
+        em.cur = nextId
+        var c = load(em, idxSlot)
+        var one = intConst(em, 1)
+        var nxt = temp(em)
+        instr(em, IrInstr.BinOp(nxt, IrBinOp.Add, c, one))
+        instr(em, IrInstr.StoreSlot(idxSlot, nxt))
+        term(em, IrTerm.Branch(condId))
+        em.cur = endId
+        out
     }
 
     /// Comparison kind for `pickle_list_sort`: 0 = int/byte/char/bool boxed
