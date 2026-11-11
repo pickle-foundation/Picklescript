@@ -1,0 +1,183 @@
+// `List.flatten`, `List.flatMap`, and `List.sorted`: beyond-parity members that
+// produce a fresh list and read through `&List` without touching the receiver.
+
+fn borrowed_flatten(xs: &List<List<int>>) -> List<int> {
+    xs.flatten()
+}
+
+fn borrowed_flat_map(xs: &List<int>) -> List<int> {
+    xs.flatMap((v: int) => [v, v])
+}
+
+fn borrowed_sorted(xs: &List<int>) -> List<int> {
+    xs.sorted()
+}
+
+fn empty_ints() -> List<int> {
+    var out = [0]
+    out.clear()
+    out
+}
+
+fn twice(v: int) -> List<int> {
+    [v, v]
+}
+
+test fn flatten_concatenates_inner_lists_in_order() {
+    let rows: List<List<int>> = [[1, 2], [3], [4, 5, 6]]
+    let flat = rows.flatten()
+    expect(flat.len()).toBe(6)
+    expect(flat[0]).toBe(1)
+    expect(flat[1]).toBe(2)
+    expect(flat[2]).toBe(3)
+    expect(flat[3]).toBe(4)
+    expect(flat[5]).toBe(6)
+}
+
+test fn flatten_of_an_empty_outer_list_is_empty() {
+    var rows: List<List<int>> = [[1]]
+    rows.clear()
+    expect(rows.flatten().isEmpty()).toBe(true)
+}
+
+test fn flatten_skips_empty_inner_lists() {
+    var empty = [0]
+    empty.clear()
+    let rows: List<List<int>> = [empty, [1], empty, [2, 3]]
+    let flat = rows.flatten()
+    expect(flat.len()).toBe(3)
+    expect(flat[0]).toBe(1)
+    expect(flat[2]).toBe(3)
+}
+
+test fn flatten_returns_a_fresh_list() {
+    let rows: List<List<int>> = [[1], [2]]
+    let flat = rows.flatten()
+    flat.push(99)
+    expect(flat.len()).toBe(3)
+    expect(rows.len()).toBe(2)
+    expect(rows[0].len()).toBe(1)
+}
+
+test fn flatten_preserves_string_elements() {
+    let rows: List<List<string>> = [["a", "bb"], ["ccc"]]
+    let flat = rows.flatten()
+    expect(flat.len()).toBe(3)
+    expect(flat[1]).toBe("bb")
+    expect(flat[2]).toBe("ccc")
+}
+
+test fn flatten_reads_through_an_immutable_borrow() {
+    let rows: List<List<int>> = [[1, 2], [3]]
+    let flat = borrowed_flatten(rows)
+    expect(flat.len()).toBe(3)
+    expect(flat[2]).toBe(3)
+}
+
+test fn flat_map_concatenates_callback_lists() {
+    let xs = [1, 2, 3]
+    let ys = xs.flatMap((v: int) => [v, v * 10])
+    expect(ys.len()).toBe(6)
+    expect(ys[0]).toBe(1)
+    expect(ys[1]).toBe(10)
+    expect(ys[4]).toBe(3)
+    expect(ys[5]).toBe(30)
+}
+
+test fn flat_map_accepts_a_named_function() {
+    let xs = [4, 5]
+    let ys = xs.flatMap(twice)
+    expect(ys.len()).toBe(4)
+    expect(ys[0]).toBe(4)
+    expect(ys[3]).toBe(5)
+}
+
+test fn flat_map_can_change_the_element_type() {
+    let xs = [1, 2]
+    let ss = xs.flatMap((v: int) => [str(v), "!"])
+    expect(ss.len()).toBe(4)
+    expect(ss[0]).toBe("1")
+    expect(ss[1]).toBe("!")
+    expect(ss[2]).toBe("2")
+}
+
+test fn flat_map_drops_empty_callback_results() {
+    let xs = [1, 2]
+    let ys = xs.flatMap((v: int) => empty_ints())
+    expect(ys.isEmpty()).toBe(true)
+}
+
+test fn flat_map_of_an_empty_list_is_empty() {
+    var xs = [0]
+    xs.clear()
+    let ys = xs.flatMap((v: int) => [v])
+    expect(ys.isEmpty()).toBe(true)
+}
+
+test fn flat_map_returns_a_fresh_list() {
+    let xs = [1, 2]
+    let ys = xs.flatMap((v: int) => [v])
+    ys.push(7)
+    expect(ys.len()).toBe(3)
+    expect(xs.len()).toBe(2)
+}
+
+test fn flat_map_reads_through_an_immutable_borrow() {
+    let xs = [1, 2]
+    let ys = borrowed_flat_map(xs)
+    expect(ys.len()).toBe(4)
+    expect(ys[1]).toBe(1)
+    expect(ys[3]).toBe(2)
+}
+
+test fn sorted_orders_a_fresh_copy() {
+    let xs = [3, 1, 2]
+    let ys = xs.sorted()
+    expect(ys.len()).toBe(3)
+    expect(ys[0]).toBe(1)
+    expect(ys[1]).toBe(2)
+    expect(ys[2]).toBe(3)
+    expect(xs[0]).toBe(3)
+    expect(xs[2]).toBe(2)
+}
+
+test fn sorted_handles_strings_floats_and_bytes() {
+    let ss = ["b", "a", "c"].sorted()
+    expect(ss[0]).toBe("a")
+    expect(ss[2]).toBe("c")
+    let fs = [2.5, 1.5].sorted()
+    expect(fs[0]).toBe(1.5)
+    let bs: List<byte> = [3 as byte, 1 as byte, 2 as byte]
+    expect(bs.sorted()[0]).toBe(1 as byte)
+}
+
+test fn sorted_of_an_empty_list_is_empty() {
+    var xs = [0]
+    xs.clear()
+    expect(xs.sorted().isEmpty()).toBe(true)
+}
+
+test fn sorted_returns_a_fresh_list() {
+    let xs = [2, 1]
+    let ys = xs.sorted()
+    ys.push(9)
+    expect(ys.len()).toBe(3)
+    expect(xs.len()).toBe(2)
+    expect(xs[0]).toBe(2)
+}
+
+test fn sorted_reads_through_an_immutable_borrow() {
+    let xs = [3, 2, 1]
+    let ys = borrowed_sorted(xs)
+    expect(ys[0]).toBe(1)
+    expect(ys[2]).toBe(3)
+    expect(xs[0]).toBe(3)
+}
+
+test fn flatten_and_flat_map_compose() {
+    let rows: List<List<int>> = [[1, 2], [3]]
+    let doubled = rows.flatten().flatMap((v: int) => [v, v])
+    expect(doubled.len()).toBe(6)
+    expect(doubled[5]).toBe(3)
+    expect(doubled.sorted()[0]).toBe(1)
+}

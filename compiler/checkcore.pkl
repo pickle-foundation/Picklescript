@@ -1688,6 +1688,20 @@ fn checkCall(ck: Checker, e: Expr, callee: Expr, args: List<CallArg>) -> Ty {
                                         } else {
                                             outRet = Ty.Option(lret)
                                         }
+                                    } else if (recvList) {
+                                        // `List.flatMap`: the callback returns a
+                                        // list, which becomes the result directly.
+                                        var fbList = false
+                                        match (lret) {
+                                            case Ty.List(_) -> fbList = true
+                                            case _ -> {}
+                                        }
+                                        if (fbList) {
+                                            outRet = lret
+                                        } else {
+                                            err(ck, e.span, "`flatMap` needs a callback returning a list, found `{bareName(lret)}`")
+                                            outRet = Ty.Unknown
+                                        }
                                     } else if (lret == Ty.None) {
                                         outRet = Ty.Option(Ty.Unknown)
                                     } else if (let some(_ui) = innerOption(lret)) {
@@ -2337,6 +2351,30 @@ fn checkMember(ck: Checker, e: Expr, object: Expr, name: string) -> Ty {
                 if (name == "zip") {
                     return Ty.Fn([Ty.Ref(Ty.List(inner))], Ty.List(Ty.Tuple([inner, inner])))
                 }
+                // `flatten` collapses one level of nesting; `flatMap`'s result
+                // type comes from the callback, so `checkCall` refines the
+                // placeholder `List<?>`.
+                if (name == "flatten") {
+                    match (inner) {
+                        case Ty.List(x) -> {
+                            return Ty.Fn(emptyTyList(), Ty.List(x))
+                        }
+                        case _ -> {
+                            err(ck, e.span, "`flatten` needs a `List<List<T>>` (got `List<{bareName(inner)}>`)")
+                            return Ty.Unknown
+                        }
+                    }
+                }
+                if (name == "flatMap") {
+                    return Ty.Fn([Ty.Fn([inner], Ty.Unknown)], Ty.List(Ty.Unknown))
+                }
+                if (name == "sorted" && isListSortable(inner)) {
+                    return Ty.Fn(emptyTyList(), Ty.List(inner))
+                }
+                if (name == "sorted") {
+                    err(ck, e.span, "`sorted` needs a `List` of int, float, byte, char, bool, or string (got `List<{bareName(inner)}>`)")
+                    return Ty.Unknown
+                }
                 err(ck, e.span, "no member `{name}` on `List<{bareName(inner)}>`")
                 return Ty.Unknown
             }
@@ -2426,6 +2464,12 @@ fn checkMember(ck: Checker, e: Expr, object: Expr, name: string) -> Ty {
                 }
                 if (name == "padEnd") {
                     return Ty.Fn([Ty.Int, Ty.String], Ty.String)
+                }
+                if (name == "lastIndexOf") {
+                    return Ty.Fn([Ty.String], optOf(Ty.Int))
+                }
+                if (name == "count") {
+                    return Ty.Fn([Ty.String], Ty.Int)
                 }
             }
             case Ty.Option(inner) -> {

@@ -6588,7 +6588,7 @@ fn listMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List<C
         }
         // Only the read-only methods read through an immutable borrow; the
         // mutators would write through `&List`, so they keep bailing.
-        if (isBorrowed && name != "contains" && name != "indexOf" && name != "len" && name != "isEmpty" && name != "slice" && name != "join" && name != "map" && name != "filter" && name != "any" && name != "all" && name != "find" && name != "count" && name != "take" && name != "skip" && name != "first" && name != "last" && name != "enumerate" && name != "zip") {
+        if (isBorrowed && name != "contains" && name != "indexOf" && name != "len" && name != "isEmpty" && name != "slice" && name != "join" && name != "map" && name != "filter" && name != "any" && name != "all" && name != "find" && name != "count" && name != "take" && name != "skip" && name != "first" && name != "last" && name != "enumerate" && name != "zip" && name != "flatten" && name != "flatMap" && name != "sorted") {
             bad(em, e.span, "`" + name + "` mutates a `List` through an immutable reference (`&List`)")
             return none
         }
@@ -6894,6 +6894,34 @@ fn listMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List<C
                         return none
                     }
                     return listZipCall(em, e, obj, args[0].value)
+                }
+                case "flatten" -> {
+                    if (!(len(args) == 0)) {
+                        bad(em, e.span, "`flatten` takes no arguments")
+                        return none
+                    }
+                    return listFlattenCall(em, e, obj)
+                }
+                case "flatMap" -> {
+                    if (!(len(args) == 1)) {
+                        bad(em, e.span, "`flatMap` takes one function argument")
+                        return none
+                    }
+                    return listFlatMapCall(em, e, obj, args[0].value, elem)
+                }
+                case "sorted" -> {
+                    if (!(len(args) == 0)) {
+                        bad(em, e.span, "`sorted` takes no arguments")
+                        return none
+                    }
+                    var kv = sortKind(em, elem, e.span)
+                    if (let some(kind) = kv) {
+                        var total = externCallT1(em, "pickle_list_len", [IrTy.Ptr], IrTy.Int, [obj])
+                        var copy = externCallT1(em, "pickle_list_slice", [IrTy.Ptr, IrTy.Int, IrTy.Int], IrTy.Ptr, [obj, intConst(em, 0), total])
+                        externCallVoid(em, "pickle_list_sort", [IrTy.Ptr, IrTy.Int], [copy, kind])
+                        return copy
+                    }
+                    return none
                 }
                 case _ -> {
                     bad(em, e.span, "`" + name + "` method on `List` is not lowered yet")
@@ -7276,6 +7304,166 @@ fn listZipCall(em: Emitter, e: Expr, obj: int, other: Expr) -> int? {
         out
     }
 
+    /// Push every element of `src` into `out`, walking `src` by index.
+    /// Shared tail of `flatten` and `flatMap`; the caller owns `jSlot` and
+    /// branches on afterwards.
+fn listPushAll(em: Emitter, out: int, src: int, jSlot: int) -> int {
+        var subLen = externCallT1(em, "pickle_list_len", [IrTy.Ptr], IrTy.Int, [src])
+        var z = temp(em)
+        instr(em, IrInstr.Const(z, IrConst.Int(0)))
+        instr(em, IrInstr.StoreSlot(jSlot, z))
+        var condId = newBlock(em)
+        var bodyId = newBlock(em)
+        var nextId = newBlock(em)
+        var endId = newBlock(em)
+        term(em, IrTerm.Branch(condId))
+        em.cur = condId
+        var j0 = load(em, jSlot)
+        var c = temp(em)
+        instr(em, IrInstr.BinOp(c, IrBinOp.Lt, j0, subLen))
+        term(em, IrTerm.BranchIf(c, bodyId, endId))
+        em.cur = bodyId
+        var jj = load(em, jSlot)
+        var el = externCallT1(em, "pickle_list_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [src, jj])
+        externCallVoid(em, "pickle_list_push", [IrTy.Ptr, IrTy.Ptr], [out, el])
+        term(em, IrTerm.Branch(nextId))
+        em.cur = nextId
+        var jn = load(em, jSlot)
+        var one = intConst(em, 1)
+        var jn2 = temp(em)
+        instr(em, IrInstr.BinOp(jn2, IrBinOp.Add, jn, one))
+        instr(em, IrInstr.StoreSlot(jSlot, jn2))
+        term(em, IrTerm.Branch(condId))
+        em.cur = endId
+        0
+    }
+
+    /// `xs.flatten()` on a `List<List<T>>`: append every inner element, in
+    /// order, to a fresh result list. Elements are stored pointers, so no
+    /// per-element boxing is needed.
+fn listFlattenCall(em: Emitter, e: Expr, obj: int) -> int? {
+        var cap = externCallT1(em, "pickle_list_len", [IrTy.Ptr], IrTy.Int, [obj])
+        var out = externCallT1(em, "pickle_list_new", [IrTy.Int], IrTy.Ptr, [intConst(em, 0)])
+        var iSlot = newSlot(em, IrTy.Int)
+        var nSlot = newSlot(em, IrTy.Int)
+        var jSlot = newSlot(em, IrTy.Int)
+        var zero = temp(em)
+        instr(em, IrInstr.Const(zero, IrConst.Int(0)))
+        instr(em, IrInstr.StoreSlot(iSlot, zero))
+        instr(em, IrInstr.StoreSlot(nSlot, cap))
+        var condId = newBlock(em)
+        var bodyId = newBlock(em)
+        var nextId = newBlock(em)
+        var endId = newBlock(em)
+        term(em, IrTerm.Branch(condId))
+        em.cur = condId
+        var i0 = load(em, iSlot)
+        var n0 = load(em, nSlot)
+        var c0 = temp(em)
+        instr(em, IrInstr.BinOp(c0, IrBinOp.Lt, i0, n0))
+        term(em, IrTerm.BranchIf(c0, bodyId, endId))
+        em.cur = bodyId
+        var curI = load(em, iSlot)
+        var sub = externCallT1(em, "pickle_list_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [obj, curI])
+        let _ = listPushAll(em, out, sub, jSlot)
+        term(em, IrTerm.Branch(nextId))
+        em.cur = nextId
+        var c = load(em, iSlot)
+        var one = intConst(em, 1)
+        var nxt = temp(em)
+        instr(em, IrInstr.BinOp(nxt, IrBinOp.Add, c, one))
+        instr(em, IrInstr.StoreSlot(iSlot, nxt))
+        term(em, IrTerm.Branch(condId))
+        em.cur = endId
+        out
+    }
+
+    /// `xs.flatMap(f)`: call `f` per element (each call returns a list) and
+    /// append every element of that list to a fresh result list. Mirrors
+    /// `map`'s closure protocol: the element pointer is passed through, and a
+    /// scalar element is unboxed for the call.
+fn listFlatMapCall(em: Emitter, e: Expr, obj: int, f: Expr, elem: Ty) -> int? {
+        var fty0 = tyOf(em, f.span)
+        if (let none = fty0) {
+            bad(em, f.span, "`flatMap` needs a function argument")
+            return none
+        }
+        var fty = Ty.Unknown
+        if (let some(t) = fty0) {
+            fty = t
+        }
+        var isFn = false
+        match (fty) {
+            case Ty.Fn(_, _) -> isFn = true
+            case _ -> {}
+        }
+        if (!isFn) {
+            bad(em, f.span, "`flatMap` needs a one-argument function")
+            return none
+        }
+        var rp = elemRep(em, elem, e.span)
+        if (let none = rp) {
+            return none
+        }
+        var rep = ElemRep.ptr()
+        if (let some(r) = rp) {
+            rep = r
+        }
+        var fv0 = expr(em, f)
+        if (let none = fv0) {
+            return none
+        }
+        var fv = 0
+        if (let some(v) = fv0) {
+            fv = v
+        }
+        var cap = externCallT1(em, "pickle_list_len", [IrTy.Ptr], IrTy.Int, [obj])
+        var out = externCallT1(em, "pickle_list_new", [IrTy.Int], IrTy.Ptr, [intConst(em, 0)])
+        var iSlot = newSlot(em, IrTy.Int)
+        var nSlot = newSlot(em, IrTy.Int)
+        var jSlot = newSlot(em, IrTy.Int)
+        var zero = temp(em)
+        instr(em, IrInstr.Const(zero, IrConst.Int(0)))
+        instr(em, IrInstr.StoreSlot(iSlot, zero))
+        instr(em, IrInstr.StoreSlot(nSlot, cap))
+        var condId = newBlock(em)
+        var bodyId = newBlock(em)
+        var nextId = newBlock(em)
+        var endId = newBlock(em)
+        term(em, IrTerm.Branch(condId))
+        em.cur = condId
+        var i0 = load(em, iSlot)
+        var n0 = load(em, nSlot)
+        var c0 = temp(em)
+        instr(em, IrInstr.BinOp(c0, IrBinOp.Lt, i0, n0))
+        term(em, IrTerm.BranchIf(c0, bodyId, endId))
+        em.cur = bodyId
+        var curI = load(em, iSlot)
+        var raw = externCallT1(em, "pickle_list_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [obj, curI])
+        var argIr = IrTy.Ptr
+        var argV = raw
+        if (!rep.isPtr) {
+            argV = externCallT1(em, rep.unboxSym, [IrTy.Ptr], rep.ir, [raw])
+            argIr = rep.ir
+        }
+        var zero2 = intConst(em, 0)
+        var addrBoxed = externCallT1(em, "pickle_obj_slot_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [fv, zero2])
+        var fnAddr = externCallT1(em, "pickle_unbox_i64", [IrTy.Ptr], IrTy.Int, [addrBoxed])
+        var dst = temp(em)
+        instr(em, IrInstr.CallInd(dst, fnAddr, [IrTy.Ptr, argIr], IrTy.Ptr, [fv, argV]))
+        let _ = listPushAll(em, out, dst, jSlot)
+        term(em, IrTerm.Branch(nextId))
+        em.cur = nextId
+        var c = load(em, iSlot)
+        var one = intConst(em, 1)
+        var nxt = temp(em)
+        instr(em, IrInstr.BinOp(nxt, IrBinOp.Add, c, one))
+        instr(em, IrInstr.StoreSlot(iSlot, nxt))
+        term(em, IrTerm.Branch(condId))
+        em.cur = endId
+        out
+    }
+
     /// Comparison kind for `pickle_list_sort`: 0 = int/byte/char/bool boxed
     /// payloads, 1 = float bits, 2 = string bytes. Mirrors `sort_kind`.
 
@@ -7580,6 +7768,34 @@ fn stringMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List
                             return externCallT1(em, "pickle_str_pad_end", [IrTy.Str, IrTy.Int, IrTy.Str], IrTy.Str, [obj, width, pad])
                         }
                         return none
+                    }
+                    return none
+                }
+                case "lastIndexOf" -> {
+                    if (!(len(args) == 1)) {
+                        bad(em, e.span, "`lastIndexOf` takes one argument")
+                        return none
+                    }
+                    var needle = expr(em, args[0].value)
+                    if (let some(needle) = needle) {
+                        if (isBorrowed) {
+                            return externCallT1(em, "pickle_str_last_index_of", [IrTy.Ptr, IrTy.Str], IrTy.Ptr, [obj, needle])
+                        }
+                        return externCallT1(em, "pickle_str_last_index_of", [IrTy.Str, IrTy.Str], IrTy.Ptr, [obj, needle])
+                    }
+                    return none
+                }
+                case "count" -> {
+                    if (!(len(args) == 1)) {
+                        bad(em, e.span, "`count` takes one substring argument")
+                        return none
+                    }
+                    var needle = expr(em, args[0].value)
+                    if (let some(needle) = needle) {
+                        if (isBorrowed) {
+                            return externCallT1(em, "pickle_str_count", [IrTy.Ptr, IrTy.Str], IrTy.Int, [obj, needle])
+                        }
+                        return externCallT1(em, "pickle_str_count", [IrTy.Str, IrTy.Str], IrTy.Int, [obj, needle])
                     }
                     return none
                 }
