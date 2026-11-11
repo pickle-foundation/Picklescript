@@ -621,6 +621,102 @@ fn abiStrChars(s: *int) -> *int {
     }
 }
 
+/// Copy every byte of `s` into `out` starting at byte offset `off`.
+/// The caller sizes `out`; this is the shared tail of the padding bodies.
+fn copyInto(out: *int, off: int, s: *int) -> int {
+    unsafe {
+        var n = abiStrLen(s)
+        var i = 0
+        while (i < n) {
+            byteInto(out, off + i, byteAt(s, i))
+            i = i + 1
+        }
+        return 0
+    }
+}
+
+/// Write `count` bytes of the repeating `pad` cycle into `out` starting at
+/// byte offset `off`. `pad` must be non-empty; the caller checks that.
+fn fillInto(out: *int, off: int, count: int, pad: *int) -> int {
+    unsafe {
+        var pn = abiStrLen(pad)
+        var k = 0
+        while (k < count) {
+            byteInto(out, off + k, byteAt(pad, k % pn))
+            k = k + 1
+        }
+        return 0
+    }
+}
+
+/// Repeat `s` `n` times into a fresh string.
+///
+/// BEYOND PARITY - `runtime/src/strings.rs` has no repeat. The result is
+/// exactly `max(0, n) * len(s)` bytes: a count of zero or less, or an empty
+/// `s`, yields the empty string. The unit is the byte, matching `len`,
+/// `substring`, and `slice`, so repeating multi-byte text keeps its bytes
+/// intact.
+#[symbol("pickle_str_repeat")]
+fn abiStrRepeat(s: *int, n: int) -> *int {
+    unsafe {
+        var sn = abiStrLen(s)
+        if (n < 1 || sn < 1) {
+            return newStr(0)
+        }
+        var out = newStr(sn * n)
+        var rep = 0
+        var pos = 0
+        while (rep < n) {
+            copyInto(out, pos, s)
+            pos = pos + sn
+            rep = rep + 1
+        }
+        return out
+    }
+}
+
+/// `s.padStart(width, pad)`: left-pad to `width` bytes with the repeating
+/// `pad` cycle, truncated from the front.
+///
+/// BEYOND PARITY. When `s` is already at least `width` bytes long the result is
+/// a fresh copy of `s`; an empty `pad` cannot add anything, so it also returns
+/// a fresh copy. `"abc".padStart(6, "xy")` is `"xyxabc"`. Byte units again.
+#[symbol("pickle_str_pad_start")]
+fn abiStrPadStart(s: *int, width: int, pad: *int) -> *int {
+    unsafe {
+        var n = abiStrLen(s)
+        var pn = abiStrLen(pad)
+        if (width <= n || pn < 1) {
+            return abiStrSubstring(s, 0, n)
+        }
+        var out = newStr(width)
+        var fill = width - n
+        fillInto(out, 0, fill, pad)
+        copyInto(out, fill, s)
+        return out
+    }
+}
+
+/// `s.padEnd(width, pad)`: right-pad to `width` bytes with the repeating `pad`
+/// cycle, truncated from the front.
+///
+/// BEYOND PARITY. Same copy rules as `padStart`; `"abc".padEnd(6, "xy")` is
+/// `"abcxyx"`.
+#[symbol("pickle_str_pad_end")]
+fn abiStrPadEnd(s: *int, width: int, pad: *int) -> *int {
+    unsafe {
+        var n = abiStrLen(s)
+        var pn = abiStrLen(pad)
+        if (width <= n || pn < 1) {
+            return abiStrSubstring(s, 0, n)
+        }
+        var out = newStr(width)
+        copyInto(out, 0, s)
+        fillInto(out, n, width - n, pad)
+        return out
+    }
+}
+
 /// Decimal text for an `i64`. Mirrors `strings.rs::int64_to_string`.
 ///
 /// The reference takes the magnitude `unsigned_abs`, so `i64::MIN` is formatted

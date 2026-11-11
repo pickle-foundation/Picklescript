@@ -1,6 +1,6 @@
 module runtime.abi_string_test
 
-import { wordsFor, abiStrLen, abiStrConcat, abiStrCmp, abiStrGet, abiStrSet, abiStrFromBool, abiStrFromByte, abiStrFromChar, abiStrToBytes, abiStrFromList, abiStrStartsWith, abiStrEndsWith, abiStrIndexOf, abiStrTrim, abiStrToUpper, abiStrToLower, abiStrSubstring, abiStrSplit, abiStrReplace, abiStrChars, abiStrFormat, abiListJoin, isScalar, utf8Len, leadByte } from runtime.abi_string
+import { wordsFor, abiStrLen, abiStrConcat, abiStrCmp, abiStrGet, abiStrSet, abiStrFromBool, abiStrFromByte, abiStrFromChar, abiStrToBytes, abiStrFromList, abiStrStartsWith, abiStrEndsWith, abiStrIndexOf, abiStrTrim, abiStrToUpper, abiStrToLower, abiStrSubstring, abiStrSplit, abiStrReplace, abiStrChars, abiStrRepeat, abiStrPadStart, abiStrPadEnd, abiStrFormat, abiListJoin, isScalar, utf8Len, leadByte } from runtime.abi_string
 import { abiListNew, abiListLen, abiListGet, abiListPush } from runtime.abi_list
 import { abiBoxI64, abiUnboxI64 } from runtime.abi_box
 
@@ -687,4 +687,62 @@ test fn str_format_ignores_extra_parts() {
 test fn str_format_of_a_template_without_slots_copies_it() {
     let f = abiStrFormat(bytes2(104, 105), strList([bytes1(97)]))
     expect(abiStrCmp(f, bytes2(104, 105))).toBe(0)
+}
+test fn str_repeat_copies_the_whole_string() {
+    let s = bytes2(97, 98)
+    let r = abiStrRepeat(s, 3)
+    expect(abiStrLen(r)).toBe(6)
+    expect(abiStrCmp(r, abiStrConcat(abiStrConcat(bytes2(97, 98), bytes2(97, 98)), bytes2(97, 98)))).toBe(0)
+}
+
+test fn str_repeat_of_zero_or_less_is_empty() {
+    let s = bytes2(97, 98)
+    expect(abiStrLen(abiStrRepeat(s, 0))).toBe(0)
+    expect(abiStrLen(abiStrRepeat(s, -3))).toBe(0)
+    expect(abiStrLen(abiStrRepeat(abiStrRepeat(s, 0), 4))).toBe(0)
+}
+
+test fn str_pad_start_fills_from_the_cycle() {
+    // "abc".padStart(6, "xy") == "xyxabc"
+    let r = abiStrPadStart(bytes3(97, 98, 99), 6, bytes2(120, 121))
+    expect(abiStrLen(r)).toBe(6)
+    expect(abiStrCmp(r, abiStrConcat(bytes3(120, 121, 120), bytes3(97, 98, 99)))).toBe(0)
+}
+
+test fn str_pad_start_never_truncates() {
+    let s = bytes3(97, 98, 99)
+    let pad = bytes2(120, 121)
+    expect(abiStrCmp(abiStrPadStart(s, 3, pad), s)).toBe(0)
+    expect(abiStrCmp(abiStrPadStart(s, 2, pad), s)).toBe(0)
+    expect(abiStrCmp(abiStrPadStart(s, -1, pad), s)).toBe(0)
+}
+
+test fn str_pad_end_fills_from_the_cycle() {
+    // "abc".padEnd(6, "xy") == "abcxyx"
+    let r = abiStrPadEnd(bytes3(97, 98, 99), 6, bytes2(120, 121))
+    expect(abiStrLen(r)).toBe(6)
+    expect(abiStrCmp(r, abiStrConcat(bytes3(97, 98, 99), bytes3(120, 121, 120)))).toBe(0)
+}
+
+test fn str_pad_end_never_truncates() {
+    let s = bytes3(97, 98, 99)
+    let pad = bytes2(120, 121)
+    expect(abiStrCmp(abiStrPadEnd(s, 3, pad), s)).toBe(0)
+    expect(abiStrCmp(abiStrPadEnd(s, 2, pad), s)).toBe(0)
+}
+
+test fn str_padding_with_an_empty_pad_is_a_copy() {
+    let s = bytes3(97, 98, 99)
+    let empty = abiStrRepeat(bytes1(0), 0)
+    expect(abiStrCmp(abiStrPadStart(s, 6, empty), s)).toBe(0)
+    expect(abiStrCmp(abiStrPadEnd(s, 6, empty), s)).toBe(0)
+}
+
+test fn str_padding_can_fill_a_completely_empty_string() {
+    let empty = abiStrRepeat(bytes1(0), 0)
+    let r = abiStrPadStart(empty, 4, bytes2(97, 98))
+    expect(abiStrLen(r)).toBe(4)
+    expect(abiStrCmp(r, bytes4(97, 98, 97, 98))).toBe(0)
+    let q = abiStrPadEnd(empty, 4, bytes2(97, 98))
+    expect(abiStrCmp(q, bytes4(97, 98, 97, 98))).toBe(0)
 }
