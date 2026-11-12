@@ -8899,6 +8899,20 @@ fn optionMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List
             }
             return optMapCall(em, e, object, name, args[0].value, inner)
         }
+        if (name == "andThen") {
+            if (!(len(args) == 1)) {
+                bad(em, e.span, "`andThen` takes one function argument")
+                return none
+            }
+            return optMapCall(em, e, object, "andThen", args[0].value, inner)
+        }
+        if (name == "mapOr") {
+            if (!(len(args) == 2)) {
+                bad(em, e.span, "`mapOr` takes a default value and a function")
+                return none
+            }
+            return optMapOrCall(em, e, object, args[0].value, args[1].value, inner)
+        }
         if (name == "filter") {
             if (!(len(args) == 1)) {
                 bad(em, e.span, "`filter` takes one predicate argument")
@@ -8947,9 +8961,9 @@ fn optMapCall(em: Emitter, e: Expr, object: Expr, name: string, f: Expr, inner: 
             bad(em, f.span, "`" + name + "` needs a one-argument function")
             return none
         }
-        if (name == "flatMap") {
+        if (name == "flatMap" || name == "andThen") {
             if (let none = innerOption(prt)) {
-                bad(em, f.span, "`flatMap` needs a callback returning an option")
+                bad(em, f.span, "`" + name + "` needs a callback returning an option")
                 return none
             }
         }
@@ -9062,6 +9076,143 @@ fn optMapCall(em: Emitter, e: Expr, object: Expr, name: string, f: Expr, inner: 
             }
         }
         instr(em, IrInstr.StoreSlot(resSlot, outV))
+        term(em, IrTerm.Branch(join))
+        em.cur = join
+        load(em, resSlot)
+    }
+
+    /// `x.mapOr(default, f)`: `f(payload)` when `x` is present, otherwise
+    /// `default`. The receiver, the default, and the callback are evaluated
+    /// eagerly, in that order. The result type is the default's type.
+fn optMapOrCall(em: Emitter, e: Expr, object: Expr, def: Expr, f: Expr, inner: Ty) -> int? {
+        var fty0 = tyOf(em, f.span)
+        if (let none = fty0) {
+            bad(em, f.span, "`mapOr` needs a function argument")
+            return none
+        }
+        var fty = Ty.Unknown
+        if (let some(t) = fty0) {
+            fty = t
+        }
+        var pty = emptyTys()
+        var prt = Ty.Unknown
+        var isFn = false
+        match (fty) {
+            case Ty.Fn(pts, r) -> {
+                pty = pts
+                prt = r
+                isFn = true
+            }
+            case _ -> {}
+        }
+        if (!isFn || len(pty) != 1) {
+            bad(em, f.span, "`mapOr` needs a one-argument function")
+            return none
+        }
+        var resTy0 = tyOf(em, def.span)
+        if (let none = resTy0) {
+            bad(em, def.span, "`mapOr` needs a default value")
+            return none
+        }
+        var resTy = Ty.Unknown
+        if (let some(t) = resTy0) {
+            resTy = t
+        }
+        var resIr0 = mapTy(em, resTy, e.span)
+        if (let none = resIr0) {
+            return none
+        }
+        var resIr = IrTy.Unit
+        if (let some(x) = resIr0) {
+            resIr = x
+        }
+        var resSlot = newSlot(em, resIr)
+        var a0 = expr(em, object)
+        if (let none = a0) {
+            return none
+        }
+        var a = 0
+        if (let some(v) = a0) {
+            a = v
+        }
+        var d0 = expr(em, def)
+        if (let none = d0) {
+            return none
+        }
+        var d = 0
+        if (let some(v) = d0) {
+            d = v
+        }
+        var fv0 = expr(em, f)
+        if (let none = fv0) {
+            return none
+        }
+        var fv = 0
+        if (let some(v) = fv0) {
+            fv = v
+        }
+        var present0 = optIsPresent(em, a)
+        if (let none = present0) {
+            return none
+        }
+        var present = 0
+        if (let some(p) = present0) {
+            present = p
+        }
+        var someId = newBlock(em)
+        var noneId = newBlock(em)
+        var join = newBlock(em)
+        term(em, IrTerm.BranchIf(present, someId, noneId))
+        em.cur = noneId
+        instr(em, IrInstr.StoreSlot(resSlot, d))
+        term(em, IrTerm.Branch(join))
+        em.cur = someId
+        var payload0 = optResolve(em, a, inner, e.span)
+        if (let none = payload0) {
+            return none
+        }
+        var payload = 0
+        if (let some(v) = payload0) {
+            payload = v
+        }
+        // Pass the payload to the callback: a scalar `&T` parameter borrows a
+        // temporary slot, everything else passes by value.
+        var argIr = IrTy.Ptr
+        var argV = payload
+        var borrowScalar = false
+        match (pty[0]) {
+            case Ty.Ref(ri) -> {
+                if (let some(sir) = scalarIr(ri)) {
+                    var box = newSlot(em, sir)
+                    instr(em, IrInstr.StoreSlot(box, payload))
+                    var addr = temp(em)
+                    instr(em, IrInstr.LocalAddr(addr, box))
+                    argV = addr
+                    borrowScalar = true
+                }
+            }
+            case _ -> {}
+        }
+        if (!borrowScalar) {
+            var mir = mapTy(em, pty[0], e.span)
+            if (let some(ir) = mir) {
+                argIr = ir
+            }
+        }
+        var zero = intConst(em, 0)
+        var addrBoxed = externCallT1(em, "pickle_obj_slot_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [fv, zero])
+        var fnAddr = externCallT1(em, "pickle_unbox_i64", [IrTy.Ptr], IrTy.Int, [addrBoxed])
+        var irRet0 = mapTy(em, prt, e.span)
+        if (let none = irRet0) {
+            return none
+        }
+        var irRet = IrTy.Ptr
+        if (let some(ir) = irRet0) {
+            irRet = ir
+        }
+        var dst = temp(em)
+        instr(em, IrInstr.CallInd(dst, fnAddr, [IrTy.Ptr, argIr], irRet, [fv, argV]))
+        instr(em, IrInstr.StoreSlot(resSlot, dst))
         term(em, IrTerm.Branch(join))
         em.cur = join
         load(em, resSlot)

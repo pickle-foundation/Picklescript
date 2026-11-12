@@ -1,0 +1,88 @@
+// `Option.mapOr` and `Option.andThen`: beyond-parity members on `T?`.
+// `mapOr` supplies a default for the absent case and returns the callback's
+// result for the present one; `andThen` is the option-returning alias of
+// `flatMap`.
+
+fn map_or_double(v: int) -> int {
+    v * 2
+}
+
+fn map_or_positive(v: int) -> int? {
+    if (v > 0) {
+        return v
+    }
+    none
+}
+
+fn borrowed_map_or(o: &int?) -> int {
+    o.mapOr(0, (v: int) => v + 1)
+}
+
+fn borrowed_and_then(o: &int?) -> int? {
+    o.andThen((v: int) -> int? { v * 2 })
+}
+
+test fn option_map_or_uses_the_callback_when_present() {
+    let o: int? = 5
+    expect(o.mapOr(0, (v: int) => v * 2)).toBe(10)
+}
+
+test fn option_map_or_uses_the_default_when_absent() {
+    let z: int? = none
+    expect(z.mapOr(7, (v: int) => v * 2)).toBe(7)
+}
+
+test fn option_map_or_can_change_the_result_type() {
+    let o: int? = 3
+    expect(o.mapOr("none", (v: int) => str(v))).toBe("3")
+    let z: int? = none
+    expect(z.mapOr("none", (v: int) => str(v))).toBe("none")
+}
+
+test fn option_map_or_accepts_a_named_function() {
+    let o: int? = 4
+    expect(o.mapOr(0, map_or_double)).toBe(8)
+}
+
+test fn option_map_or_result_binds_as_the_default_type() {
+    let o: int? = 2
+    let r: int = o.mapOr(-1, (v: int) => v + 1)
+    expect(r).toBe(3)
+    let z: int? = none
+    let d: int = z.mapOr(-1, (v: int) => v + 1)
+    expect(d).toBe(-1)
+}
+
+test fn option_map_or_reads_through_an_immutable_borrow() {
+    let o: int? = 5
+    expect(borrowed_map_or(o)).toBe(6)
+    let z: int? = none
+    expect(borrowed_map_or(z)).toBe(0)
+}
+
+test fn option_and_then_flattens_present_and_absent() {
+    let o: int? = 3
+    expect(o.andThen((v: int) -> int? { v * 2 }).unwrap()).toBe(6)
+    let z: int? = none
+    expect(z.andThen((v: int) -> int? { v * 2 }).isNone()).toBe(true)
+}
+
+test fn option_and_then_can_filter() {
+    let yes: int? = 5
+    let no: int? = -5
+    expect(yes.andThen(map_or_positive).unwrap()).toBe(5)
+    expect(no.andThen(map_or_positive).isNone()).toBe(true)
+}
+
+test fn option_and_then_result_binds_as_an_option() {
+    let o: int? = 6
+    let r: int? = o.andThen((v: int) -> int? { v + 1 })
+    expect(r.unwrap()).toBe(7)
+}
+
+test fn option_and_then_reads_through_an_immutable_borrow() {
+    let o: int? = 4
+    expect(borrowed_and_then(o).unwrap()).toBe(8)
+    let z: int? = none
+    expect(borrowed_and_then(z).isNone()).toBe(true)
+}

@@ -1649,7 +1649,7 @@ fn checkCall(ck: Checker, e: Expr, callee: Expr, args: List<CallArg>) -> Ty {
                         case ExprKind.Member(_, n) -> n
                         case _ -> ""
                     }
-                    if (fmName == "map" || fmName == "flatMap") {
+                    if (fmName == "map" || fmName == "flatMap" || fmName == "andThen") {
                         let fmObj = match (callee.kind) {
                             case ExprKind.Member(o, _) -> o
                             case _ -> callee
@@ -1707,7 +1707,7 @@ fn checkCall(ck: Checker, e: Expr, callee: Expr, args: List<CallArg>) -> Ty {
                                     } else if (let some(_ui) = innerOption(lret)) {
                                         outRet = lret
                                     } else {
-                                        err(ck, e.span, "`flatMap` needs a callback returning an option, found `{bareName(lret)}`")
+                                        err(ck, e.span, "`" + fmName + "` needs a callback returning an option, found `{bareName(lret)}`")
                                         outRet = Ty.Unknown
                                     }
                                 }
@@ -1717,6 +1717,13 @@ fn checkCall(ck: Checker, e: Expr, callee: Expr, args: List<CallArg>) -> Ty {
                     // `List.fold(init, f)` returns the accumulator, so the
                     // result type is the initial value's type.
                     if (fmName == "fold" && len(args) == 2) {
+                        if (let some(at) = ck.types.get(spanKey(args[0].value.span))) {
+                            outRet = at
+                        }
+                    }
+                    // `Option.mapOr(default, f)` returns the default's type; the
+                    // callback must produce that same type.
+                    if (fmName == "mapOr" && len(args) == 2) {
                         if (let some(at) = ck.types.get(spanKey(args[0].value.span))) {
                             outRet = at
                         }
@@ -2596,13 +2603,19 @@ fn checkMember(ck: Checker, e: Expr, object: Expr, name: string) -> Ty {
                 if (name == "flatMap") {
                     return Ty.Fn([Ty.Fn([inner], Ty.Unknown)], Ty.Option(Ty.Unknown))
                 }
+                if (name == "andThen") {
+                    return Ty.Fn([Ty.Fn([inner], Ty.Unknown)], Ty.Option(Ty.Unknown))
+                }
+                if (name == "mapOr") {
+                    return Ty.Fn([Ty.Unknown, Ty.Fn([inner], Ty.Unknown)], Ty.Unknown)
+                }
                 if (name == "filter") {
                     return Ty.Fn([Ty.Fn([inner], Ty.Bool)], optOf(inner))
                 }
                 if (name == "toList") {
                     return Ty.Fn(emptyTyList(), Ty.List(inner))
                 }
-                err(ck, e.span, "no member `{name}` on `{bareName(inner)}?` (members are `isSome`, `isNone`, `unwrap`, `unwrapOr`, `expect`, `map`, `flatMap`, `filter`, `toList`)")
+                err(ck, e.span, "no member `{name}` on `{bareName(inner)}?` (members are `isSome`, `isNone`, `unwrap`, `unwrapOr`, `expect`, `map`, `flatMap`, `andThen`, `mapOr`, `filter`, `toList`)")
                 return Ty.Unknown
             }
             case Ty.Stream -> {
