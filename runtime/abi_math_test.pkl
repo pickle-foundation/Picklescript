@@ -11,9 +11,10 @@ module runtime.abi_math_test
 // exact results the native routine produces - a platform `pow` would answer
 // differently.
 
-import { abiIntPow, abiFloatPow, abiListIndexOf } from runtime.abi_math
+import { abiIntPow, abiFloatPow, abiListIndexOf, abiListLastIndexOf, abiListSumI64, abiListSumF64, abiListMin, abiListMax } from runtime.abi_math
 import { listNew, abiListPush } from runtime.abi_list
-import { abiBoxI64, abiUnboxI64 } from runtime.abi_box
+import { abiBoxI64, abiUnboxI64, abiBoxF64, abiUnboxF64 } from runtime.abi_box
+import { abiStrFromByte } from runtime.abi_string
 
 test fn int_pow_matches_repeated_multiplication() {
     expect(abiIntPow(2, 10)).toBe(1024)
@@ -128,4 +129,74 @@ test fn list_index_of_compares_structurally() {
     abiListPush(probe, abiBoxI64(3))
     abiListPush(probe, abiBoxI64(4))
     expect(abiUnboxI64(abiListIndexOf(outer, probe))).toBe(1)
+}
+
+test fn list_last_index_of_returns_the_final_match() {
+    var xs = listNew(0)
+    abiListPush(xs, abiBoxI64(5))
+    abiListPush(xs, abiBoxI64(6))
+    abiListPush(xs, abiBoxI64(7))
+    abiListPush(xs, abiBoxI64(6))
+    expect(abiUnboxI64(abiListLastIndexOf(xs, abiBoxI64(5)))).toBe(0)
+    expect(abiUnboxI64(abiListLastIndexOf(xs, abiBoxI64(7)))).toBe(2)
+    // Duplicates report the final occurrence, the mirror of `indexOf`.
+    expect(abiUnboxI64(abiListLastIndexOf(xs, abiBoxI64(6)))).toBe(3)
+}
+
+test fn list_last_index_of_returns_null_when_absent_or_empty() {
+    var xs = listNew(0)
+    abiListPush(xs, abiBoxI64(1))
+    abiListPush(xs, abiBoxI64(2))
+    expect(abiListLastIndexOf(xs, abiBoxI64(9)) as int).toBe(0)
+    var empty = listNew(0)
+    expect(abiListLastIndexOf(empty, abiBoxI64(1)) as int).toBe(0)
+}
+
+test fn list_sum_adds_every_element() {
+    var xs = listNew(0)
+    // The empty sum is the additive identity, not a null.
+    expect(abiListSumI64(xs)).toBe(0)
+    abiListPush(xs, abiBoxI64(3))
+    abiListPush(xs, abiBoxI64(0 - 4))
+    abiListPush(xs, abiBoxI64(10))
+    expect(abiListSumI64(xs)).toBe(9)
+}
+
+test fn list_sum_f64_adds_floats() {
+    var xs = listNew(0)
+    expect(abiListSumF64(xs)).toBe(0.0)
+    abiListPush(xs, abiBoxF64(1.5))
+    abiListPush(xs, abiBoxF64(0.0 - 0.25))
+    abiListPush(xs, abiBoxF64(2.0))
+    expect(abiListSumF64(xs)).toBe(3.25)
+}
+
+test fn list_min_max_pick_the_extremes() {
+    var xs = listNew(0)
+    expect(abiListMin(xs, 0) as int).toBe(0)
+    expect(abiListMax(xs, 0) as int).toBe(0)
+    abiListPush(xs, abiBoxI64(4))
+    abiListPush(xs, abiBoxI64(0 - 2))
+    abiListPush(xs, abiBoxI64(9))
+    expect(abiUnboxI64(abiListMin(xs, 0))).toBe(0 - 2)
+    expect(abiUnboxI64(abiListMax(xs, 0))).toBe(9)
+}
+
+test fn list_min_max_order_floats() {
+    var xs = listNew(0)
+    abiListPush(xs, abiBoxF64(0.5))
+    abiListPush(xs, abiBoxF64(0.0 - 1.5))
+    abiListPush(xs, abiBoxF64(2.25))
+    expect(abiUnboxF64(abiListMin(xs, 1))).toBe(0.0 - 1.5)
+    expect(abiUnboxF64(abiListMax(xs, 1))).toBe(2.25)
+}
+
+test fn list_min_max_compare_strings_by_bytes() {
+    var xs = listNew(0)
+    let a = abiStrFromByte(97)
+    let b = abiStrFromByte(98)
+    abiListPush(xs, b)
+    abiListPush(xs, a)
+    expect((abiListMin(xs, 2) as int) == (a as int)).toBe(true)
+    expect((abiListMax(xs, 2) as int) == (b as int)).toBe(true)
 }

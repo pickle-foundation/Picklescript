@@ -391,6 +391,99 @@ fn abiStrTrim(s: *int) -> *int {
     }
 }
 
+/// Copy `s` with leading ASCII whitespace removed.
+///
+/// BEYOND PARITY - the leading half of `abiStrTrim`. Only the four single-byte
+/// ASCII whitespace bytes (space, tab, LF, CR) are stripped, so a multi-byte
+/// scalar is never split. A string with nothing to strip is returned unchanged.
+#[symbol("pickle_str_trim_start")]
+fn abiStrTrimStart(s: *int) -> *int {
+    unsafe {
+        var n = abiStrLen(s)
+        var start = 0
+        while (start < n) {
+            var c = byteAt(s, start)
+            if (c == 32 || c == 9 || c == 10 || c == 13) {
+                start = start + 1
+            } else {
+                break
+            }
+        }
+        if (start == 0) {
+            return s
+        }
+        var out = newStr(n - start)
+        var i = start
+        while (i < n) {
+            byteInto(out, i - start, byteAt(s, i))
+            i = i + 1
+        }
+        return out
+    }
+}
+
+/// Copy `s` with trailing ASCII whitespace removed. The trailing half of
+/// `abiStrTrim`, with the same byte-oriented rule and unchanged fast path.
+#[symbol("pickle_str_trim_end")]
+fn abiStrTrimEnd(s: *int) -> *int {
+    unsafe {
+        var n = abiStrLen(s)
+        var end = n
+        while (end > 0) {
+            var c = byteAt(s, end - 1)
+            if (c == 32 || c == 9 || c == 10 || c == 13) {
+                end = end - 1
+            } else {
+                break
+            }
+        }
+        if (end == n) {
+            return s
+        }
+        var out = newStr(end)
+        var i = 0
+        while (i < end) {
+            byteInto(out, i, byteAt(s, i))
+            i = i + 1
+        }
+        return out
+    }
+}
+
+/// Split `s` into lines at `\n`, treating `\r\n` as one line ending.
+///
+/// BEYOND PARITY, with the semantics of Rust's `str::lines`: the final line
+/// ending is optional, so a trailing `\n` does not add an empty final line, and
+/// an empty string yields an empty list. A `\r` is dropped only when it directly
+/// precedes the `\n` that ends a line, so a lone trailing `\r` is preserved.
+#[symbol("pickle_str_split_lines")]
+fn abiStrSplitLines(s: *int) -> *int {
+    unsafe {
+        var n = abiStrLen(s)
+        var out = abiListNew(0)
+        if (n == 0) {
+            return out
+        }
+        var start = 0
+        var i = 0
+        while (i < n) {
+            if (byteAt(s, i) == 10) {
+                var end = i
+                if (end > start && byteAt(s, end - 1) == 13) {
+                    end = end - 1
+                }
+                abiListPush(out, abiStrSubstring(s, start, end))
+                start = i + 1
+            }
+            i = i + 1
+        }
+        if (start < n) {
+            abiListPush(out, abiStrSubstring(s, start, n))
+        }
+        return out
+    }
+}
+
 /// Copy `s` with ASCII lower-case letters (`a`-`z`) upper-cased.
 ///
 /// BEYOND PARITY - `runtime/src/strings.rs` has no case mapping. Full Unicode

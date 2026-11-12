@@ -1,6 +1,6 @@
 module runtime.abi_string_test
 
-import { wordsFor, abiStrLen, abiStrConcat, abiStrCmp, abiStrGet, abiStrSet, abiStrFromBool, abiStrFromByte, abiStrFromChar, abiStrToBytes, abiStrFromList, abiStrStartsWith, abiStrEndsWith, abiStrIndexOf, abiStrLastIndexOf, abiStrCount, abiStrTrim, abiStrToUpper, abiStrToLower, abiStrSubstring, abiStrSplit, abiStrReplace, abiStrChars, abiStrRepeat, abiStrPadStart, abiStrPadEnd, abiStrFormat, abiListJoin, isScalar, utf8Len, leadByte } from runtime.abi_string
+import { wordsFor, abiStrLen, abiStrConcat, abiStrCmp, abiStrGet, abiStrSet, abiStrFromBool, abiStrFromByte, abiStrFromChar, abiStrToBytes, abiStrFromList, abiStrStartsWith, abiStrEndsWith, abiStrIndexOf, abiStrLastIndexOf, abiStrCount, abiStrTrim, abiStrTrimStart, abiStrTrimEnd, abiStrSplitLines, abiStrToUpper, abiStrToLower, abiStrSubstring, abiStrSplit, abiStrReplace, abiStrChars, abiStrRepeat, abiStrPadStart, abiStrPadEnd, abiStrFormat, abiListJoin, isScalar, utf8Len, leadByte } from runtime.abi_string
 import { abiListNew, abiListLen, abiListGet, abiListPush } from runtime.abi_list
 import { abiBoxI64, abiUnboxI64 } from runtime.abi_box
 
@@ -771,4 +771,77 @@ test fn str_count_tallies_non_overlapping_matches() {
     expect(abiStrCount(s, bytes2(97, 97))).toBe(1)
     expect(abiStrCount(s, bytes1(122))).toBe(0)
     expect(abiStrCount(s, abiStrRepeat(bytes1(0), 0))).toBe(0)
+}
+
+test fn str_trim_start_strips_leading_whitespace_only() {
+    // "  hi" -> "hi"
+    expect(abiStrCmp(abiStrTrimStart(bytes4(32, 32, 104, 105)), bytes2(104, 105))).toBe(0)
+    // "\t\r\n hi" -> "hi"
+    let mixed = abiStrConcat(bytes4(9, 13, 10, 32), bytes2(104, 105))
+    expect(abiStrCmp(abiStrTrimStart(mixed), bytes2(104, 105))).toBe(0)
+    // Trailing whitespace is untouched.
+    expect(abiStrLen(abiStrTrimStart(bytes2(104, 32)))).toBe(2)
+}
+
+test fn str_trim_start_returns_the_input_when_nothing_strips() {
+    let x = bytes2(104, 105)
+    expect((abiStrTrimStart(x) as int) == (x as int)).toBe(true)
+    // All-whitespace input strips to the empty string.
+    expect(abiStrLen(abiStrTrimStart(bytes1(32)))).toBe(0)
+}
+
+test fn str_trim_end_strips_trailing_whitespace_only() {
+    // "hi  " -> "hi"
+    expect(abiStrCmp(abiStrTrimEnd(bytes4(104, 105, 32, 32)), bytes2(104, 105))).toBe(0)
+    // "hi \n\r\t" -> "hi"
+    let mixed = abiStrConcat(bytes2(104, 105), bytes4(32, 10, 13, 9))
+    expect(abiStrCmp(abiStrTrimEnd(mixed), bytes2(104, 105))).toBe(0)
+    // Leading whitespace is untouched.
+    expect(abiStrLen(abiStrTrimEnd(bytes2(32, 104)))).toBe(2)
+}
+
+test fn str_trim_end_returns_the_input_when_nothing_strips() {
+    let x = bytes2(104, 105)
+    expect((abiStrTrimEnd(x) as int) == (x as int)).toBe(true)
+    expect(abiStrLen(abiStrTrimEnd(bytes1(32)))).toBe(0)
+}
+
+test fn str_split_lines_splits_on_newline() {
+    // "a\nb\nc"
+    let s = abiStrConcat(bytes4(97, 10, 98, 10), bytes1(99))
+    let ls = abiStrSplitLines(s)
+    expect(abiListLen(ls)).toBe(3)
+    expect(abiStrCmp(fieldAt(ls, 0), bytes1(97))).toBe(0)
+    expect(abiStrCmp(fieldAt(ls, 1), bytes1(98))).toBe(0)
+    expect(abiStrCmp(fieldAt(ls, 2), bytes1(99))).toBe(0)
+}
+
+test fn str_split_lines_treats_crlf_as_one_ending_and_drops_a_final_one() {
+    // "a\r\nb\n" -> ["a", "b"]
+    let s = abiStrConcat(bytes4(97, 13, 10, 98), bytes1(10))
+    let ls = abiStrSplitLines(s)
+    expect(abiListLen(ls)).toBe(2)
+    expect(abiStrCmp(fieldAt(ls, 0), bytes1(97))).toBe(0)
+    expect(abiStrCmp(fieldAt(ls, 1), bytes1(98))).toBe(0)
+}
+
+test fn str_split_lines_keeps_interior_empty_lines_and_a_lone_cr() {
+    // "a\n\nb\r" -> ["a", "", "b\r"]
+    let s = abiStrConcat(bytes4(97, 10, 10, 98), bytes1(13))
+    let ls = abiStrSplitLines(s)
+    expect(abiListLen(ls)).toBe(3)
+    expect(abiStrCmp(fieldAt(ls, 0), bytes1(97))).toBe(0)
+    expect(abiStrLen(fieldAt(ls, 1))).toBe(0)
+    expect(abiStrCmp(fieldAt(ls, 2), bytes2(98, 13))).toBe(0)
+}
+
+test fn str_split_lines_of_empty_and_ending_only_strings() {
+    expect(abiListLen(abiStrSplitLines(abiStrRepeat(bytes1(0), 0)))).toBe(0)
+    // "\n" is one empty line; "\r\n" is the same one empty line.
+    let onlyNl = abiStrSplitLines(bytes1(10))
+    expect(abiListLen(onlyNl)).toBe(1)
+    expect(abiStrLen(fieldAt(onlyNl, 0))).toBe(0)
+    let onlyCrLf = abiStrSplitLines(bytes2(13, 10))
+    expect(abiListLen(onlyCrLf)).toBe(1)
+    expect(abiStrLen(fieldAt(onlyCrLf, 0))).toBe(0)
 }

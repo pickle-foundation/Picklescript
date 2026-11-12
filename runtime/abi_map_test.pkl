@@ -10,7 +10,7 @@ module runtime.abi_map_test
 /// constants all reproduce the standard algorithm. `0xCBF29CE484222325` is written as
 /// `(0 - 0x340D631B7BDDDCDB)` because Pickle rejects literals above `i64::MAX`.
 
-import { abiMapNew, abiMapSet, abiMapGet, abiMapGetBoxed, abiMapHas, abiMapRemove, abiMapMerge, abiMapEntries } from runtime.abi_map
+import { abiMapNew, abiMapSet, abiMapGet, abiMapGetBoxed, abiMapHas, abiMapRemove, abiMapMerge, abiMapClear, abiMapEntries } from runtime.abi_map
 import { abiMapLen, abiMapKeys, abiMapValues, keyHash, keyEq, deepHash, mapNew, entriesCount, needsGrow, isLiveKey, occupiedCount } from runtime.abi_map
 import { LEN_WORD, CAP_WORD, ENTRIES_WORD, GOLDEN, CYCLIC_HASH } from runtime.abi_map
 import { abiTupleField } from runtime.abi_tuple
@@ -796,4 +796,23 @@ test fn entries_cover_every_live_slot_after_removal() {
     expect(abiListLen(es)).toBe(1)
     let pair = abiListGet(es, 0)
     expect(abiUnboxI64(abiTupleField(pair, 1))).toBe(2)
+}
+
+test fn clear_empties_the_map_and_keeps_it_usable() {
+    var m = abiMapNew(0)
+    abiMapSet(m, mkAlpha(), abiBoxI64(1))
+    abiMapSet(m, mkBeta(), abiBoxI64(2))
+    expect(abiMapLen(m)).toBe(2)
+    abiMapClear(m)
+    expect(abiMapLen(m)).toBe(0)
+    expect(abiMapHas(m, mkAlpha())).toBe(false)
+    expect(abiMapGet(m, mkAlpha()) as int).toBe(0)
+    expect(abiListLen(abiMapEntries(m))).toBe(0)
+    // The same table is reused, so refilling needs no rehash.
+    abiMapSet(m, mkAlpha(), abiBoxI64(7))
+    expect(abiMapLen(m)).toBe(1)
+    expect(abiUnboxI64(abiMapGet(m, mkAlpha()))).toBe(7)
+    // Clearing an already-empty map is a no-op.
+    abiMapClear(m)
+    expect(abiMapLen(m)).toBe(0)
 }

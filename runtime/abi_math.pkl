@@ -29,9 +29,9 @@ module runtime.abi_math
 /// same structural equality map keys use (`pickle_list_contains` mirrors the
 /// native `value_eq`, which is `key_eq`), and `abiStrContains` is a byte-run
 /// scan over the string payload, matching `strings.rs::string_contains`.
-import { pow2, f64Bits, abiF64FromBits, abiBoxI64 } from runtime.abi_box
+import { pow2, f64Bits, abiF64FromBits, abiBoxI64, abiUnboxI64, abiUnboxF64 } from runtime.abi_box
 import { keyEq } from runtime.abi_map
-import { abiStrLen, byteAt } from runtime.abi_string
+import { abiStrLen, byteAt, abiStrCmp } from runtime.abi_string
 import { LEN_WORD, DATA_WORD } from runtime.abi_list
 
 const LN_2: float = 0.6931471805599453
@@ -321,6 +321,124 @@ fn abiListIndexOf(list: *int, value: *int) -> *int {
         }
     }
     return 0 as *int
+}
+
+/// Index of the LAST element structurally equal to `value`, boxed, or the null
+/// pointer when absent. BEYOND PARITY - the mirror of `abiListIndexOf`, scanning
+/// right to left so the returned box is the `int?` the compiler already uses.
+#[symbol("pickle_list_last_index_of")]
+fn abiListLastIndexOf(list: *int, value: *int) -> *int {
+    unsafe {
+        var n = list[LEN_WORD]
+        var data = list[DATA_WORD] as *int
+        var i = n - 1
+        while (i >= 0) {
+            if (keyEq(data[i] as *int, value)) {
+                return abiBoxI64(i)
+            }
+            i = i - 1
+        }
+    }
+    return 0 as *int
+}
+
+/// Sum of a `List<int>` / `List<byte>` / `List<char>` as a raw `i64`.
+///
+/// BEYOND PARITY. Every element is boxed with `pickle_box_i64` (byte and char
+/// share that payload), so one unbox-and-add loop covers all three. An empty
+/// list sums to `0`. The caller passes the result straight through; the element
+/// type decides whether the compiler labels the temp `int`, `byte`, or `char`,
+/// which are all `i64` at the ABI.
+#[symbol("pickle_list_sum_i64")]
+fn abiListSumI64(list: *int) -> int {
+    unsafe {
+        var n = list[LEN_WORD]
+        var data = list[DATA_WORD] as *int
+        var total = 0
+        var i = 0
+        while (i < n) {
+            total = total + abiUnboxI64(data[i] as *int)
+            i = i + 1
+        }
+        return total
+    }
+}
+
+/// Sum of a `List<float>` as a raw `f64`. BEYOND PARITY, the float mirror of
+/// `abiListSumI64`; an empty list sums to `0.0`.
+#[symbol("pickle_list_sum_f64")]
+fn abiListSumF64(list: *int) -> float {
+    unsafe {
+        var n = list[LEN_WORD]
+        var data = list[DATA_WORD] as *int
+        var total = 0.0
+        var i = 0
+        while (i < n) {
+            total = total + abiUnboxF64(data[i] as *int)
+            i = i + 1
+        }
+        return total
+    }
+}
+
+/// Whether element `a` orders before `b` for the `min`/`max` scans. `kind`
+/// matches `sortKind`: 0 = int/byte/char/bool (boxed `i64` payload), 1 = float,
+/// 2 = string (`abiStrCmp`, byte-lexicographic).
+fn elemLess(a: *int, b: *int, kind: int) -> bool {
+    if (kind == 1) {
+        return abiUnboxF64(a) < abiUnboxF64(b)
+    }
+    if (kind == 2) {
+        return abiStrCmp(a, b) < 0
+    }
+    return abiUnboxI64(a) < abiUnboxI64(b)
+}
+
+/// Smallest element pointer, or the null pointer when the list is empty.
+///
+/// BEYOND PARITY. The list already stores each element as its boxed/pointer
+/// representation, so the winner is returned as-is: no re-boxing, and the result
+/// is exactly the `T?` the compiler represents. `kind` selects the ordering.
+#[symbol("pickle_list_min")]
+fn abiListMin(list: *int, kind: int) -> *int {
+    unsafe {
+        var n = list[LEN_WORD]
+        if (n == 0) {
+            return 0 as *int
+        }
+        var data = list[DATA_WORD] as *int
+        var best = data[0]
+        var i = 1
+        while (i < n) {
+            if (elemLess(data[i] as *int, best as *int, kind)) {
+                best = data[i]
+            }
+            i = i + 1
+        }
+        return best as *int
+    }
+}
+
+/// Largest element pointer, or the null pointer when the list is empty. The
+/// mirror of `abiListMin`, reusing `elemLess` with the operands swapped.
+#[symbol("pickle_list_max")]
+fn abiListMax(list: *int, kind: int) -> *int {
+    unsafe {
+        var n = list[LEN_WORD]
+        if (n == 0) {
+            return 0 as *int
+        }
+        var data = list[DATA_WORD] as *int
+        var best = data[0]
+        var i = 1
+        while (i < n) {
+            if (elemLess(best as *int, data[i] as *int, kind)) {
+                best = data[i]
+            }
+            i = i + 1
+        }
+        return best as *int
+    }
 }
 
 /// Whether the bytes of `needle` occur as a contiguous run in `hay`. An empty

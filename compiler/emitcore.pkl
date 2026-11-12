@@ -5559,7 +5559,7 @@ bad(em, e.span, "`" + classOfName(em, cc) + "` has no method `" + name + "`")
                 }
                 var obj = expr(em, object)
                 if (let some(obj) = obj) {
-                    if (mapBorrowed && (name == "remove" || name == "merge")) {
+                    if (mapBorrowed && (name == "remove" || name == "merge" || name == "clear")) {
                         bad(em, e.span, "`" + name + "` mutates a `Map` through an immutable reference (`&Map`)")
                         return none
                     }
@@ -5711,6 +5711,14 @@ var k = expr(em, args[0].value)
                                 return unitTemp(em)
                             }
                             return none
+                        }
+                        case "clear" -> {
+                            if (!(len(args) == 0)) {
+                                bad(em, e.span, "`clear` takes no arguments")
+                                return none
+                            }
+                            externCallVoid(em, "pickle_map_clear", [IrTy.Ptr], [obj])
+                            return unitTemp(em)
                         }
                         case _ -> {
                             bad(em, e.span, "`" + name + "` method on `Map` is not lowered yet")
@@ -6588,7 +6596,7 @@ fn listMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List<C
         }
         // Only the read-only methods read through an immutable borrow; the
         // mutators would write through `&List`, so they keep bailing.
-        if (isBorrowed && name != "contains" && name != "indexOf" && name != "len" && name != "isEmpty" && name != "slice" && name != "join" && name != "map" && name != "filter" && name != "any" && name != "all" && name != "find" && name != "count" && name != "take" && name != "skip" && name != "first" && name != "last" && name != "enumerate" && name != "zip" && name != "flatten" && name != "flatMap" && name != "sorted") {
+        if (isBorrowed && name != "contains" && name != "indexOf" && name != "lastIndexOf" && name != "len" && name != "isEmpty" && name != "slice" && name != "join" && name != "map" && name != "filter" && name != "any" && name != "all" && name != "find" && name != "count" && name != "take" && name != "skip" && name != "first" && name != "last" && name != "enumerate" && name != "zip" && name != "flatten" && name != "flatMap" && name != "sorted" && name != "sum" && name != "min" && name != "max") {
             bad(em, e.span, "`" + name + "` mutates a `List` through an immutable reference (`&List`)")
             return none
         }
@@ -6753,6 +6761,65 @@ fn listMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List<C
                             return none
                         }
                         return none
+                    }
+                    return none
+                }
+                case "lastIndexOf" -> {
+                    if (!(len(args) == 1)) {
+                        bad(em, e.span, "`lastIndexOf` takes one argument")
+                        return none
+                    }
+                    var rp = elemRep(em, elem, e.span)
+                    if (let some(rep) = rp) {
+                        var v = expr(em, args[0].value)
+                        if (let some(v) = v) {
+                            var vt = elem
+                            if (let some(t) = tyOf(em, args[0].value.span)) {
+                                vt = t
+                            }
+                            var key = packMapKey(em, rep, v, vt, args[0].value.span)
+                            if (let some(k) = key) {
+                                return externCallT1(em, "pickle_list_last_index_of", [IrTy.Ptr, IrTy.Ptr], IrTy.Ptr, [obj, k])
+                            }
+                            return none
+                        }
+                        return none
+                    }
+                    return none
+                }
+                case "sum" -> {
+                    if (!(len(args) == 0)) {
+                        bad(em, e.span, "`sum` takes no arguments")
+                        return none
+                    }
+                    if (elem == Ty.Float) {
+                        return externCallT1(em, "pickle_list_sum_f64", [IrTy.Ptr], IrTy.Float, [obj])
+                    }
+                    var sret = IrTy.Int
+                    if (let some(si) = scalarIr(elem)) {
+                        sret = si
+                    }
+                    return externCallT1(em, "pickle_list_sum_i64", [IrTy.Ptr], sret, [obj])
+                }
+                case "min" -> {
+                    if (!(len(args) == 0)) {
+                        bad(em, e.span, "`min` takes no arguments")
+                        return none
+                    }
+                    var kv = sortKind(em, elem, e.span)
+                    if (let some(kind) = kv) {
+                        return externCallT1(em, "pickle_list_min", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [obj, kind])
+                    }
+                    return none
+                }
+                case "max" -> {
+                    if (!(len(args) == 0)) {
+                        bad(em, e.span, "`max` takes no arguments")
+                        return none
+                    }
+                    var kv = sortKind(em, elem, e.span)
+                    if (let some(kind) = kv) {
+                        return externCallT1(em, "pickle_list_max", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [obj, kind])
                     }
                     return none
                 }
@@ -7798,6 +7865,36 @@ fn stringMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List
                         return externCallT1(em, "pickle_str_count", [IrTy.Str, IrTy.Str], IrTy.Int, [obj, needle])
                     }
                     return none
+                }
+                case "trimStart" -> {
+                    if (!(len(args) == 0)) {
+                        bad(em, e.span, "`trimStart` takes no arguments")
+                        return none
+                    }
+                    if (isBorrowed) {
+                        return externCallT1(em, "pickle_str_trim_start", [IrTy.Ptr], IrTy.Str, [obj])
+                    }
+                    return externCallT1(em, "pickle_str_trim_start", [IrTy.Str], IrTy.Str, [obj])
+                }
+                case "trimEnd" -> {
+                    if (!(len(args) == 0)) {
+                        bad(em, e.span, "`trimEnd` takes no arguments")
+                        return none
+                    }
+                    if (isBorrowed) {
+                        return externCallT1(em, "pickle_str_trim_end", [IrTy.Ptr], IrTy.Str, [obj])
+                    }
+                    return externCallT1(em, "pickle_str_trim_end", [IrTy.Str], IrTy.Str, [obj])
+                }
+                case "splitLines" -> {
+                    if (!(len(args) == 0)) {
+                        bad(em, e.span, "`splitLines` takes no arguments")
+                        return none
+                    }
+                    if (isBorrowed) {
+                        return externCallT1(em, "pickle_str_split_lines", [IrTy.Ptr], IrTy.Ptr, [obj])
+                    }
+                    return externCallT1(em, "pickle_str_split_lines", [IrTy.Str], IrTy.Ptr, [obj])
                 }
                 case _ -> {
                     bad(em, e.span, "`" + name + "` method on `string` is not lowered yet")
