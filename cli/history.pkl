@@ -12,7 +12,7 @@ module cli.history
 import { frontendChecked, FrontOutput } from compiler.front
 import { stringTrim, strLt, subStr, sortStrs, dedupStrs, eqStrs } from compiler.front
 import { DiagnosticSink } from compiler.diag
-import { Snapshot, PublicItem, SurfaceChange, extractSurface, depsOf, diffSurfaces, transitLabel, fnv1a64, emptyPublicItems, cps } from compiler.history
+import { Snapshot, PublicItem, SurfaceChange, extractSurface, depsOf, diffSurfaces, transitLabel, fnv1a64, cps } from compiler.history
 import { emitIr } from compiler.emit
 import { git, Result, currentDir, splitLines } from std.process
 import { writeStderr } from runtime.abi_stdio
@@ -91,7 +91,7 @@ fn pklHistory(root: string) -> List<CommitEntry>? {
 fn parseHistory(out: string) -> List<CommitEntry> {
     let recSep = cps(30)
     let hdrSep = cps(31)
-    var entries = emptyEntries()
+    var entries = List<CommitEntry>()
     let parts = splitBy(out, recSep)
     var i = 0
     while (i < len(parts)) {
@@ -104,8 +104,8 @@ fn parseHistory(out: string) -> List<CommitEntry> {
                 if (len(lines) > 0) {
                     message = lines[0]
                 }
-                var files = emptyStrs()
-                var shas = emptyStrs()
+                var files = List<string>()
+                var shas = List<string>()
                 var j = 1
                 while (j < len(lines)) {
                     let t = trimEnd(lines[j])
@@ -130,7 +130,7 @@ fn parseHistory(out: string) -> List<CommitEntry> {
         }
         i = i + 1
     }
-    let out = emptyEntries()
+    let out = List<CommitEntry>()
     var m = len(entries) - 1
     while (m >= 0) {
         out.push(entries[m])
@@ -183,7 +183,7 @@ fn cachePath(root: string) -> string {
 }
 
 fn readCache(root: string) -> List<Snapshot> {
-    var out = emptySnaps()
+    var out = List<Snapshot>()
     match (read_file(cachePath(root))) {
         case none -> { return out }
         case some(text) -> {
@@ -208,7 +208,7 @@ fn readCache(root: string) -> List<Snapshot> {
 /// fresh list before `str`, keeping the whole split O(n).
 fn fastSplitLines(s: string) -> List<string> {
     let bs = bytes(s)
-    var out = emptyStrs()
+    var out = List<string>()
     var start = 0
     var i = 0
     let n = len(bs)
@@ -275,7 +275,7 @@ fn buildSnapshot(e: CommitEntry, file: string, content: string) -> Snapshot {
     if (let some(o) = out) {
         let _ = emitIr(o.program, o.resolved, diags)
     }
-    var codes = emptyStrs()
+    var codes = List<string>()
     var i = 0
     while (i < len(diags.diagnostics)) {
         match (diags.diagnostics[i].code) {
@@ -286,8 +286,8 @@ fn buildSnapshot(e: CommitEntry, file: string, content: string) -> Snapshot {
     }
     sortStrs(codes)
     dedupStrs(codes)
-    var items = emptyPublicItems()
-    var deps = emptyStrs()
+    var items = List<PublicItem>()
+    var deps = List<string>()
     match (out) {
         case some(o) -> {
             items = extractSurface(o.program)
@@ -312,7 +312,7 @@ fn collectSnapshots(root: string) -> List<Snapshot>? {
         case none -> { return none }
         case some(history) -> {
             var cached = readCache(root)
-            var fresh = emptySnaps()
+            var fresh = List<Snapshot>()
             var i = 0
             while (i < len(history)) {
                 let e = history[i]
@@ -389,7 +389,7 @@ fn fmtCommit(short: string, date: string, message: string) -> string {
 /// `pickle history [--file F] [--limit N]`: per file, the last `limit`
 /// versions with the surface evolution between consecutive ones.
 fn renderHistory(snapshots: List<Snapshot>, fileFilter: string?, limit: int) {
-    var files = emptyStrs()
+    var files = List<string>()
     var i = 0
     while (i < len(snapshots)) {
         if (!listHasStr(files, snapshots[i].file)) {
@@ -399,7 +399,7 @@ fn renderHistory(snapshots: List<Snapshot>, fileFilter: string?, limit: int) {
     }
     match (fileFilter) {
         case some(f) -> {
-            var kept = emptyStrs()
+            var kept = List<string>()
             var k = 0
             while (k < len(files)) {
                 if (files[k] == f) {
@@ -416,7 +416,7 @@ fn renderHistory(snapshots: List<Snapshot>, fileFilter: string?, limit: int) {
     var fi = 0
     while (fi < len(files)) {
         let file = files[fi]
-        var seq = emptySnaps()
+        var seq = List<Snapshot>()
         var s0 = 0
         while (s0 < len(snapshots)) {
             if (snapshots[s0].file == file) {
@@ -424,7 +424,7 @@ fn renderHistory(snapshots: List<Snapshot>, fileFilter: string?, limit: int) {
             }
             s0 = s0 + 1
         }
-        var shown = emptySnaps()
+        var shown = List<Snapshot>()
         var m = len(seq) - 1
         while (m >= 0 && len(shown) < lim) {
             shown.push(seq[m])
@@ -501,7 +501,7 @@ fn optOrEmpty(o: string?) -> string {
 /// first) with their status and error codes.
 fn renderBuilds(snapshots: List<Snapshot>, limit: int) {
     let lim = intMax(limit, 1)
-    var rows = emptyRows()
+    var rows = List<BuildRow>()
     var i = 0
     while (i < len(snapshots)) {
         let s = snapshots[i]
@@ -519,7 +519,7 @@ fn renderBuilds(snapshots: List<Snapshot>, limit: int) {
         }
         j = j + 1
     }
-    var shown = emptyRows()
+    var shown = List<BuildRow>()
     var m = 0
     while (m < len(rows) && m < lim) {
         shown.push(rows[m])
@@ -566,7 +566,7 @@ fn rowBefore(a: BuildRow, b: BuildRow) -> bool {
 /// `pickle explain <CODE> --history`: every version (oldest first) where the
 /// code fired.
 fn renderExplainHistory(snapshots: List<Snapshot>, code: string) {
-    var hits = emptySnaps()
+    var hits = List<Snapshot>()
     var i = 0
     while (i < len(snapshots)) {
         if (listHasStr(snapshots[i].codes, code)) {
@@ -689,7 +689,7 @@ fn hasSuffix(s: string, suf: string) -> bool {
 fn splitBy(s: string, d: string) -> List<string> {
     let bs = bytes(s)
     let db = bytes(d)
-    var out = emptyStrs()
+    var out = List<string>()
     var cur = ""
     var i = 0
     while (i < len(bs)) {
@@ -772,26 +772,3 @@ fn reverseSnaps(l: List<Snapshot>) {
     }
 }
 
-fn emptyStrs() -> List<string> {
-    var l = [""]
-    l.pop()
-    l
-}
-
-fn emptySnaps() -> List<Snapshot> {
-    var l = [Snapshot("", "", "", "", "", "", false, emptyStrs(), emptyStrs(), emptyPublicItems())]
-    l.pop()
-    l
-}
-
-fn emptyEntries() -> List<CommitEntry> {
-    var l = [CommitEntry("", "", "", "", emptyStrs(), emptyStrs())]
-    l.pop()
-    l
-}
-
-fn emptyRows() -> List<BuildRow> {
-    var l = [BuildRow("", "", "", false, emptyStrs())]
-    l.pop()
-    l
-}

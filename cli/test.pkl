@@ -188,28 +188,29 @@ fn hookGroupOf(name: string) -> string {
     rest
 }
 
-/// The runner helpers are pulled in under aliased names instead of a wildcard
-/// import. A `import * from std.test` in the root would dump every std.test
-/// export (including `emptyStrs`, `emptyTests`, `emptyHooks`, `emptyCallArgs`)
-/// into the same flattened namespace as the test body's own imports and
-/// declarations, which the Rust CLI never does (the Rust runner is native, and
-/// the test file is its own module). Aliased item imports keep the root free of
-/// those bare names while still reaching the runner; `captureBegin`/`captureTake`
-/// resolve as name-level builtins.
+/// The runner is reached through a module alias instead of a wildcard import.
+/// A `import * from std.test` in the root would dump every std.test export
+/// (including `TestCase`, `Hook`, `runTests`, `NameParts`) into the same
+/// flattened namespace as the test body's own imports and declarations, which
+/// the Rust CLI never does (the Rust runner is native, and the test file is its
+/// own module). `import std.test as __h_std` keeps the root free of those bare
+/// names while still reaching the runner, and `__h_std.TestCase` resolves in
+/// both value and type position. An *item* alias (`TestCase as __h_TestCase`)
+/// would not do: it registers a value rename only, so `List<__h_TestCase>` is
+/// an unknown type. `captureBegin`/`captureTake` resolve as name-level builtins.
 ///
 /// `mod` is the module path the original test file declared. It is re-emitted
 /// as the harness root's own module declaration so the root's top-level names
 /// count as module exports. That makes names the test file also exports
-/// (`emptyCallArgs` vs `compiler.ast`, `emptyTests`/`emptyHooks` vs `std.test`)
-/// register as `collided`, so the front end renames both providers and the
-/// flattened program has no duplicate declarations — exactly the Rust CLI's
-/// per-module behavior.
+/// (`TestCase` vs `std.test`, `Hook` vs `std.test`) register as `collided`,
+/// so the front end renames both providers and the flattened program has no
+/// duplicate declarations - exactly the Rust CLI's per-module behavior.
 fn buildHarness(names: List<string>, groups: List<string>, kinds: List<int>, target: string, src: string, mod: string) -> string {
     var h = ""
     if (len(mod) > 0) {
         h = h + "module " + mod + "\n"
     }
-    h = h + "import {{ emptyTests as __h_emptyTests, emptyHooks as __h_emptyHooks, TestCase as __h_TestCase, Hook as __h_Hook, runTests as __h_runTests }} from std.test\n"
+    h = h + "import std.test as __h_std\n"
     var i = 0
     while (i < len(names)) {
         h = h + "fn __w" + str(i) + "() -> string? " + chrCode(123) + "\n"
@@ -222,19 +223,19 @@ fn buildHarness(names: List<string>, groups: List<string>, kinds: List<int>, tar
     h = h + "fn main() " + chrCode(123) + "\n"
     h = h + "    println(\"running \" + str(" + str(len(names)) + ") + \" test(s) from \" + " + quoted(target) + ")\n"
     h = h + "    captureBegin()\n"
-    h = h + "    var tests = __h_emptyTests()\n"
+    h = h + "    var tests = List<__h_std.TestCase>()\n"
     i = 0
     while (i < len(names)) {
-        h = h + "    tests.push(__h_TestCase(" + quoted(names[i]) + ", __w" + str(i) + "))\n"
+        h = h + "    tests.push(__h_std.TestCase(" + quoted(names[i]) + ", __w" + str(i) + "))\n"
         i = i + 1
     }
-    h = h + "    var hooks = __h_emptyHooks()\n"
+    h = h + "    var hooks = List<__h_std.Hook>()\n"
     i = 0
     while (i < len(groups)) {
-        h = h + "    hooks.push(__h_Hook(" + quoted(groups[i]) + ", " + str(kinds[i]) + ", __h" + str(i) + "))\n"
+        h = h + "    hooks.push(__h_std.Hook(" + quoted(groups[i]) + ", " + str(kinds[i]) + ", __h" + str(i) + "))\n"
         i = i + 1
     }
-    h = h + "    let code = __h_runTests(tests, hooks)\n"
+    h = h + "    let code = __h_std.runTests(tests, hooks)\n"
     h = h + "    exit(code)\n"
     h = h + chrCode(125) + "\n"
     h = h + src

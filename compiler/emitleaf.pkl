@@ -8,7 +8,7 @@ module compiler.emitleaf
 
 import * from compiler.ast
 import { Diagnostic, DiagnosticSink, Span } from compiler.diag
-import { IrBlock, IrFunc, IrGlobal, IrInstr, IrTerm, IrTy, emptyIrBlocks } from compiler.ir
+import { IrBlock, IrFunc, IrGlobal, IrInstr, IrTerm, IrTy } from compiler.ir
 import { ResolvedProgram } from compiler.resolvebag
 import * from compiler.ty
 import * from compiler.emitutil
@@ -130,11 +130,11 @@ fn registerFn(em: Emitter, f: FnDecl, isTest: bool, attrs: List<Attribute>) -> b
             var fid = len(em.irModule.funcs)
             var symbol = symbolForAttrs(em, f.name, isTest, attrs)
             em.irModule.funcsByName[f.name] = fid
-            em.irModule.funcs.push(IrFunc(f.name, symbol, emptyIrParams(), IrTy.Unit, emptyIrTys(), 0, emptyIrBlocks(), !isTest && f.name == "main", isTest, itemTags(attrs)))
+            em.irModule.funcs.push(IrFunc(f.name, symbol, List<IrParam>(), IrTy.Unit, List<IrTy>(), 0, List<IrBlock>(), !isTest && f.name == "main", isTest, itemTags(attrs)))
             em.fidList.push(fid)
             em.fsource[fid] = FnSource.TopLevel(f)
             em.finfo[fid] = info
-            var stys = emptyTys()
+            var stys = List<Ty>()
             for (p in info.params) {
                 stys.push(p.ty)
             }
@@ -150,22 +150,22 @@ fn registerAsyncFn(em: Emitter, f: FnDecl, isTest: bool, attrs: List<Attribute>,
         var hiddenSymbol = symbol + "__future"
         var hidden = len(em.irModule.funcs)
         em.irModule.funcsByName[hiddenName] = hidden
-        em.irModule.funcs.push(IrFunc(hiddenName, hiddenSymbol, emptyIrParams(), IrTy.Unit, emptyIrTys(), 0, emptyIrBlocks(), false, false, emptyStrs()))
+        em.irModule.funcs.push(IrFunc(hiddenName, hiddenSymbol, List<IrParam>(), IrTy.Unit, List<IrTy>(), 0, List<IrBlock>(), false, false, List<string>()))
         em.fidList.push(hidden)
-        var htys = emptyTys()
+        var htys = List<Ty>()
         for (p in info.params) {
             htys.push(p.ty)
         }
         em.fsource[hidden] = FnSource.AsyncBody(f, htys, info.ret)
-        var hiddenInfo = CallableInfo(info.name, info.span, info.visibility, info.isAsync, info.isStatic, info.isOverride, info.isAbstract, info.operator, info.generics, emptyParamInfos(), info.ret)
+        var hiddenInfo = CallableInfo(info.name, info.span, info.visibility, info.isAsync, info.isStatic, info.isOverride, info.isAbstract, info.operator, info.generics, List<ParamInfo>(), info.ret)
         em.finfo[hidden] = hiddenInfo
         var wfid = len(em.irModule.funcs)
         em.irModule.funcsByName[f.name] = wfid
-        em.irModule.funcs.push(IrFunc(f.name, symbol, emptyIrParams(), IrTy.Unit, emptyIrTys(), 0, emptyIrBlocks(), !isTest && f.name == "main", isTest, itemTags(attrs)))
+        em.irModule.funcs.push(IrFunc(f.name, symbol, List<IrParam>(), IrTy.Unit, List<IrTy>(), 0, List<IrBlock>(), !isTest && f.name == "main", isTest, itemTags(attrs)))
         em.fidList.push(wfid)
         em.fsource[wfid] = FnSource.AsyncFn(f, hidden)
         em.finfo[wfid] = info
-        var stys = emptyTys()
+        var stys = List<Ty>()
         for (p in info.params) {
             stys.push(p.ty)
         }
@@ -181,7 +181,7 @@ fn registerAsyncMethod(em: Emitter, cname: string, table: ClassTable, md: Method
                 thisTy = Ty.Class(cname, args)
             }
         }
-        var pty = emptyTys()
+        var pty = List<Ty>()
         if (let some(t) = thisTy) {
             pty.push(t)
         }
@@ -195,7 +195,7 @@ fn registerAsyncMethod(em: Emitter, cname: string, table: ClassTable, md: Method
             stem = "pkl_" + cname + "_" + md.name
         }
         var hidden = pushClassFunc(em, cname + "." + md.name + ".future", stem + suffix + "__future", FnSource.AsyncMethodBody(table, md, pty, info.ret, info.isStatic))
-        var hiddenInfo = CallableInfo(info.name, info.span, info.visibility, info.isAsync, info.isStatic, info.isOverride, info.isAbstract, info.operator, info.generics, emptyParamInfos(), info.ret)
+        var hiddenInfo = CallableInfo(info.name, info.span, info.visibility, info.isAsync, info.isStatic, info.isOverride, info.isAbstract, info.operator, info.generics, List<ParamInfo>(), info.ret)
         em.finfo[hidden] = hiddenInfo
         em.fidOwner[hidden] = cid
         if (let some(s) = map) {
@@ -204,7 +204,7 @@ fn registerAsyncMethod(em: Emitter, cname: string, table: ClassTable, md: Method
         }
         var wfid = pushClassFunc(em, cname + "." + md.name, stem + suffix, FnSource.AsyncMethod(table, md, hidden, info.isStatic, thisTy))
         em.finfo[wfid] = info
-        var stys = emptyTys()
+        var stys = List<Ty>()
         for (p in info.params) {
             stys.push(p.ty)
         }
@@ -306,7 +306,7 @@ fn ancestry(em: Emitter, name: string) -> List<string> {
                 break
             }
         }
-        var reversed = emptyStrs()
+        var reversed = List<string>()
         var i = len(chain) - 1
         while (i >= 0) {
             reversed.push(chain[i])
@@ -328,7 +328,7 @@ fn isAncestor(em: Emitter, anc: string, desc: string) -> bool {
     }
 
 fn buildVirtualDispatch(em: Emitter) {
-        var visible: Map<int, List<NamedFid>> = emptyNamedFidMap()
+        var visible: Map<int, List<NamedFid>> = Map<int, List<NamedFid>>()
         for (me in em.methodSeq) {
             if (!me.isStatic) {
                 if (let some(l) = visible.get(me.cid)) {
@@ -347,7 +347,7 @@ fn buildVirtualDispatch(em: Emitter) {
             }
             if (let some(names) = visible.get(p.classId)) {
                 for (nm in names) {
-                    var branches = emptyDispatchDepths()
+                    var branches = List<DispatchBranchDepth>()
                     for (d in em.classes) {
                         if (d.classId == p.classId) {
                             continue
@@ -375,7 +375,7 @@ fn buildVirtualDispatch(em: Emitter) {
                         continue
                     }
                     sortBranches(branches)
-                    var db = emptyDispatchBranches()
+                    var db = List<DispatchBranch>()
                     for (b in branches) {
                         db.push(DispatchBranch(b.dcid, b.dfid))
                     }
@@ -410,7 +410,7 @@ fn staticPropDef(em: Emitter, cid: int, name: string, isSet: bool, fid: int) {
 
 fn ownInstanceFields(em: Emitter, name: string) -> List<FieldInfo> {
         if (let some(t) = tableOf(em, name)) {
-            var out = emptyFieldInfos()
+            var out = List<FieldInfo>()
             for (f in t.fields) {
                 if (!f.isStatic) {
                     out.push(f)
@@ -418,7 +418,7 @@ fn ownInstanceFields(em: Emitter, name: string) -> List<FieldInfo> {
             }
             out
         } else {
-            emptyFieldInfos()
+            List<FieldInfo>()
         }
     }
 
@@ -437,7 +437,7 @@ fn instanceFieldInfo(em: Emitter, cname: string, name: string) -> FieldInfo? {
     }
 
 fn collectInstanceInits(em: Emitter, name: string) -> List<SlotInit> {
-        var out = emptySlotInits()
+        var out = List<SlotInit>()
         var base = 0
         for (cname in ancestry(em, name)) {
             var own = ownInstanceFields(em, cname)
@@ -479,7 +479,7 @@ fn collectInstanceInits(em: Emitter, name: string) -> List<SlotInit> {
     }
 
 fn collectInitBlocks(em: Emitter, name: string) -> List<Block> {
-        var out = emptyBlocks()
+        var out = List<Block>()
         for (cname in ancestry(em, name)) {
             var decl = planName(cname)
             var members: List<ClassMember>? = none
@@ -516,7 +516,7 @@ fn ifaceIdFor(em: Emitter, name: string, args: List<Ty>, span: Span) -> int? {
             var id = em.nextIfaceId
             em.nextIfaceId = em.nextIfaceId + 1
             if (!em.ifaceMembers.has(id)) {
-                var plan = emptyIfaceMemberList()
+                var plan = List<IfaceMember>()
                 var mi = 0
                 for (m in t.members) {
                     if (m.isProperty) {
@@ -545,7 +545,7 @@ fn registerImplements(em: Emitter, cname: string, cid: int, ifaces: List<Ty>, sp
         for (t in ifaces) {
             if (let some(ir) = ifaceOf(t)) {
                 if (let some(id) = ifaceIdFor(em, ir.name, ir.args, span)) {
-                    var slots = emptyDispatchBranches()
+                    var slots = List<DispatchBranch>()
                     var members = em.ifaceMembers.get(id)
                     if (let some(ms) = members) {
                         for (m in ms) {
@@ -701,7 +701,7 @@ fn maybeRegisterClass(em: Emitter, name: string, members: List<ClassMember>, tab
                 case _ -> {}
             }
         }
-        var statics = emptyStaticSlotInits()
+        var statics = List<StaticSlotInit>()
         for (f in table.fields) {
             if (f.isStatic) {
                 if (let some(slot) = staticFieldSlot(table, f.name)) {
@@ -755,7 +755,7 @@ fn maybeRegisterClass(em: Emitter, name: string, members: List<ClassMember>, tab
                                 ncinfo = nc
                             }
                         }
-                        var ps = emptyTys()
+                        var ps = List<Ty>()
                         if (let some(cinfo) = ncinfo) {
                             for (p in cinfo.ctor.params) {
                                 ps.push(p.ty)
@@ -801,7 +801,7 @@ fn maybeRegisterClass(em: Emitter, name: string, members: List<ClassMember>, tab
                             continue
                         }
                         if (md.isAsync) {
-                            registerAsyncMethod(em, name, table, md, inf, cid, emptyTys(), false, "", none)
+                            registerAsyncMethod(em, name, table, md, inf, cid, List<Ty>(), false, "", none)
                             continue
                         }
                         var symbol = ""
@@ -812,7 +812,7 @@ fn maybeRegisterClass(em: Emitter, name: string, members: List<ClassMember>, tab
                         }
                         var mid = pushClassFunc(em, name + "." + md.name, symbol, FnSource.Method(table, md))
                         em.finfo[mid] = inf
-                        var ps = emptyTys()
+                        var ps = List<Ty>()
                         for (p in inf.params) {
                             ps.push(p.ty)
                         }
@@ -898,8 +898,8 @@ fn registerLambdas(em: Emitter) {
                 case ItemKind.Class(c) -> walkClassMembers(em, c.members, c.name)
                 case ItemKind.Struct(s) -> walkClassMembers(em, s.members, s.name)
 case ItemKind.Const(c) -> {
-                        var scope = emptyScopeMaps()
-                        var acc = emptyNameRefs()
+                        var scope = List<Map<string, bool>>()
+                        var acc = List<NameRef>()
                         walkExpr(em, c.value, none, none, 0, scope, acc)
                     }
                     // A managed global's initializer is real code evaluated by
@@ -907,15 +907,15 @@ case ItemKind.Const(c) -> {
                     // and closure class registered exactly like one in a function
                     // body. Scalar globals fold to bytes and cannot contain one.
                     case ItemKind.Global(g) -> {
-                        var scope = emptyScopeMaps()
-                        var acc = emptyNameRefs()
+                        var scope = List<Map<string, bool>>()
+                        var acc = List<NameRef>()
                         walkExpr(em, g.value, none, none, 0, scope, acc)
                     }
                 case _ -> {}
             }
             if (let some(f) = fnItem) {
-                var scope = emptyScopeMaps()
-                var acc = emptyNameRefs()
+                var scope = List<Map<string, bool>>()
+                var acc = List<NameRef>()
                 if (let some(b) = f.body) {
                     var generic = !(len(f.generics) == 0)
                     var saved = em.genericFnCtx
@@ -948,8 +948,8 @@ fn walkClassMembers(em: Emitter, members: List<ClassMember>, cls: string) {
         }
         var ocid: int? = em.classByName.get(cls)
         for (m in members) {
-            var scope = emptyScopeMaps()
-            var acc = emptyNameRefs()
+            var scope = List<Map<string, bool>>()
+            var acc = List<NameRef>()
             match (m) {
                 case ClassMember.Field(fname, _, finit, _, _, _, _, _) -> {
                     if (let some(e) = finit) {
@@ -978,8 +978,8 @@ fn walkClassMembers(em: Emitter, members: List<ClassMember>, cls: string) {
         for (m in members) {
             match (m) {
                 case ClassMember.Constructor(cd) -> {
-                    var scope = emptyScopeMaps()
-                    var acc = emptyNameRefs()
+                    var scope = List<Map<string, bool>>()
+                    var acc = List<NameRef>()
                     walkBlock(em, cd.body, ocid, cls, 0, scope, acc)
                 }
                 case _ -> {}
@@ -989,8 +989,8 @@ fn walkClassMembers(em: Emitter, members: List<ClassMember>, cls: string) {
     }
 
 fn walkAccessor(em: Emitter, a: PropertyAccessor, ownerCid: int?, ownerName: string?) {
-        var scope = emptyScopeMaps()
-        var acc = emptyNameRefs()
+        var scope = List<Map<string, bool>>()
+        var acc = List<NameRef>()
         match (a) {
             case PropertyAccessor.Expr(e) -> walkExpr(em, e, ownerCid, ownerName, 0, scope, acc)
             case PropertyAccessor.Block(b) -> walkBlock(em, b, ownerCid, ownerName, 0, scope, acc)
@@ -1038,11 +1038,11 @@ fn walkStmt(em: Emitter, s: Stmt, ownerCid: int?, ownerName: string?, lmark: int
                 // Each block gets its own scope, so a name bound inside a `try`
                 // body, handler, or `finally` never leaks out of it -- and the
                 // catch binder is only in scope for the handler body.
-                scope.push(emptyScopeMap())
+                scope.push(Map<string, bool>())
                 walkBlock(em, body4, ownerCid, ownerName, lmark, scope, acc)
                 scope.pop()
                 if (let some(h) = handler) {
-                    scope.push(emptyScopeMap())
+                    scope.push(Map<string, bool>())
                     if (let some(name) = binder) {
                         scopeBind(scope, name)
                     }
@@ -1050,7 +1050,7 @@ fn walkStmt(em: Emitter, s: Stmt, ownerCid: int?, ownerName: string?, lmark: int
                     scope.pop()
                 }
                 if (let some(f) = fin) {
-                    scope.push(emptyScopeMap())
+                    scope.push(Map<string, bool>())
                     walkBlock(em, f, ownerCid, ownerName, lmark, scope, acc)
                     scope.pop()
                 }
@@ -1058,7 +1058,7 @@ fn walkStmt(em: Emitter, s: Stmt, ownerCid: int?, ownerName: string?, lmark: int
             case Stmt.Expr(e) -> walkExpr(em, e, ownerCid, ownerName, lmark, scope, acc)
             case Stmt.While(cond, body2, _) -> {
                 walkExpr(em, cond, ownerCid, ownerName, lmark, scope, acc)
-                scope.push(emptyScopeMap())
+                scope.push(Map<string, bool>())
                 walkBlock(em, body2, ownerCid, ownerName, lmark, scope, acc)
                 scope.pop()
             }
@@ -1066,7 +1066,7 @@ fn walkStmt(em: Emitter, s: Stmt, ownerCid: int?, ownerName: string?, lmark: int
                 match (header) {
                     case ForHeader.In(pattern, sequence) -> {
                         walkExpr(em, sequence, ownerCid, ownerName, lmark, scope, acc)
-                        scope.push(emptyScopeMap())
+                        scope.push(Map<string, bool>())
                         for (n in patternBinds(pattern)) {
                             scopeBind(scope, n)
                         }
@@ -1074,7 +1074,7 @@ fn walkStmt(em: Emitter, s: Stmt, ownerCid: int?, ownerName: string?, lmark: int
                         scope.pop()
                     }
                     case ForHeader.Range(init, cond, step) -> {
-                        scope.push(emptyScopeMap())
+                        scope.push(Map<string, bool>())
                         walkStmt(em, init, ownerCid, ownerName, lmark, scope, acc)
                         walkExpr(em, cond, ownerCid, ownerName, lmark, scope, acc)
                         walkExpr(em, step, ownerCid, ownerName, lmark, scope, acc)
@@ -1224,7 +1224,7 @@ fn walkExpr(em: Emitter, e: Expr, ownerCid: int?, ownerName: string?, lmark: int
                 }
                 scope.pop()
                 var capsOpt: List<Capture>? = decideCaptures(em, freeNames, ownerCid, ownerName, e.span)
-                var chosen: List<Capture> = emptyCaptures()
+                var chosen: List<Capture> = List<Capture>()
                 if (let some(c2) = capsOpt) {
                     chosen = c2
                 } else {
@@ -1251,7 +1251,7 @@ match (cond) {
                     }
                     case IfCond.Binding(pattern, value) -> {
                         walkExpr(em, value, ownerCid, ownerName, lmark, scope, acc)
-                        scope.push(emptyScopeMap())
+                        scope.push(Map<string, bool>())
                         for (n in patternBinds(pattern)) {
                             scopeBind(scope, n)
                         }
@@ -1266,7 +1266,7 @@ match (cond) {
             case ExprKind.Match(scrutinee, arms) -> {
                 walkExpr(em, scrutinee, ownerCid, ownerName, lmark, scope, acc)
                 for (arm in arms) {
-                    scope.push(emptyScopeMap())
+                    scope.push(Map<string, bool>())
                     for (n in patternBinds(arm.pattern)) {
                         scopeBind(scope, n)
                     }
@@ -1280,12 +1280,12 @@ match (cond) {
             case ExprKind.Await(x) -> walkExpr(em, x, ownerCid, ownerName, lmark, scope, acc)
             case ExprKind.Cast(expr, _, _) -> walkExpr(em, expr, ownerCid, ownerName, lmark, scope, acc)
             case ExprKind.Unsafe(b) -> {
-                scope.push(emptyScopeMap())
+                scope.push(Map<string, bool>())
                 walkBlock(em, b, ownerCid, ownerName, lmark, scope, acc)
                 scope.pop()
             }
             case ExprKind.Block(b) -> {
-                scope.push(emptyScopeMap())
+                scope.push(Map<string, bool>())
                 walkBlock(em, b, ownerCid, ownerName, lmark, scope, acc)
                 scope.pop()
             }
@@ -1325,8 +1325,8 @@ fn isFnTy(em: Emitter, span: Span) -> bool {
     }
 
 fn decideCaptures(em: Emitter, free: List<NameRef>, ownerCid: int?, ownerName: string?, span: Span) -> List<Capture>? {
-        var seen = emptyScopeMap()
-        var caps = emptyCaptures()
+        var seen = Map<string, bool>()
+        var caps = List<Capture>()
         var needsThis = false
         for (fr in free) {
             if (fr.name == "__super") {
@@ -1383,7 +1383,7 @@ fn decideCaptures(em: Emitter, free: List<NameRef>, ownerCid: int?, ownerName: s
                 bad(em, span, "internal: owner member with no owner name")
                 return none
             }
-            caps.push(Capture("this", Ty.Class(oname, emptyTys()), span))
+            caps.push(Capture("this", Ty.Class(oname, List<Ty>()), span))
         }
         var i = 1
         while (i < len(caps)) {
@@ -1515,11 +1515,11 @@ fn inferLambdaRet(em: Emitter, body: FnBody) -> Ty {
     }
 
 fn registerLambda(em: Emitter, lambda: Expr, captures: List<Capture>, ownerCid: int?) {
-        registerLambdaAt(em, lambda, captures, ownerCid, emptyStringTyMap(), none)
+        registerLambdaAt(em, lambda, captures, ownerCid, Map<string, Ty>(), none)
     }
 
 fn registerLambdaAt(em: Emitter, lambda: Expr, captures: List<Capture>, ownerCid: int?, smap: Map<string, Ty>, base: int?) -> int? {
-        var lbody: FnBody = FnBody.Block(Block(emptyStmts(), none, Span(0, 0)))
+        var lbody: FnBody = FnBody.Block(Block(List<Stmt>(), none, Span(0, 0)))
         match (lambda.kind) {
             case ExprKind.Lambda(_, _, _, b) -> lbody = b
             case _ -> { return none }
@@ -1529,7 +1529,7 @@ fn registerLambdaAt(em: Emitter, lambda: Expr, captures: List<Capture>, ownerCid
         if (let some(t) = em.types.get(spanKey(lambda.span))) {
             fnty = t
         }
-        var pts: List<Ty> = emptyTys()
+        var pts: List<Ty> = List<Ty>()
         var isFnTy = false
         match (fnty) {
             case Ty.Fn(pts0, _) -> {
@@ -1544,7 +1544,7 @@ fn registerLambdaAt(em: Emitter, lambda: Expr, captures: List<Capture>, ownerCid
         if (paramsLen(lambda) != len(pts)) {
             return none
         }
-        var subbedPts = emptyTys()
+        var subbedPts = List<Ty>()
         for (pt in pts) {
             subbedPts.push(subst(pt, smap))
         }
@@ -1589,7 +1589,7 @@ fn registerLambdaAt(em: Emitter, lambda: Expr, captures: List<Capture>, ownerCid
         if (let none = mapTy(em, subbedRet, lambda.span)) {
             return none
         }
-        var subbedCaps = emptyCaptures()
+        var subbedCaps = List<Capture>()
         for (c in captures) {
             subbedCaps.push(Capture(c.name, subst(c.ty, smap), c.span))
         }
@@ -1610,7 +1610,7 @@ fn registerClosureClass(em: Emitter, captureCount: int, span: Span) -> int? {
         if (let some(cid) = em.classByName.get(name2)) {
             return cid
         }
-        var fields = emptyFieldInfos()
+        var fields = List<FieldInfo>()
         var fl = 0
         while (fl <= captureCount) {
             var fname = ""
@@ -1622,7 +1622,7 @@ fn registerClosureClass(em: Emitter, captureCount: int, span: Span) -> int? {
             fields.push(FieldInfo(fname, Visibility.Private, false, false, false, false, Ty.Int, span))
             fl = fl + 1
         }
-        var table = ClassTable(name2, span, Visibility.Private, emptyStrs(), none, emptyTys(), fields, emptyCallableInfos(), emptyPropertyInfos(), none, emptyNamedCtorInfos(), emptyFieldInfos())
+        var table = ClassTable(name2, span, Visibility.Private, List<string>(), none, List<Ty>(), fields, List<CallableInfo>(), List<PropertyInfo>(), none, List<NamedCtorInfo>(), List<FieldInfo>())
         var cid2 = PICKLE_CLASS_USER_BASE + em.cidSalt + len(em.classes)
         em.closureTables[name2] = table
         em.classByName[name2] = cid2
@@ -1639,7 +1639,7 @@ fn registerTrampoline(em: Emitter, span: Span, fnName: string) {
         if (let some(fv) = fidOpt) {
             fid = fv
         }
-        var pty: List<Ty> = emptyTys()
+        var pty: List<Ty> = List<Ty>()
         var ret: Ty = Ty.Unknown
         var hasFn = false
         if (let some(t) = em.types.get(spanKey(span))) {
@@ -1679,7 +1679,7 @@ fn registerTrampoline(em: Emitter, span: Span, fnName: string) {
     }
 
 fn registerMethodTrampoline(em: Emitter, span: Span, fid: int, cid: int, name: string) {
-        var pty: List<Ty> = emptyTys()
+        var pty: List<Ty> = List<Ty>()
         var ret: Ty = Ty.Unknown
         var hasFn = false
         if (let some(t) = em.types.get(spanKey(span))) {
@@ -1708,7 +1708,7 @@ fn registerMethodTrampoline(em: Emitter, span: Span, fid: int, cid: int, name: s
         if (let none = mapTy(em, ret, span)) {
             return
         }
-        var branches = emptyDispatchBranches()
+        var branches = List<DispatchBranch>()
         if (let some(b) = em.virtualDispatch.get(pairKey(str(cid), name))) {
             branches = b
         }
@@ -1829,7 +1829,7 @@ fn classConstDefined(em: Emitter, cid: int, name: string) -> bool {
 
 fn classIdOf(em: Emitter, ty: Ty, span: Span) -> int? {
         var n = ""
-        var args = emptyTys()
+        var args = List<Ty>()
         var isTy = false
         match (ty) {
             case Ty.Class(nm, a) -> {
@@ -1910,7 +1910,7 @@ fn registerClassInstantiation(em: Emitter, name: string, args: List<Ty>, span: S
             bad(em, span, "`" + name + "` is not lowerable")
             return none
         }
-        var ms = emptyClassMembers()
+        var ms = List<ClassMember>()
         if (let some(x) = members2) {
             ms = x
         }
@@ -1986,13 +1986,13 @@ fn registerClassInstantiation(em: Emitter, name: string, args: List<Ty>, span: S
             bad(em, span, "`" + name + "` uses static state, which is not lowered yet for generic classes/structs")
             return none
         }
-        var map = emptyStringTyMap()
+        var map = Map<string, Ty>()
         var gi = 0
         while (gi < len(table.generics) && gi < len(args)) {
             map[table.generics[gi]] = args[gi]
             gi = gi + 1
         }
-        var implements = emptyTys()
+        var implements = List<Ty>()
         for (t in table.implements) {
             implements.push(subst(t, map))
         }
@@ -2015,32 +2015,32 @@ fn registerClassInstantiation(em: Emitter, name: string, args: List<Ty>, span: S
             di = di + 1
         }
         display = display + ">"
-        var stabFields = emptyFieldInfos()
+        var stabFields = List<FieldInfo>()
         for (f in table.fields) {
             var fsub = subst(f.ty, map)
             stabFields.push(FieldInfo(f.name, f.visibility, f.isStatic, f.mutable, f.const_, f.manual, fsub, f.span))
         }
-        var stabMethods = emptyCallableInfos()
+        var stabMethods = List<CallableInfo>()
         for (m in table.methods) {
-            var nps = emptyParamInfos()
+            var nps = List<ParamInfo>()
             for (p in m.params) {
                 nps.push(ParamInfo(p.name, subst(p.ty, map), p.hasDefault, p.rest, p.span))
             }
             stabMethods.push(CallableInfo(m.name, m.span, m.visibility, m.isAsync, m.isStatic, m.isOverride, m.isAbstract, m.operator, m.generics, nps, subst(m.ret, map)))
         }
-        var stabProps = emptyPropertyInfos()
+        var stabProps = List<PropertyInfo>()
         for (p in table.properties) {
             stabProps.push(PropertyInfo(p.name, p.visibility, p.isStatic, subst(p.ty, map), p.hasGet, p.hasSet, p.span))
         }
         var stabCtor: CtorInfo? = none
         if (let some(c) = table.ctor) {
-            var nps2 = emptyParamInfos()
+            var nps2 = List<ParamInfo>()
             for (p in c.params) {
                 nps2.push(ParamInfo(p.name, subst(p.ty, map), p.hasDefault, p.rest, p.span))
             }
             stabCtor = CtorInfo(c.span, c.visibility, nps2)
         }
-        var stable = ClassTable(display, table.span, table.visibility, table.generics, none, emptyTys(), stabFields, stabMethods, stabProps, stabCtor, emptyNamedCtorInfos(), emptyFieldInfos())
+        var stable = ClassTable(display, table.span, table.visibility, table.generics, none, List<Ty>(), stabFields, stabMethods, stabProps, stabCtor, List<NamedCtorInfo>(), List<FieldInfo>())
         var ctorDecl: ConstructorDecl? = none
         for (m in ms) {
             match (m) {
@@ -2111,7 +2111,7 @@ var m2 = seedCallableInfo()
                     var symbol = uniqSymbol(em, tref)
                     var mid = pushClassFunc(em, display + "." + md.name, symbol, FnSource.Method(stable, md))
                     em.finfo[mid] = m2
-                    var mtys = emptyTys()
+                    var mtys = List<Ty>()
                     for (p in m2.params) {
                         mtys.push(p.ty)
                     }
@@ -2179,7 +2179,7 @@ fn ownerFor(em: Emitter, fid: int, cname: string) -> int? {
 
 fn pushClassFunc(em: Emitter, name: string, symbol: string, src: FnSource) -> int {
         var fid = len(em.irModule.funcs)
-        em.irModule.funcs.push(IrFunc(name, symbol, emptyIrParams(), IrTy.Unit, emptyIrTys(), 0, emptyIrBlocks(), false, false, emptyStrs()))
+        em.irModule.funcs.push(IrFunc(name, symbol, List<IrParam>(), IrTy.Unit, List<IrTy>(), 0, List<IrBlock>(), false, false, List<string>()))
         em.fidList.push(fid)
         em.fsource[fid] = src
         fid
@@ -2195,7 +2195,7 @@ fn symbolForAttrs(em: Emitter, name: string, isTest: bool, attrs: List<Attribute
 
 fn userCallable(em: Emitter, name: string) -> CallableInfo? {
         if (let some(infos) = em.resolved.fns.get(name)) {
-            var users = emptyCallableInfos()
+            var users = List<CallableInfo>()
             for (c in infos) {
                 if (!(c.span.start == 0 && c.span.end == 0)) {
                     users.push(c)
@@ -2325,7 +2325,7 @@ fn packForPointerBoundary(em: Emitter, rep: ElemRep, v: int, vt: Ty, span: Span)
     }
 
 fn srcParamList(em: Emitter, fid: int) -> List<Ty> {
-        var p = emptyTys()
+        var p = List<Ty>()
         if (let some(v) = em.srcParamTys.get(fid)) {
             p = v
         }
@@ -2340,7 +2340,7 @@ fn srcParamList(em: Emitter, fid: int) -> List<Ty> {
     /// spread call see a zero-parameter target and reject every element.
     /// Mirrors the parameter list `buildCtorBody` derives.
 fn ctorParamTys(em: Emitter, table: ClassTable) -> List<Ty> {
-        var out = emptyTys()
+        var out = List<Ty>()
         if (let some(c) = table.ctor) {
             for (p in c.params) {
                 out.push(p.ty)
@@ -2432,7 +2432,7 @@ fn iterableElem(em: Emitter, ty: Ty) -> Ty? {
             case _ -> {}
         }
         var name = ""
-        var args = emptyTys()
+        var args = List<Ty>()
         match (ty) {
             case Ty.Class(n, a) -> {
                 name = n
@@ -2446,7 +2446,7 @@ fn iterableElem(em: Emitter, ty: Ty) -> Ty? {
                 return none
             }
         }
-        var argsMap = emptyStringTyMap()
+        var argsMap = Map<string, Ty>()
         if (let some(entry) = em.resolved.types.get(name)) {
             var gs = entryGenerics(entry)
             var i = 0
@@ -2459,8 +2459,8 @@ fn iterableElem(em: Emitter, ty: Ty) -> Ty? {
                 i = i + 1
             }
         }
-        var chain = emptyStrs()
-        var seen = emptyStrs()
+        var chain = List<string>()
+        var seen = List<string>()
         chain.push(name)
         while (len(chain) > 0) {
             var cname = chain[len(chain) - 1]
@@ -2537,7 +2537,7 @@ fn loopContinueTarget(em: Emitter) -> int? {
     }
 
 fn panicNoMatchAt(em: Emitter, span: Span, sv: int) {
-        externCallVoid(em, "pickle_panic_no_match", emptyIrTys(), emptyInts())
+        externCallVoid(em, "pickle_panic_no_match", List<IrTy>(), List<int>())
     }
 
 fn concatStr(em: Emitter, parts: List<int>) -> int? {
@@ -2570,7 +2570,7 @@ fn icePathTail(em: Emitter) -> string {
 
 fn icePoke(em: Emitter, g: string) -> bool {
         if (len(em.iceSeq) > 1000) {
-            var nxt = emptyStrs()
+            var nxt = List<string>()
             var start = len(em.iceSeq) - 400
             var i = start
             while (i < len(em.iceSeq)) {

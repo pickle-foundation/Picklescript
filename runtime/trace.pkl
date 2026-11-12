@@ -79,13 +79,6 @@ const W_TUPLE_LEN: int = TUPLE_LEN_OFF / 8
 /// `MapEntry { key, value }` is two words.
 const MAP_ENTRY_WORDS: int = 2
 
-/// An empty `List<int>` (see `object.pkl`: `[]` is `List<?>`).
-fn emptyInts() -> List<int> {
-    var xs = [0]
-    xs.pop()
-    xs
-}
-
 /// A root cell: `*mut *mut PickleObject`. The native trace reads `**cell`, so
 /// a root is an indirection that is followed at trace time -- clearing the cell
 /// before the trace removes the root, and the port models that with a settable
@@ -130,7 +123,7 @@ class DescriptorTable {
     var descs: List<TraceDesc>
 
     constructor() {
-        this.descs = emptyDescs()
+        this.descs = List<TraceDesc>()
     }
 
     fn get(classId: int) -> TraceDesc? {
@@ -147,19 +140,11 @@ class DescriptorTable {
     fn register(classId: int, name: string, slotCount: int, managedMask: List<int>, flags: int) -> TraceDesc {
         var d = TraceDesc(name, slotCount, managedMask, flags)
         while (len(this.descs) <= classId) {
-            this.descs.push(TraceDesc("", 0, emptyInts(), 0))
+            this.descs.push(TraceDesc("", 0, List<int>(), 0))
         }
         this.descs[classId] = d
         d
     }
-}
-
-/// An empty `List<TraceDesc>` (seed-and-pop: `[]` is `List<?>`).
-fn emptyDescs() -> List<TraceDesc> {
-    var seed = TraceDesc("seed", 0, emptyInts(), 0)
-    var xs = [seed]
-    xs.pop()
-    xs
 }
 
 /// A heap of REAL object blocks addressed by modeled integer addresses.
@@ -178,9 +163,9 @@ class TraceHeap {
     var visits: List<int>
 
     constructor() {
-        this.blocks = emptyPointers()
-        this.words = emptyInts()
-        this.visits = emptyInts()
+        this.blocks = List<*int>()
+        this.words = List<int>()
+        this.visits = List<int>()
     }
 
     /// Allocate a zeroed block of `size` bytes and return its address.
@@ -308,15 +293,15 @@ class TraceHeap {
                 i = i + 1
             }
         }
-        this.blocks = emptyPointers()
-        this.words = emptyInts()
+        this.blocks = List<*int>()
+        this.words = List<int>()
     }
 
     /// Addresses of every allocated block that carries the mark bit, in
     /// allocation order. This is the marker's output, independent of the order
     /// the worklist happened to visit.
     fn marked() -> List<int> {
-        var out = emptyInts()
+        var out = List<int>()
         var i = 1
         while (i <= len(this.blocks)) {
             if (this.isMarked(i)) {
@@ -334,17 +319,6 @@ class TraceHeap {
             this.clearMarked(i)
             i = i + 1
         }
-    }
-}
-
-/// An empty `List<*int>` (seed-and-pop).
-fn emptyPointers() -> List<*int> {
-    unsafe {
-        var seed = alloc(int, 1)
-        var xs = [seed]
-        xs.pop()
-        free(seed)
-        xs
     }
 }
 
@@ -462,7 +436,7 @@ fn traceOne(heap: TraceHeap, descs: DescriptorTable, obj: int, worklist: List<in
 /// `ShadowRegistry.allSlotValues`, which already yields one consistent
 /// innermost-first snapshot of all threads with nulls dropped.
 fn traceFromRoots(heap: TraceHeap, descs: DescriptorTable, shadow: ShadowRegistry, rootCells: List<RootCell>, manual: List<int>, tempRoots: List<int>) -> int {
-    var worklist = emptyInts()
+    var worklist = List<int>()
     var i = 0
     while (i < len(rootCells)) {
         var r = rootCells[i].value

@@ -2,7 +2,7 @@ module cli.selflink
 
 import { DiagnosticSink } from compiler.diag
 import { sortStrings, hashOf, stampOf, ensureDir } from compiler.cache
-import { scanDefs, select, sectionKept, canonSecName, emptyInts, isCrtImp, strFrom } from compiler.linklib
+import { scanDefs, select, sectionKept, canonSecName, isCrtImp, strFrom } from compiler.linklib
 import { CoffObj, coffRead, blobFrom } from compiler.objread
 import { newObjs, lowerProgram, lowerProgramEx, lowerModuleObj, lowerModuleObjEx, lowerModuleObjBytes, lowerModuleObjExBytes, linkExe } from cli.buildlib
 
@@ -42,12 +42,6 @@ fn hasSuffix(s: string, suf: string) -> bool {
         i = i + 1
     }
     true
-}
-
-fn emptyStrs() -> List<string> {
-    var l = [""]
-    l.pop()
-    l
 }
 
 /// Normalize `\` to `/`: `list_dir` returns native separators, but the loader
@@ -129,7 +123,7 @@ fn main() {
     let argv = args()
     var mapOnly = false
     var pos = 0
-    var clean = emptyStrs()
+    var clean = List<string>()
     var i = 0
     while (i < len(argv)) {
         if (argv[i] == "--map") {
@@ -163,7 +157,7 @@ fn runLink(target: string, src: string, outExe: string, rtDir: string, mapOnly: 
     let sinks = DiagnosticSink()
     let programOpt = lowerProgram(target, src, sinks)
     if (let some(program) = programOpt) {
-        var members = emptyStrs()
+        var members = List<string>()
         let dirOpt = list_dir(rtDir)
         if (let some(files) = dirOpt) {
             for (f in files) {
@@ -184,8 +178,8 @@ fn runLink(target: string, src: string, outExe: string, rtDir: string, mapOnly: 
         // salts. This yields the defs the selection needs and each object's
         // class-table size, which phase B turns into cumulative salts.
         var aObjs = newObjs()
-        var aPaths = emptyStrs()
-        var aCounts = emptyInts()
+        var aPaths = List<string>()
+        var aCounts = List<int>()
         aObjs.push(program.obj)
         aPaths.push(target)
 
@@ -261,8 +255,8 @@ fn runLink(target: string, src: string, outExe: string, rtDir: string, mapOnly: 
         // list is terminal, phase B adds no new definitions for it).
         let definitionsA = OrderedMap<string, int>("", 0)
         scanDefs(aObjs, definitionsA)
-        let chosen = emptyInts()
-        let unresolved = emptyStrs()
+        let chosen = List<int>()
+        let unresolved = List<string>()
         select(aObjs, definitionsA, chosen, unresolved)
         var u = 0
         while (u < len(unresolved)) {
@@ -286,13 +280,13 @@ fn runLink(target: string, src: string, outExe: string, rtDir: string, mapOnly: 
         // re-select over the phase-B objects, fold any newly required member
         // back into the chosen set — which restarts the salt assignment, since
         // salts follow ascending member order — and try again.
-        var extraSetups = emptyStrs()
+        var extraSetups = List<string>()
         var bObjs = newObjs()
         var settled = false
         var rounds = 0
         while (!settled && rounds < 8) {
             rounds = rounds + 1
-            extraSetups = emptyStrs()
+            extraSetups = List<string>()
             let bMembers = newObjs()
             var salt = program.classCount
             var ci = 0
@@ -354,8 +348,8 @@ fn runLink(target: string, src: string, outExe: string, rtDir: string, mapOnly: 
 
                 let definitionsB = OrderedMap<string, int>("", 0)
                 scanDefs(bObjs, definitionsB)
-                let chosenB = emptyInts()
-                let unresolvedB = emptyStrs()
+                let chosenB = List<int>()
+                let unresolvedB = List<string>()
                 select(bObjs, definitionsB, chosenB, unresolvedB)
                 if (len(unresolvedB) == 0) {
                     settled = true
@@ -412,7 +406,7 @@ fn runLink(target: string, src: string, outExe: string, rtDir: string, mapOnly: 
         if (mapOnly) {
             // The linked bytes are the phase-B objects, so the map must be
             // their layout, not phase A's — gdb crash offsets land here.
-            let bPaths = emptyStrs()
+            let bPaths = List<string>()
             bPaths.push(target)
             var pi = 0
             while (pi < len(chosen)) {
@@ -442,8 +436,8 @@ fn runLink(target: string, src: string, outExe: string, rtDir: string, mapOnly: 
 fn printMap(objects: List<CoffObj>, objPaths: List<string>) {
     let definitions = OrderedMap<string, int>("", 0)
     scanDefs(objects, definitions)
-    let chosen = emptyInts()
-    let unresolved = emptyStrs()
+    let chosen = List<int>()
+    let unresolved = List<string>()
     select(objects, definitions, chosen, unresolved)
     var u = 0
     while (u < len(unresolved)) {
@@ -451,7 +445,7 @@ fn printMap(objects: List<CoffObj>, objPaths: List<string>) {
         u = u + 1
     }
 
-    var use = emptyInts()
+    var use = List<int>()
     use.push(0)
     var c = 0
     while (c < len(chosen)) {

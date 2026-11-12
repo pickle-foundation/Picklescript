@@ -158,8 +158,8 @@ class Loader {
 
     constructor(diags: DiagnosticSink) {
         this.diags = diags
-        this.loaded = emptyMapStrInt()
-        this.files = emptyModuleFiles()
+        this.loaded = Map<string, int>()
+        this.files = List<ModuleFile>()
         this.workspace = emptyWorkspace()
     }
 
@@ -175,20 +175,20 @@ class Loader {
             if (let some(md) = pp.modDecl) {
                 declared = md.path
             }
-            var modulePath = emptyStrs()
+            var modulePath = List<string>()
             if (let some(d) = declared) {
                 modulePath = copyStrs(d)
             }
-            var exports = emptyStrs()
+            var exports = List<string>()
             for (item in pp.items) {
                 exports.push(topLevelName(item))
             }
             this.workspace = discoverWorkspace(fileName)
-            this.files.push(ModuleFile(fileName, modulePath, exports, false, emptyPubNs(), emptyPubItems(), pp.imports, pp, emptyFileImports()))
+            this.files.push(ModuleFile(fileName, modulePath, exports, false, List<PubNs>(), List<PubItem>(), pp.imports, pp, emptyFileImports()))
             this.loaded[fileName] = 0
             this.processImports(0)
 
-            var itemCounts = emptyMapStrInt()
+            var itemCounts = Map<string, int>()
             for (f in this.files) {
                 if (len(f.modulePath) == 0 || f.isPackage) {
                     continue
@@ -201,20 +201,20 @@ class Loader {
                     itemCounts[n] = cnt + 1
                 }
             }
-            var collided = emptyStrs()
+            var collided = List<string>()
             for (k in itemCounts.keys()) {
                 if (itemCounts[k] > 1) {
                     collided.push(k)
                 }
             }
 
-            var items = emptyItems()
+            var items = List<Item>()
             for (f in this.files) {
                 for (it in f.program.items) {
                     items.push(it)
                 }
             }
-            let merged = Program(pp.modDecl, emptyImportDecls(), items, pp.intLiteralOverflow)
+            let merged = Program(pp.modDecl, List<ImportDecl>(), items, pp.intLiteralOverflow)
             return LoadedModules(merged, collided)
         }
         none
@@ -224,13 +224,13 @@ class Loader {
         let imports = this.files[idx].imports
         let importer = this.files[idx].filePath
         var fi = emptyFileImports()
-        var boundAliases = emptyStrs()
-        var boundSymbols = emptyStrs()
+        var boundAliases = List<string>()
+        var boundSymbols = List<string>()
         for (imp in imports) {
             match (imp.kind) {
                 case ImportKind.Module(al) -> {
                     let target = this.ensureModule(importer, imp.source, imp.span)
-                    var exports = emptyStrs()
+                    var exports = List<string>()
                     if (let some(t) = target) {
                         exports = copyStrs(this.files[t].exports)
                     }
@@ -301,7 +301,7 @@ class Loader {
                                             0
                                         }
                                         case none -> {
-                                            var provs = emptyStrs()
+                                            var provs = List<string>()
                                             if (let some(existing) = fi.bindings.get(name)) {
                                                 provs = existing
                                             }
@@ -320,7 +320,7 @@ class Loader {
                 }
                 case ImportKind.Wildcard -> {
                     let target = this.ensureModule(importer, imp.source, imp.span)
-                    var exports = emptyStrs()
+                    var exports = List<string>()
                     if (let some(t) = target) {
                         exports = copyStrs(this.files[t].exports)
                     }
@@ -337,7 +337,7 @@ class Loader {
                         if (let some(d) = def) {
                             provider = renderPath(this.files[d].modulePath)
                         }
-                        var provs = emptyStrs()
+                        var provs = List<string>()
                         if (let some(existing) = fi.bindings.get(name)) {
                             provs = existing
                         }
@@ -367,7 +367,7 @@ class Loader {
         if (len(own) > 0) {
             let ownProvider = renderPath(own)
             for (name in this.files[idx].exports) {
-                var provs = emptyStrs()
+                var provs = List<string>()
                 if (let some(existing) = fi.bindings.get(name)) {
                     provs = existing
                 }
@@ -416,18 +416,18 @@ class Loader {
                         }
                     }
                 }
-                var modulePath = emptyStrs()
+                var modulePath = List<string>()
                 if (let some(d) = declared) {
                     modulePath = copyStrs(d)
                 } else if (let some(ia) = importedAs) {
                     modulePath = copyStrs(ia.path)
                 }
-                var exports = emptyStrs()
+                var exports = List<string>()
                 for (item in pp.items) {
                     exports.push(topLevelName(item))
                 }
                 let idx = len(this.files)
-                this.files.push(ModuleFile(path, modulePath, exports, false, emptyPubNs(), emptyPubItems(), pp.imports, pp, emptyFileImports()))
+                this.files.push(ModuleFile(path, modulePath, exports, false, List<PubNs>(), List<PubItem>(), pp.imports, pp, emptyFileImports()))
                 this.loaded[path] = idx
                 this.processImports(idx)
                 this.finishExports(idx)
@@ -439,13 +439,13 @@ class Loader {
     }
 
     fn loadPackage(dir: string, importedAs: ImportedAs?) -> int? {
-        var segments = emptyStrs()
+        var segments = List<string>()
         var ispan: Span? = none
         if (let some(ia) = importedAs) {
             segments = copyStrs(ia.path)
             ispan = ia.span
         }
-        var exports = emptyStrs()
+        var exports = List<string>()
         if (let some(entries) = list_dir(dir)) {
             for (p in entries) {
                 if (stringEndsWith(p, ".pkl") && isFileP(p)) {
@@ -467,14 +467,14 @@ class Loader {
             }
         }
         let idx = len(this.files)
-        let emptyProg = Program(none, emptyImportDecls(), emptyItems(), false)
-        this.files.push(ModuleFile(dir, segments, exports, true, emptyPubNs(), emptyPubItems(), emptyImportDecls(), emptyProg, emptyFileImports()))
+        let emptyProg = Program(none, List<ImportDecl>(), List<Item>(), false)
+        this.files.push(ModuleFile(dir, segments, exports, true, List<PubNs>(), List<PubItem>(), List<ImportDecl>(), emptyProg, emptyFileImports()))
         this.loaded[dir] = idx
         var fi = emptyFileImports()
         if (len(segments) > 0) {
             let ownProvider = renderPath(segments)
             for (name in exports) {
-                var provs = emptyStrs()
+                var provs = List<string>()
                 if (let some(existing) = fi.bindings.get(name)) {
                     provs = existing
                 }
@@ -636,7 +636,7 @@ class Loader {
             }
             return none
         }
-        var bases = emptyStrs()
+        var bases = List<string>()
         var d: string? = importerDir(importer)
         while (true) {
             if (let some(dir) = d) {
@@ -668,7 +668,7 @@ fn frontend(fileName: string, source: string, diags: DiagnosticSink) -> FrontOut
     let loader = Loader(diags)
     if (let some(loaded) = loader.loadRoot(fileName, source)) {
         var i = 0
-        var paths = emptyStrs()
+        var paths = List<string>()
         while (i < len(loader.files)) {
             let rw = Rewriter(loader.files[i].fi, loaded.collided, diags)
             rw.rewriteItems(loader.files[i].program.items)
@@ -741,7 +741,7 @@ class Rewriter {
     }
 
     fn canonicalOrAmbiguous(name: string, providers: List<string>, span: Span) -> Expr? {
-        var uniq = emptyStrs()
+        var uniq = List<string>()
         for (p in providers) {
             uniq.push(p)
         }
@@ -1385,7 +1385,7 @@ fn readWorkspaceMembers(manifest: string) -> Map<string, string>? {
         if (len(raw.keys()) == 0) {
             return none
         }
-        var out = emptyMapStrStr()
+        var out = Map<string, string>()
         for (k in raw.keys()) {
             if (let some(v) = raw.get(k)) {
                 out[k] = pathJoin(base, v)
@@ -1397,7 +1397,7 @@ fn readWorkspaceMembers(manifest: string) -> Map<string, string>? {
 }
 
 fn parseWorkspaceMembers(text: string) -> Map<string, string> {
-    var members = emptyMapStrStr()
+    var members = Map<string, string>()
     var section = ""
     var pending: string? = none
     for (rl in splitLines(text)) {
@@ -1731,7 +1731,7 @@ fn stringTrimStart(s: string) -> string {
 }
 
 fn splitLines(s: string) -> List<string> {
-    var out = emptyStrs()
+    var out = List<string>()
     let bs = bytes(s)
     var start = 0
     var i = 0
@@ -1889,7 +1889,7 @@ fn importerDir(importer: string) -> string? {
 }
 
 fn copyStrs(l: List<string>) -> List<string> {
-    var out = emptyStrs()
+    var out = List<string>()
     for (x in l) {
         out.push(x)
     }
@@ -1897,7 +1897,7 @@ fn copyStrs(l: List<string>) -> List<string> {
 }
 
 fn singleStr(x: string) -> List<string> {
-    var l = emptyStrs()
+    var l = List<string>()
     l.push(x)
     l
 }
@@ -1912,7 +1912,7 @@ fn listHasStr(l: List<string>, s: string) -> bool {
 }
 
 fn subListStr(l: List<string>, start: int, count: int) -> List<string> {
-    var out = emptyStrs()
+    var out = List<string>()
     var i = start
     var end = start + count
     if (end > len(l)) {
@@ -1988,58 +1988,11 @@ fn dedupStrs(l: List<string>) {
     }
 }
 
-fn emptyModuleFiles() -> List<ModuleFile> {
-    var l = [ModuleFile("", emptyStrs(), emptyStrs(), false, emptyPubNs(), emptyPubItems(), emptyImportDecls(), Program(none, emptyImportDecls(), emptyItems(), false), emptyFileImports())]
-    l.pop()
-    l
-}
-
 fn emptyFileImports() -> FileImports {
-    FileImports(emptyMapStrBinding(), emptyMapStrStringList(), emptyMapStrRename(), emptyMapStrStringList(), none)
-}
-
-fn emptyPubNs() -> List<PubNs> {
-    var l = [PubNs("x", emptyStrs(), emptyStrs())]
-    l.pop()
-    l
-}
-
-fn emptyPubItems() -> List<PubItem> {
-    var l = [PubItem("x", 0)]
-    l.pop()
-    l
+    FileImports(Map<string, ModuleBinding>(), Map<string, List<string>>(), Map<string, RenameTarget>(), Map<string, List<string>>(), none)
 }
 
 fn emptyWorkspace() -> Workspace {
-    Workspace(emptyMapStrStr())
+    Workspace(Map<string, string>())
 }
 
-fn emptyMapStrBinding() -> Map<string, ModuleBinding> {
-    let m = {"::seed::": ModuleBinding(emptyStrs(), none)}
-    m.remove("::seed::")
-    m
-}
-
-fn emptyMapStrStringList() -> Map<string, List<string>> {
-    let m = {"::seed::": emptyStrs()}
-    m.remove("::seed::")
-    m
-}
-
-fn emptyMapStrRename() -> Map<string, RenameTarget> {
-    let m = {"::seed::": RenameTarget("", emptyStrs())}
-    m.remove("::seed::")
-    m
-}
-
-fn emptyMapStrStr() -> Map<string, string> {
-    let m = {"::seed::": ""}
-    m.remove("::seed::")
-    m
-}
-
-fn emptyMapStrInt() -> Map<string, int> {
-    let m = {"::seed::": 0}
-    m.remove("::seed::")
-    m
-}

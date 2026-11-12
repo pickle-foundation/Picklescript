@@ -75,18 +75,18 @@ fn dummyPattern() -> Pattern {
 
 
 fn dummyModuleDecl() -> ModuleDecl {
-    ModuleDecl(emptyStrs(), Span(0, 0))
+    ModuleDecl(List<string>(), Span(0, 0))
 }
 
 fn dummyImportDecl() -> ImportDecl {
-    ImportDecl(false, emptyStrs(), ImportKind.Wildcard, Span(0, 0))
+    ImportDecl(false, List<string>(), ImportKind.Wildcard, Span(0, 0))
 }
 
 
 
 
 fn dummyProgram() -> Program {
-    Program(none, emptyImportDecls(), emptyItems(), false)
+    Program(none, List<ImportDecl>(), List<Item>(), false)
 }
 
 
@@ -115,8 +115,8 @@ fn dummyProgram() -> Program {
 
 fn parseProgram(pa: Parser) -> Program {
         var modDecl: ModuleDecl? = none
-        let imports = emptyImportDecls()
-        let items = emptyItems()
+        let imports = List<ImportDecl>()
+        let items = List<Item>()
         newlines(pa)
         while (true) {
             if (at(pa, Tok.Eof)) {
@@ -168,7 +168,7 @@ fn parseModuleDecl(pa: Parser) -> ModuleDecl {
         if (pa.failed) {
             return dummyModuleDecl()
         }
-        let path = emptyStrs()
+        let path = List<string>()
         while (true) {
             path.push(expectIdent(pa, "module path"))
             if (pa.failed) {
@@ -196,11 +196,11 @@ fn parseImport(pa: Parser) -> ImportDecl {
             return dummyImportDecl()
         }
 
-        var source = emptyStrs()
+        var source = List<string>()
         var kind: ImportKind
         if (at(pa, Tok.LBrace)) {
             bump(pa)
-            let items = emptyImports()
+            let items = List<ImportItem>()
             if (at(pa, Tok.RBrace)) {
                 errHere(pa, "import list must not be empty")
                 pa.failed = true
@@ -268,7 +268,7 @@ fn parseImport(pa: Parser) -> ImportDecl {
                     }
                 }
                 let span = start.to(prevSpan(pa))
-                let items = emptyImports()
+                let items = List<ImportItem>()
                 items.push(ImportItem(first, alias, span))
                 kind = ImportKind.Items(items)
             } else {
@@ -293,11 +293,11 @@ fn parseImport(pa: Parser) -> ImportDecl {
 }
 
 fn parseDottedPath(pa: Parser, what: string) -> List<string> {
-        let segs = emptyStrs()
+        let segs = List<string>()
         while (true) {
             segs.push(expectIdent(pa, what))
             if (pa.failed) {
-                return emptyStrs()
+                return List<string>()
             }
             if (at(pa, Tok.Dot)) {
                 bump(pa)
@@ -379,30 +379,30 @@ fn parseTestCallItem(pa: Parser) -> ItemKind {
         }
         flattenBlockTail(block)
         let span = start.to(prevSpan(pa))
-        ItemKind.Test(FnDecl(desc, span, Visibility.Default, false, emptyGenericParams(), emptyParams(), none, FnBody.Block(block)))
+        ItemKind.Test(FnDecl(desc, span, Visibility.Default, false, List<GenericParam>(), List<Param>(), none, FnBody.Block(block)))
 }
 
 
 fn parseAttributes(pa: Parser) -> List<Attribute> {
-        let out = emptyAttrs()
+        let out = List<Attribute>()
         while (at(pa, Tok.Hash)) {
             let start = span(pa)
             bump(pa)
             expect(pa, Tok.LBracket)
             if (pa.failed) {
-                return emptyAttrs()
+                return List<Attribute>()
             }
             let name = expectIdent(pa, "attribute name")
             if (pa.failed) {
-                return emptyAttrs()
+                return List<Attribute>()
             }
-            let args = emptyExprs()
+            let args = List<Expr>()
             if (eat(pa, Tok.LParen)) {
                 if (!at(pa, Tok.RParen)) {
                     while (true) {
                         args.push(parseExpr(pa))
                         if (pa.failed) {
-                            return emptyAttrs()
+                            return List<Attribute>()
                         }
                         if (eat(pa, Tok.Comma)) {
                             if (at(pa, Tok.RParen)) {
@@ -415,12 +415,12 @@ fn parseAttributes(pa: Parser) -> List<Attribute> {
                 }
                 expect(pa, Tok.RParen)
                 if (pa.failed) {
-                    return emptyAttrs()
+                    return List<Attribute>()
                 }
             }
             expect(pa, Tok.RBracket)
             if (pa.failed) {
-                return emptyAttrs()
+                return List<Attribute>()
             }
             out.push(Attribute(name, args, start.to(prevSpan(pa))))
             newlines(pa)
@@ -429,20 +429,20 @@ fn parseAttributes(pa: Parser) -> List<Attribute> {
 }
 
 fn parseItem(pa: Parser) -> List<Item> {
-        let doc = emptyStrs()
+        let doc = List<string>()
         let start = span(pa)
         let attrs = parseAttributes(pa)
         if (pa.failed) {
-            return emptyItems()
+            return List<Item>()
         }
 
         if (isTestCallAhead(pa)) {
             let kind = parseTestCallItem(pa)
             if (pa.failed) {
-                return emptyItems()
+                return List<Item>()
             }
             let span = start.to(prevSpan(pa))
-            let items = emptyItems()
+            let items = List<Item>()
             items.push(Item(doc, attrs, span, kind))
             return items
         }
@@ -450,7 +450,7 @@ fn parseItem(pa: Parser) -> List<Item> {
         if (isDescribeCallAhead(pa)) {
             let items = parseDescribeItem(pa)
             if (pa.failed) {
-                return emptyItems()
+                return List<Item>()
             }
             return items
         }
@@ -458,10 +458,10 @@ fn parseItem(pa: Parser) -> List<Item> {
         if (isHookCallAhead(pa)) {
             let kind = parseHookItem(pa)
             if (pa.failed) {
-                return emptyItems()
+                return List<Item>()
             }
             let span = start.to(prevSpan(pa))
-            let items = emptyItems()
+            let items = List<Item>()
             items.push(Item(doc, attrs, span, kind))
             return items
         }
@@ -499,11 +499,11 @@ fn parseItem(pa: Parser) -> List<Item> {
             bump(pa)
             if (kind(pa) != Tok.Fn) {
                 errHere(pa, "expected `fn` after `async`")
-                return emptyItems()
+                return List<Item>()
             }
             let f = parseFn(pa)
             if (pa.failed) {
-                return emptyItems()
+                return List<Item>()
             }
             setFnVis(f, visibility)
             f.isAsync = true
@@ -511,7 +511,7 @@ fn parseItem(pa: Parser) -> List<Item> {
         } else if (k == Tok.Fn) {
             let f = parseFn(pa)
             if (pa.failed) {
-                return emptyItems()
+                return List<Item>()
             }
             setFnVis(f, visibility)
             if (isTest) {
@@ -522,14 +522,14 @@ fn parseItem(pa: Parser) -> List<Item> {
         } else if (k == Tok.Class) {
             let c = parseTypeDecl(pa, true)
             if (pa.failed) {
-                return emptyItems()
+                return List<Item>()
             }
             c.visibility = visibility
             kind = ItemKind.Class(c)
         } else if (k == Tok.Struct) {
             let c = parseTypeDecl(pa, false)
             if (pa.failed) {
-                return emptyItems()
+                return List<Item>()
             }
             c.visibility = visibility
             let ext = c.extends
@@ -543,35 +543,35 @@ fn parseItem(pa: Parser) -> List<Item> {
         } else if (k == Tok.Enum) {
             let e = parseEnum(pa)
             if (pa.failed) {
-                return emptyItems()
+                return List<Item>()
             }
             e.visibility = visibility
             kind = ItemKind.Enum(e)
         } else if (k == Tok.Interface) {
             let i = parseInterface(pa)
             if (pa.failed) {
-                return emptyItems()
+                return List<Item>()
             }
             i.visibility = visibility
             kind = ItemKind.Interface(i)
         } else if (k == Tok.Const) {
             let c = parseConst(pa)
             if (pa.failed) {
-                return emptyItems()
+                return List<Item>()
             }
             kind = ItemKind.Const(c)
         } else if (k == Tok.Var) {
             let g = parseGlobal(pa)
             if (pa.failed) {
-                return emptyItems()
+                return List<Item>()
             }
             kind = ItemKind.Global(g)
         } else {
             errHere(pa, "expected a declaration (class, fn, struct, enum, interface, const, var), found " + describeTok(kind(pa)))
-            return emptyItems()
+            return List<Item>()
         }
         let span = start.to(prevSpan(pa))
-        let items = emptyItems()
+        let items = List<Item>()
         items.push(Item(doc, attrs, span, kind))
         items
 }
@@ -581,33 +581,33 @@ fn parseDescribeItem(pa: Parser) -> List<Item> {
         bump(pa) // `describe`
         expect(pa, Tok.LParen)
         if (pa.failed) {
-            return emptyItems()
+            return List<Item>()
         }
         let desc = parseTestDescription(pa)
         if (pa.failed) {
-            return emptyItems()
+            return List<Item>()
         }
         expect(pa, Tok.Comma)
         if (pa.failed) {
-            return emptyItems()
+            return List<Item>()
         }
         newlines(pa)
         var block = parseBlock(pa)
         if (pa.failed) {
-            return emptyItems()
+            return List<Item>()
         }
         newlines(pa)
         expect(pa, Tok.RParen)
         if (pa.failed) {
-            return emptyItems()
+            return List<Item>()
         }
         flattenBlockTail(block)
         let span = start.to(prevSpan(pa))
-        let out = emptyItems()
+        let out = List<Item>()
         desugarDescribeBlock(pa, 0, [desc], block, out)
         let _ = span
         if (pa.failed) {
-            return emptyItems()
+            return List<Item>()
         }
         out
 }
@@ -639,7 +639,7 @@ fn parseHookItem(pa: Parser) -> ItemKind {
             kindPart = h
         }
         let name = "__pkl_hook_" + kindPart + "_"
-        ItemKind.Fn(FnDecl(name, span, Visibility.Default, false, emptyGenericParams(), emptyParams(), none, FnBody.Block(block)))
+        ItemKind.Fn(FnDecl(name, span, Visibility.Default, false, List<GenericParam>(), List<Param>(), none, FnBody.Block(block)))
 }
 
 
@@ -698,9 +698,9 @@ fn parseOptionalReturnType(pa: Parser) -> TypeExpr? {
 fn parseParamList(pa: Parser) -> List<Param> {
         expect(pa, Tok.LParen)
         if (pa.failed) {
-            return emptyParams()
+            return List<Param>()
         }
-        let params = emptyParams()
+        let params = List<Param>()
         if (at(pa, Tok.RParen)) {
             bump(pa)
             return params
@@ -709,25 +709,25 @@ fn parseParamList(pa: Parser) -> List<Param> {
             let start = span(pa)
             let attrs = parseAttributes(pa)
             if (pa.failed) {
-                return emptyParams()
+                return List<Param>()
             }
             let rest = eat(pa, Tok.Ellipsis)
             let name = expectIdent(pa, "parameter")
             if (pa.failed) {
-                return emptyParams()
+                return List<Param>()
             }
             var ty: TypeExpr? = none
             if (eat(pa, Tok.Colon)) {
                 ty = parseType(pa)
                 if (pa.failed) {
-                    return emptyParams()
+                    return List<Param>()
                 }
             }
             var default: Expr? = none
             if (eat(pa, Tok.Assign)) {
                 let d = parseExpr(pa)
                 if (pa.failed) {
-                    return emptyParams()
+                    return List<Param>()
                 }
                 default = d
             }
@@ -743,7 +743,7 @@ fn parseParamList(pa: Parser) -> List<Param> {
         }
         expect(pa, Tok.RParen)
         if (pa.failed) {
-            return emptyParams()
+            return List<Param>()
         }
         params
 }
@@ -772,7 +772,7 @@ fn parseBlock(pa: Parser) -> Block {
         if (pa.failed) {
             return emptyBlock()
         }
-        let stmts = emptyStmts()
+        let stmts = List<Stmt>()
         var expr: Expr? = none
         newlines(pa)
         while (true) {
@@ -860,7 +860,7 @@ fn parseStmtInner(pa: Parser) -> Stmt {
                 init = e
             }
             let span = spanStart.to(prevSpan(pa))
-            Stmt.Let(pat, ty, init, mutable, emptyAttrs(), span)
+            Stmt.Let(pat, ty, init, mutable, List<Attribute>(), span)
         } else if (k == Tok.Const) {
             let start = span(pa)
             bump(pa)
@@ -1209,7 +1209,7 @@ fn parseTypePrefix(pa: Parser) -> TypeExpr {
             if (pa.failed) {
                 return dummyType()
             }
-            let pts = emptyTypeExprs()
+            let pts = List<TypeExpr>()
             if (!at(pa, Tok.RParen)) {
                 while (true) {
                     pts.push(parseType(pa))
@@ -1240,7 +1240,7 @@ fn parseTypePrefix(pa: Parser) -> TypeExpr {
             TypeExpr(span, TypeExprKind.Fn(pts, ret, isAsync))
         } else if (k == Tok.LParen) {
             bump(pa)
-            let parts = emptyTypeExprs()
+            let parts = List<TypeExpr>()
             if (!at(pa, Tok.RParen)) {
                 while (true) {
                     parts.push(parseType(pa))
@@ -1288,7 +1288,7 @@ fn parseTypePrefix(pa: Parser) -> TypeExpr {
                 bump(pa)
                 TypeExpr(start, TypeExprKind.Infer)
             } else if (isIdentTok(k)) {
-                let path = emptyStrs()
+                let path = List<string>()
                 let span0 = start
                 while (true) {
                     path.push(expectIdent(pa, "type name"))
@@ -1324,9 +1324,9 @@ fn parseTypePrefix(pa: Parser) -> TypeExpr {
 fn parseTypeArgs(pa: Parser) -> List<TypeExpr> {
         expect(pa, Tok.Lt)
         if (pa.failed) {
-            return emptyTypeExprs()
+            return List<TypeExpr>()
         }
-        let args = emptyTypeExprs()
+        let args = List<TypeExpr>()
         if (at(pa, Tok.Gt)) {
             bump(pa)
             return args
@@ -1334,7 +1334,7 @@ fn parseTypeArgs(pa: Parser) -> List<TypeExpr> {
         while (true) {
             args.push(parseType(pa))
             if (pa.failed) {
-                return emptyTypeExprs()
+                return List<TypeExpr>()
             }
             if (at(pa, Tok.Comma)) {
                 bump(pa)
@@ -1358,7 +1358,7 @@ fn parseTypeArgs(pa: Parser) -> List<TypeExpr> {
             } else {
                 errHere(pa, "expected `>` or `,` in type arguments, found " + describeTok(kind(pa)))
                 pa.failed = true
-                return emptyTypeExprs()
+                return List<TypeExpr>()
             }
         }
         args
@@ -1372,7 +1372,7 @@ fn parsePattern(pa: Parser) -> Pattern {
             return Pattern.Wildcard
         }
         if (at(pa, Tok.Pipe)) {
-            let alts = emptyPatterns()
+            let alts = List<Pattern>()
             alts.push(p)
             while (eat(pa, Tok.Pipe)) {
                 let q = parsePatternInner(pa)
@@ -1438,7 +1438,7 @@ fn parsePatternInner(pa: Parser) -> Pattern {
             }
             case Tok.LParen -> {
                 bump(pa)
-                let parts = emptyPatterns()
+                let parts = List<Pattern>()
                 if (!at(pa, Tok.RParen)) {
                     while (true) {
                         parts.push(parsePattern(pa))
@@ -1468,7 +1468,7 @@ fn parsePatternInner(pa: Parser) -> Pattern {
             case _ -> {
                 let isName = isIdentTok(k) || isSomeStr(contextualIdent(k))
                 if (isName) {
-                    let path = emptyStrs()
+                    let path = List<string>()
                     path.push(expectIdent(pa, "pattern"))
                     if (pa.failed) {
                         return Pattern.Wildcard
@@ -1482,7 +1482,7 @@ fn parsePatternInner(pa: Parser) -> Pattern {
                     }
                     if (at(pa, Tok.LParen)) {
                         bump(pa)
-                        let payloads = emptyPatterns()
+                        let payloads = List<Pattern>()
                         if (!at(pa, Tok.RParen)) {
                             while (true) {
                                 payloads.push(parsePattern(pa))
@@ -1512,7 +1512,7 @@ fn parsePatternInner(pa: Parser) -> Pattern {
                         }
                         Pattern.Binding(path[0], ty)
                     } else if (len(path) > 1) {
-                        Pattern.Variant(path, emptyPatterns())
+                        Pattern.Variant(path, List<Pattern>())
                     } else {
                         Pattern.Binding(path[0], none)
                     }
@@ -1526,7 +1526,7 @@ fn parsePatternInner(pa: Parser) -> Pattern {
 }
 
 fn stringParts(pa: Parser, lit: StrLit) -> List<StrPart> {
-        let parts = emptyStrParts()
+        let parts = List<StrPart>()
         for (seg in lit.segments) {
             match (seg) {
                 case StrSeg.Text(text) -> parts.push(StrPart.Text(text))
@@ -1535,7 +1535,7 @@ fn stringParts(pa: Parser, lit: StrLit) -> List<StrPart> {
                     let e = parseExpr(sub)
                     if (sub.failed) {
                         pa.failed = true
-                        return emptyStrParts()
+                        return List<StrPart>()
                     }
                     parts.push(StrPart.Expr(e))
                 }
@@ -1717,9 +1717,9 @@ fn parsePostfix(pa: Parser) -> Expr {
 fn parseCallArgsInternal(pa: Parser) -> List<CallArg> {
         expect(pa, Tok.LParen)
         if (pa.failed) {
-            return emptyCallArgs()
+            return List<CallArg>()
         }
-        let args = emptyCallArgs()
+        let args = List<CallArg>()
         if (at(pa, Tok.RParen)) {
             bump(pa)
             return args
@@ -1731,17 +1731,17 @@ fn parseCallArgsInternal(pa: Parser) -> List<CallArg> {
             if (peekIsNamedArg(pa)) {
                 let n = expectIdent(pa, "argument name")
                 if (pa.failed) {
-                    return emptyCallArgs()
+                    return List<CallArg>()
                 }
                 expect(pa, Tok.Colon)
                 if (pa.failed) {
-                    return emptyCallArgs()
+                    return List<CallArg>()
                 }
                 name = n
             }
             let value = parseExpr(pa)
             if (pa.failed) {
-                return emptyCallArgs()
+                return List<CallArg>()
             }
             args.push(CallArg(name, value, spread, start.to(prevSpan(pa))))
             if (eat(pa, Tok.Comma)) {
@@ -1755,7 +1755,7 @@ fn parseCallArgsInternal(pa: Parser) -> List<CallArg> {
         }
         expect(pa, Tok.RParen)
         if (pa.failed) {
-            return emptyCallArgs()
+            return List<CallArg>()
         }
         args
 }
@@ -1875,8 +1875,8 @@ fn parsePrimary(pa: Parser) -> Expr {
                             return dummyExpr()
                         }
                         let end = prevSpan(pa)
-                        let closure = Expr(body.span, ExprKind.Lambda(emptyParams(), none, false, FnBody.Block(body)))
-                        let cargs = emptyCallArgs()
+                        let closure = Expr(body.span, ExprKind.Lambda(List<Param>(), none, false, FnBody.Block(body)))
+                        let cargs = List<CallArg>()
                         cargs.push(CallArg(none, closure, false, end))
                         Expr(start.to(end), ExprKind.Call(Expr(start, ExprKind.Ident("thread_spawn")), cargs))
                     } else {
@@ -1898,7 +1898,7 @@ fn parsePrimary(pa: Parser) -> Expr {
                     parseParenExpr(pa)
                 } else if (k == Tok.LBracket) {
                     bump(pa)
-                    let elems = emptyExprs()
+                    let elems = List<Expr>()
                     if (!at(pa, Tok.RBracket)) {
                         while (true) {
                             elems.push(parseExpr(pa))
@@ -1947,7 +1947,7 @@ fn parseMapLiteral(pa: Parser, start: Span) -> Expr {
         if (pa.failed) {
             return dummyExpr()
         }
-        let entries = emptyMapEntries()
+        let entries = List<MapEntry>()
         newlines(pa)
         if (!at(pa, Tok.RBrace)) {
             while (true) {
@@ -2003,7 +2003,7 @@ fn parseParenExpr(pa: Parser) -> Expr {
             return dummyExpr()
         }
         if (at(pa, Tok.Comma)) {
-            let items = emptyExprs()
+            let items = List<Expr>()
             items.push(first)
             while (eat(pa, Tok.Comma)) {
                 continuationAfter(pa, Tok.Comma)
@@ -2066,7 +2066,7 @@ fn tryParseLambdaParens(pa: Parser, start: Span) -> Expr? {
         }
         pa.pos = saved
         bump(pa) // LParen
-        let params = emptyParams()
+        let params = List<Param>()
         if (!at(pa, Tok.RParen)) {
             while (true) {
                 let ps = span(pa)
@@ -2082,7 +2082,7 @@ fn tryParseLambdaParens(pa: Parser, start: Span) -> Expr? {
                         return none
                     }
                 }
-                params.push(Param(name, ty, none, rest, emptyAttrs(), ps.to(prevSpan(pa))))
+                params.push(Param(name, ty, none, rest, List<Attribute>(), ps.to(prevSpan(pa))))
                 if (eat(pa, Tok.Comma)) {
                     continuationAfter(pa, Tok.Comma)
                     if (at(pa, Tok.RParen)) {
@@ -2178,10 +2178,10 @@ fn parseAsyncLambda(pa: Parser, start: Span) -> Expr {
             case FnBody.Block(b) -> { innerSpan = b.span }
             case FnBody.Expr(e) -> { innerSpan = e.span }
         }
-        let inner = Expr(innerSpan, ExprKind.Lambda(emptyParams(), returnTy, false, body))
+        let inner = Expr(innerSpan, ExprKind.Lambda(List<Param>(), returnTy, false, body))
         // Outer lambda carries the user's parameters; its body is exactly the
         // inner lambda, so calling it builds the future.
-        let bodyBlock = Block(emptyStmts(), inner, start.to(end))
+        let bodyBlock = Block(List<Stmt>(), inner, start.to(end))
         Expr(start.to(end), ExprKind.Lambda(params, none, false, FnBody.Block(bodyBlock)))
 }
 
@@ -2322,7 +2322,7 @@ fn parseMatch(pa: Parser) -> Expr {
         if (pa.failed) {
             return dummyExpr()
         }
-        let arms = emptyMatchArms()
+        let arms = List<MatchArm>()
         newlines(pa)
         while (true) {
             if (at(pa, Tok.RBrace) || at(pa, Tok.Eof)) {
@@ -2347,7 +2347,7 @@ fn parseMatch(pa: Parser) -> Expr {
                     return dummyExpr()
                 }
                 if (eat(pa, Tok.Comma)) {
-                    let pats = emptyPatterns()
+                    let pats = List<Pattern>()
                     pats.push(first)
                     pats.push(parsePattern(pa))
                     if (pa.failed) {
@@ -2417,7 +2417,7 @@ fn parseTypeDecl(pa: Parser, isClass: bool) -> ClassDecl {
             return dummyClassDecl()
         }
         var extends: TypeExpr? = none
-        let implements = emptyTypeExprs()
+        let implements = List<TypeExpr>()
         if (isClass && at(pa, Tok.Extends)) {
             bump(pa)
             let e = parseType(pa)
@@ -2468,7 +2468,7 @@ fn parseEnum(pa: Parser) -> EnumDecl {
         if (pa.failed) {
             return dummyEnumDecl()
         }
-        let implements = emptyTypeExprs()
+        let implements = List<TypeExpr>()
         if (at(pa, Tok.Implements)) {
             bump(pa)
             while (true) {
@@ -2487,7 +2487,7 @@ fn parseEnum(pa: Parser) -> EnumDecl {
         if (pa.failed) {
             return dummyEnumDecl()
         }
-        let variants = emptyEnumVariants()
+        let variants = List<EnumVariant>()
         newlines(pa)
         while (true) {
             if (at(pa, Tok.RBrace) || at(pa, Tok.Eof)) {
@@ -2501,7 +2501,7 @@ fn parseEnum(pa: Parser) -> EnumDecl {
             if (pa.failed) {
                 return dummyEnumDecl()
             }
-            let fields = emptyEnumFields()
+            let fields = List<EnumField>()
             var discriminant: int? = none
             if (at(pa, Tok.LParen)) {
                 bump(pa)
@@ -2575,7 +2575,7 @@ fn parseInterface(pa: Parser) -> InterfaceDecl {
         if (pa.failed) {
             return dummyInterfaceDecl()
         }
-        let extends = emptyTypeExprs()
+        let extends = List<TypeExpr>()
         if (at(pa, Tok.Extends)) {
             bump(pa)
             while (true) {
@@ -2594,7 +2594,7 @@ fn parseInterface(pa: Parser) -> InterfaceDecl {
         if (pa.failed) {
             return dummyInterfaceDecl()
         }
-        let members = emptyIfaceMembers()
+        let members = List<InterfaceMember>()
         newlines(pa)
         while (true) {
             if (at(pa, Tok.RBrace) || at(pa, Tok.Eof)) {
@@ -2671,7 +2671,7 @@ fn parseInterface(pa: Parser) -> InterfaceDecl {
 }
 
 fn parseClassMembers(pa: Parser) -> List<ClassMember> {
-        let members = emptyProcMembers()
+        let members = List<ClassMember>()
         newlines(pa)
         while (true) {
             if (at(pa, Tok.RBrace) || at(pa, Tok.Eof)) {
@@ -2679,7 +2679,7 @@ fn parseClassMembers(pa: Parser) -> List<ClassMember> {
             }
             members.push(parseClassMember(pa))
             if (pa.failed) {
-                return emptyProcMembers()
+                return List<ClassMember>()
             }
             if (at(pa, Tok.Newline)) {
                 newlines(pa)

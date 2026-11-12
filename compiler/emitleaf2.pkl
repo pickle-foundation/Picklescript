@@ -5,7 +5,7 @@ module compiler.emitleaf2
 
 import * from compiler.ast
 import { Diagnostic, DiagnosticSink, Span } from compiler.diag
-import { IrBlock, IrFunc, IrGlobal, IrInstr, IrTerm, IrTy, emptyIrBlocks } from compiler.ir
+import { IrBlock, IrFunc, IrGlobal, IrInstr, IrTerm, IrTy } from compiler.ir
 import { ResolvedProgram } from compiler.resolvebag
 import * from compiler.ty
 import * from compiler.emitutil
@@ -60,7 +60,7 @@ fn optUnwrapVal(em: Emitter, span: Span, p: int, inner: Ty) -> int? {
                 var join = newBlock(em)
                 term(em, IrTerm.BranchIf(present, someId, noneId))
                 em.cur = noneId
-                externCallVoid(em, "pickle_panic_none_unwrap", emptyIrTys(), emptyInts())
+                externCallVoid(em, "pickle_panic_none_unwrap", List<IrTy>(), List<int>())
                 term(em, IrTerm.Branch(join))
                 em.cur = someId
                 var v = optResolve(em, p, inner, span)
@@ -128,12 +128,12 @@ fn ifacePropertyTy(em: Emitter, ift: Ty, name: string) -> Ty? {
             return none
         }
         var iname = ""
-        var iargs = emptyTys()
+        var iargs = List<Ty>()
         if (let some(r) = ir) {
             iname = r.name
             iargs = r.args
         }
-        var imap = emptyStringTyMap()
+        var imap = Map<string, Ty>()
         if (let some(entry) = em.resolved.types.get(iname)) {
             match (entry) {
                 case TypeTableEntry.Interface(it) -> {
@@ -782,7 +782,7 @@ fn patternTestCond(em: Emitter, p: Pattern, st: Ty, a: int, span: Span) -> int? 
                 return load(em, resSlot)
             }
             case Pattern.Tuple(parts) -> {
-                var tupleTys: List<Ty> = emptyTys()
+                var tupleTys: List<Ty> = List<Ty>()
                 match (st) {
                     case Ty.Tuple(tt) -> tupleTys = tt
                     case _ -> {
@@ -1097,7 +1097,7 @@ fn bindMatchValue(em: Emitter, p: Pattern, st: Ty, v: int, span: Span) -> bool {
                 bindPatternValue(em, payloads[0], inner, resolvedV, span)
             }
             case Pattern.Tuple(parts) -> {
-                var tupleTys: List<Ty> = emptyTys()
+                var tupleTys: List<Ty> = List<Ty>()
                 match (st) {
                     case Ty.Tuple(tt) -> tupleTys = tt
                     case _ -> {
@@ -1206,8 +1206,8 @@ var rv = load(em, root)
     }
 
 fn enumVariantCond(em: Emitter, p: Pattern, st: Ty, v: int, span: Span) -> int? {
-        var path: List<string> = emptyStrs()
-        var payloads: List<Pattern> = emptyPatterns()
+        var path: List<string> = List<string>()
+        var payloads: List<Pattern> = List<Pattern>()
         match (p) {
             case Pattern.Variant(pa, pl) -> {
                 path = pa
@@ -1747,7 +1747,7 @@ fn checkPropagates(em: Emitter, fid: int) -> bool {
     }
 
 fn solveMayThrow(em: Emitter) {
-        var throws = emptyIntBoolMap()
+        var throws = Map<int, bool>()
         for (fid in em.directThrow.keys()) {
             throws[fid] = true
         }
@@ -1776,7 +1776,7 @@ fn solveMayThrow(em: Emitter) {
                 }
             }
         }
-        var result = emptyIntBoolMap()
+        var result = Map<int, bool>()
         for (fid in em.fidList) {
             var v = false
             if (let some(hit) = throws.get(fid)) {
@@ -1874,7 +1874,7 @@ fn genericFnValue(em: Emitter, e: Expr, name: string, typeArgs: List<TypeExpr>) 
         if (let some(x) = info) {
             inf = x
         }
-        var argTys = emptyTys()
+        var argTys = List<Ty>()
         for (te in typeArgs) {
             var t = em.resolved.resolveTy(te, em.fnGenerics, em.diags)
             argTys.push(substTy(em, t))
@@ -1892,7 +1892,7 @@ fn genericFnValueFor(em: Emitter, e: Expr, info: CallableInfo, argTys: List<Ty>)
             return none
         }
         var name = info.name
-        var map = emptyStringTyMap()
+        var map = Map<string, Ty>()
         var zi = 0
         while (zi < len(info.generics) && zi < len(argTys)) {
             map[info.generics[zi]] = argTys[zi]
@@ -1918,7 +1918,7 @@ fn genericFnValueFor(em: Emitter, e: Expr, info: CallableInfo, argTys: List<Ty>)
         } else {
             return none
         }
-        closureObj(em, e, tramp, emptyCaptures())
+        closureObj(em, e, tramp, List<Capture>())
     }
 
 fn valueTrampoline(em: Emitter, span: Span, target: int) -> int? {
@@ -1934,7 +1934,7 @@ fn valueTrampoline(em: Emitter, span: Span, target: int) -> int? {
         if (let some(x) = infO) {
             info = x
         }
-        var pty = emptyTys()
+        var pty = List<Ty>()
         for (p in info.params) {
             pty.push(p.ty)
         }
@@ -1959,7 +1959,7 @@ fn valueTrampoline(em: Emitter, span: Span, target: int) -> int? {
     }
 
 fn inferGenericFnArgs(em: Emitter, span: Span, info: CallableInfo, args: List<CallArg>) -> List<Ty>? {
-        var map = emptyStringTyMap()
+        var map = Map<string, Ty>()
         var i = 0
         while (i < len(args)) {
             var a = args[i]
@@ -2000,7 +2000,7 @@ fn inferGenericFnArgs(em: Emitter, span: Span, info: CallableInfo, args: List<Ca
             }
             i = i + 1
         }
-        var missing = emptyStrs()
+        var missing = List<string>()
         for (g in info.generics) {
             if (!(map.has(g))) {
                 missing.push(g)
@@ -2025,7 +2025,7 @@ fn inferGenericFnArgs(em: Emitter, span: Span, info: CallableInfo, args: List<Ca
             bad(em, span, "cannot infer the type argument" + plural + " " + names + " for `" + info.name + "`; specify them explicitly like `" + info.name + "<...>(...)`")
             return none
         }
-        var out = emptyTys()
+        var out = List<Ty>()
         for (g in info.generics) {
             var got = Ty.Unknown
             if (let some(t) = map.get(g)) {
@@ -2060,7 +2060,7 @@ fn instantiateGenericFn(em: Emitter, span: Span, info: CallableInfo, keyName: st
             bad(em, span, "generic function `" + name + "` with default or rest parameters is not lowered yet")
             return none
         }
-        var params = emptyParamInfos()
+        var params = List<ParamInfo>()
         for (p in info.params) {
             params.push(ParamInfo(p.name, subst(p.ty, map), p.hasDefault, p.rest, p.span))
         }
@@ -2103,33 +2103,33 @@ fn instantiateGenericFn(em: Emitter, span: Span, info: CallableInfo, keyName: st
             // carry the substitution, mirroring the non-generic pair.
             var hiddenSymbol = symbol + "__future"
             var hidden = len(em.irModule.funcs)
-            em.irModule.funcs.push(IrFunc(name + "__future", hiddenSymbol, emptyIrParams(), IrTy.Unit, emptyIrTys(), 0, emptyIrBlocks(), false, false, emptyStrs()))
+            em.irModule.funcs.push(IrFunc(name + "__future", hiddenSymbol, List<IrParam>(), IrTy.Unit, List<IrTy>(), 0, List<IrBlock>(), false, false, List<string>()))
             em.fidList.push(hidden)
-            var htys = emptyTys()
+            var htys = List<Ty>()
             for (p in params) {
                 htys.push(p.ty)
             }
             em.fsource[hidden] = FnSource.AsyncBody(f, htys, ret)
-            var hiddenInfo = CallableInfo(info.name, info.span, info.visibility, info.isAsync, info.isStatic, info.isOverride, info.isAbstract, info.operator, info.generics, emptyParamInfos(), info.ret)
+            var hiddenInfo = CallableInfo(info.name, info.span, info.visibility, info.isAsync, info.isStatic, info.isOverride, info.isAbstract, info.operator, info.generics, List<ParamInfo>(), info.ret)
             em.finfo[hidden] = hiddenInfo
             em.instantonSubst[hidden] = map
-            var hg = emptyStrs()
+            var hg = List<string>()
             for (g in f.generics) {
                 hg.push(g.name)
             }
             em.fidGenerics[hidden] = hg
             var wfid = len(em.irModule.funcs)
-            em.irModule.funcs.push(IrFunc(name, symbol, emptyIrParams(), IrTy.Unit, emptyIrTys(), 0, emptyIrBlocks(), false, false, emptyStrs()))
+            em.irModule.funcs.push(IrFunc(name, symbol, List<IrParam>(), IrTy.Unit, List<IrTy>(), 0, List<IrBlock>(), false, false, List<string>()))
             em.fidList.push(wfid)
             em.fsource[wfid] = FnSource.AsyncFn(f, hidden)
             em.finfo[wfid] = CallableInfo(info.name, info.span, info.visibility, info.isAsync, info.isStatic, info.isOverride, info.isAbstract, info.operator, info.generics, params, ret)
-            var stys = emptyTys()
+            var stys = List<Ty>()
             for (p in params) {
                 stys.push(p.ty)
             }
             em.srcParamTys[wfid] = stys
             em.instantonSubst[wfid] = map
-            var wg = emptyStrs()
+            var wg = List<string>()
             for (g in f.generics) {
                 wg.push(g.name)
             }
@@ -2138,11 +2138,11 @@ fn instantiateGenericFn(em: Emitter, span: Span, info: CallableInfo, keyName: st
             return wfid
         }
         var fid = len(em.irModule.funcs)
-        em.irModule.funcs.push(IrFunc(name, symbol, emptyIrParams(), IrTy.Unit, emptyIrTys(), 0, emptyIrBlocks(), false, false, emptyStrs()))
+        em.irModule.funcs.push(IrFunc(name, symbol, List<IrParam>(), IrTy.Unit, List<IrTy>(), 0, List<IrBlock>(), false, false, List<string>()))
         em.fidList.push(fid)
         em.fsource[fid] = FnSource.TopLevel(f)
         em.finfo[fid] = CallableInfo(info.name, info.span, info.visibility, info.isAsync, info.isStatic, info.isOverride, info.isAbstract, info.operator, info.generics, params, ret)
-        var stys = emptyTys()
+        var stys = List<Ty>()
         for (p in info.params) {
             stys.push(subst(p.ty, map))
         }
@@ -2251,7 +2251,7 @@ fn lambdaValue(em: Emitter, e: Expr) -> int? {
                 bad(em, e.span, "this lambda was not registered for lowering")
                 return none
             }
-            var caps0 = emptyCaptures()
+            var caps0 = List<Capture>()
             var cg = em.lambdaCaps.get(baseKey)
             if (let some(c) = cg) {
                 caps0 = c
@@ -2261,7 +2261,7 @@ fn lambdaValue(em: Emitter, e: Expr) -> int? {
             if (let some(o) = og) {
                 owner = o
             }
-            var sub = emptyStringTyMap()
+            var sub = Map<string, Ty>()
             var sg = em.instantonSubst.get(inst)
             if (let some(s) = sg) {
                 sub = s
@@ -2282,7 +2282,7 @@ fn lambdaValue(em: Emitter, e: Expr) -> int? {
             bad(em, e.span, "this lambda was not registered for lowering")
             return none
         }
-        var caps = emptyCaptures()
+        var caps = List<Capture>()
         var gotCaps = false
         if (hasInst) {
             var c1 = em.lambdaCaps.get(instKeyStr)
@@ -2317,7 +2317,7 @@ fn fnValueClosure(em: Emitter, e: Expr, fid: int) -> int? {
             bad(em, e.span, "function value was not registered for dynamic dispatch")
             return none
         }
-        return closureObj(em, e, tramp, emptyCaptures())
+        return closureObj(em, e, tramp, List<Capture>())
     }
 
 fn genericFnArgValue(em: Emitter, v: Expr, hint: Ty) -> int? {
@@ -2344,14 +2344,14 @@ fn genericFnArgValue(em: Emitter, v: Expr, hint: Ty) -> int? {
         if (len(inf.generics) == 0) {
             return none
         }
-        var pty = emptyTys()
+        var pty = List<Ty>()
         for (p in inf.params) {
             pty.push(p.ty)
         }
         var sig = Ty.Fn(pty, inf.ret)
-        var map = emptyStringTyMap()
+        var map = Map<string, Ty>()
         inferFrom(sig, hint, map)
-        var argTys = emptyTys()
+        var argTys = List<Ty>()
         for (g in inf.generics) {
             var got = Ty.Unknown
             if (let some(t) = map.get(g)) {
@@ -2444,7 +2444,7 @@ fn staticStore(em: Emitter, cid: int, slot: int, boxed: int) {
     }
 
 fn allInstanceFields(em: Emitter, cname: string) -> List<FieldInfo> {
-        var out = emptyFieldInfos()
+        var out = List<FieldInfo>()
         for (cn in ancestry(em, cname)) {
             var own = ownInstanceFields(em, cn)
             for (f in own) {
@@ -2514,7 +2514,7 @@ fn buildSpreadTrampoline(em: Emitter, span: Span, target: int, pty: List<Ty>, re
         em.fparams.push(IrParam("boxed", IrTy.Ptr))
         declare(em, "boxed", listSlot)
         var list = load(em, listSlot)
-        var real = emptyInts()
+        var real = List<int>()
         var i = 0
         while (i < len(pty)) {
             var idx = intConst(em, i)
@@ -2532,7 +2532,7 @@ fn buildSpreadTrampoline(em: Emitter, span: Span, target: int, pty: List<Ty>, re
             }
             i = i + 1
         }
-        var args = emptyInts()
+        var args = List<int>()
         if (receiver) {
             args.push(load(em, recvSlot))
         }
@@ -2557,7 +2557,7 @@ fn buildTrampoline(em: Emitter, span: Span, target: int, pty: List<Ty>, ret: Ty)
         var envSlot = newSlot(em, IrTy.Ptr)
         em.fparams.push(IrParam("env", IrTy.Ptr))
         declare(em, "env", envSlot)
-        var args = emptyInts()
+        var args = List<int>()
         for (t in pty) {
             var it = mapTy(em, t, span)
             var ir = IrTy.Ptr
@@ -2582,7 +2582,7 @@ fn buildTrampoline(em: Emitter, span: Span, target: int, pty: List<Ty>, ret: Ty)
 
 fn buildAsyncMethodWrapper(em: Emitter, md: MethodDecl, info: CallableInfo, hidden: int, isStatic: bool, thisTy: Ty?) -> bool {
         var d = 0
-        var captures = emptyCaptures()
+        var captures = List<Capture>()
         if (!isStatic) {
             em.fslots.push(IrTy.Ptr)
             em.fparams.push(IrParam("this", IrTy.Ptr))
@@ -2644,11 +2644,11 @@ fn totalInstanceSlotCount(em: Emitter, name: string) -> int {
 
 fn synthesizedCtorParamMeta(em: Emitter, name: string) -> CtorParamMeta {
         var cc = collectInstanceInits(em, name)
-        var empty = emptyInts()
+        var empty = List<int>()
         for (si in cc) {
             empty.push(si.slot)
         }
-        var slots = emptyInts()
+        var slots = List<int>()
         var cparamCount = 0
         var cutBase = 0
         var anc = nearestExplicitPrimaryAncestor(em, name)
@@ -2731,7 +2731,7 @@ fn injectClassRegistrations(em: Emitter) {
         if (len(em.classes) == 0 && isNoneInt(em.staticInitId) && isNoneInt(em.globalsInitId) && len(em.extraSetups) == 0) {
             return
         }
-        var plans = emptyRegPlans()
+        var plans = List<RegPlan>()
         for (p in em.classes) {
             var fields = allInstanceFields(em, p.name)
             var owned = 0
@@ -2748,7 +2748,7 @@ fn injectClassRegistrations(em: Emitter) {
             }
             plans.push(RegPlan(p.name, totalInstanceSlotCount(em, p.name), p.classId, parentCid, owned))
         }
-        var instrs = emptyIrInstrs()
+        var instrs = List<IrInstr>()
         for (rp in plans) {
             var sid = internString(em, rp.name)
             var addr = temp(em)
@@ -2776,7 +2776,7 @@ fn injectClassRegistrations(em: Emitter) {
             instrs.push(IrInstr.Const(parT, IrConst.Int(rp.parent)))
             var ex = externId(em, "pickle_class_register", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], IrTy.Unit)
             instrs.push(IrInstr.Call(none, Callee.Extern(ex), [addr, addrLen, countT, maskT, ownedT, finT, parT]))
-            var buckets = emptyIfaceBuckets()
+            var buckets = List<IfaceBucket>()
             if (let some(b) = em.classIfaceBuckets.get(rp.cid)) {
                 buckets = b
             }
@@ -2802,19 +2802,19 @@ fn injectClassRegistrations(em: Emitter) {
         // class registration because a `Ptr` initializer may call a constructor,
         // which reads the descriptor that registration creates.
         if (let some(fid4) = em.globalsInitId) {
-            instrs.push(IrInstr.Call(none, Callee.Func(fid4), emptyInts()))
+            instrs.push(IrInstr.Call(none, Callee.Func(fid4), List<int>()))
         }
         // Peer objects' setup functions (split link): their classes are
         // registered and their globals rooted before this object's static
         // initializers run, because a static initializer may call into a peer.
         for (s in em.extraSetups) {
-            var exU = externId(em, s, emptyIrTys(), IrTy.Unit)
-            instrs.push(IrInstr.Call(none, Callee.Extern(exU), emptyInts()))
+            var exU = externId(em, s, List<IrTy>(), IrTy.Unit)
+            instrs.push(IrInstr.Call(none, Callee.Extern(exU), List<int>()))
         }
         if (let some(fid3) = em.staticInitId) {
-            instrs.push(IrInstr.Call(none, Callee.Func(fid3), emptyInts()))
+            instrs.push(IrInstr.Call(none, Callee.Func(fid3), List<int>()))
         }
-        var ni = emptyIrInstrs()
+        var ni = List<IrInstr>()
         for (x in instrs) {
             ni.push(x)
         }

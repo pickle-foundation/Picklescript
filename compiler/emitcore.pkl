@@ -6,7 +6,7 @@ module compiler.emitcore
 
 import * from compiler.ast
 import { Span, Diagnostic, DiagnosticSink } from compiler.diag
-import { IrBlock, IrFunc, IrGlobal, IrModule, IrParam, IrTy, emptyIrBlocks, emptyIrGlobals, emptyIrParams, emptyIrTys, emptyModule, irTyStr, irxParseFloat } from compiler.ir
+import { IrBlock, IrFunc, IrGlobal, IrModule, IrParam, IrTy, emptyModule, irTyStr, irxParseFloat } from compiler.ir
 import { CallableInfo, ClassTable, CtorInfo, entryGenerics, EnumTable, FieldInfo, ParamInfo, PropertyInfo, ResolvedProgram, TypeTableEntry } from compiler.resolvebag
 
 import { collectExprTypes } from compiler.checkcore
@@ -449,7 +449,7 @@ fn expr1(em: Emitter, e: Expr) -> int? {
                     } else {
                         return none
                     }
-                    return fnValueCallFrom(em, e, obj, Ty.Fn(emptyTyList(), prt), emptyCallArgs())
+                    return fnValueCallFrom(em, e, obj, Ty.Fn(List<Ty>(), prt), List<CallArg>())
                 }
                 match (t0) {
                     case some(Ty.Unknown) -> {
@@ -531,7 +531,7 @@ fn identExpr(em: Emitter, e: Expr, name: string) -> int? {
             if (let some(fid) = em.propertyIds.get(tripleKey(str(cid), name, str(false)))) {
                 var tthis = thisValue(em, e)
                 if (let some(tthis) = tthis) {
-                    return callMethod(em, e, fid, emptyCallArgs(), tthis)
+                    return callMethod(em, e, fid, List<CallArg>(), tthis)
                 }
                 return none
             }
@@ -620,7 +620,7 @@ fn memberValue(em: Emitter, e: Expr, object: Expr, name: string) -> int? {
             if (let some(fid) = em.propertyIds.get(tripleKey(str(cc), name, str(false)))) {
                 var obj = expr(em, object)
                 if (let some(obj) = obj) {
-                    return callMethod(em, e, fid, emptyCallArgs(), obj)
+                    return callMethod(em, e, fid, List<CallArg>(), obj)
                 }
                 return none
             }
@@ -656,7 +656,7 @@ fn memberValue(em: Emitter, e: Expr, object: Expr, name: string) -> int? {
         if (let some(tname) = exprKindIdentName(object)) {
             if (let some(cx) = em.classByName.get(tname)) {
                 if (let some(fid) = em.staticPropertyIds.get(tripleKey(str(cx), name, str(false)))) {
-                    return callMethod(em, e, fid, emptyCallArgs(), none)
+                    return callMethod(em, e, fid, List<CallArg>(), none)
                 }
                 if (let some(sf) = staticField(em, cx, name)) {
                     return staticRead(em, e.span, sf.dcid, sf.slot, sf.info.ty)
@@ -867,7 +867,7 @@ if (let some(cc) = cid) {
             }
             if (let some(fid) = em.propertyIds.get(tripleKey(str(cc), name, str(false)))) {
                 var pty = propertyTyOf(em, cname, name)
-                var v = callMethod(em, e, fid, emptyCallArgs(), obj)
+                var v = callMethod(em, e, fid, List<CallArg>(), obj)
                 if (let some(v) = v) {
                     return OptMemberVal(pty, v)
                 }
@@ -1321,7 +1321,7 @@ fn cast(em: Emitter, e: Expr, operand: Expr, ty: TypeExpr, kind: CastKind) -> in
         if (let some(t) = tyOf(em, operand.span)) {
             src = t
         }
-        var dst = em.resolved.resolveTy(ty, emptyStrs(), em.diags)
+        var dst = em.resolved.resolveTy(ty, List<string>(), em.diags)
         match (kind) {
             case CastKind.Is -> castIs(em, e, operand, src, dst)
             case CastKind.As -> castAs(em, e, operand, src, dst)
@@ -1683,7 +1683,7 @@ var fidO = em.staticPropertyIds.get(tripleKey(str(cid), name, str(true)))
                             getFid = g
                         }
                         var ptyTy = propertyTyOf(em, tname, name)
-                        var curO = callMethod(em, e, getFid, emptyCallArgs(), none)
+                        var curO = callMethod(em, e, getFid, List<CallArg>(), none)
                         if (let none = curO) {
                             return none
                         }
@@ -1965,7 +1965,7 @@ if (cidVal < 0) {
                 if (let some(o) = obj) {
                     objId = o
                 }
-                var curO = callMethod(em, e, getFid, emptyCallArgs(), objId)
+                var curO = callMethod(em, e, getFid, List<CallArg>(), objId)
                 if (let none = curO) {
                     return none
                 }
@@ -2339,7 +2339,7 @@ if (vrep.isPtr) {
             }
             // String value: an absent key reads as `""`, then the current
             // string is concatenated with the RHS and stored back.
-            var defaultO = stringLiteral(em, emptyStrParts())
+            var defaultO = stringLiteral(em, List<StrPart>())
             if (let none = defaultO) {
                 return none
             }
@@ -2897,10 +2897,10 @@ fn matchExpr(em: Emitter, e: Expr, scrutinee: Expr, arms: List<MatchArm>) -> int
             }
             resSlot = newSlot(em, rt)
         }
-        var cfs = emptyInts()
-        var gBlocks = emptyInts()
-        var bBlocks = emptyInts()
-        var ends = emptyInts()
+        var cfs = List<int>()
+        var gBlocks = List<int>()
+        var bBlocks = List<int>()
+        var ends = List<int>()
         if (!(matchPrepArms(em, arms, st, enumName, isEnum, sSlot, resSlot, table, cfs, gBlocks, bBlocks, ends))) {
             return none
         }
@@ -3894,7 +3894,7 @@ fn spreadStaticCall(em: Emitter, e: Expr, span: Span, fid: int, pty: List<Ty>, r
         var join = newBlock(em)
         term(em, IrTerm.BranchIf(ok, rOk, rPanic))
         em.cur = rPanic
-        externCallVoid(em, "pickle_panic_arity_diff", emptyIrTys(), emptyInts())
+        externCallVoid(em, "pickle_panic_arity_diff", List<IrTy>(), List<int>())
         term(em, IrTerm.Branch(join))
         em.cur = rOk
         var rMissing = len(pty) - m
@@ -3905,7 +3905,7 @@ fn spreadStaticCall(em: Emitter, e: Expr, span: Span, fid: int, pty: List<Ty>, r
             externCallVoid(em, "pickle_list_push", [IrTy.Ptr, IrTy.Ptr], [xs, raw])
             k = k + 1
         }
-        var callArgs = emptyInts()
+        var callArgs = List<int>()
         if (let some(recv) = receiver) {
             callArgs.push(recv)
         }
@@ -4051,7 +4051,7 @@ var fidO = em.irModule.funcsByName.get(name)
                 return spreadStaticCall(em, e, e.span, fid, pty, rt, none, args)
             }
             var fparams = em.irModule.funcs[fid].params
-            var argTemps = emptyInts()
+            var argTemps = List<int>()
             var i = 0
             while (i < len(args)) {
                 var a = args[i]
@@ -4106,10 +4106,10 @@ var cidO = em.classByName.get(name)
             if (let some(fid) = ctorO) {
                 if (anySpread(args)) {
                     var pty = srcParamList(em, fid)
-                    return spreadStaticCall(em, e, e.span, fid, pty, Ty.Class(name, emptyTys()), none, args)
+                    return spreadStaticCall(em, e, e.span, fid, pty, Ty.Class(name, List<Ty>()), none, args)
                 }
                 var fparams = em.irModule.funcs[fid].params
-                var argTemps = emptyInts()
+                var argTemps = List<int>()
                 var i = 0
                 while (i < len(args)) {
                     var a = args[i]
@@ -4292,7 +4292,7 @@ case "print" | "println" -> {
                     }
                 }
                 if (newline) {
-                    externCallVoid(em, "pickle_print_newline", emptyIrTys(), emptyInts())
+                    externCallVoid(em, "pickle_print_newline", List<IrTy>(), List<int>())
                 }
                 return unitTemp(em)
             }
@@ -4940,7 +4940,7 @@ case "stdout_stream" | "stderr_stream" -> {
                 if (name == "stdout_stream") {
                     sym = "pickle_stdout_stream"
                 }
-                return externCallT1(em, sym, emptyIrTys(), IrTy.Ptr, emptyInts())
+                return externCallT1(em, sym, List<IrTy>(), IrTy.Ptr, List<int>())
             }
             case "args" -> {
                 if (!(len(args) == 0)) {
@@ -4949,7 +4949,7 @@ case "stdout_stream" | "stderr_stream" -> {
                 }
                 // Returns a `List<string>` of the program's command-line
                 // arguments, excluding the program name.
-                return externCallT1(em, "pickle_args", emptyIrTys(), IrTy.Ptr, emptyInts())
+                return externCallT1(em, "pickle_args", List<IrTy>(), IrTy.Ptr, List<int>())
             }
             case "exit" -> {
                 if (len(args) != 1) {
@@ -4985,7 +4985,7 @@ case "stdout_stream" | "stderr_stream" -> {
                     bad(em, e.span, "`run_cmd(argv, cwd, envs, env_removes, stdin_bytes, max_out, timeout_ms, inherit_io)` takes exactly eight arguments")
                     return none
                 }
-                var temps = emptyInts()
+                var temps = List<int>()
                 for (a in args) {
                     if (let some(t) = expr(em, a.value)) {
                         var tt = t
@@ -5016,7 +5016,7 @@ case "stdout_stream" | "stderr_stream" -> {
                     bad(em, e.span, "`run_spawn(argv, cwd, envs, env_removes, max_out)` takes exactly five arguments")
                     return none
                 }
-                var temps = emptyInts()
+                var temps = List<int>()
                 for (a in args) {
                     if (let some(t) = expr(em, a.value)) {
                         var tt = t
@@ -5119,14 +5119,14 @@ case "stdout_stream" | "stderr_stream" -> {
                     bad(em, e.span, "`current_dir()` takes no arguments")
                     return none
                 }
-                return externCallT1(em, "pickle_current_dir", emptyIrTys(), IrTy.Ptr, emptyInts())
+                return externCallT1(em, "pickle_current_dir", List<IrTy>(), IrTy.Ptr, List<int>())
             }
             case "captureBegin" -> {
                 if (!(len(args) == 0)) {
                     bad(em, e.span, "`captureBegin()` takes no arguments")
                     return none
                 }
-                externCallVoid(em, "pickle_test_capture_begin", emptyIrTys(), emptyInts())
+                externCallVoid(em, "pickle_test_capture_begin", List<IrTy>(), List<int>())
                 return unitTemp(em)
             }
             case "captureTake" -> {
@@ -5136,7 +5136,7 @@ case "stdout_stream" | "stderr_stream" -> {
                 }
                 // Returns the captured failure message as a `string` object, or
                 // `null` (`none`) when there is none.
-                return externCallT1(em, "pickle_test_capture_take", emptyIrTys(), IrTy.Ptr, emptyInts())
+                return externCallT1(em, "pickle_test_capture_take", List<IrTy>(), IrTy.Ptr, List<int>())
             }
             case _ -> {
                 if (let some(fb) = flatBuiltin(name)) {
@@ -5197,7 +5197,7 @@ fn positionalArgs(em: Emitter, e: Expr, name: string, args: List<CallArg>, param
             bad(em, e.span, "`" + name + "(" + shown + ")` takes exactly " + str(len(params)) + " " + word)
             return none
         }
-        var temps = emptyInts()
+        var temps = List<int>()
         for (a in args) {
             if (let some(t) = expr(em, a.value)) {
                 temps.push(t)
@@ -5227,7 +5227,7 @@ fn enumCtor(em: Emitter, e: Expr, t: EnumTable, name: string, args: List<CallArg
         }
         var spread = spreadAt < len(args)
         var vi = -1
-        var ftypes = emptyTys()
+        var ftypes = List<Ty>()
         var found = false
         var i = 0
         for (v in t.variants) {
@@ -5350,7 +5350,7 @@ fn enumCtor(em: Emitter, e: Expr, t: EnumTable, name: string, args: List<CallArg
             var join = newBlock(em)
             term(em, IrTerm.BranchIf(ok, rOk, rPanic))
             em.cur = rPanic
-            externCallVoid(em, "pickle_panic_arity_diff", emptyIrTys(), emptyInts())
+            externCallVoid(em, "pickle_panic_arity_diff", List<IrTy>(), List<int>())
             term(em, IrTerm.Branch(join))
             em.cur = rOk
             var k = 0
@@ -5399,7 +5399,7 @@ fn methodCall1(em: Emitter, e: Expr, object: Expr, name: string, args: List<Call
                         // A named constructor is a plain function returning the
                         // instance, so the shared spread trampoline works as-is.
                         var pty = srcParamList(em, fid)
-                        var rt = Ty.Class(tname, emptyTys())
+                        var rt = Ty.Class(tname, List<Ty>())
                         return spreadStaticCall(em, e, e.span, fid, pty, rt, none, args)
                     }
                     return callMethod(em, e, fid, args, none)
@@ -5814,7 +5814,7 @@ fn callMethod(em: Emitter, e: Expr, fid: int, args: List<CallArg>, receiver: int
             var rt = callRetFor(em, fid)
             return spreadStaticCall(em, e, e.span, fid, pty, rt, receiver, args)
         }
-var callArgs = emptyInts()
+var callArgs = List<int>()
         var ca = marshalMethodArgs(em, e, fid, args, receiver)
         if (let some(c) = ca) {
             callArgs = c
@@ -5834,7 +5834,7 @@ fn marshalMethodArgs(em: Emitter, e: Expr, fid: int, args: List<CallArg>, receiv
         }
         let _ = e
         var fparams = em.irModule.funcs[fid].params
-        var callArgs = emptyInts()
+        var callArgs = List<int>()
         if (let some(r) = receiver) {
             callArgs.push(r)
         }
@@ -5940,7 +5940,7 @@ fn guardPropagation(em: Emitter, fid: int) {
     /// After a call that may have thrown, branch to the innermost `catch` in
     /// this function or out of it. The flag stays set until someone consumes it.
 fn checkPending(em: Emitter) {
-        let pending = externCallT1(em, EXC_PENDING, emptyIrTys(), IrTy.Bool, emptyInts())
+        let pending = externCallT1(em, EXC_PENDING, List<IrTy>(), IrTy.Bool, List<int>())
         let thrown = newBlock(em)
         let resume = newBlock(em)
         term(em, IrTerm.BranchIf(pending, thrown, resume))
@@ -5972,7 +5972,7 @@ fn exitThroughFinallys(em: Emitter, exit: Exit) {
             return
         }
         let chain = em.finallys
-        em.finallys = emptyBlocks()
+        em.finallys = List<Block>()
         // The flag is set on every path that reaches here through a throw, so the
         // `finally` bodies run with propagation checks suppressed.
         let saved = em.inThrowTransfer
@@ -6015,7 +6015,7 @@ fn transferToHandlerOrPropagate(em: Emitter) {
         }
         let handler = em.handlers[len(em.handlers) - 1]
         let chain = em.finallys
-        em.finallys = emptyBlocks()
+        em.finallys = List<Block>()
         // The `try` emits its own `finally` after the handler body, not before,
         // so the first `finally` still owed on the way is one past it when the
         // owning `try` has one of its own, and exactly at the base when it does
@@ -6141,7 +6141,7 @@ fn tryStmt(em: Emitter, body: Block, binder: string?, handler: Block?, fin: Bloc
 
         if (hasHandler) {
             // A call in the body may have thrown: hand over to the handler.
-            let pending = externCallT1(em, EXC_PENDING, emptyIrTys(), IrTy.Bool, emptyInts())
+            let pending = externCallT1(em, EXC_PENDING, List<IrTy>(), IrTy.Bool, List<int>())
             term(em, IrTerm.BranchIf(pending, handlerId, afterBody))
         } else {
             term(em, IrTerm.Branch(afterBody))
@@ -6159,7 +6159,7 @@ fn tryStmt(em: Emitter, body: Block, binder: string?, handler: Block?, fin: Bloc
         if (let some(h) = handler) {
             // Consume the throw: this both clears the flag and yields the payload,
             // and it is the only thing that unroots the payload.
-            let payload = externCallT1(em, EXC_TAKE, emptyIrTys(), IrTy.Ptr, emptyInts())
+            let payload = externCallT1(em, EXC_TAKE, List<IrTy>(), IrTy.Ptr, List<int>())
             pushScope(em)
             if (let some(name) = binder) {
                 let slot = newSlot(em, IrTy.Ptr)
@@ -6226,7 +6226,7 @@ fn virtualMethodCall(em: Emitter, e: Expr, fallbackFid: int, args: List<CallArg>
             var found = externCallT1(em, "pickle_class_is", [IrTy.Ptr, IrTy.Int], IrTy.Bool, [receiver, dc])
             term(em, IrTerm.BranchIf(found, cb, next))
             em.cur = cb
-            var callArgs = emptyInts()
+            var callArgs = List<int>()
             var ca1 = marshalMethodArgs(em, e, b.fid, args, receiver)
             if (let some(c1) = ca1) {
                 callArgs = c1
@@ -6238,7 +6238,7 @@ fn virtualMethodCall(em: Emitter, e: Expr, fallbackFid: int, args: List<CallArg>
             term(em, IrTerm.Branch(join))
             em.cur = next
         }
-        var fallbackArgs = emptyInts()
+        var fallbackArgs = List<int>()
         var caf = marshalMethodArgs(em, e, fallbackFid, args, receiver)
         if (let some(cf) = caf) {
             fallbackArgs = cf
@@ -6281,7 +6281,7 @@ fn interfaceMethodCall(em: Emitter, e: Expr, ift: Ty, object: Expr, name: string
     /// and indirect-calls it. Mirrors `interface_dispatch`.
 fn interfaceDispatch(em: Emitter, e: Expr, span2: Span, ift: Ty, receiver: int, name: string, args: List<CallArg>, retTy: IrTy) -> int? {
         var ifaceName = ""
-        var ifaceArgs = emptyTys()
+        var ifaceArgs = List<Ty>()
         var isIface = false
         if (let some(ir) = ifaceOf(ift)) {
             ifaceName = ir.name
@@ -6314,7 +6314,7 @@ fn interfaceDispatch(em: Emitter, e: Expr, span2: Span, ift: Ty, receiver: int, 
             bad(em, span2, "`" + ifaceName + "` has no method `" + name + "`")
             return none
         }
-        var branches = emptyIfaceDepths()
+        var branches = List<IfaceDepthBranch>()
         for (p in em.classes) {
             if (!classImplementsIface(em, p.classId, ifaceId)) {
                 continue
@@ -6346,7 +6346,7 @@ fn interfaceDispatch(em: Emitter, e: Expr, span2: Span, ift: Ty, receiver: int, 
             var found = externCallT1(em, "pickle_class_is", [IrTy.Ptr, IrTy.Int], IrTy.Bool, [receiver, dc])
             term(em, IrTerm.BranchIf(found, cb, next))
             em.cur = cb
-            var callArgs2 = emptyInts()
+            var callArgs2 = List<int>()
             var ca2 = marshalMethodArgs(em, e, b.fid, args, receiver)
             if (let some(c2) = ca2) {
                 callArgs2 = c2
@@ -6372,18 +6372,18 @@ fn interfaceDispatch(em: Emitter, e: Expr, span2: Span, ift: Ty, receiver: int, 
         var guard = newBlock(em)
         term(em, IrTerm.BranchIf(isZero, guard, ok))
         em.cur = guard
-        externCallVoid(em, "pickle_panic_no_iface_method", emptyIrTys(), emptyInts())
+        externCallVoid(em, "pickle_panic_no_iface_method", List<IrTy>(), List<int>())
         term(em, IrTerm.Branch(join))
         em.cur = ok
         var prototype = branches[0].fid
-        var protoArgs = emptyInts()
+        var protoArgs = List<int>()
         var cap = marshalMethodArgs(em, e, prototype, args, receiver)
         if (let some(cp) = cap) {
             protoArgs = cp
         } else {
             return none
         }
-        var params = emptyIrTys()
+        var params = List<IrTy>()
         params.push(IrTy.Ptr)
         var spsO = em.srcParamTys.get(prototype)
         if (let some(src) = spsO) {
@@ -6423,7 +6423,7 @@ fn zeroForRet(em: Emitter, t: IrTy, span: Span) -> int? {
     /// reserve a getter slot and a setter slot in the interface's member table.
 fn interfaceAccessorDispatch(em: Emitter, span2: Span, ift: Ty, receiver: int, name: string, isSet: bool, pty: Ty, valueSrcTy: Ty, value: int?, retTy: IrTy) -> int? {
         var ifaceName = ""
-        var ifaceArgs = emptyTys()
+        var ifaceArgs = List<Ty>()
         var isIface = false
         if (let some(ir) = ifaceOf(ift)) {
             ifaceName = ir.name
@@ -6477,7 +6477,7 @@ fn interfaceAccessorDispatch(em: Emitter, span2: Span, ift: Ty, receiver: int, n
                 }
             }
         }
-        var branches = emptyIfaceDepths()
+        var branches = List<IfaceDepthBranch>()
         for (p in em.classes) {
             if (!classImplementsIface(em, p.classId, ifaceId)) {
                 continue
@@ -6492,7 +6492,7 @@ fn interfaceAccessorDispatch(em: Emitter, span2: Span, ift: Ty, receiver: int, n
             // read-only field satisfying a writable interface property). The
             // checker accepted the program, so panic the same way a missing
             // runtime method-table entry does.
-            externCallVoid(em, "pickle_panic_no_iface_method", emptyIrTys(), emptyInts())
+            externCallVoid(em, "pickle_panic_no_iface_method", List<IrTy>(), List<int>())
             return zeroForRet(em, retTy, span2)
         }
         sortIfaceBranches(branches)
@@ -6506,7 +6506,7 @@ fn interfaceAccessorDispatch(em: Emitter, span2: Span, ift: Ty, receiver: int, n
             var hit = externCallT1(em, "pickle_class_is", [IrTy.Ptr, IrTy.Int], IrTy.Bool, [receiver, dc])
             term(em, IrTerm.BranchIf(hit, cb, next))
             em.cur = cb
-            var callArgs = emptyInts()
+            var callArgs = List<int>()
             callArgs.push(receiver)
             if (isSet) {
                 callArgs.push(packed)
@@ -6530,12 +6530,12 @@ fn interfaceAccessorDispatch(em: Emitter, span2: Span, ift: Ty, receiver: int, n
         var guard = newBlock(em)
         term(em, IrTerm.BranchIf(isZero, guard, ok))
         em.cur = guard
-        externCallVoid(em, "pickle_panic_no_iface_method", emptyIrTys(), emptyInts())
+        externCallVoid(em, "pickle_panic_no_iface_method", List<IrTy>(), List<int>())
         term(em, IrTerm.Branch(join))
         em.cur = ok
-        var indParams = emptyIrTys()
+        var indParams = List<IrTy>()
         indParams.push(IrTy.Ptr)
-        var indArgs = emptyInts()
+        var indArgs = List<int>()
         indArgs.push(receiver)
         if (isSet) {
             var valueIr = IrTy.Ptr
@@ -6560,7 +6560,7 @@ fn interfaceAccessorDispatch(em: Emitter, span2: Span, ift: Ty, receiver: int, n
     /// Mirrors `interface_zero_arg_call` in emit.rs.
 fn interfaceZeroArgCall(em: Emitter, span2: Span, ift: Ty, rec: int, name: string, retTy: IrTy) -> int? {
         var dummy = Expr(span2, ExprKind.Ident(""))
-        interfaceDispatch(em, dummy, span2, ift, rec, name, emptyCallArgs(), retTy)
+        interfaceDispatch(em, dummy, span2, ift, rec, name, List<CallArg>(), retTy)
     }
 
     /// `xs.push(v)` and `xs.pop()` for `List<T>` receivers. Mirrors
@@ -7713,7 +7713,7 @@ fn listFoldCall(em: Emitter, e: Expr, obj: int, init: Expr, f: Expr, elem: Ty) -
         if (let some(t) = fty0) {
             fty = t
         }
-        var pty = emptyTys()
+        var pty = List<Ty>()
         var isFn = false
         match (fty) {
             case Ty.Fn(pts, _) -> {
@@ -7839,7 +7839,7 @@ fn listReduceCall(em: Emitter, e: Expr, obj: int, f: Expr, elem: Ty) -> int? {
         if (let some(t) = fty0) {
             fty = t
         }
-        var pty = emptyTys()
+        var pty = List<Ty>()
         var isFn = false
         match (fty) {
             case Ty.Fn(pts, _) -> {
@@ -7971,7 +7971,7 @@ fn listTakeWhileCall(em: Emitter, e: Expr, obj: int, f: Expr, elem: Ty) -> int? 
             fty = t
         }
         var prt = Ty.Unknown
-        var pty = emptyTyList()
+        var pty = List<Ty>()
         var isFn = false
         match (fty) {
             case Ty.Fn(pts, r) -> {
@@ -8078,7 +8078,7 @@ fn listSkipWhileCall(em: Emitter, e: Expr, obj: int, f: Expr, elem: Ty) -> int? 
             fty = t
         }
         var prt = Ty.Unknown
-        var pty = emptyTyList()
+        var pty = List<Ty>()
         var isFn = false
         match (fty) {
             case Ty.Fn(pts, r) -> {
@@ -8196,7 +8196,7 @@ fn listFindIndexCall(em: Emitter, e: Expr, obj: int, f: Expr, elem: Ty) -> int? 
             fty = t
         }
         var prt = Ty.Unknown
-        var pty = emptyTyList()
+        var pty = List<Ty>()
         var isFn = false
         match (fty) {
             case Ty.Fn(pts, r) -> {
@@ -8309,7 +8309,7 @@ fn listPartitionCall(em: Emitter, e: Expr, obj: int, f: Expr, elem: Ty) -> int? 
             fty = t
         }
         var prt = Ty.Unknown
-        var pty = emptyTyList()
+        var pty = List<Ty>()
         var isFn = false
         match (fty) {
             case Ty.Fn(pts, r) -> {
@@ -8947,7 +8947,7 @@ fn optMapCall(em: Emitter, e: Expr, object: Expr, name: string, f: Expr, inner: 
             fty = t
         }
         var prt = Ty.Unknown
-        var pty = emptyTys()
+        var pty = List<Ty>()
         var isFn = false
         match (fty) {
             case Ty.Fn(pts, r) -> {
@@ -9094,7 +9094,7 @@ fn optMapOrCall(em: Emitter, e: Expr, object: Expr, def: Expr, f: Expr, inner: T
         if (let some(t) = fty0) {
             fty = t
         }
-        var pty = emptyTys()
+        var pty = List<Ty>()
         var prt = Ty.Unknown
         var isFn = false
         match (fty) {
@@ -9231,7 +9231,7 @@ fn optFilterCall(em: Emitter, e: Expr, object: Expr, f: Expr, inner: Ty) -> int?
         if (let some(t) = fty0) {
             fty = t
         }
-        var pty = emptyTys()
+        var pty = List<Ty>()
         var prt = Ty.Unknown
         var isFn = false
         match (fty) {
@@ -9560,7 +9560,7 @@ fn genericCall(em: Emitter, e: Expr, name: string, typeArgs: List<TypeExpr>, arg
         if (let some(x) = info) {
             inf = x
         }
-        var argTys = emptyTys()
+        var argTys = List<Ty>()
         for (te in typeArgs) {
             var t = em.resolved.resolveTy(te, em.fnGenerics, em.diags)
             argTys.push(substTy(em, t))
@@ -9581,7 +9581,7 @@ fn genericFnCall(em: Emitter, e: Expr, info: CallableInfo, argTys: List<Ty>, arg
             bad(em, e.span, "cannot instantiate `" + name + "` with unresolved type arguments; specify them explicitly like `" + name + "<...>(...)`")
             return none
         }
-        var map = emptyStringTyMap()
+        var map = Map<string, Ty>()
         var zi = 0
         while (zi < len(info.generics) && zi < len(argTys)) {
             map[info.generics[zi]] = argTys[zi]
@@ -9607,7 +9607,7 @@ fn genericFnCall(em: Emitter, e: Expr, info: CallableInfo, argTys: List<Ty>, arg
             var rt = callRetFor(em, fid)
             return spreadStaticCall(em, e, e.span, fid, pty, rt, none, args)
         }
-        var argTemps = emptyInts()
+        var argTemps = List<int>()
         var i = 0
         while (i < len(args)) {
             var a = args[i]
@@ -9689,7 +9689,7 @@ fn genericFnCall(em: Emitter, e: Expr, info: CallableInfo, argTys: List<Ty>, arg
     /// calls its implicit constructor exactly like a plain `TypeName(arg)`
     /// call. Mirrors `generic_class_call` in emit.rs.
 fn genericClassCall(em: Emitter, e: Expr, name: string, cls: ClassTable, typeArgs: List<TypeExpr>, args: List<CallArg>) -> int? {
-        var argTys = emptyTys()
+        var argTys = List<Ty>()
         for (te in typeArgs) {
             var t = em.resolved.resolveTy(te, em.fnGenerics, em.diags)
             argTys.push(substTy(em, t))
@@ -9729,7 +9729,7 @@ fn genericClassCall(em: Emitter, e: Expr, name: string, cls: ClassTable, typeArg
         // Mirror the plain class-constructor call: borrow `&T` reference
         // parameters, wrap optional parameters, and store the result.
         var fparams = em.irModule.funcs[fid].params
-        var argTemps = emptyInts()
+        var argTemps = List<int>()
         var i = 0
         while (i < len(args)) {
             var a = args[i]
@@ -9819,7 +9819,7 @@ fn fnValueCall(em: Emitter, e: Expr, callee: Expr, args: List<CallArg>) -> int? 
     /// closure object first, then the real arguments. Mirrors
     /// `fn_value_call_from` in emit.rs.
 fn fnValueCallFrom(em: Emitter, e: Expr, fv: int, fty: Ty, args: List<CallArg>) -> int? {
-        var pty = emptyTys()
+        var pty = List<Ty>()
         var prt = Ty.None
         var isFn = false
         match (fty) {
@@ -9907,7 +9907,7 @@ fn fnValueCallFrom(em: Emitter, e: Expr, fv: int, fty: Ty, args: List<CallArg>) 
                 var join = newBlock(em)
                 term(em, IrTerm.BranchIf(ok, rOk, rPanic))
                 em.cur = rPanic
-                externCallVoid(em, "pickle_panic_arity_diff", emptyIrTys(), emptyInts())
+                externCallVoid(em, "pickle_panic_arity_diff", List<IrTy>(), List<int>())
                 term(em, IrTerm.Branch(join))
                 em.cur = rOk
                 var k = 0
@@ -10073,7 +10073,7 @@ fn boundMethodValue(em: Emitter, e: Expr, object: Expr) -> int? {
     /// `(a, b, c)` tuple literal: allocate a tuple and set each field, boxing
     /// scalars. Mirrors `tuple_literal` in emit.rs.
 fn tupleLiteral(em: Emitter, e: Expr, items: List<Expr>) -> int? {
-        var tys = emptyTys()
+        var tys = List<Ty>()
         var isTuple = false
         if (let some(t) = tyOf(em, e.span)) {
             match (t) {
@@ -10584,7 +10584,7 @@ var obj = expr(em, object)
                                         return none
                                     }
                                 } else if (vty == Ty.String) {
-                                    var sl = stringLiteral(em, emptyStrParts())
+                                    var sl = stringLiteral(em, List<StrPart>())
                                     if (let some(sl) = sl) {
                                         defaultVal = sl
                                         haveDefault = true

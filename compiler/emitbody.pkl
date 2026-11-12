@@ -7,7 +7,7 @@ module compiler.emitbody
 
 import * from compiler.ast
 import { Span, Diagnostic, DiagnosticSink } from compiler.diag
-import { IrBlock, IrFunc, IrGlobal, IrModule, IrParam, IrTy, emptyIrBlocks, emptyIrGlobals, emptyIrParams, emptyIrTys, emptyModule, irTyStr, irxParseFloat } from compiler.ir
+import { IrBlock, IrFunc, IrGlobal, IrModule, IrParam, IrTy, emptyModule, irTyStr, irxParseFloat } from compiler.ir
 import { CallableInfo, ClassTable, CtorInfo, entryGenerics, EnumTable, FieldInfo, ParamInfo, PropertyInfo, ResolvedProgram, TypeTableEntry } from compiler.resolvebag
 import { collectExprTypes } from compiler.checkcore
 import { containsStr, isNoneStr, spanKey } from compiler.checkutil
@@ -78,7 +78,7 @@ fn emit(em: Emitter) {
         // initializer only after every class id is assigned.
         if (!(len(em.staticInits) == 0)) {
             var inits = em.staticInits
-em.staticInits = emptyStaticInitEntries()
+em.staticInits = List<StaticInitEntry>()
             em.staticInitId = pushClassFunc(em, "static.init", "pkl_static_init", FnSource.StaticInit(inits))
         }
         // Managed top-level `var`s have no static bytes. Register every slot as a
@@ -86,7 +86,7 @@ em.staticInits = emptyStaticInitEntries()
         // the first code that can allocate.
         if (!(len(em.managedGlobalInits) == 0)) {
             var ginits = em.managedGlobalInits
-            em.managedGlobalInits = emptyManagedGlobalInits()
+            em.managedGlobalInits = List<ManagedGlobalInit>()
             em.globalsInitId = pushClassFunc(em, "globals.init", "pkl_globals_init", FnSource.GlobalsInit(ginits))
         }
         // Test modules have no `main`, so the class-registration preamble
@@ -127,10 +127,10 @@ em.staticInits = emptyStaticInitEntries()
             for (d in em.suppressed) {
                 em.diags.emit(d)
             }
-            em.suppressed = emptyDiagnostics()
+            em.suppressed = List<Diagnostic>()
             return
         }
-        em.suppressed = emptyDiagnostics()
+        em.suppressed = List<Diagnostic>()
         em.progMayThrow = len(em.directThrow.keys()) > 0
         if (em.progMayThrow) {
             solveMayThrow(em)
@@ -150,37 +150,37 @@ fn buildAll(em: Emitter) {
 fn buildFunc(em: Emitter, fid: int) {
         em.fname = em.irModule.funcs[fid].name
         em.symbol = em.irModule.funcs[fid].symbol
-        em.fparams = emptyIrParams()
-        em.fslots = emptyIrTys()
-        em.env = emptyIntScopeMap()
+        em.fparams = List<IrParam>()
+        em.fslots = List<IrTy>()
+        em.env = List<Map<string, int>>()
         em.env.push(seedIntScopeMap())
-        em.manualEnv = emptyScopeMaps()
+        em.manualEnv = List<Map<string, bool>>()
         em.manualEnv.push(seedScopeMap())
-        em.blocks = emptyIrBlocks()
-        em.blocks.push(IrBlock(0, emptyIrInstrs(), IrTerm.Unreachable))
+        em.blocks = List<IrBlock>()
+        em.blocks.push(IrBlock(0, List<IrInstr>(), IrTerm.Unreachable))
         em.nextBlock = 1
         em.nextTemp = 0
-        em.loops = emptyLoopCtxs()
+        em.loops = List<LoopCtx>()
         em.cur = 0
         // Reset the exception context per function alongside `loops`. Both stacks
         // balance themselves on a clean lowering, but a pass that bailed out
         // early can leave them dirty -- and the two-pass driver re-runs this
         // function, so pass 2 must not inherit that.
-        em.finallys = emptyBlocks()
-        em.handlers = emptyHandlerCtxs()
+        em.finallys = List<Block>()
+        em.handlers = List<HandlerCtx>()
         em.inThrowTransfer = false
         em.owner = none
         em.currentFid = fid
         em.iceDepth = 0
-        em.icePath = emptyStrs()
-        em.iceSeq = emptyStrs()
+        em.icePath = List<string>()
+        em.iceSeq = List<string>()
 
         if (let some(s) = em.instantonSubst.get(fid)) {
             em.currentSubst = s
         } else {
-            em.currentSubst = emptyStringTyMap()
+            em.currentSubst = Map<string, Ty>()
         }
-        var fg = emptyStrs()
+        var fg = List<string>()
         if (let some(g) = em.fidGenerics.get(fid)) {
             fg = g
         } else {
@@ -282,7 +282,7 @@ case FnSource.MethodTrampoline(span, target, pts, rt, branches) -> {
                     // each parameter under its own name (slot 0 is the hidden
                     // body). Runs no user code.
                     em.fret = IrTy.Ptr
-                    var captures = emptyCaptures()
+                    var captures = List<Capture>()
                     for (p in info3.params) {
                         captures.push(Capture(p.name, p.ty, p.span))
                     }
@@ -396,7 +396,7 @@ fn blockTailAsReturn(em: Emitter, b: Block) {
     }
 
 fn emitBody(em: Emitter, body: FnBody?) -> bool {
-        em.iceSeq = emptyStrs()
+        em.iceSeq = List<string>()
         if (let some(b) = body) {
             match (b) {
                 case FnBody.Block(bb) -> {
@@ -430,7 +430,7 @@ fn emitBody(em: Emitter, body: FnBody?) -> bool {
 
 fn buildLambdaBody(em: Emitter, lambda: Expr, captures: List<Capture>, pty: List<Ty>, ret: Ty, owner: int?, fid: int) {
         let _ = fid
-        var params = emptyParams()
+        var params = List<Param>()
         var lb = FnBody.Expr(Expr(Span(0, 0), ExprKind.This))
         match (lambda.kind) {
             case ExprKind.Lambda(ps, _rt, _ia, b) -> {
@@ -644,7 +644,7 @@ fn buildMethodTrampoline(em: Emitter, span: Span, target: int, pty: List<Ty>, re
         var env = load(em, envSlot)
         var one = intConst(em, 1)
         var receiver = externCallT1(em, "pickle_obj_slot_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [env, one])
-        var real = emptyInts()
+        var real = List<int>()
         var i = 0
         while (i < len(pty)) {
             var t = pty[i]
@@ -661,7 +661,7 @@ fn buildMethodTrampoline(em: Emitter, span: Span, target: int, pty: List<Ty>, re
             i = i + 1
         }
         if (len(branches) == 0) {
-            var args = emptyInts()
+            var args = List<int>()
             args.push(receiver)
             for (r in real) {
                 args.push(r)
@@ -686,7 +686,7 @@ fn buildMethodTrampoline(em: Emitter, span: Span, target: int, pty: List<Ty>, re
             var found = externCallT1(em, "pickle_class_is", [IrTy.Ptr, IrTy.Int], IrTy.Bool, [receiver, dc])
             term(em, IrTerm.BranchIf(found, cb, next))
             em.cur = cb
-            var bargs = emptyInts()
+            var bargs = List<int>()
             bargs.push(receiver)
             for (r in real) {
                 bargs.push(r)
@@ -696,7 +696,7 @@ fn buildMethodTrampoline(em: Emitter, span: Span, target: int, pty: List<Ty>, re
             term(em, IrTerm.Branch(join))
             em.cur = next
         }
-        var fargs = emptyInts()
+        var fargs = List<int>()
         fargs.push(receiver)
         for (r in real) {
             fargs.push(r)
@@ -732,7 +732,7 @@ fn emitCtorBlockFrom(em: Emitter, b: Block, fromIdx: int) -> bool {
     }
 
 fn emitSuperChain(em: Emitter, ownerName: string, delegation: Expr) -> bool {
-        var args = emptyCallArgs()
+        var args = List<CallArg>()
         var isCall = false
         match (delegation.kind) {
             case ExprKind.Call(_super, a) -> {
@@ -774,7 +774,7 @@ fn emitSuperChain(em: Emitter, ownerName: string, delegation: Expr) -> bool {
         if (spread && spreadAt > len(ptypes)) {
             return bad(em, delegation.span, "`super(...)` passes more argument(s) than `" + parent + "` expects")
         }
-        var vals = emptyCtorArgVals()
+        var vals = List<CtorArgVal>()
         var ai = 0
         while (ai < spreadAt) {
             var a = args[ai]
@@ -849,7 +849,7 @@ fn emitSuperChain(em: Emitter, ownerName: string, delegation: Expr) -> bool {
             var rPanic = newBlock(em)
             term(em, IrTerm.BranchIf(ok, rOk, rPanic))
             em.cur = rPanic
-            externCallVoid(em, "pickle_panic_arity_diff", emptyIrTys(), emptyInts())
+            externCallVoid(em, "pickle_panic_arity_diff", List<IrTy>(), List<int>())
             term(em, IrTerm.Unreachable)
             em.cur = rOk
             var k = 0
@@ -885,11 +885,11 @@ fn emitSynthesizedSuperChain(em: Emitter, ancestor: string, count: int) -> bool 
         if (let some(t) = at) {
             atable = t
         }
-        var cparams = emptyParamInfos()
+        var cparams = List<ParamInfo>()
         if (let some(c) = atable.ctor) {
             cparams = c.params
         }
-        var vals = emptyCtorArgVals()
+        var vals = List<CtorArgVal>()
         var i = 0
         while (i < count && i < len(cparams)) {
             var p = cparams[i]
@@ -929,7 +929,7 @@ fn emitCtorChain(em: Emitter, cname: string, ct: ClassTable, vals: List<CtorArgV
             if (let some(x) = cd) {
                 ctorDecl = x
             }
-            var cparams = emptyParamInfos()
+            var cparams = List<ParamInfo>()
             if (let some(c) = ct.ctor) {
                 cparams = c.params
             }
@@ -1004,7 +1004,7 @@ fn emitCtorChain(em: Emitter, cname: string, ct: ClassTable, vals: List<CtorArgV
             }
             var thisObj = load(em, thisSlot)
             if (!(meta.chainName == "")) {
-                var candVals = emptyCtorArgVals()
+                var candVals = List<CtorArgVal>()
                 var kk = 0
                 while (kk < meta.chainCount && kk < len(vals)) {
                     candVals.push(vals[kk])
@@ -1061,14 +1061,14 @@ fn emitCtorChain(em: Emitter, cname: string, ct: ClassTable, vals: List<CtorArgV
 
 fn buildCtorBody(em: Emitter, table: ClassTable, inits: List<SlotInit>, initBlocks: List<Block>, ctor: ConstructorDecl?) -> bool {
         var ifields = allInstanceFields(em, table.name)
-        var params = emptyCtorParams()
+        var params = List<CtorParam>()
         var meta = synthesizedCtorParamMeta(em, table.name)
         var hasCtor = false
         if (let some(_) = table.ctor) {
             hasCtor = true
         }
         if (hasCtor) {
-            var ctorParams = emptyParamInfos()
+            var ctorParams = List<ParamInfo>()
             if (let some(c) = table.ctor) {
                 ctorParams = c.params
             }
@@ -1251,7 +1251,7 @@ fn buildNamedCtor(em: Emitter, table: ClassTable, cd: ConstructorDecl) -> bool {
                 }
             }
         }
-        var params = emptyParamInfos()
+        var params = List<ParamInfo>()
         if (let some(c) = info) {
             params = c.params
         }
@@ -1277,7 +1277,7 @@ fn buildNamedCtor(em: Emitter, table: ClassTable, cd: ConstructorDecl) -> bool {
         if (let some(d2) = dg) {
             delegation = d2
         }
-        var args = emptyCallArgs()
+        var args = List<CallArg>()
         var isCall = false
         match (delegation.kind) {
             case ExprKind.Call(_callee, a) -> {
@@ -1306,7 +1306,7 @@ fn buildNamedCtor(em: Emitter, table: ClassTable, cd: ConstructorDecl) -> bool {
             // The delegation target is a plain function returning the new
             // instance, so the shared spread trampoline can drive it.
             var pty = ctorParamTys(em, table)
-            var rt = Ty.Class(table.name, emptyTys())
+            var rt = Ty.Class(table.name, List<Ty>())
             var sv = spreadStaticCall(em, delegation, cd.span, primary, pty, rt, none, args)
             if (let some(v) = sv) {
                 term(em, IrTerm.Return(v))
@@ -1315,7 +1315,7 @@ fn buildNamedCtor(em: Emitter, table: ClassTable, cd: ConstructorDecl) -> bool {
             return false
         }
         var fparams = em.irModule.funcs[primary].params
-        var argTemps = emptyInts()
+        var argTemps = List<int>()
         var ai = 0
         while (ai < len(args)) {
             var a = args[ai]

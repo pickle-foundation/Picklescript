@@ -1,44 +1,20 @@
 module compiler.x64_spillplan_test
 
-import { IrTy, IrConst, IrInstr, IrTerm, IrBlock, IrFunc, IrModule, IrExtern, Callee, emptyIrTys, emptyIrParams, emptyIrGlobals } from compiler.ir
+import { IrTy, IrConst, IrInstr, IrTerm, IrBlock, IrFunc, IrModule, IrExtern, Callee } from compiler.ir
 import { FnPlan, analyze, computeMayGC } from compiler.x64
 import { DiagnosticSink } from compiler.diag
 
-fn emptyInstrs() -> List<IrInstr> {
-    var l = [IrInstr.Const(0, IrConst.Int(0))]
-    l.pop()
-    l
-}
-
-fn emptyInts() -> List<int> {
-    var l = [0]
-    l.pop()
-    l
-}
-
-fn emptyBlocks() -> List<IrBlock> {
-    var l = [IrBlock(0, emptyInstrs(), IrTerm.Unreachable)]
-    l.pop()
-    l
-}
-
-fn emptyTags() -> List<string> {
-    var l = [""]
-    l.pop()
-    l
-}
-
 fn mkExtern(ret: IrTy) -> IrExtern {
-    IrExtern("pickle_support_tick", emptyIrTys(), ret)
+    IrExtern("pickle_support_tick", List<IrTy>(), ret)
 }
 
 fn mkFunc(slots: List<IrTy>, body: List<IrInstr>) -> IrFunc {
     let blocks = [IrBlock(0, body, IrTerm.Return(none))]
-    IrFunc("f", "call_site", emptyIrParams(), IrTy.Unit, slots, 0, blocks, false, false, emptyTags())
+    IrFunc("f", "call_site", List<IrParam>(), IrTy.Unit, slots, 0, blocks, false, false, List<string>())
 }
 
 fn planOf(slots: List<IrTy>, body: List<IrInstr>, ret: IrTy) -> FnPlan {
-    var fs = [IrFunc("seed", "", emptyIrParams(), IrTy.Unit, emptyIrTys(), 0, emptyBlocks(), false, false, emptyTags())]
+    var fs = [IrFunc("seed", "", List<IrParam>(), IrTy.Unit, List<IrTy>(), 0, List<IrBlock>(), false, false, List<string>())]
     fs.pop()
     fs.push(mkFunc(slots, body))
     var es = [mkExtern(ret)]
@@ -46,7 +22,7 @@ fn planOf(slots: List<IrTy>, body: List<IrInstr>, ret: IrTy) -> FnPlan {
     bn.remove("s")
     var ss = [[0]]
     ss.pop()
-    let m = IrModule(fs, es, bn, ss, emptyIrGlobals())
+    let m = IrModule(fs, es, bn, ss, List<IrGlobal>())
     analyze(m, m.funcs[0], computeMayGC(m))
 }
 
@@ -69,7 +45,7 @@ fn homeOf(plan: FnPlan, s: int, which: int) -> int {
 describe("spill plan metadata coverage", {
     test("every managed home gets a dense ordered cell", {
         let slots = [IrTy.Str, IrTy.Str, IrTy.Int]
-        let body = [IrInstr.Call(3, Callee.Extern(0), emptyInts()), IrInstr.Call(4, Callee.Extern(0), emptyInts())]
+        let body = [IrInstr.Call(3, Callee.Extern(0), List<int>()), IrInstr.Call(4, Callee.Extern(0), List<int>())]
         let p = planOf(slots, body, IrTy.Str)
         expect(p.ncells).toBe(4)
         expect(p.shadowed).toBe(true)
@@ -80,7 +56,7 @@ describe("spill plan metadata coverage", {
 
     test("unmanaged homes sit strictly above the shadow frame", {
         let slots = [IrTy.Str, IrTy.Int]
-        let body = [IrInstr.Const(2, IrConst.Int(7)), IrInstr.Call(3, Callee.Extern(0), emptyInts())]
+        let body = [IrInstr.Const(2, IrConst.Int(7)), IrInstr.Call(3, Callee.Extern(0), List<int>())]
         let p = planOf(slots, body, IrTy.Str)
         expect(p.ncells).toBe(2)
         expect(p.shadowed).toBe(true)
@@ -101,7 +77,7 @@ describe("spill plan metadata coverage", {
 
     test("ptr homes are rooted like str homes", {
         let slots = [IrTy.Ptr]
-        let body = [IrInstr.Call(none, Callee.Extern(0), emptyInts())]
+        let body = [IrInstr.Call(none, Callee.Extern(0), List<int>())]
         let p = planOf(slots, body, IrTy.Ptr)
         expect(p.ncells).toBe(1)
         expect(p.shadowed).toBe(true)

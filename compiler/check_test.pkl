@@ -1,14 +1,13 @@
 ﻿module compiler.check_test
 
-import { emptyStrList } from compiler.checkbag
 import { checkProgram, isThisCall, listHasTy, listRemoveStr, namedCtorDelegation, strPartsText, unOpName } from compiler.checkcore
-import { absDiffInt, binOpName, classifyMessage, containsStr, emptyTyList, isClassOrStruct, isListSortable, isListSummable, isNoneExpr, isNoneStr, joinStrs, listHasStr, mergeFlowTypes, patternIntroducesBinding, spanKey, tyVars } from compiler.checkutil
+import { absDiffInt, binOpName, classifyMessage, containsStr, isClassOrStruct, isListSortable, isListSummable, isNoneExpr, isNoneStr, joinStrs, listHasStr, mergeFlowTypes, patternIntroducesBinding, spanKey, tyVars } from compiler.checkutil
 import { Span, DiagnosticSink, Severity } from compiler.diag
 import { Lexer } from compiler.lexer
 import { parse } from compiler.parsercore
 import { Resolver } from compiler.resolvebag
-import { StrPart, BinOp, UnOp, Expr, ExprKind, Block, Stmt, Pattern, Lit, emptyStrs } from compiler.ast
-import { Ty, tyEq, optOf, emptyTys } from compiler.ty
+import { StrPart, BinOp, UnOp, Expr, ExprKind, Block, Stmt, Pattern, Lit } from compiler.ast
+import { Ty, tyEq, optOf } from compiler.ty
 import { resolve } from compiler.resolvecore
 
 fn optTy(t: Ty) -> Ty? {
@@ -40,13 +39,7 @@ fn makeSpan(s: int, e: int) -> Span {
 
 fn makeThisCall(s: int, e: int) -> Expr {
     let thisE = Expr(makeSpan(s, e), ExprKind.This)
-    Expr(makeSpan(s, e), ExprKind.Call(thisE, emptyCallArgs()))
-}
-
-fn emptyCallArgs() -> List<CallArg> {
-    var l = [CallArg(someString(""), Expr(makeSpan(0, 0), ExprKind.Ident("x")), false, makeSpan(0, 0))]
-    l.pop()
-    l
+    Expr(makeSpan(s, e), ExprKind.Call(thisE, List<CallArg>()))
 }
 
 test fn contains_str() {
@@ -61,7 +54,7 @@ test fn contains_str() {
 test fn join_strs() {
     expect(joinStrs(["a", "b", "c"], ", ")).toBe("a, b, c")
     expect(joinStrs(["a"], ",")).toBe("a")
-    var l = emptyStrList()
+    var l = List<string>()
     expect(joinStrs(l, ",")).toBe("")
     expect(joinStrs(["a", "b"], "")).toBe("ab")
 }
@@ -69,7 +62,7 @@ test fn join_strs() {
 test fn list_has_str() {
     expect(listHasStr(["a", "b"], "a")).toBe(true)
     expect(listHasStr(["a", "b"], "c")).toBe(false)
-    var l = emptyStrList()
+    var l = List<string>()
     expect(listHasStr(l, "x")).toBe(false)
 }
 
@@ -87,7 +80,7 @@ test fn list_has_ty() {
     expect(listHasTy([Ty.Int], Ty.Int)).toBe(true)
     expect(listHasTy([Ty.Int], Ty.Float)).toBe(false)
     expect(listHasTy([Ty.String, Ty.Bool], Ty.Bool)).toBe(true)
-    var l = emptyTyList()
+    var l = List<Ty>()
     expect(listHasTy(l, Ty.Int)).toBe(false)
 }
 
@@ -185,10 +178,10 @@ test fn ty_vars() {
 }
 
 test fn is_class_or_struct() {
-    expect(isClassOrStruct(Ty.Class("A", emptyTys()))).toBe(true)
-    expect(isClassOrStruct(Ty.Struct("B", emptyTys()))).toBe(true)
+    expect(isClassOrStruct(Ty.Class("A", List<Ty>()))).toBe(true)
+    expect(isClassOrStruct(Ty.Struct("B", List<Ty>()))).toBe(true)
     expect(isClassOrStruct(Ty.Int)).toBe(false)
-    expect(isClassOrStruct(Ty.Enum("E", emptyTys()))).toBe(false)
+    expect(isClassOrStruct(Ty.Enum("E", List<Ty>()))).toBe(false)
     expect(isClassOrStruct(Ty.String)).toBe(false)
 }
 
@@ -200,12 +193,12 @@ test fn is_this_call() {
 
 test fn named_ctor_delegation() {
     let call = makeThisCall(0, 0)
-    let emptyBlock = Block(emptyStmtList(), none, makeSpan(0, 0))
+    let emptyBlock = Block(List<Stmt>(), none, makeSpan(0, 0))
     match (namedCtorDelegation(emptyBlock)) {
         case some(_) -> expect(true).toBe(false)
         case none -> expect(true).toBe(true)
     }
-    let tail = Block(emptyStmtList(), optExpr(call), makeSpan(0, 0))
+    let tail = Block(List<Stmt>(), optExpr(call), makeSpan(0, 0))
     match (namedCtorDelegation(tail)) {
         case some(e) -> expect(isThisCall(e)).toBe(true)
         case none -> expect(true).toBe(false)
@@ -313,12 +306,6 @@ fn optExpr(e: Expr) -> Expr? {
     e
 }
 
-fn emptyStmtList() -> List<Stmt> {
-    var l = [Stmt.Empty(makeSpan(0, 0))]
-    l.pop()
-    l
-}
-
 fn makeStmtList() -> List<Stmt> {
     [Stmt.Expr(makeThisCall(0, 0))]
 }
@@ -341,7 +328,7 @@ fn makeTwoStmtList() -> List<Stmt> {
 fn checkSource(src: string) -> List<string> {
     let toks = Lexer(bytes(src), 0, 0, none, range(0), 0).run()
     let diags = DiagnosticSink()
-    var out = emptyStrList()
+    var out = List<string>()
     if (let some(prog) = parse(toks, diags)) {
         let r = Resolver(diags)
         checkProgram(prog, resolve(r, prog), diags)

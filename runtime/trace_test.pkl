@@ -2,7 +2,7 @@ module runtime.trace_test
 
 import { HEADER, LIST_OBJECT_SIZE, MAP_OBJECT_SIZE, enumObjectSize, tupleObjectSize } from runtime.layout
 import { PICKLE_CLASS_STRING, PICKLE_CLASS_LIST, PICKLE_CLASS_MAP, PICKLE_CLASS_ENUM, PICKLE_CLASS_TUPLE, PICKLE_CLASS_USER_BASE, PICKLE_CLASS_FLAG_FINALIZER } from runtime.object
-import { TraceHeap, TraceDesc, DescriptorTable, RootCell, traceFromRoots, traceOne, enqueue, enumFieldCountOf, NULL_ADDR, NIL_SENTINEL_ADDR, NONE_KEY_ADDR, PICKLE_FLAG_MARKED, SLOTS_PER_MASK_WORD, W_NEXT, W_CLASS_FLAGS, W_SIZE, W_PAYLOAD, W_LIST_LEN, W_LIST_CAP, W_LIST_DATA, W_MAP_CAP, W_MAP_ENTRIES, W_TUPLE_LEN, U32_MASK, emptyInts } from runtime.trace
+import { TraceHeap, TraceDesc, DescriptorTable, RootCell, traceFromRoots, traceOne, enqueue, enumFieldCountOf, NULL_ADDR, NIL_SENTINEL_ADDR, NONE_KEY_ADDR, PICKLE_FLAG_MARKED, SLOTS_PER_MASK_WORD, W_NEXT, W_CLASS_FLAGS, W_SIZE, W_PAYLOAD, W_LIST_LEN, W_LIST_CAP, W_LIST_DATA, W_MAP_CAP, W_MAP_ENTRIES, W_TUPLE_LEN, U32_MASK } from runtime.trace
 import { ShadowRegistry, ShadowFrame } from runtime.shadow
 import { Collector } from runtime.collector
 
@@ -23,7 +23,7 @@ fn cells(v: int) -> List<RootCell> {
 }
 
 fn noRoots() -> List<int> {
-    emptyInts()
+    List<int>()
 }
 
 fn newObject(heap: TraceHeap, classId: int, size: int) -> int {
@@ -88,7 +88,7 @@ fn newTuple(heap: TraceHeap, fieldCount: int) -> int {
 
 /// The managed-mask words covering `indices`: word `s/32`, bit `s%32`.
 fn maskOf(indices: List<int>) -> List<int> {
-    var words = emptyInts()
+    var words = List<int>()
     var i = 0
     while (i < len(indices)) {
         var s = indices[i]
@@ -380,7 +380,7 @@ test fn an_empty_mask_traces_no_slots() {
     let o = newUserObject(t, PICKLE_CLASS_USER_BASE, 2)
     t.setPayload(o, 0, 42)
     t.setPayload(o, 1, 43)
-    d.register(PICKLE_CLASS_USER_BASE, "Marker", 2, emptyInts(), 0)
+    d.register(PICKLE_CLASS_USER_BASE, "Marker", 2, List<int>(), 0)
     mark(t, d, sh, o)
     expect(t.marked()).toBe([o])
     t.destroy()
@@ -413,7 +413,7 @@ test fn a_zero_mask_word_is_skipped() {
     // Word 0 is all-zero, word 1 marks slot 37. A walk that did not skip the
     // zero word would still work here, but one that mis-indexed it would not
     // find slot 37.
-    var mask = emptyInts()
+    var mask = List<int>()
     mask.push(0)
     mask.push(1 << 5)
     d.register(PICKLE_CLASS_USER_BASE, "Sparse", 40, mask, 0)
@@ -465,7 +465,7 @@ test fn mask_words_past_the_second_are_fully_walked() {
     t.setPayload(o, 70, third)
     t.setPayload(o, 85, tail)
     // Full 3-word mask: every one of the 86 slots is a managed pointer.
-    var mask = emptyInts()
+    var mask = List<int>()
     mask.push(U32_MASK)
     mask.push(U32_MASK)
     mask.push((1 << 22) - 1) // 86 - 64 = 22 bits in the last word
@@ -522,7 +522,7 @@ test fn a_shared_child_is_traced_once() {
     t.setPayload(root, 0, shared)
     t.setPayload(root, 1, shared)
     d.register(PICKLE_CLASS_USER_BASE, "Root", 2, maskOf([0, 1]), 0)
-    d.register(PICKLE_CLASS_USER_BASE + 1, "Shared", 0, emptyInts(), 0)
+    d.register(PICKLE_CLASS_USER_BASE + 1, "Shared", 0, List<int>(), 0)
     mark(t, d, sh, root)
     expect(t.marked()).toBe([shared, root])
     expect(t.visits).toBe([root, shared])
@@ -541,8 +541,8 @@ test fn the_worklist_is_drained_lifo() {
     t.setPayload(root, 0, a)
     t.setPayload(root, 1, b)
     d.register(PICKLE_CLASS_USER_BASE, "Root", 2, maskOf([0, 1]), 0)
-    d.register(PICKLE_CLASS_USER_BASE + 1, "A", 0, emptyInts(), 0)
-    d.register(PICKLE_CLASS_USER_BASE + 2, "B", 0, emptyInts(), 0)
+    d.register(PICKLE_CLASS_USER_BASE + 1, "A", 0, List<int>(), 0)
+    d.register(PICKLE_CLASS_USER_BASE + 2, "B", 0, List<int>(), 0)
     mark(t, d, sh, root)
     expect(t.visits).toBe([root, b, a])
     t.destroy()
@@ -551,7 +551,7 @@ test fn the_worklist_is_drained_lifo() {
 test fn enqueue_rejects_null_and_sentinels() {
     let t = TraceHeap()
     let a = newObject(t, PICKLE_CLASS_STRING, HEADER)
-    var wl = emptyInts()
+    var wl = List<int>()
     enqueue(t, wl, NULL_ADDR)
     enqueue(t, wl, NIL_SENTINEL_ADDR)
     enqueue(t, wl, NONE_KEY_ADDR)
@@ -574,7 +574,7 @@ test fn a_root_cell_is_dereferenced_at_trace_time() {
     let b = newUserObject(t, PICKLE_CLASS_USER_BASE + 1, 0)
     t.setPayload(a, 0, b)
     d.register(PICKLE_CLASS_USER_BASE, "A", 1, maskOf([0]), 0)
-    d.register(PICKLE_CLASS_USER_BASE + 1, "B", 0, emptyInts(), 0)
+    d.register(PICKLE_CLASS_USER_BASE + 1, "B", 0, List<int>(), 0)
     var roots = cells(a)
     roots[0].value = NULL_ADDR
     traceFromRoots(t, d, sh, roots, noRoots(), noRoots())
@@ -622,8 +622,8 @@ test fn shadow_stack_slots_are_roots() {
     let sh = shadow()
     let a = newUserObject(t, PICKLE_CLASS_USER_BASE, 0)
     let b = newUserObject(t, PICKLE_CLASS_USER_BASE + 1, 0)
-    d.register(PICKLE_CLASS_USER_BASE, "A", 0, emptyInts(), 0)
-    d.register(PICKLE_CLASS_USER_BASE + 1, "B", 0, emptyInts(), 0)
+    d.register(PICKLE_CLASS_USER_BASE, "A", 0, List<int>(), 0)
+    d.register(PICKLE_CLASS_USER_BASE + 1, "B", 0, List<int>(), 0)
     sh.registerThread()
     let f = sh.newFrame(2)
     sh.pushFrame(f)
@@ -647,8 +647,8 @@ test fn shadow_roots_span_every_registered_thread() {
     let sh = shadow()
     let mine = newUserObject(t, PICKLE_CLASS_USER_BASE, 0)
     let theirs = newUserObject(t, PICKLE_CLASS_USER_BASE + 1, 0)
-    d.register(PICKLE_CLASS_USER_BASE, "A", 0, emptyInts(), 0)
-    d.register(PICKLE_CLASS_USER_BASE + 1, "B", 0, emptyInts(), 0)
+    d.register(PICKLE_CLASS_USER_BASE, "A", 0, List<int>(), 0)
+    d.register(PICKLE_CLASS_USER_BASE + 1, "B", 0, List<int>(), 0)
     sh.registerThread()
     sh.registerForeignThread()
     let f1 = sh.newFrame(1)
@@ -677,9 +677,9 @@ test fn root_sources_are_seeded_in_the_native_order() {
     var a = newUserObject(t, PICKLE_CLASS_USER_BASE, 0)
     var b = newUserObject(t, PICKLE_CLASS_USER_BASE + 1, 0)
     var c = newUserObject(t, PICKLE_CLASS_USER_BASE + 2, 0)
-    d.register(PICKLE_CLASS_USER_BASE, "A", 0, emptyInts(), 0)
-    d.register(PICKLE_CLASS_USER_BASE + 1, "B", 0, emptyInts(), 0)
-    d.register(PICKLE_CLASS_USER_BASE + 2, "C", 0, emptyInts(), 0)
+    d.register(PICKLE_CLASS_USER_BASE, "A", 0, List<int>(), 0)
+    d.register(PICKLE_CLASS_USER_BASE + 1, "B", 0, List<int>(), 0)
+    d.register(PICKLE_CLASS_USER_BASE + 2, "C", 0, List<int>(), 0)
     var ms = noRoots()
     ms.push(b)
     var ts = noRoots()
@@ -713,7 +713,7 @@ test fn descriptor_reports_its_finalizer() {
 test fn trace_one_visits_exactly_one_object() {
     let t = TraceHeap()
     let d = descs()
-    let wl = emptyInts()
+    let wl = List<int>()
     let a = newObject(t, PICKLE_CLASS_STRING, HEADER)
     traceOne(t, d, a, wl)
     expect(t.visits).toBe([a])
@@ -742,7 +742,7 @@ test fn differential_against_the_modeled_collector() {
 
     d.register(PICKLE_CLASS_USER_BASE, "Root", 2, maskOf([0, 1]), 0)
     d.register(PICKLE_CLASS_USER_BASE + 1, "LeafA", 1, maskOf([0]), 0)
-    d.register(PICKLE_CLASS_USER_BASE + 2, "LeafB", 1, emptyInts(), 0)
+    d.register(PICKLE_CLASS_USER_BASE + 2, "LeafB", 1, List<int>(), 0)
 
     t.setPayload(troot, 0, tleafA)
     t.setPayload(troot, 1, tleafB)

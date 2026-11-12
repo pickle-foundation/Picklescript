@@ -17,18 +17,6 @@ fn newObjs() -> List<CoffObj> {
     objs
 }
 
-fn emptyInts() -> List<int> {
-    var nums = [0]
-    nums.pop()
-    nums
-}
-
-fn emptyStrs() -> List<string> {
-    var strs = [""]
-    strs.pop()
-    strs
-}
-
 fn hasMain(m: IrModule) -> bool {
     for (f in m.funcs) {
         if (f.isMain) {
@@ -77,7 +65,7 @@ fn lowerModuleObj(target: string, src: string, sinks: DiagnosticSink) -> Lowered
 /// function under that symbol for the linking program to call.
 fn lowerModuleObjEx(target: string, src: string, sinks: DiagnosticSink, cidSalt: int, moduleSetupSymbol: string) -> LoweredProgram? {
     if (let some(loaded) = frontend(target, src, sinks)) {
-        if (let some(emitted) = emitIrEx(loaded.program, loaded.resolved, sinks, cidSalt, moduleSetupSymbol, emptyStrs())) {
+        if (let some(emitted) = emitIrEx(loaded.program, loaded.resolved, sinks, cidSalt, moduleSetupSymbol, List<string>())) {
             return finishLower(target, emitted, sinks)
         }
     }
@@ -104,7 +92,7 @@ class LoweredBytes {
 /// caches them. Same lowering, same result.
 fn lowerModuleObjBytes(target: string, src: string, sinks: DiagnosticSink) -> LoweredBytes? {
     if (let some(loaded) = frontend(target, src, sinks)) {
-        if (let some(emitted) = emitIrEx(loaded.program, loaded.resolved, sinks, 0, "", emptyStrs())) {
+        if (let some(emitted) = emitIrEx(loaded.program, loaded.resolved, sinks, 0, "", List<string>())) {
             if (let some(xout) = x64LowerModule(emitted.ir, sinks)) {
                 return LoweredBytes(coffObjFor(emitted.ir, xout), emitted.classCount)
             }
@@ -119,7 +107,7 @@ fn lowerModuleObjBytes(target: string, src: string, sinks: DiagnosticSink) -> Lo
 /// is what lets the split linker reuse one cached object across every program.
 fn lowerModuleObjExBytes(target: string, src: string, sinks: DiagnosticSink, cidSalt: int, moduleSetupSymbol: string) -> LoweredBytes? {
     if (let some(loaded) = frontend(target, src, sinks)) {
-        if (let some(emitted) = emitIrEx(loaded.program, loaded.resolved, sinks, cidSalt, moduleSetupSymbol, emptyStrs())) {
+        if (let some(emitted) = emitIrEx(loaded.program, loaded.resolved, sinks, cidSalt, moduleSetupSymbol, List<string>())) {
             if (let some(xout) = x64LowerModule(emitted.ir, sinks)) {
                 return LoweredBytes(coffObjFor(emitted.ir, xout), emitted.classCount)
             }
@@ -129,7 +117,7 @@ fn lowerModuleObjExBytes(target: string, src: string, sinks: DiagnosticSink, cid
 }
 
 fn lowerProgram(target: string, src: string, sinks: DiagnosticSink) -> LoweredProgram? {
-    lowerProgramEx(target, src, sinks, emptyStrs())
+    lowerProgramEx(target, src, sinks, List<string>())
 }
 
 /// Split-link form of `lowerProgram`: `extraSetups` are peer setup symbols
@@ -169,13 +157,13 @@ fn loadArchive(path: string) -> List<CoffObj>? {
 fn linkExe(objects: List<CoffObj>, outputPath: string, progOverrides: List<string>) -> string? {
     let definitions = OrderedMap<string, int>("", 0)
     scanDefs(objects, definitions)
-    let chosen = emptyInts()
-    let unresolved = emptyStrs()
+    let chosen = List<int>()
+    let unresolved = List<string>()
     select(objects, definitions, chosen, unresolved)
     if (len(unresolved) > 0) {
         var msg = "unresolved symbol: " + unresolved[0]
         if (len(unresolved) > 1) {
-            var extra = emptyStrs()
+            var extra = List<string>()
             var u = 1
             while (u < len(unresolved)) {
                 extra.push(unresolved[u])

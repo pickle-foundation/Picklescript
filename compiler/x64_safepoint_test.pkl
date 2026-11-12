@@ -1,44 +1,20 @@
 module compiler.x64_safepoint_test
 
-import { IrTy, IrConst, IrInstr, IrTerm, IrExtern, IrBlock, IrFunc, IrModule, Callee, emptyIrTys, emptyIrParams, emptyIrGlobals } from compiler.ir
-import { X64Func, X64Out, x64LowerModule, emptyRelocs } from compiler.x64
+import { IrTy, IrConst, IrInstr, IrTerm, IrExtern, IrBlock, IrFunc, IrModule, Callee } from compiler.ir
+import { X64Func, X64Out, x64LowerModule } from compiler.x64
 import { DiagnosticSink } from compiler.diag
 
-fn emptyInstrs() -> List<IrInstr> {
-    var l = [IrInstr.Const(0, IrConst.Int(0))]
-    l.pop()
-    l
-}
-
-fn emptyInts() -> List<int> {
-    var l = [0]
-    l.pop()
-    l
-}
-
-fn emptyBlocks() -> List<IrBlock> {
-    var l = [IrBlock(0, emptyInstrs(), IrTerm.Unreachable)]
-    l.pop()
-    l
-}
-
-fn emptyTags() -> List<string> {
-    var l = [""]
-    l.pop()
-    l
-}
-
 fn mkExtern(sym: string) -> IrExtern {
-    IrExtern(sym, emptyIrTys(), IrTy.Unit)
+    IrExtern(sym, List<IrTy>(), IrTy.Unit)
 }
 
 fn mkFunc(name: string, symbol: string, slots: List<IrTy>, body: List<IrInstr>) -> IrFunc {
     let blocks = [IrBlock(0, body, IrTerm.Return(none))]
-    IrFunc(name, symbol, emptyIrParams(), IrTy.Unit, slots, 0, blocks, false, false, emptyTags())
+    IrFunc(name, symbol, List<IrParam>(), IrTy.Unit, slots, 0, blocks, false, false, List<string>())
 }
 
 fn mkModule(f: IrFunc, sym: string) -> IrModule {
-    var fs = [IrFunc("seed", "", emptyIrParams(), IrTy.Unit, emptyIrTys(), 0, emptyBlocks(), false, false, emptyTags())]
+    var fs = [IrFunc("seed", "", List<IrParam>(), IrTy.Unit, List<IrTy>(), 0, List<IrBlock>(), false, false, List<string>())]
     fs.pop()
     fs.push(f)
     var es = [mkExtern(sym)]
@@ -46,7 +22,7 @@ fn mkModule(f: IrFunc, sym: string) -> IrModule {
     bn.remove("s")
     var ss = [[0]]
     ss.pop()
-    IrModule(fs, es, bn, ss, emptyIrGlobals())
+    IrModule(fs, es, bn, ss, List<IrGlobal>())
 }
 
 fn lowerOne(f: IrFunc, sym: string) -> X64Func {
@@ -54,7 +30,7 @@ fn lowerOne(f: IrFunc, sym: string) -> X64Func {
     match (out) {
         case none -> {
             expect(false).toBe(true)
-            X64Func("bad", emptyInts(), emptyRelocs(), 0, 0)
+            X64Func("bad", List<int>(), List<Reloc>(), 0, 0)
         }
         case some(o) -> o.funcs[0]
     }
@@ -106,7 +82,7 @@ fn packedOf(f: X64Func) -> int {
 describe("safepoint ABI shape", {
     test("gc site roots its cells and stamps the frame", {
         let slots = [IrTy.Str]
-        let body = [IrInstr.Call(none, Callee.Extern(0), emptyInts())]
+        let body = [IrInstr.Call(none, Callee.Extern(0), List<int>())]
         let f = lowerOne(mkFunc("f", "call_ext", slots, body), "pickle_support_tick")
         expect(f.ncells).toBe(1)
         expect(countSym(f, "pickle_shadow_push")).toBe(1)
@@ -127,7 +103,7 @@ describe("safepoint ABI shape", {
 
     test("shadow api exempts itself from framing", {
         let slots = [IrTy.Str]
-        let body = [IrInstr.Const(1, IrConst.Int(0)), IrInstr.CallInd(none, 1, emptyIrTys(), IrTy.Unit, emptyInts())]
+        let body = [IrInstr.Const(1, IrConst.Int(0)), IrInstr.CallInd(none, 1, List<IrTy>(), IrTy.Unit, List<int>())]
         let f = lowerOne(mkFunc("abiShadowHead", "call_ish", slots, body), "pickle_shadow_pop")
         expect(f.ncells).toBe(1)
         expect(countSym(f, "pickle_shadow_push")).toBe(0)
