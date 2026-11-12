@@ -219,7 +219,28 @@ fn coffRead(name: string, b: List<int>) -> CoffObj {
         cs.sizeRaw = u32At(b, at + 16)
         cs.ptrRaw = u32At(b, at + 20)
         cs.ptrReloc = u32At(b, at + 24)
-        cs.nReloc = u16At(b, at + 32)
+        // `NumberOfRelocations` is a u16 in the COFF section header, so a
+        // section with more than 65535 relocations cannot state its count
+        // there: the field wraps modulo 65536 and a reader that trusts it
+        // silently applies only the first slice of the table, leaving every
+        // later call site at its unrelocated placeholder (a `movabs $0` +
+        // `call` that faults at address 0). `coffObjFor` lays the reloc table
+        // out immediately before the symbol table with no padding, so the
+        // true count is exactly the gap divided by the 10-byte record size.
+        // Trust the gap only when it carries a truncation signature: either
+        // the field is the `0xFFFF` sentinel our writer clamps to, or it is
+        // the true count wrapped modulo 65536 (what an older writer emitted).
+        // Both also hold in the ordinary `gap == nRel` case. A foreign object
+        // whose reloc table is followed by another section's relocs (or by
+        // padding) fails this test and keeps its header count.
+        var nRel = u16At(b, at + 32)
+        if (cs.ptrReloc > 0 && ptrSym > cs.ptrReloc) {
+            let gap = (ptrSym - cs.ptrReloc) / 10
+            if (gap > nRel && (nRel == 0xFFFF || (gap % 65536) == nRel)) {
+                nRel = gap
+            }
+        }
+        cs.nReloc = nRel
         cs.chars = u32At(b, at + 36)
         cs.isBss = (cs.chars & 128) != 0
         var r = 0
