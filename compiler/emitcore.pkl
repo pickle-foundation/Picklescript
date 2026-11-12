@@ -6596,7 +6596,7 @@ fn listMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List<C
         }
         // Only the read-only methods read through an immutable borrow; the
         // mutators would write through `&List`, so they keep bailing.
-        if (isBorrowed && name != "contains" && name != "indexOf" && name != "lastIndexOf" && name != "len" && name != "isEmpty" && name != "slice" && name != "join" && name != "map" && name != "filter" && name != "any" && name != "all" && name != "find" && name != "count" && name != "take" && name != "skip" && name != "first" && name != "last" && name != "enumerate" && name != "zip" && name != "flatten" && name != "flatMap" && name != "sorted" && name != "sum" && name != "min" && name != "max" && name != "reversed" && name != "distinct" && name != "chunks" && name != "windows" && name != "fold" && name != "reduce" && name != "intersperse" && name != "dedup") {
+        if (isBorrowed && name != "contains" && name != "indexOf" && name != "lastIndexOf" && name != "len" && name != "isEmpty" && name != "slice" && name != "join" && name != "map" && name != "filter" && name != "any" && name != "all" && name != "find" && name != "count" && name != "take" && name != "skip" && name != "first" && name != "last" && name != "enumerate" && name != "zip" && name != "flatten" && name != "flatMap" && name != "sorted" && name != "sum" && name != "min" && name != "max" && name != "reversed" && name != "distinct" && name != "chunks" && name != "windows" && name != "fold" && name != "reduce" && name != "intersperse" && name != "dedup" && name != "takeWhile" && name != "skipWhile" && name != "findIndex" && name != "partition") {
             bad(em, e.span, "`" + name + "` mutates a `List` through an immutable reference (`&List`)")
             return none
         }
@@ -7053,6 +7053,34 @@ fn listMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List<C
                         return none
                     }
                     return externCallT1(em, "pickle_list_dedup", [IrTy.Ptr], IrTy.Ptr, [obj])
+                }
+                case "takeWhile" -> {
+                    if (!(len(args) == 1)) {
+                        bad(em, e.span, "`takeWhile` takes one function argument")
+                        return none
+                    }
+                    return listTakeWhileCall(em, e, obj, args[0].value, elem)
+                }
+                case "skipWhile" -> {
+                    if (!(len(args) == 1)) {
+                        bad(em, e.span, "`skipWhile` takes one function argument")
+                        return none
+                    }
+                    return listSkipWhileCall(em, e, obj, args[0].value, elem)
+                }
+                case "findIndex" -> {
+                    if (!(len(args) == 1)) {
+                        bad(em, e.span, "`findIndex` takes one function argument")
+                        return none
+                    }
+                    return listFindIndexCall(em, e, obj, args[0].value, elem)
+                }
+                case "partition" -> {
+                    if (!(len(args) == 1)) {
+                        bad(em, e.span, "`partition` takes one function argument")
+                        return none
+                    }
+                    return listPartitionCall(em, e, obj, args[0].value, elem)
                 }
                 case _ -> {
                     bad(em, e.span, "`" + name + "` method on `List` is not lowered yet")
@@ -7929,6 +7957,461 @@ fn listReduceCall(em: Emitter, e: Expr, obj: int, f: Expr, elem: Ty) -> int? {
         load(em, accSlot)
     }
 
+    /// `xs.takeWhile(f)`: a fresh list holding the longest leading run whose
+    /// `bool` predicate is true. It stops at the first false and copies the
+    /// stored element pointers, so the copy is shallow. Read-only.
+fn listTakeWhileCall(em: Emitter, e: Expr, obj: int, f: Expr, elem: Ty) -> int? {
+        var fty0 = tyOf(em, f.span)
+        if (let none = fty0) {
+            bad(em, f.span, "`takeWhile` needs a function argument")
+            return none
+        }
+        var fty = Ty.Unknown
+        if (let some(t) = fty0) {
+            fty = t
+        }
+        var prt = Ty.Unknown
+        var pty = emptyTyList()
+        var isFn = false
+        match (fty) {
+            case Ty.Fn(pts, r) -> {
+                prt = r
+                pty = pts
+                isFn = true
+            }
+            case _ -> {}
+        }
+        if (!isFn || len(pty) != 1) {
+            bad(em, f.span, "`takeWhile` needs a one-argument function")
+            return none
+        }
+        if (prt != Ty.Bool) {
+            bad(em, f.span, "`takeWhile` needs a callback returning `bool`, found `" + bareName(prt) + "`")
+            return none
+        }
+        var refParam = false
+        match (pty[0]) {
+            case Ty.Ref(_) -> refParam = true
+            case _ -> {}
+        }
+        if (refParam) {
+            bad(em, f.span, "`takeWhile` callbacks take values, not `&T` references")
+            return none
+        }
+        var rp = elemRep(em, elem, e.span)
+        if (let none = rp) {
+            return none
+        }
+        var rep = ElemRep.ptr()
+        if (let some(r) = rp) {
+            rep = r
+        }
+        var fv0 = expr(em, f)
+        if (let none = fv0) {
+            return none
+        }
+        var fv = 0
+        if (let some(v) = fv0) {
+            fv = v
+        }
+        var cap = externCallT1(em, "pickle_list_len", [IrTy.Ptr], IrTy.Int, [obj])
+        var out = externCallT1(em, "pickle_list_new", [IrTy.Int], IrTy.Ptr, [cap])
+        var idxSlot = newSlot(em, IrTy.Int)
+        var lenSlot = newSlot(em, IrTy.Int)
+        var zero = intConst(em, 0)
+        instr(em, IrInstr.StoreSlot(idxSlot, zero))
+        instr(em, IrInstr.StoreSlot(lenSlot, cap))
+        var condId = newBlock(em)
+        var bodyId = newBlock(em)
+        var pushId = newBlock(em)
+        var nextId = newBlock(em)
+        var endId = newBlock(em)
+        term(em, IrTerm.Branch(condId))
+        em.cur = condId
+        var curT = load(em, idxSlot)
+        var endL = load(em, lenSlot)
+        var cmp = temp(em)
+        instr(em, IrInstr.BinOp(cmp, IrBinOp.Lt, curT, endL))
+        term(em, IrTerm.BranchIf(cmp, bodyId, endId))
+        em.cur = bodyId
+        var curI = load(em, idxSlot)
+        var raw = externCallT1(em, "pickle_list_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [obj, curI])
+        var argIr = IrTy.Ptr
+        var argV = raw
+        if (!(rep.isPtr)) {
+            argV = externCallT1(em, rep.unboxSym, [IrTy.Ptr], rep.ir, [raw])
+            argIr = rep.ir
+        }
+        var zero2 = intConst(em, 0)
+        var addrBoxed = externCallT1(em, "pickle_obj_slot_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [fv, zero2])
+        var fnAddr = externCallT1(em, "pickle_unbox_i64", [IrTy.Ptr], IrTy.Int, [addrBoxed])
+        var dst = temp(em)
+        instr(em, IrInstr.CallInd(dst, fnAddr, [IrTy.Ptr, argIr], IrTy.Bool, [fv, argV]))
+        term(em, IrTerm.BranchIf(dst, pushId, endId))
+        em.cur = pushId
+        var pushI = load(em, idxSlot)
+        var raw2 = externCallT1(em, "pickle_list_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [obj, pushI])
+        externCallVoid(em, "pickle_list_push", [IrTy.Ptr, IrTy.Ptr], [out, raw2])
+        term(em, IrTerm.Branch(nextId))
+        em.cur = nextId
+        var c = load(em, idxSlot)
+        var one = intConst(em, 1)
+        var nxt = temp(em)
+        instr(em, IrInstr.BinOp(nxt, IrBinOp.Add, c, one))
+        instr(em, IrInstr.StoreSlot(idxSlot, nxt))
+        term(em, IrTerm.Branch(condId))
+        em.cur = endId
+        out
+    }
+
+    /// `xs.skipWhile(f)`: a fresh list holding the tail after the longest
+    /// leading run whose `bool` predicate is true. A list that satisfies the
+    /// predicate everywhere yields an empty list. Read-only.
+fn listSkipWhileCall(em: Emitter, e: Expr, obj: int, f: Expr, elem: Ty) -> int? {
+        var fty0 = tyOf(em, f.span)
+        if (let none = fty0) {
+            bad(em, f.span, "`skipWhile` needs a function argument")
+            return none
+        }
+        var fty = Ty.Unknown
+        if (let some(t) = fty0) {
+            fty = t
+        }
+        var prt = Ty.Unknown
+        var pty = emptyTyList()
+        var isFn = false
+        match (fty) {
+            case Ty.Fn(pts, r) -> {
+                prt = r
+                pty = pts
+                isFn = true
+            }
+            case _ -> {}
+        }
+        if (!isFn || len(pty) != 1) {
+            bad(em, f.span, "`skipWhile` needs a one-argument function")
+            return none
+        }
+        if (prt != Ty.Bool) {
+            bad(em, f.span, "`skipWhile` needs a callback returning `bool`, found `" + bareName(prt) + "`")
+            return none
+        }
+        var refParam = false
+        match (pty[0]) {
+            case Ty.Ref(_) -> refParam = true
+            case _ -> {}
+        }
+        if (refParam) {
+            bad(em, f.span, "`skipWhile` callbacks take values, not `&T` references")
+            return none
+        }
+        var rp = elemRep(em, elem, e.span)
+        if (let none = rp) {
+            return none
+        }
+        var rep = ElemRep.ptr()
+        if (let some(r) = rp) {
+            rep = r
+        }
+        var fv0 = expr(em, f)
+        if (let none = fv0) {
+            return none
+        }
+        var fv = 0
+        if (let some(v) = fv0) {
+            fv = v
+        }
+        var cap = externCallT1(em, "pickle_list_len", [IrTy.Ptr], IrTy.Int, [obj])
+        var out = externCallT1(em, "pickle_list_new", [IrTy.Int], IrTy.Ptr, [cap])
+        var idxSlot = newSlot(em, IrTy.Int)
+        var lenSlot = newSlot(em, IrTy.Int)
+        var zero = intConst(em, 0)
+        instr(em, IrInstr.StoreSlot(idxSlot, zero))
+        instr(em, IrInstr.StoreSlot(lenSlot, cap))
+        var condId = newBlock(em)
+        var bodyId = newBlock(em)
+        var nextId = newBlock(em)
+        var copyCondId = newBlock(em)
+        var copyBodyId = newBlock(em)
+        var endId = newBlock(em)
+        term(em, IrTerm.Branch(condId))
+        em.cur = condId
+        var curT = load(em, idxSlot)
+        var endL = load(em, lenSlot)
+        var cmp = temp(em)
+        instr(em, IrInstr.BinOp(cmp, IrBinOp.Lt, curT, endL))
+        term(em, IrTerm.BranchIf(cmp, bodyId, copyCondId))
+        em.cur = bodyId
+        var curI = load(em, idxSlot)
+        var raw = externCallT1(em, "pickle_list_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [obj, curI])
+        var argIr = IrTy.Ptr
+        var argV = raw
+        if (!(rep.isPtr)) {
+            argV = externCallT1(em, rep.unboxSym, [IrTy.Ptr], rep.ir, [raw])
+            argIr = rep.ir
+        }
+        var zero2 = intConst(em, 0)
+        var addrBoxed = externCallT1(em, "pickle_obj_slot_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [fv, zero2])
+        var fnAddr = externCallT1(em, "pickle_unbox_i64", [IrTy.Ptr], IrTy.Int, [addrBoxed])
+        var dst = temp(em)
+        instr(em, IrInstr.CallInd(dst, fnAddr, [IrTy.Ptr, argIr], IrTy.Bool, [fv, argV]))
+        term(em, IrTerm.BranchIf(dst, nextId, copyCondId))
+        em.cur = nextId
+        var c = load(em, idxSlot)
+        var one = intConst(em, 1)
+        var nxt = temp(em)
+        instr(em, IrInstr.BinOp(nxt, IrBinOp.Add, c, one))
+        instr(em, IrInstr.StoreSlot(idxSlot, nxt))
+        term(em, IrTerm.Branch(condId))
+        em.cur = copyCondId
+        var copyT = load(em, idxSlot)
+        var copyL = load(em, lenSlot)
+        var copyCmp = temp(em)
+        instr(em, IrInstr.BinOp(copyCmp, IrBinOp.Lt, copyT, copyL))
+        term(em, IrTerm.BranchIf(copyCmp, copyBodyId, endId))
+        em.cur = copyBodyId
+        var copyI = load(em, idxSlot)
+        var raw2 = externCallT1(em, "pickle_list_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [obj, copyI])
+        externCallVoid(em, "pickle_list_push", [IrTy.Ptr, IrTy.Ptr], [out, raw2])
+        var c2 = load(em, idxSlot)
+        var one2 = intConst(em, 1)
+        var nxt2 = temp(em)
+        instr(em, IrInstr.BinOp(nxt2, IrBinOp.Add, c2, one2))
+        instr(em, IrInstr.StoreSlot(idxSlot, nxt2))
+        term(em, IrTerm.Branch(copyCondId))
+        em.cur = endId
+        out
+    }
+
+    /// `xs.findIndex(f)`: the zero-based index of the first element whose
+    /// `bool` predicate is true, boxed as `int?`, or `none`. Read-only.
+fn listFindIndexCall(em: Emitter, e: Expr, obj: int, f: Expr, elem: Ty) -> int? {
+        var fty0 = tyOf(em, f.span)
+        if (let none = fty0) {
+            bad(em, f.span, "`findIndex` needs a function argument")
+            return none
+        }
+        var fty = Ty.Unknown
+        if (let some(t) = fty0) {
+            fty = t
+        }
+        var prt = Ty.Unknown
+        var pty = emptyTyList()
+        var isFn = false
+        match (fty) {
+            case Ty.Fn(pts, r) -> {
+                prt = r
+                pty = pts
+                isFn = true
+            }
+            case _ -> {}
+        }
+        if (!isFn || len(pty) != 1) {
+            bad(em, f.span, "`findIndex` needs a one-argument function")
+            return none
+        }
+        if (prt != Ty.Bool) {
+            bad(em, f.span, "`findIndex` needs a callback returning `bool`, found `" + bareName(prt) + "`")
+            return none
+        }
+        var refParam = false
+        match (pty[0]) {
+            case Ty.Ref(_) -> refParam = true
+            case _ -> {}
+        }
+        if (refParam) {
+            bad(em, f.span, "`findIndex` callbacks take values, not `&T` references")
+            return none
+        }
+        var rp = elemRep(em, elem, e.span)
+        if (let none = rp) {
+            return none
+        }
+        var rep = ElemRep.ptr()
+        if (let some(r) = rp) {
+            rep = r
+        }
+        var fv0 = expr(em, f)
+        if (let none = fv0) {
+            return none
+        }
+        var fv = 0
+        if (let some(v) = fv0) {
+            fv = v
+        }
+        var cap = externCallT1(em, "pickle_list_len", [IrTy.Ptr], IrTy.Int, [obj])
+        var idxSlot = newSlot(em, IrTy.Int)
+        var lenSlot = newSlot(em, IrTy.Int)
+        var zero = intConst(em, 0)
+        instr(em, IrInstr.StoreSlot(idxSlot, zero))
+        instr(em, IrInstr.StoreSlot(lenSlot, cap))
+        var resSlot = newSlot(em, IrTy.Ptr)
+        var nul = nullTemp(em)
+        if (let none = nul) {
+            return none
+        }
+        if (let some(n) = nul) {
+            instr(em, IrInstr.StoreSlot(resSlot, n))
+        }
+        var condId = newBlock(em)
+        var bodyId = newBlock(em)
+        var hitId = newBlock(em)
+        var nextId = newBlock(em)
+        var endId = newBlock(em)
+        term(em, IrTerm.Branch(condId))
+        em.cur = condId
+        var curT = load(em, idxSlot)
+        var endL = load(em, lenSlot)
+        var cmp = temp(em)
+        instr(em, IrInstr.BinOp(cmp, IrBinOp.Lt, curT, endL))
+        term(em, IrTerm.BranchIf(cmp, bodyId, endId))
+        em.cur = bodyId
+        var curI = load(em, idxSlot)
+        var raw = externCallT1(em, "pickle_list_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [obj, curI])
+        var argIr = IrTy.Ptr
+        var argV = raw
+        if (!(rep.isPtr)) {
+            argV = externCallT1(em, rep.unboxSym, [IrTy.Ptr], rep.ir, [raw])
+            argIr = rep.ir
+        }
+        var zero2 = intConst(em, 0)
+        var addrBoxed = externCallT1(em, "pickle_obj_slot_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [fv, zero2])
+        var fnAddr = externCallT1(em, "pickle_unbox_i64", [IrTy.Ptr], IrTy.Int, [addrBoxed])
+        var dst = temp(em)
+        instr(em, IrInstr.CallInd(dst, fnAddr, [IrTy.Ptr, argIr], IrTy.Bool, [fv, argV]))
+        term(em, IrTerm.BranchIf(dst, hitId, nextId))
+        em.cur = hitId
+        var hitI = load(em, idxSlot)
+        var boxed = externCallT1(em, "pickle_box_i64", [IrTy.Int], IrTy.Ptr, [hitI])
+        instr(em, IrInstr.StoreSlot(resSlot, boxed))
+        term(em, IrTerm.Branch(endId))
+        em.cur = nextId
+        var c = load(em, idxSlot)
+        var one = intConst(em, 1)
+        var nxt = temp(em)
+        instr(em, IrInstr.BinOp(nxt, IrBinOp.Add, c, one))
+        instr(em, IrInstr.StoreSlot(idxSlot, nxt))
+        term(em, IrTerm.Branch(condId))
+        em.cur = endId
+        load(em, resSlot)
+    }
+
+    /// `xs.partition(f)`: `(matching, rest)`, two fresh lists that preserve the
+    /// receiver's order. The predicate must return `bool`. Read-only.
+fn listPartitionCall(em: Emitter, e: Expr, obj: int, f: Expr, elem: Ty) -> int? {
+        var fty0 = tyOf(em, f.span)
+        if (let none = fty0) {
+            bad(em, f.span, "`partition` needs a function argument")
+            return none
+        }
+        var fty = Ty.Unknown
+        if (let some(t) = fty0) {
+            fty = t
+        }
+        var prt = Ty.Unknown
+        var pty = emptyTyList()
+        var isFn = false
+        match (fty) {
+            case Ty.Fn(pts, r) -> {
+                prt = r
+                pty = pts
+                isFn = true
+            }
+            case _ -> {}
+        }
+        if (!isFn || len(pty) != 1) {
+            bad(em, f.span, "`partition` needs a one-argument function")
+            return none
+        }
+        if (prt != Ty.Bool) {
+            bad(em, f.span, "`partition` needs a callback returning `bool`, found `" + bareName(prt) + "`")
+            return none
+        }
+        var refParam = false
+        match (pty[0]) {
+            case Ty.Ref(_) -> refParam = true
+            case _ -> {}
+        }
+        if (refParam) {
+            bad(em, f.span, "`partition` callbacks take values, not `&T` references")
+            return none
+        }
+        var rp = elemRep(em, elem, e.span)
+        if (let none = rp) {
+            return none
+        }
+        var rep = ElemRep.ptr()
+        if (let some(r) = rp) {
+            rep = r
+        }
+        var fv0 = expr(em, f)
+        if (let none = fv0) {
+            return none
+        }
+        var fv = 0
+        if (let some(v) = fv0) {
+            fv = v
+        }
+        var cap = externCallT1(em, "pickle_list_len", [IrTy.Ptr], IrTy.Int, [obj])
+        var yes = externCallT1(em, "pickle_list_new", [IrTy.Int], IrTy.Ptr, [cap])
+        var no = externCallT1(em, "pickle_list_new", [IrTy.Int], IrTy.Ptr, [cap])
+        var idxSlot = newSlot(em, IrTy.Int)
+        var lenSlot = newSlot(em, IrTy.Int)
+        var zero = intConst(em, 0)
+        instr(em, IrInstr.StoreSlot(idxSlot, zero))
+        instr(em, IrInstr.StoreSlot(lenSlot, cap))
+        var condId = newBlock(em)
+        var bodyId = newBlock(em)
+        var yesId = newBlock(em)
+        var noId = newBlock(em)
+        var nextId = newBlock(em)
+        var endId = newBlock(em)
+        term(em, IrTerm.Branch(condId))
+        em.cur = condId
+        var curT = load(em, idxSlot)
+        var endL = load(em, lenSlot)
+        var cmp = temp(em)
+        instr(em, IrInstr.BinOp(cmp, IrBinOp.Lt, curT, endL))
+        term(em, IrTerm.BranchIf(cmp, bodyId, endId))
+        em.cur = bodyId
+        var curI = load(em, idxSlot)
+        var raw = externCallT1(em, "pickle_list_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [obj, curI])
+        var argIr = IrTy.Ptr
+        var argV = raw
+        if (!(rep.isPtr)) {
+            argV = externCallT1(em, rep.unboxSym, [IrTy.Ptr], rep.ir, [raw])
+            argIr = rep.ir
+        }
+        var zero2 = intConst(em, 0)
+        var addrBoxed = externCallT1(em, "pickle_obj_slot_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [fv, zero2])
+        var fnAddr = externCallT1(em, "pickle_unbox_i64", [IrTy.Ptr], IrTy.Int, [addrBoxed])
+        var dst = temp(em)
+        instr(em, IrInstr.CallInd(dst, fnAddr, [IrTy.Ptr, argIr], IrTy.Bool, [fv, argV]))
+        term(em, IrTerm.BranchIf(dst, yesId, noId))
+        em.cur = yesId
+        var yesI = load(em, idxSlot)
+        var yesRaw = externCallT1(em, "pickle_list_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [obj, yesI])
+        externCallVoid(em, "pickle_list_push", [IrTy.Ptr, IrTy.Ptr], [yes, yesRaw])
+        term(em, IrTerm.Branch(nextId))
+        em.cur = noId
+        var noI = load(em, idxSlot)
+        var noRaw = externCallT1(em, "pickle_list_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [obj, noI])
+        externCallVoid(em, "pickle_list_push", [IrTy.Ptr, IrTy.Ptr], [no, noRaw])
+        term(em, IrTerm.Branch(nextId))
+        em.cur = nextId
+        var c = load(em, idxSlot)
+        var one = intConst(em, 1)
+        var nxt = temp(em)
+        instr(em, IrInstr.BinOp(nxt, IrBinOp.Add, c, one))
+        instr(em, IrInstr.StoreSlot(idxSlot, nxt))
+        term(em, IrTerm.Branch(condId))
+        em.cur = endId
+        var tv = externCallT1(em, "pickle_tuple_new", [IrTy.Int], IrTy.Ptr, [intConst(em, 2)])
+        externCallVoid(em, "pickle_tuple_set_field", [IrTy.Ptr, IrTy.Int, IrTy.Ptr], [tv, intConst(em, 0), yes])
+        externCallVoid(em, "pickle_tuple_set_field", [IrTy.Ptr, IrTy.Int, IrTy.Ptr], [tv, intConst(em, 1), no])
+        tv
+    }
+
     /// Comparison kind for `pickle_list_sort`: 0 = int/byte/char/bool boxed
     /// payloads, 1 = float bits, 2 = string bytes. Mirrors `sort_kind`.
 
@@ -8171,6 +8654,24 @@ fn stringMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List
                                 return externCallT1(em, "pickle_str_replace", [IrTy.Ptr, IrTy.Str, IrTy.Str], IrTy.Str, [obj, needle, repl])
                             }
                             return externCallT1(em, "pickle_str_replace", [IrTy.Str, IrTy.Str, IrTy.Str], IrTy.Str, [obj, needle, repl])
+                        }
+                        return none
+                    }
+                    return none
+                }
+                case "replaceFirst" -> {
+                    if (!(len(args) == 2)) {
+                        bad(em, e.span, "`replaceFirst` takes a `from` and a `to` string")
+                        return none
+                    }
+                    var needle = expr(em, args[0].value)
+                    if (let some(needle) = needle) {
+                        var repl = expr(em, args[1].value)
+                        if (let some(repl) = repl) {
+                            if (isBorrowed) {
+                                return externCallT1(em, "pickle_str_replace_first", [IrTy.Ptr, IrTy.Str, IrTy.Str], IrTy.Str, [obj, needle, repl])
+                            }
+                            return externCallT1(em, "pickle_str_replace_first", [IrTy.Str, IrTy.Str, IrTy.Str], IrTy.Str, [obj, needle, repl])
                         }
                         return none
                     }
