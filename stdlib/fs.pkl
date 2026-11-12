@@ -55,6 +55,83 @@ fn pathDir(p: string) -> string {
     sliceRange(p, 0, i)
 }
 
+/// The extension of `p` without the dot (Rust `Path::extension`): `"gz"` for
+/// `"a.tar.gz"`, `""` for `"a."`, and `none` for a name with no dot or a
+/// dotfile such as `".gitignore"`.
+fn pathExtension(p: string) -> string? {
+    let name = pathName(p)
+    if (name == "" || name == "." || name == "..") {
+        return none
+    }
+    var i = len(name) - 1
+    while (i >= 0 && (name[i] as int) != 0x2E) {
+        i = i - 1
+    }
+    if (i <= 0) {
+        return none
+    }
+    sliceRange(name, i + 1, len(name))
+}
+
+/// Lexically normalize `p`: collapse `//`, drop `.` segments, apply `..` to
+/// the preceding segment, keep a leading `/`, and map the empty result to `.`
+/// (or `/` for an absolute path).
+fn pathNormalize(p: string) -> string {
+    var absolute = false
+    if (len(p) > 0 && (p[0] as int) == 0x2F) {
+        absolute = true
+    }
+    var parts = [""]
+    parts.pop()
+    var start = 0
+    var i = 0
+    while (i <= len(p)) {
+        if (i == len(p) || (p[i] as int) == 0x2F) {
+            if (i > start) {
+                let seg = sliceRange(p, start, i)
+                if (seg == "..") {
+                    if (len(parts) > 0 && parts[len(parts) - 1] != "..") {
+                        parts.pop()
+                    } else if (!absolute) {
+                        parts.push("..")
+                    }
+                } else if (seg != ".") {
+                    parts.push(seg)
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    var out = ""
+    for (seg in parts) {
+        if (out != "") {
+            out = out + "/"
+        }
+        out = out + seg
+    }
+    if (absolute) {
+        out = "/" + out
+    }
+    if (out == "") {
+        out = "."
+    }
+    out
+}
+
+/// The absolute form of `p`: an already-absolute path is normalized in place,
+/// a relative one is joined to the current directory first.
+fn pathAbsolute(p: string) -> string {
+    if (len(p) > 0 && (p[0] as int) == 0x2F) {
+        return pathNormalize(p)
+    }
+    let cwd = current_dir()
+    match (cwd) {
+        case some(c) -> pathNormalize(pathJoin(c, p))
+        case none -> pathNormalize(p)
+    }
+}
+
 /// A POSIX-style path wrapper.
 class Path {
     var p: string
@@ -81,6 +158,21 @@ class Path {
     /// The parent directory portion.
     fn dir() -> string {
         pathDir(this.p)
+    }
+
+    /// The extension without the dot (Rust `Path::extension`).
+    fn extension() -> string? {
+        pathExtension(this.p)
+    }
+
+    /// The lexically normalized path (`.`/`..` resolved, `//` collapsed).
+    fn normalize() -> string {
+        pathNormalize(this.p)
+    }
+
+    /// The absolute form (relative paths joined to the current directory).
+    fn absolute() -> string {
+        pathAbsolute(this.p)
     }
 
     /// Whether the path exists on disk.
@@ -110,6 +202,46 @@ class File {
     /// Overwrite the file; `false` when the write fails.
     fn write(text: string) -> bool {
         write_file(this.p, text)
+    }
+
+    /// Append `text` to the file, creating it when absent; `false` when the
+    /// file cannot be opened or the write is short.
+    fn append(text: string) -> bool {
+        let s = stream_open_append(this.p)
+        match (s) {
+            case some(st) -> {
+                let bs = bytes(text)
+                let n = st.write(bs)
+                st.close()
+                n == len(bs)
+            }
+            case none -> false
+        }
+    }
+
+    /// Copy this file's bytes to `dest`, overwriting it; `false` on any
+    /// failure.
+    fn copy(dest: string) -> bool {
+        let text = read_file(this.p)
+        match (text) {
+            case some(t) -> write_file(dest, t)
+            case none -> false
+        }
+    }
+
+    /// Move this file to `dest` (copy then delete); `false` when either step
+    /// fails, leaving the source in place if the copy failed.
+    fn move(dest: string) -> bool {
+        let text = read_file(this.p)
+        match (text) {
+            case some(t) -> {
+                if (write_file(dest, t)) {
+                    return delete(this.p)
+                }
+                false
+            }
+            case none -> false
+        }
     }
 
     fn exists() -> bool {

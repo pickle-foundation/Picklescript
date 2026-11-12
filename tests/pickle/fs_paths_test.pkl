@@ -1,0 +1,131 @@
+// `std.fs` path and whole-file completion: `Path.extension`/`normalize`/
+// `absolute`, `File.append`/`copy`/`move`, and `std.os.currentDir`.
+
+module fs_paths_test
+
+import { pathJoin, pathExtension, pathNormalize, pathAbsolute, Path, File } from std.fs
+import { currentDir } from std.os
+
+test fn path_extension_matches_rust() {
+    expect(pathExtension("a/b/c.txt").unwrap()).toBe("txt")
+    expect(pathExtension("a.tar.gz").unwrap()).toBe("gz")
+    expect(pathExtension("foo.").unwrap()).toBe("")
+    expect(pathExtension("foo/bar.rs").unwrap()).toBe("rs")
+    expect(pathExtension("..foo").unwrap()).toBe("foo")
+    expect(pathExtension(".gitignore").isNone()).toBe(true)
+    expect(pathExtension("a/.hidden").isNone()).toBe(true)
+    expect(pathExtension("foo").isNone()).toBe(true)
+    expect(pathExtension("foo/..").isNone()).toBe(true)
+    expect(pathExtension("/").isNone()).toBe(true)
+    expect(pathExtension("").isNone()).toBe(true)
+}
+
+test fn path_class_exposes_extension() {
+    expect(Path("x/y.md").extension().unwrap()).toBe("md")
+    expect(Path(".bashrc").extension().isNone()).toBe(true)
+}
+
+test fn path_normalize_is_lexical() {
+    expect(pathNormalize("a//b/./c")).toBe("a/b/c")
+    expect(pathNormalize("a/b/../c")).toBe("a/c")
+    expect(pathNormalize("a/../../b")).toBe("../b")
+    expect(pathNormalize("/a//b/../c")).toBe("/a/c")
+    expect(pathNormalize("//a")).toBe("/a")
+    expect(pathNormalize("a/..")).toBe(".")
+    expect(pathNormalize(".")).toBe(".")
+    expect(pathNormalize("")).toBe(".")
+    expect(pathNormalize("/")).toBe("/")
+    expect(pathNormalize("/..")).toBe("/")
+}
+
+test fn path_class_exposes_normalize() {
+    expect(Path("a//b/./c").normalize()).toBe("a/b/c")
+    expect(Path("a/b/../c").normalize()).toBe("a/c")
+}
+
+test fn path_absolute_normalizes_absolute_input() {
+    expect(pathAbsolute("/x/./y")).toBe("/x/y")
+    expect(pathAbsolute("/x/../y")).toBe("/y")
+    expect(Path("/x//y").absolute()).toBe("/x/y")
+}
+
+test fn path_absolute_joins_a_relative_path_to_the_cwd() {
+    let cwd = currentDir().unwrap()
+    expect(pathAbsolute("sub/./x")).toBe(pathJoin(cwd, "sub/x"))
+    expect(Path("a/b/../c").absolute()).toBe(pathJoin(cwd, "a/c"))
+}
+
+test fn file_append_creates_and_appends() {
+    let path = "tests/pickle/__fs_paths_append.tmp"
+    let f = File(path)
+    if (f.exists()) {
+        f.remove()
+    }
+    expect(f.append("ab")).toBe(true)
+    expect(f.append("cd")).toBe(true)
+    expect(f.read().unwrap()).toBe("abcd")
+    expect(f.remove()).toBe(true)
+}
+
+test fn file_append_of_an_unopenable_path_is_false() {
+    let f = File("tests/pickle/__fs_paths_missing_dir/x.tmp")
+    expect(f.append("x")).toBe(false)
+}
+
+test fn file_copy_duplicates_bytes() {
+    let src = "tests/pickle/__fs_paths_src.tmp"
+    let dst = "tests/pickle/__fs_paths_dst.tmp"
+    let a = File(src)
+    let b = File(dst)
+    if (a.exists()) {
+        a.remove()
+    }
+    if (b.exists()) {
+        b.remove()
+    }
+    expect(a.write("hello")).toBe(true)
+    expect(a.copy(dst)).toBe(true)
+    expect(a.exists()).toBe(true)
+    expect(b.read().unwrap()).toBe("hello")
+    a.remove()
+    b.remove()
+}
+
+test fn file_copy_of_a_missing_source_is_false() {
+    let src = "tests/pickle/__fs_paths_nope.tmp"
+    let dst = "tests/pickle/__fs_paths_nope_dst.tmp"
+    let a = File(src)
+    let b = File(dst)
+    if (a.exists()) {
+        a.remove()
+    }
+    if (b.exists()) {
+        b.remove()
+    }
+    expect(a.copy(dst)).toBe(false)
+    expect(b.exists()).toBe(false)
+}
+
+test fn file_move_renames_and_removes_the_source() {
+    let src = "tests/pickle/__fs_paths_move_src.tmp"
+    let dst = "tests/pickle/__fs_paths_move_dst.tmp"
+    let a = File(src)
+    let b = File(dst)
+    if (a.exists()) {
+        a.remove()
+    }
+    if (b.exists()) {
+        b.remove()
+    }
+    expect(a.write("xyz")).toBe(true)
+    expect(a.move(dst)).toBe(true)
+    expect(a.exists()).toBe(false)
+    expect(b.read().unwrap()).toBe("xyz")
+    b.remove()
+}
+
+test fn current_dir_is_present() {
+    let d = currentDir()
+    expect(d.isSome()).toBe(true)
+    expect(d.unwrap().len() > 0).toBe(true)
+}
