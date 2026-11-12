@@ -6596,7 +6596,7 @@ fn listMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List<C
         }
         // Only the read-only methods read through an immutable borrow; the
         // mutators would write through `&List`, so they keep bailing.
-        if (isBorrowed && name != "contains" && name != "indexOf" && name != "lastIndexOf" && name != "len" && name != "isEmpty" && name != "slice" && name != "join" && name != "map" && name != "filter" && name != "any" && name != "all" && name != "find" && name != "count" && name != "take" && name != "skip" && name != "first" && name != "last" && name != "enumerate" && name != "zip" && name != "flatten" && name != "flatMap" && name != "sorted" && name != "sum" && name != "min" && name != "max") {
+        if (isBorrowed && name != "contains" && name != "indexOf" && name != "lastIndexOf" && name != "len" && name != "isEmpty" && name != "slice" && name != "join" && name != "map" && name != "filter" && name != "any" && name != "all" && name != "find" && name != "count" && name != "take" && name != "skip" && name != "first" && name != "last" && name != "enumerate" && name != "zip" && name != "flatten" && name != "flatMap" && name != "sorted" && name != "sum" && name != "min" && name != "max" && name != "reversed" && name != "distinct" && name != "chunks" && name != "windows") {
             bad(em, e.span, "`" + name + "` mutates a `List` through an immutable reference (`&List`)")
             return none
         }
@@ -6987,6 +6987,42 @@ fn listMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List<C
                         var copy = externCallT1(em, "pickle_list_slice", [IrTy.Ptr, IrTy.Int, IrTy.Int], IrTy.Ptr, [obj, intConst(em, 0), total])
                         externCallVoid(em, "pickle_list_sort", [IrTy.Ptr, IrTy.Int], [copy, kind])
                         return copy
+                    }
+                    return none
+                }
+                case "reversed" -> {
+                    if (!(len(args) == 0)) {
+                        bad(em, e.span, "`reversed` takes no arguments")
+                        return none
+                    }
+                    return externCallT1(em, "pickle_list_reversed", [IrTy.Ptr], IrTy.Ptr, [obj])
+                }
+                case "distinct" -> {
+                    if (!(len(args) == 0)) {
+                        bad(em, e.span, "`distinct` takes no arguments")
+                        return none
+                    }
+                    return externCallT1(em, "pickle_list_distinct", [IrTy.Ptr], IrTy.Ptr, [obj])
+                }
+                case "chunks" -> {
+                    if (!(len(args) == 1)) {
+                        bad(em, e.span, "`chunks` takes one size argument")
+                        return none
+                    }
+                    var n = expr(em, args[0].value)
+                    if (let some(n) = n) {
+                        return externCallT1(em, "pickle_list_chunks", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [obj, n])
+                    }
+                    return none
+                }
+                case "windows" -> {
+                    if (!(len(args) == 1)) {
+                        bad(em, e.span, "`windows` takes one size argument")
+                        return none
+                    }
+                    var n = expr(em, args[0].value)
+                    if (let some(n) = n) {
+                        return externCallT1(em, "pickle_list_windows", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [obj, n])
                     }
                     return none
                 }
@@ -7895,6 +7931,34 @@ fn stringMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List
                         return externCallT1(em, "pickle_str_split_lines", [IrTy.Ptr], IrTy.Ptr, [obj])
                     }
                     return externCallT1(em, "pickle_str_split_lines", [IrTy.Str], IrTy.Ptr, [obj])
+                }
+                case "stripPrefix" -> {
+                    if (!(len(args) == 1)) {
+                        bad(em, e.span, "`stripPrefix` takes one argument")
+                        return none
+                    }
+                    var prefix = expr(em, args[0].value)
+                    if (let some(prefix) = prefix) {
+                        if (isBorrowed) {
+                            return externCallT1(em, "pickle_str_strip_prefix", [IrTy.Ptr, IrTy.Str], IrTy.Ptr, [obj, prefix])
+                        }
+                        return externCallT1(em, "pickle_str_strip_prefix", [IrTy.Str, IrTy.Str], IrTy.Ptr, [obj, prefix])
+                    }
+                    return none
+                }
+                case "stripSuffix" -> {
+                    if (!(len(args) == 1)) {
+                        bad(em, e.span, "`stripSuffix` takes one argument")
+                        return none
+                    }
+                    var suffix = expr(em, args[0].value)
+                    if (let some(suffix) = suffix) {
+                        if (isBorrowed) {
+                            return externCallT1(em, "pickle_str_strip_suffix", [IrTy.Ptr, IrTy.Str], IrTy.Ptr, [obj, suffix])
+                        }
+                        return externCallT1(em, "pickle_str_strip_suffix", [IrTy.Str, IrTy.Str], IrTy.Ptr, [obj, suffix])
+                    }
+                    return none
                 }
                 case _ -> {
                     bad(em, e.span, "`" + name + "` method on `string` is not lowered yet")

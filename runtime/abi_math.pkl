@@ -32,7 +32,7 @@ module runtime.abi_math
 import { pow2, f64Bits, abiF64FromBits, abiBoxI64, abiUnboxI64, abiUnboxF64 } from runtime.abi_box
 import { keyEq } from runtime.abi_map
 import { abiStrLen, byteAt, abiStrCmp } from runtime.abi_string
-import { LEN_WORD, DATA_WORD } from runtime.abi_list
+import { LEN_WORD, DATA_WORD, abiListNew, abiListPush } from runtime.abi_list
 
 const LN_2: float = 0.6931471805599453
 const INV_LN_2: float = 1.4426950408889634
@@ -441,6 +441,119 @@ fn abiListMax(list: *int, kind: int) -> *int {
     }
 }
 
+/// Fresh list with the elements in reverse order.
+///
+/// BEYOND PARITY. Elements are the stored pointers, so the copy is shallow; the
+/// source is untouched.
+#[symbol("pickle_list_reversed")]
+fn abiListReversed(list: *int) -> *int {
+    unsafe {
+        var n = list[LEN_WORD]
+        var data = list[DATA_WORD] as *int
+        var out = abiListNew(n)
+        var i = n - 1
+        while (i >= 0) {
+            abiListPush(out, data[i] as *int)
+            i = i - 1
+        }
+        return out
+    }
+}
+
+/// Fresh list of the elements with duplicates removed, keeping the first
+/// occurrence of each.
+///
+/// BEYOND PARITY. Uniqueness uses `keyEq`, the structural equality `contains`
+/// and map keys use, so floats, strings, lists, and maps compare by value. The
+/// scan is quadratic but keeps first-occurrence order without a hash table.
+#[symbol("pickle_list_distinct")]
+fn abiListDistinct(list: *int) -> *int {
+    unsafe {
+        var n = list[LEN_WORD]
+        var data = list[DATA_WORD] as *int
+        var out = abiListNew(0)
+        var i = 0
+        while (i < n) {
+            var v = data[i] as *int
+            var seen = false
+            var j = 0
+            while (j < out[LEN_WORD]) {
+                var kept = out[DATA_WORD] as *int
+                if (keyEq(kept[j] as *int, v)) {
+                    seen = true
+                    break
+                }
+                j = j + 1
+            }
+            if (!seen) {
+                abiListPush(out, v)
+            }
+            i = i + 1
+        }
+        return out
+    }
+}
+
+/// Fresh list of consecutive groups of at most `size` elements.
+///
+/// BEYOND PARITY. Total where Rust's `slice::chunks` panics: a non-positive
+/// `size` yields an empty list. The final group may be shorter; an empty source
+/// yields no groups.
+#[symbol("pickle_list_chunks")]
+fn abiListChunks(list: *int, size: int) -> *int {
+    unsafe {
+        var n = list[LEN_WORD]
+        var data = list[DATA_WORD] as *int
+        var out = abiListNew(0)
+        if (size <= 0) {
+            return out
+        }
+        var i = 0
+        while (i < n) {
+            var end = i + size
+            if (end > n) {
+                end = n
+            }
+            var chunk = abiListNew(end - i)
+            var j = i
+            while (j < end) {
+                abiListPush(chunk, data[j] as *int)
+                j = j + 1
+            }
+            abiListPush(out, chunk)
+            i = end
+        }
+        return out
+    }
+}
+
+/// Fresh list of every sliding window of exactly `size` elements.
+///
+/// BEYOND PARITY. Total where Rust's `slice::windows` panics: a non-positive
+/// `size`, or one longer than the list, yields an empty list.
+#[symbol("pickle_list_windows")]
+fn abiListWindows(list: *int, size: int) -> *int {
+    unsafe {
+        var n = list[LEN_WORD]
+        var data = list[DATA_WORD] as *int
+        var out = abiListNew(0)
+        if (size <= 0 || size > n) {
+            return out
+        }
+        var i = 0
+        while (i + size <= n) {
+            var win = abiListNew(size)
+            var j = 0
+            while (j < size) {
+                abiListPush(win, data[i + j] as *int)
+                j = j + 1
+            }
+            abiListPush(out, win)
+            i = i + 1
+        }
+        return out
+    }
+}
 /// Whether the bytes of `needle` occur as a contiguous run in `hay`. An empty
 /// needle is a substring of every string. Mirrors
 /// `strings.rs::string_contains`.

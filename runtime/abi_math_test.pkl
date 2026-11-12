@@ -11,8 +11,8 @@ module runtime.abi_math_test
 // exact results the native routine produces - a platform `pow` would answer
 // differently.
 
-import { abiIntPow, abiFloatPow, abiListIndexOf, abiListLastIndexOf, abiListSumI64, abiListSumF64, abiListMin, abiListMax } from runtime.abi_math
-import { listNew, abiListPush } from runtime.abi_list
+import { abiIntPow, abiFloatPow, abiListIndexOf, abiListLastIndexOf, abiListSumI64, abiListSumF64, abiListMin, abiListMax, abiListReversed, abiListDistinct, abiListChunks, abiListWindows } from runtime.abi_math
+import { listNew, abiListPush, abiListLen, abiListGet } from runtime.abi_list
 import { abiBoxI64, abiUnboxI64, abiBoxF64, abiUnboxF64 } from runtime.abi_box
 import { abiStrFromByte } from runtime.abi_string
 
@@ -199,4 +199,65 @@ test fn list_min_max_compare_strings_by_bytes() {
     abiListPush(xs, a)
     expect((abiListMin(xs, 2) as int) == (a as int)).toBe(true)
     expect((abiListMax(xs, 2) as int) == (b as int)).toBe(true)
+}
+
+test fn list_reversed_copies_in_reverse_order() {
+    var xs = listNew(0)
+    abiListPush(xs, abiBoxI64(1))
+    abiListPush(xs, abiBoxI64(2))
+    abiListPush(xs, abiBoxI64(3))
+    let r = abiListReversed(xs)
+    expect(abiListLen(r)).toBe(3)
+    expect(abiUnboxI64(abiListGet(r, 0))).toBe(3)
+    expect(abiUnboxI64(abiListGet(r, 1))).toBe(2)
+    expect(abiUnboxI64(abiListGet(r, 2))).toBe(1)
+    // The source keeps its order.
+    expect(abiUnboxI64(abiListGet(xs, 0))).toBe(1)
+}
+
+test fn list_distinct_keeps_first_occurrences() {
+    var xs = listNew(0)
+    abiListPush(xs, abiBoxI64(3))
+    abiListPush(xs, abiBoxI64(1))
+    abiListPush(xs, abiBoxI64(3))
+    let d = abiListDistinct(xs)
+    expect(abiListLen(d)).toBe(2)
+    expect(abiUnboxI64(abiListGet(d, 0))).toBe(3)
+    expect(abiUnboxI64(abiListGet(d, 1))).toBe(1)
+}
+
+test fn list_chunks_groups_and_clamps() {
+    var xs = listNew(0)
+    var i = 1
+    while (i <= 5) {
+        abiListPush(xs, abiBoxI64(i))
+        i = i + 1
+    }
+    let cs = abiListChunks(xs, 2)
+    expect(abiListLen(cs)).toBe(3)
+    let last = abiListGet(cs, 2)
+    expect(abiListLen(last)).toBe(1)
+    expect(abiUnboxI64(abiListGet(last, 0))).toBe(5)
+    expect(abiListLen(abiListChunks(xs, 9))).toBe(1)
+    expect(abiListLen(abiListChunks(xs, 0))).toBe(0)
+    expect(abiListLen(abiListChunks(xs, 0 - 1))).toBe(0)
+}
+
+test fn list_windows_slides_by_one() {
+    var xs = listNew(0)
+    var i = 1
+    while (i <= 4) {
+        abiListPush(xs, abiBoxI64(i))
+        i = i + 1
+    }
+    let ws = abiListWindows(xs, 2)
+    expect(abiListLen(ws)).toBe(3)
+    let w0 = abiListGet(ws, 0)
+    let w2 = abiListGet(ws, 2)
+    expect(abiUnboxI64(abiListGet(w0, 0))).toBe(1)
+    expect(abiUnboxI64(abiListGet(w0, 1))).toBe(2)
+    expect(abiUnboxI64(abiListGet(w2, 0))).toBe(3)
+    expect(abiUnboxI64(abiListGet(w2, 1))).toBe(4)
+    expect(abiListLen(abiListWindows(xs, 5))).toBe(0)
+    expect(abiListLen(abiListWindows(xs, 0))).toBe(0)
 }
