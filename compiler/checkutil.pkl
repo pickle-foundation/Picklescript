@@ -1,4 +1,4 @@
-﻿// checkutil - the checker utility layer carved one-way out of checkcore.
+﻿﻿// checkutil - the checker utility layer carved one-way out of checkcore.
 // Closure by walker_scan.ps1: no member reaches the checkExpr/checkStmt spine,
 // checkcore imports the pool, and the pool imports nothing from checkcore.
 
@@ -757,7 +757,7 @@ fn checkAssignRhs(ck: Checker, want: Ty, got: Ty, value: Expr, span: Span, what:
                 case _ -> {}
             }
         }
-        checkAssignable(ck, want, got, span, what)
+        checkAssignable(ck, want, adoptEmptyList(ck, value, want, got), span, what)
 }
 
 fn guardRefUse(ck: Checker, ty: Ty, span: Span, whereStr: string) {
@@ -1542,7 +1542,91 @@ fn methodRetTy(ck: Checker, m: CallableInfo, map: Map<string, Ty>) -> Ty {
         ret
 }
 
+/// The key types `Map` accepts: the scalar keys plus the pointer-shaped ones.
+/// `Ty.Var` stays allowed so a `Map<K,V>()` inside a generic body typechecks;
+/// the emitter checks the substituted type when it instantiates.
+fn mapKeyTyAllowed(k: Ty) -> bool {
+        match (k) {
+            case Ty.String -> true
+            case Ty.Int -> true
+            case Ty.Float -> true
+            case Ty.Bool -> true
+            case Ty.Char -> true
+            case Ty.Byte -> true
+            case Ty.List(_) -> true
+            case Ty.Map(_, _) -> true
+            case Ty.Class(_, _) -> true
+            case Ty.Struct(_, _) -> true
+            case Ty.Enum(_, _) -> true
+            case Ty.Interface(_, _) -> true
+            case Ty.Range(_) -> true
+            case Ty.Option(_) -> true
+            case Ty.Tuple(_) -> true
+            case Ty.Var(_) -> true
+            case _ -> false
+        }
+}
+
+/// `Map<K,V>()` and `List<T>()`: typed empty-collection constructors. `{}`
+/// parses as an empty block, so a map cannot be written as a literal, and `[]`
+/// carries no element type of its own. The constructor is the unambiguous
+/// spelling for both. Returns `none` for every other name so the generic
+/// function/class paths can run unchanged.
+fn builtinCollectionCtorTy(ck: Checker, e: Expr, name: string, typeArgs: List<TypeExpr>) -> Ty? {
+        if (name == "Map") {
+            if (!(len(typeArgs) == 2)) {
+                err(ck, e.span, "`Map` takes two type arguments, found {len(typeArgs)}")
+                return Ty.Fn(emptyTyList(), Ty.Unknown)
+            }
+            let k = resolvedFnTy(ck, typeArgs[0], copyStrList(ck.fnGenerics))
+            let v = resolvedFnTy(ck, typeArgs[1], copyStrList(ck.fnGenerics))
+            if (!mapKeyTyAllowed(k)) {
+                err(ck, e.span, "`Map` keys must be `string`, `int`, `float`, `bool`, `char`, `byte`, a list, a map, a class/struct, an enum, an option, or a tuple, found `{bareName(k)}`")
+            }
+            return Ty.Fn(emptyTyList(), Ty.Map(k, v))
+        }
+        if (name == "List") {
+            if (!(len(typeArgs) == 1)) {
+                err(ck, e.span, "`List` takes one type argument, found {len(typeArgs)}")
+                return Ty.Fn(emptyTyList(), Ty.Unknown)
+            }
+            let t = resolvedFnTy(ck, typeArgs[0], copyStrList(ck.fnGenerics))
+            return Ty.Fn(emptyTyList(), Ty.List(t))
+        }
+        none
+}
+
+/// An empty `[]` literal has no element type of its own, so it adopts the type
+/// of the position it initializes: `let xs: List<int> = []`, a `return []`
+/// from a `-> List<int>` function, or `xs = []`. Every other expression keeps
+/// the type `checkExpr` inferred for it.
+fn adoptEmptyList(ck: Checker, e: Expr, expected: Ty, inferred: Ty) -> Ty {
+        var isEmpty = false
+        match (e.kind) {
+            case ExprKind.Array(parts) -> {
+                if (len(parts) == 0) {
+                    isEmpty = true
+                }
+            }
+            case _ -> {}
+        }
+        if (!isEmpty) {
+            return inferred
+        }
+        match (expected) {
+            case Ty.List(_) -> {
+                ck.types[spanKey(e.span)] = expected
+                return expected
+            }
+            case _ -> {}
+        }
+        inferred
+}
+
 fn genericFnTy(ck: Checker, e: Expr, name: string, typeArgs: List<TypeExpr>) -> Ty {
+        if (let some(t) = builtinCollectionCtorTy(ck, e, name, typeArgs)) {
+            return t
+        }
         if (let none = ck.resolved.fns.get(name)) {
             err(ck, e.span, "unknown generic function `{name}`")
             return Ty.Unknown
@@ -1688,7 +1772,7 @@ fn checkArgsTyped(ck: Checker, e: Expr, params: List<Ty>, args: List<CallArg>, g
                 } else {
                     Ty.Unknown
                 }
-                checkAssignable(ck, want, gotTy, a.span, "argument")
+                checkAssignable(ck, want, adoptEmptyList(ck, a.value, want, gotTy), a.span, "argument")
             } else if (!hasSpread) {
                 err(ck, e.span, "too many arguments in call")
             }

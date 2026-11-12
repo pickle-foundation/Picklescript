@@ -9483,12 +9483,53 @@ fn optExpect(em: Emitter, e: Expr, object: Expr, msg: Expr, inner: Ty) -> int? {
     /// Whether a registered class (or one of its ancestors) directly declared
     /// `implements` for `iface_id`. Mirrors `class_implements_iface`.
 
+    /// `Map<K,V>()` / `List<T>()`: the typed empty-collection constructors.
+    /// `{}` parses as an empty block and `[]` carries no element type of its
+    /// own, so this is how an empty map (or an explicitly typed empty list) is
+    /// written. Emits `pickle_map_new(0)` / `pickle_list_new(0)` with the
+    /// key/element representation the type arguments select.
+fn emptyCollectionCtor(em: Emitter, e: Expr, name: string, typeArgs: List<TypeExpr>, args: List<CallArg>) -> int? {
+        if (!(len(args) == 0)) {
+            bad(em, e.span, "`" + name + "` takes no value arguments")
+            return none
+        }
+        var cap = intConst(em, 0)
+        if (name == "Map") {
+            if (!(len(typeArgs) == 2)) {
+                bad(em, e.span, "`Map` takes two type arguments, found " + str(len(typeArgs)))
+                return none
+            }
+            var kt = em.resolved.resolveTy(typeArgs[0], em.fnGenerics, em.diags)
+            var vt = em.resolved.resolveTy(typeArgs[1], em.fnGenerics, em.diags)
+            var krep = keyRep(em, substTy(em, kt), e.span)
+            var vrep = elemRep(em, substTy(em, vt), e.span)
+            if (let some(_k) = krep) {
+                if (let some(_v) = vrep) {
+                    return externCallT1(em, "pickle_map_new", [IrTy.Int], IrTy.Ptr, [cap])
+                }
+            }
+            return none
+        }
+        if (!(len(typeArgs) == 1)) {
+            bad(em, e.span, "`List` takes one type argument, found " + str(len(typeArgs)))
+            return none
+        }
+        var et = em.resolved.resolveTy(typeArgs[0], em.fnGenerics, em.diags)
+        if (let some(_r) = elemRep(em, substTy(em, et), e.span)) {
+            return externCallT1(em, "pickle_list_new", [IrTy.Int], IrTy.Ptr, [cap])
+        }
+        none
+}
+
     /// `name<Type,...>(args)`: an explicit generic user-function (or generic
     /// class/struct ctor) call. The call is monomorphized: the generic callee
     /// is instantiated over the resolved type arguments (substituted under the
     /// enclosing instantiation, if any), and the call is emitted as a static
     /// call to that concrete function. Mirrors `generic_call` in emit.rs.
 fn genericCall(em: Emitter, e: Expr, name: string, typeArgs: List<TypeExpr>, args: List<CallArg>) -> int? {
+        if (name == "Map" || name == "List") {
+            return emptyCollectionCtor(em, e, name, typeArgs, args)
+        }
         // `Box<int>(...)`: a generic class/struct constructor call. The name
         // shares the generic-call surface with generic functions, but
         // resolves through the type table.
@@ -10104,8 +10145,13 @@ fn arrayLiteral(em: Emitter, e: Expr, items: List<Expr>) -> int? {
             return none
         }
         if (len(items) == 0) {
-            bad(em, e.span, "empty array literal cannot be typed; add an element to infer `List<T>`")
-            return none
+            match (elemTy) {
+                case Ty.Unknown -> {
+                    bad(em, e.span, "empty array literal has no element type; annotate the binding (`let xs: List<T> = []`) or use `List<T>()`")
+                    return none
+                }
+                case _ -> {}
+            }
         }
         var rp = elemRep(em, elemTy, e.span)
         if (let some(rep) = rp) {
