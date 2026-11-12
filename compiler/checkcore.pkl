@@ -1714,6 +1714,13 @@ fn checkCall(ck: Checker, e: Expr, callee: Expr, args: List<CallArg>) -> Ty {
                             }
                         }
                     }
+                    // `List.fold(init, f)` returns the accumulator, so the
+                    // result type is the initial value's type.
+                    if (fmName == "fold" && len(args) == 2) {
+                        if (let some(at) = ck.types.get(spanKey(args[0].value.span))) {
+                            outRet = at
+                        }
+                    }
                 }
                 outRet
             }
@@ -2413,6 +2420,21 @@ fn checkMember(ck: Checker, e: Expr, object: Expr, name: string) -> Ty {
                 if (name == "windows") {
                     return Ty.Fn([Ty.Int], Ty.List(Ty.List(inner)))
                 }
+                // `fold`'s accumulator type comes from its initial value, so
+                // the parameter and result are placeholders that `checkCall`
+                // refines once the arguments are checked.
+                if (name == "fold") {
+                    return Ty.Fn([Ty.Unknown, Ty.Fn([Ty.Unknown, inner], Ty.Unknown)], Ty.Unknown)
+                }
+                if (name == "reduce") {
+                    return Ty.Fn([Ty.Fn([inner, inner], inner)], optOf(inner))
+                }
+                if (name == "intersperse") {
+                    return Ty.Fn([inner], Ty.List(inner))
+                }
+                if (name == "dedup") {
+                    return Ty.Fn(emptyTyList(), Ty.List(inner))
+                }
                 err(ck, e.span, "no member `{name}` on `List<{bareName(inner)}>`")
                 return Ty.Unknown
             }
@@ -2521,6 +2543,9 @@ fn checkMember(ck: Checker, e: Expr, object: Expr, name: string) -> Ty {
                 if (name == "splitLines") {
                     return Ty.Fn(emptyTyList(), Ty.List(Ty.String))
                 }
+                if (name == "splitWhitespace") {
+                    return Ty.Fn(emptyTyList(), Ty.List(Ty.String))
+                }
                 if (name == "stripPrefix") {
                     return Ty.Fn([Ty.String], optOf(Ty.String))
                 }
@@ -2556,7 +2581,13 @@ fn checkMember(ck: Checker, e: Expr, object: Expr, name: string) -> Ty {
                 if (name == "flatMap") {
                     return Ty.Fn([Ty.Fn([inner], Ty.Unknown)], Ty.Option(Ty.Unknown))
                 }
-                err(ck, e.span, "no member `{name}` on `{bareName(inner)}?` (members are `isSome`, `isNone`, `unwrap`, `unwrapOr`, `expect`, `map`, `flatMap`)")
+                if (name == "filter") {
+                    return Ty.Fn([Ty.Fn([inner], Ty.Bool)], optOf(inner))
+                }
+                if (name == "toList") {
+                    return Ty.Fn(emptyTyList(), Ty.List(inner))
+                }
+                err(ck, e.span, "no member `{name}` on `{bareName(inner)}?` (members are `isSome`, `isNone`, `unwrap`, `unwrapOr`, `expect`, `map`, `flatMap`, `filter`, `toList`)")
                 return Ty.Unknown
             }
             case Ty.Stream -> {
