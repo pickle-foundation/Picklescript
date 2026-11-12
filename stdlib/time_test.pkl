@@ -1,0 +1,206 @@
+module std.time_test
+
+import { Duration, Instant, Timestamp } from std.time
+
+fn absent(t: Timestamp?) -> bool {
+    if (let some(_) = t) {
+        return false
+    }
+    return true
+}
+
+// ----------------------------------------------------------------- Duration
+
+test fn duration_factories() {
+    expect(Duration.fromNanos(1500).asNanos()).toBe(1500)
+    expect(Duration.fromMillis(2).asNanos()).toBe(2000000)
+    expect(Duration.fromSeconds(3).asNanos()).toBe(3000000000)
+    expect(Duration.fromMinutes(2).asMillis()).toBe(120000)
+    expect(Duration.fromHours(2).asSeconds()).toBe(7200)
+    expect(Duration.zero().asNanos()).toBe(0)
+}
+
+test fn duration_arithmetic() {
+    let a = Duration.fromMillis(1500)
+    let b = Duration.fromMillis(500)
+    expect(a.add(b).asMillis()).toBe(2000)
+    expect(a.sub(b).asMillis()).toBe(1000)
+    expect(b.sub(a).asMillis()).toBe(-1000)
+    expect(b.mul(3).asMillis()).toBe(1500)
+    expect(Duration.fromMillis(-500).abs().asMillis()).toBe(500)
+    expect(Duration.zero().add(b).asMillis()).toBe(500)
+}
+
+test fn duration_truncates_toward_zero() {
+    expect(Duration.fromNanos(1999).asMillis()).toBe(0)
+    expect(Duration.fromNanos(1500000).asMillis()).toBe(1)
+    expect(Duration.fromNanos(-1999).asMillis()).toBe(0)
+    expect(Duration.fromNanos(-1000001).asMillis()).toBe(-1)
+    expect(Duration.fromNanos(1999).asSeconds()).toBe(0)
+    expect(Duration.fromNanos(-1).asSeconds()).toBe(0)
+}
+
+test fn duration_signs() {
+    expect(Duration.zero().isZero()).toBe(true)
+    expect(Duration.fromNanos(1).isZero()).toBe(false)
+    expect(Duration.fromNanos(-1).isNegative()).toBe(true)
+    expect(Duration.fromNanos(1).isNegative()).toBe(false)
+}
+
+test fn duration_compare() {
+    expect(Duration.fromMillis(1).compare(Duration.fromMillis(2))).toBe(-1)
+    expect(Duration.fromMillis(2).compare(Duration.fromMillis(2))).toBe(0)
+    expect(Duration.fromMillis(3).compare(Duration.fromMillis(2))).toBe(1)
+}
+
+test fn duration_to_string() {
+    expect(Duration.zero().toString()).toBe("0s")
+    expect(Duration.fromSeconds(3).toString()).toBe("3s")
+    expect(Duration.fromMillis(1500).toString()).toBe("1.5s")
+    expect(Duration.fromMillis(1).toString()).toBe("0.001s")
+    expect(Duration.fromNanos(1).toString()).toBe("0.000000001s")
+    expect(Duration.fromMillis(-1500).toString()).toBe("-1.5s")
+    expect(Duration.fromMillis(60001).toString()).toBe("60.001s")
+}
+
+// ------------------------------------------------------------------ Instant
+
+test fn instant_is_monotonic() {
+    let a = Instant.now()
+    let b = Instant.now()
+    expect(b.asNanos() >= a.asNanos()).toBe(true)
+    expect(a.elapsed().asNanos() >= 0).toBe(true)
+    expect(a.since(b).asNanos() <= 0).toBe(true)
+}
+
+test fn instant_arithmetic() {
+    let a = Instant(1000)
+    let b = a.add(Duration.fromNanos(500))
+    expect(b.asNanos()).toBe(1500)
+    expect(b.sub(Duration.fromNanos(1500)).asNanos()).toBe(0)
+    expect(a.since(Instant(400)).asNanos()).toBe(600)
+    expect(a.compare(Instant(2000))).toBe(-1)
+    expect(a.compare(Instant(1000))).toBe(0)
+    expect(a.compare(Instant(1))).toBe(1)
+}
+
+// ---------------------------------------------------------------- Timestamp
+
+test fn timestamp_epoch() {
+    let t = Timestamp.fromMillis(0)
+    expect(t.year()).toBe(1970)
+    expect(t.month()).toBe(1)
+    expect(t.day()).toBe(1)
+    expect(t.hour()).toBe(0)
+    expect(t.minute()).toBe(0)
+    expect(t.second()).toBe(0)
+    expect(t.millis()).toBe(0)
+    expect(t.weekday()).toBe(4)
+    expect(t.toSeconds()).toBe(0)
+    expect(t.format()).toBe("1970-01-01T00:00:00.000Z")
+}
+
+test fn timestamp_known_point() {
+    let t = Timestamp.fromMillis(1700000000000)
+    expect(t.format()).toBe("2023-11-14T22:13:20.000Z")
+    expect(t.toSeconds()).toBe(1700000000)
+    expect(t.year()).toBe(2023)
+    expect(t.month()).toBe(11)
+    expect(t.day()).toBe(14)
+    expect(t.hour()).toBe(22)
+    expect(t.minute()).toBe(13)
+    expect(t.second()).toBe(20)
+    expect(t.weekday()).toBe(2)
+}
+
+test fn timestamp_leap_day() {
+    let t = Timestamp.fromMillis(1709164800000)
+    expect(t.format()).toBe("2024-02-29T00:00:00.000Z")
+    expect(t.weekday()).toBe(4)
+}
+
+test fn timestamp_before_epoch() {
+    let t = Timestamp.fromMillis(-1)
+    expect(t.format()).toBe("1969-12-31T23:59:59.999Z")
+    expect(t.year()).toBe(1969)
+    expect(t.month()).toBe(12)
+    expect(t.day()).toBe(31)
+    expect(t.hour()).toBe(23)
+    expect(t.minute()).toBe(59)
+    expect(t.second()).toBe(59)
+    expect(t.millis()).toBe(999)
+    expect(t.toSeconds()).toBe(-1)
+}
+
+test fn timestamp_arithmetic() {
+    let t = Timestamp.fromMillis(0)
+    expect(t.add(Duration.fromSeconds(1)).toMillis()).toBe(1000)
+    expect(t.add(Duration.fromMillis(-1)).toMillis()).toBe(-1)
+    expect(t.addMillis(1500).toMillis()).toBe(1500)
+    expect(t.since(Timestamp.fromMillis(-500)).asMillis()).toBe(500)
+    expect(t.since(Timestamp.fromMillis(500)).asMillis()).toBe(-500)
+    expect(t.compare(Timestamp.fromMillis(1))).toBe(-1)
+    expect(t.compare(Timestamp.fromMillis(0))).toBe(0)
+    expect(t.compare(Timestamp.fromMillis(-1))).toBe(1)
+}
+
+test fn timestamp_from_seconds() {
+    let t = Timestamp.fromSeconds(86400)
+    expect(t.format()).toBe("1970-01-02T00:00:00.000Z")
+    expect(t.weekday()).toBe(5)
+}
+
+test fn timestamp_parse_round_trip() {
+    match (Timestamp.parse("2023-11-14T22:13:20.123Z")) {
+        case some(t) -> {
+            expect(t.toMillis()).toBe(1700000000123)
+            expect(t.format()).toBe("2023-11-14T22:13:20.123Z")
+        }
+        case none -> expect(true).toBe(false)
+    }
+    match (Timestamp.parse("2024-02-29")) {
+        case some(t) -> expect(t.format()).toBe("2024-02-29T00:00:00.000Z")
+        case none -> expect(true).toBe(false)
+    }
+    match (Timestamp.parse("2024-02-29 01:02:03")) {
+        case some(t) -> expect(t.format()).toBe("2024-02-29T01:02:03.000Z")
+        case none -> expect(true).toBe(false)
+    }
+    match (Timestamp.parse("2024-02-29T01:02:03.5Z")) {
+        case some(t) -> expect(t.millis()).toBe(500)
+        case none -> expect(true).toBe(false)
+    }
+    match (Timestamp.parse("2024-02-29T01:02Z")) {
+        case some(t) -> expect(t.format()).toBe("2024-02-29T01:02:00.000Z")
+        case none -> expect(true).toBe(false)
+    }
+    match (Timestamp.parse("2024-02-29T01:02:03.123456789Z")) {
+        case some(t) -> expect(t.millis()).toBe(123)
+        case none -> expect(true).toBe(false)
+    }
+}
+
+test fn timestamp_parse_rejects() {
+    expect(absent(Timestamp.parse(""))).toBe(true)
+    expect(absent(Timestamp.parse("2024-1-1"))).toBe(true)
+    expect(absent(Timestamp.parse("2024-13-01"))).toBe(true)
+    expect(absent(Timestamp.parse("2024-00-01"))).toBe(true)
+    expect(absent(Timestamp.parse("2024-02-30"))).toBe(true)
+    expect(absent(Timestamp.parse("2023-02-29"))).toBe(true)
+    expect(absent(Timestamp.parse("2024-01-01T24:00:00Z"))).toBe(true)
+    expect(absent(Timestamp.parse("2024-01-01T00:60:00Z"))).toBe(true)
+    expect(absent(Timestamp.parse("2024-01-01T00:00:60Z"))).toBe(true)
+    expect(absent(Timestamp.parse("2024-01-01T00:00:00+01:00"))).toBe(true)
+    expect(absent(Timestamp.parse("2024-01-01T00:00:00.1234567890Z"))).toBe(true)
+    expect(absent(Timestamp.parse("2024-01-01T00:00:00.Z"))).toBe(true)
+    expect(absent(Timestamp.parse("2024-01-01x"))).toBe(true)
+    expect(absent(Timestamp.parse("2024/01/01"))).toBe(true)
+}
+
+test fn timestamp_now_is_plausible() {
+    let t = Timestamp.now()
+    // Between 2024-01-01 and 2100-01-01.
+    expect(t.toMillis() > 1704067200000).toBe(true)
+    expect(t.toMillis() < 4102444800000).toBe(true)
+    expect(t.year() >= 2024).toBe(true)
+}

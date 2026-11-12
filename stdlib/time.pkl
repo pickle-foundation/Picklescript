@@ -1,0 +1,590 @@
+module std.time
+
+/// `std.time`: wall-clock and monotonic time.
+///
+/// Three types, one rule each:
+///
+///   `Duration`   a signed span, stored as whole nanoseconds.
+///   `Instant`    a monotonic point, for measuring elapsed time.
+///   `Timestamp`  a UTC point on the civil calendar, stored as milliseconds
+///                since the Unix epoch.
+///
+/// The only OS contact is `runtime/abi_time.pkl`, which owns the two clock
+/// reads (`pickle_time_unix_ms`, `pickle_time_monotonic_ns`). Everything here -
+/// arithmetic, civil-calendar conversion, ISO-8601 parsing and formatting - is
+/// integer math and therefore identical on every target.
+///
+/// UTC ONLY. Time zones are data (an offset table with its own history), not a
+/// clock, so they are deliberately not in this module; a `Timestamp` never
+/// claims a local time. `format()` always ends in `Z`.
+///
+/// RANGE. `Duration` arithmetic is plain 64-bit integer arithmetic: adding two
+/// spans whose sum leaves the `int` range wraps, and negating the minimum
+/// `int` overflows. `Timestamp` covers the whole `int` millisecond range; the
+/// civil-calendar helpers are correct for negative (pre-1970) values too.
+
+// --------------------------------------------------------------- civil math
+
+/// `a / b` rounded toward negative infinity. `b` must be positive; every
+/// caller in this module divides by a positive constant (a day, a year).
+fn floorDiv(a: int, b: int) -> int {
+    var q = a / b
+    if (a % b < 0) {
+        q = q - 1
+    }
+    return q
+}
+
+/// `a % b` in `[0, b)`. `b` must be positive.
+fn floorMod(a: int, b: int) -> int {
+    var r = a % b
+    if (r < 0) {
+        r = r + b
+    }
+    return r
+}
+
+/// Days since 1970-01-01 for the civil date `y-m-d` (Howard Hinnant's
+/// `days_from_civil`). Valid for any `y` the caller can name, including years
+/// before 1970; no calendar validation is done here.
+fn daysFromCivil(y0: int, m: int, d: int) -> int {
+    var y = y0
+    if (m <= 2) {
+        y = y - 1
+    }
+    var era = 0
+    if (y >= 0) {
+        era = y / 400
+    } else {
+        era = (y - 399) / 400
+    }
+    let yoe = y - era * 400
+    var mp = m + 9
+    if (m > 2) {
+        mp = m - 3
+    }
+    let doy = (153 * mp + 2) / 5 + d - 1
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    return era * 146097 + doe - 719468
+}
+
+/// The civil date for `z` days since 1970-01-01 (Hinnant's
+/// `civil_from_days`), as `(year, month, day)`.
+fn civilFromDays(z0: int) -> (int, int, int) {
+    let z = z0 + 719468
+    let era = floorDiv(z, 146097)
+    let doe = z - era * 146097
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let y = yoe + era * 400
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp = (5 * doy + 2) / 153
+    let d = doy - (153 * mp + 2) / 5 + 1
+    var m = mp + 3
+    if (mp >= 10) {
+        m = mp - 9
+    }
+    var yy = y
+    if (m <= 2) {
+        yy = y + 1
+    }
+    return (yy, m, d)
+}
+
+/// Whether `y` is a leap year in the proleptic Gregorian calendar.
+fn isLeapYear(y: int) -> bool {
+    if (y % 4 != 0) {
+        return false
+    }
+    if (y % 100 != 0) {
+        return true
+    }
+    return y % 400 == 0
+}
+
+/// Days in month `m` of year `y`; `m` is assumed to be 1..12.
+fn daysInMonth(y: int, m: int) -> int {
+    if (m == 2) {
+        if (isLeapYear(y)) {
+            return 29
+        }
+        return 28
+    }
+    if (m == 4 || m == 6 || m == 9 || m == 11) {
+        return 30
+    }
+    return 31
+}
+
+/// Split milliseconds since the epoch into
+/// `(year, month, day, hour, minute, second, millisecond)`, all UTC.
+fn civilOf(ms: int) -> (int, int, int, int, int, int, int) {
+    let days = floorDiv(ms, 86400000)
+    let rem = floorMod(ms, 86400000)
+    let (y, m, d) = civilFromDays(days)
+    let h = rem / 3600000
+    let mi = (rem % 3600000) / 60000
+    let s = (rem % 60000) / 1000
+    let milli = rem % 1000
+    return (y, m, d, h, mi, s, milli)
+}
+
+// ------------------------------------------------------------- formatting
+
+fn pad2(n: int) -> string {
+    if (n < 10) {
+        return "0" + str(n)
+    }
+    return str(n)
+}
+
+fn pad3(n: int) -> string {
+    if (n < 10) {
+        return "00" + str(n)
+    }
+    if (n < 100) {
+        return "0" + str(n)
+    }
+    return str(n)
+}
+
+fn pad4(n: int) -> string {
+    var s = str(n)
+    if (n < 10) {
+        s = "000" + s
+    } else if (n < 100) {
+        s = "00" + s
+    } else if (n < 1000) {
+        s = "0" + s
+    }
+    return s
+}
+
+// ----------------------------------------------------------------- parsing
+
+/// Byte `i` of `b` as an `int`, or -1 when out of range.
+fn byteAt(b: List<byte>, i: int) -> int {
+    if (i < 0 || i >= len(b)) {
+        return -1
+    }
+    return b[i] as int
+}
+
+/// Read exactly `n` ASCII digits at `i` as an `int`; -1 when the span is out
+/// of range or holds anything but a digit.
+fn readDigits(b: List<byte>, i: int, n: int) -> int {
+    if (i + n > len(b)) {
+        return -1
+    }
+    var v = 0
+    var k = 0
+    while (k < n) {
+        let c = b[i + k] as int
+        if (c < 48 || c > 57) {
+            return -1
+        }
+        v = v * 10 + (c - 48)
+        k = k + 1
+    }
+    return v
+}
+
+// ------------------------------------------------------------- clock reads
+
+/// Wall-clock milliseconds since the Unix epoch, UTC. Follows the system
+/// clock, so it can step backwards; use `Instant` to measure spans.
+fn unixMillis() -> int {
+    return time_unix_ms()
+}
+
+/// Monotonic nanoseconds from an unspecified origin. Only differences within
+/// one process are meaningful.
+fn monotonicNanos() -> int {
+    return time_monotonic_ns()
+}
+
+// ---------------------------------------------------------------- Duration
+
+/// A signed span of time, stored as whole nanoseconds.
+class Duration {
+    /// The span in nanoseconds; negative values are valid.
+    var ns: int
+
+    constructor(ns: int) {
+        this.ns = ns
+    }
+
+    /// The zero span.
+    static fn zero() -> Duration {
+        return Duration(0)
+    }
+
+    static fn fromNanos(n: int) -> Duration {
+        return Duration(n)
+    }
+
+    static fn fromMillis(ms: int) -> Duration {
+        return Duration(ms * 1000000)
+    }
+
+    static fn fromSeconds(s: int) -> Duration {
+        return Duration(s * 1000000000)
+    }
+
+    static fn fromMinutes(m: int) -> Duration {
+        return Duration(m * 60000000000)
+    }
+
+    static fn fromHours(h: int) -> Duration {
+        return Duration(h * 3600000000000)
+    }
+
+    /// The span in nanoseconds, exactly.
+    fn asNanos() -> int {
+        return this.ns
+    }
+
+    /// Whole milliseconds, truncated toward zero.
+    fn asMillis() -> int {
+        return this.ns / 1000000
+    }
+
+    /// Whole seconds, truncated toward zero.
+    fn asSeconds() -> int {
+        return this.ns / 1000000000
+    }
+
+    fn isZero() -> bool {
+        return this.ns == 0
+    }
+
+    fn isNegative() -> bool {
+        return this.ns < 0
+    }
+
+    /// The same span with a non-negative sign.
+    fn abs() -> Duration {
+        if (this.ns < 0) {
+            return Duration(0 - this.ns)
+        }
+        return Duration(this.ns)
+    }
+
+    fn add(other: Duration) -> Duration {
+        return Duration(this.ns + other.ns)
+    }
+
+    fn sub(other: Duration) -> Duration {
+        return Duration(this.ns - other.ns)
+    }
+
+    fn mul(factor: int) -> Duration {
+        return Duration(this.ns * factor)
+    }
+
+    /// -1, 0, or 1 as this span is shorter than, equal to, or longer than
+    /// `other`.
+    fn compare(other: Duration) -> int {
+        if (this.ns < other.ns) {
+            return -1
+        }
+        if (this.ns > other.ns) {
+            return 1
+        }
+        return 0
+    }
+
+    /// Decimal seconds: the largest exact form is `3s`, a fractional span is
+    /// `1.5s`, and trailing fraction zeros are trimmed. Negative spans carry
+    /// a leading `-`.
+    fn toString() -> string {
+        if (this.ns == 0) {
+            return "0s"
+        }
+        var sign = ""
+        var n = this.ns
+        if (n < 0) {
+            sign = "-"
+            n = 0 - n
+        }
+        let whole = n / 1000000000
+        let frac = n % 1000000000
+        if (frac == 0) {
+            return sign + str(whole) + "s"
+        }
+        var digits = ""
+        var scale = 100000000
+        var k = 0
+        while (k < 9) {
+            digits = digits + str((frac / scale) % 10)
+            scale = scale / 10
+            k = k + 1
+        }
+        while (len(digits) > 0 && digits.substring(len(digits) - 1, len(digits)) == "0") {
+            digits = digits.substring(0, len(digits) - 1)
+        }
+        return sign + str(whole) + "." + digits + "s"
+    }
+}
+
+// ----------------------------------------------------------------- Instant
+
+/// A point on the monotonic clock. `Instant.now()` never goes backwards, so
+/// `elapsed()` is safe across system-clock adjustments.
+class Instant {
+    /// Nanoseconds from the (unspecified) monotonic origin.
+    var ns: int
+
+    constructor(ns: int) {
+        this.ns = ns
+    }
+
+    /// The current monotonic point.
+    static fn now() -> Instant {
+        return Instant(time_monotonic_ns())
+    }
+
+    fn asNanos() -> int {
+        return this.ns
+    }
+
+    /// Time from this point to now.
+    fn elapsed() -> Duration {
+        return Duration(time_monotonic_ns() - this.ns)
+    }
+
+    /// Time from `earlier` to this point.
+    fn since(earlier: Instant) -> Duration {
+        return Duration(this.ns - earlier.ns)
+    }
+
+    fn add(d: Duration) -> Instant {
+        return Instant(this.ns + d.asNanos())
+    }
+
+    fn sub(d: Duration) -> Instant {
+        return Instant(this.ns - d.asNanos())
+    }
+
+    /// -1, 0, or 1 as this point is earlier than, equal to, or later than
+    /// `other`.
+    fn compare(other: Instant) -> int {
+        if (this.ns < other.ns) {
+            return -1
+        }
+        if (this.ns > other.ns) {
+            return 1
+        }
+        return 0
+    }
+}
+
+// --------------------------------------------------------------- Timestamp
+
+/// A UTC point on the civil calendar, stored as milliseconds since the Unix
+/// epoch.
+class Timestamp {
+    /// Milliseconds since 1970-01-01T00:00:00Z; negative before the epoch.
+    var ms: int
+
+    constructor(ms: int) {
+        this.ms = ms
+    }
+
+    /// The current wall-clock time, truncated to the millisecond.
+    static fn now() -> Timestamp {
+        return Timestamp(time_unix_ms())
+    }
+
+    static fn fromMillis(ms: int) -> Timestamp {
+        return Timestamp(ms)
+    }
+
+    static fn fromSeconds(s: int) -> Timestamp {
+        return Timestamp(s * 1000)
+    }
+
+    /// Parse ISO-8601 UTC text. Accepted forms:
+    ///
+    ///   YYYY-MM-DD
+    ///   YYYY-MM-DDTHH:MM[:SS][.fraction][Z]
+    ///
+    /// with `T` or a space as the date/time separator, 1..9 fraction digits
+    /// (truncated to milliseconds), and an optional trailing `Z`. `none` is
+    /// returned for anything else, including out-of-range fields and dates
+    /// that do not exist (`2023-02-29`). A numeric UTC offset (`+01:00`) is
+    /// rejected rather than silently treated as UTC.
+    static fn parse(text: string) -> Timestamp? {
+        let b = bytes(text)
+        if (len(b) < 10) {
+            return none
+        }
+        let y = readDigits(b, 0, 4)
+        let mo = readDigits(b, 5, 2)
+        let d = readDigits(b, 8, 2)
+        if (y < 0 || mo < 0 || d < 0) {
+            return none
+        }
+        if (byteAt(b, 4) != 45 || byteAt(b, 7) != 45) {
+            return none
+        }
+        var i = 10
+        var hh = 0
+        var mi = 0
+        var ss = 0
+        var fracMs = 0
+        if (i < len(b)) {
+            let sep = byteAt(b, i)
+            if (sep != 84 && sep != 32) {
+                return none
+            }
+            i = i + 1
+            hh = readDigits(b, i, 2)
+            if (hh < 0) {
+                return none
+            }
+            i = i + 2
+            if (byteAt(b, i) != 58) {
+                return none
+            }
+            i = i + 1
+            mi = readDigits(b, i, 2)
+            if (mi < 0) {
+                return none
+            }
+            i = i + 2
+            if (byteAt(b, i) == 58) {
+                i = i + 1
+                ss = readDigits(b, i, 2)
+                if (ss < 0) {
+                    return none
+                }
+                i = i + 2
+            }
+            if (byteAt(b, i) == 46) {
+                i = i + 1
+                var digits = 0
+                var scaled = 0
+                while (byteAt(b, i) >= 48 && byteAt(b, i) <= 57) {
+                    if (digits < 3) {
+                        scaled = scaled * 10 + (byteAt(b, i) - 48)
+                    }
+                    digits = digits + 1
+                    i = i + 1
+                }
+                if (digits == 0 || digits > 9) {
+                    return none
+                }
+                var k = digits
+                while (k < 3) {
+                    scaled = scaled * 10
+                    k = k + 1
+                }
+                fracMs = scaled
+            }
+        }
+        if (byteAt(b, i) == 90) {
+            i = i + 1
+        }
+        if (i != len(b)) {
+            return none
+        }
+        if (mo < 1 || mo > 12) {
+            return none
+        }
+        if (d < 1 || d > daysInMonth(y, mo)) {
+            return none
+        }
+        if (hh > 23 || mi > 59 || ss > 59) {
+            return none
+        }
+        let days = daysFromCivil(y, mo, d)
+        let ms = days * 86400000 + hh * 3600000 + mi * 60000 + ss * 1000 + fracMs
+        return Timestamp(ms)
+    }
+
+    fn toMillis() -> int {
+        return this.ms
+    }
+
+    /// Whole seconds since the epoch, truncated toward the epoch.
+    fn toSeconds() -> int {
+        return floorDiv(this.ms, 1000)
+    }
+
+    fn year() -> int {
+        let (y, _, _, _, _, _, _) = civilOf(this.ms)
+        return y
+    }
+
+    fn month() -> int {
+        let (_, mo, _, _, _, _, _) = civilOf(this.ms)
+        return mo
+    }
+
+    fn day() -> int {
+        let (_, _, d, _, _, _, _) = civilOf(this.ms)
+        return d
+    }
+
+    fn hour() -> int {
+        let (_, _, _, h, _, _, _) = civilOf(this.ms)
+        return h
+    }
+
+    fn minute() -> int {
+        let (_, _, _, _, mi, _, _) = civilOf(this.ms)
+        return mi
+    }
+
+    fn second() -> int {
+        let (_, _, _, _, _, s, _) = civilOf(this.ms)
+        return s
+    }
+
+    /// The millisecond field, 0..999.
+    fn millis() -> int {
+        let (_, _, _, _, _, _, milli) = civilOf(this.ms)
+        return milli
+    }
+
+    /// ISO weekday: 1 = Monday .. 7 = Sunday.
+    fn weekday() -> int {
+        let w = floorMod(floorDiv(this.ms, 86400000) + 3, 7)
+        return w + 1
+    }
+
+    fn add(d: Duration) -> Timestamp {
+        return Timestamp(this.ms + d.asMillis())
+    }
+
+    fn addMillis(ms: int) -> Timestamp {
+        return Timestamp(this.ms + ms)
+    }
+
+    /// Time from `other` to this point; negative when this point is earlier.
+    fn since(other: Timestamp) -> Duration {
+        return Duration.fromMillis(this.ms - other.ms)
+    }
+
+    /// -1, 0, or 1 as this point is earlier than, equal to, or later than
+    /// `other`.
+    fn compare(other: Timestamp) -> int {
+        if (this.ms < other.ms) {
+            return -1
+        }
+        if (this.ms > other.ms) {
+            return 1
+        }
+        return 0
+    }
+
+    /// `YYYY-MM-DDTHH:MM:SS.mmmZ`.
+    fn format() -> string {
+        let (y, mo, d, h, mi, s, milli) = civilOf(this.ms)
+        return pad4(y) + "-" + pad2(mo) + "-" + pad2(d) + "T" + pad2(h) + ":" + pad2(mi) + ":" + pad2(s) + "." + pad3(milli) + "Z"
+    }
+
+    fn toString() -> string {
+        return this.format()
+    }
+}

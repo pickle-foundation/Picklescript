@@ -1,0 +1,38 @@
+module runtime.abi_time_test
+
+import { abiTimeUnixMs, abiTimeMonotonicNs } from runtime.abi_time
+
+test fn wall_clock_is_plausible() {
+    let ms = abiTimeUnixMs()
+    // Between 2024-01-01 and 2100-01-01, in milliseconds since the epoch.
+    expect(ms > 1704067200000).toBe(true)
+    expect(ms < 4102444800000).toBe(true)
+}
+
+test fn monotonic_never_decreases() {
+    let a = abiTimeMonotonicNs()
+    let b = abiTimeMonotonicNs()
+    expect(b >= a).toBe(true)
+}
+
+test fn monotonic_advances_across_a_sleep() {
+    let a = abiTimeMonotonicNs()
+    sleep_ms(20)
+    let b = abiTimeMonotonicNs()
+    expect(b > a).toBe(true)
+    // At least 10 ms of the requested 20, in nanoseconds; the loose bound
+    // keeps the test honest on a coarse timer without being flaky.
+    expect(b - a >= 10000000).toBe(true)
+}
+
+test fn wall_clock_is_millisecond_scale() {
+    // Two reads a sleep apart must land within a sane distance of each other:
+    // this catches a unit slip (seconds read as milliseconds, or 100-ns ticks
+    // reported as milliseconds) without depending on the clock's precision.
+    let a = abiTimeUnixMs()
+    sleep_ms(10)
+    let b = abiTimeUnixMs()
+    let d = b - a
+    expect(d >= 0).toBe(true)
+    expect(d < 5000).toBe(true)
+}
