@@ -1177,15 +1177,13 @@ fn parseGlobal(pa: Parser) -> GlobalDecl {
         GlobalDecl(name, Visibility.Default, ty, value, span)
 }
 
-/// `type Name = Ty` - a transparent alias. The right-hand side goes through the
-/// same `parseType` as any annotation, so an alias may name a pointer, option,
-/// tuple, function, generic, or another alias. Generic aliases (`type Pair<T> =
-/// ...`) are rejected for now: expanding one needs type-argument substitution
-/// in the resolver, which this shape deliberately does not do.
+/// `type Name<T, U> = Ty` - a transparent alias. The right-hand side goes
+/// through the same `parseType` as any annotation, so an alias may name a
+/// pointer, option, tuple, function, generic, or another alias.
 ///
 /// `type` is contextual, not a reserved word: it introduces an alias only when
-/// it sits at item position and is followed by a name (or a `<` we then reject).
-/// Existing code that uses `type` as a field or variable name keeps parsing.
+/// it sits at item position and is followed by a name. Existing code that uses
+/// `type` as a field or variable name keeps parsing.
 fn parseAlias(pa: Parser) -> AliasDecl {
         let start = span(pa)
         bump(pa) // `type`
@@ -1193,9 +1191,17 @@ fn parseAlias(pa: Parser) -> AliasDecl {
         if (pa.failed) {
             return dummyAliasDecl()
         }
+        // `type Pair<T> = ...` takes the same `<T, U>` shape a class or
+        // function does; only the names matter here, so the declarations are
+        // flattened to strings.
+        var generics = List<string>()
         if (at(pa, Tok.Lt)) {
-            errHere(pa, "generic type aliases are not supported yet")
-            return dummyAliasDecl()
+            for (gp in parseGenericParams(pa)) {
+                generics.push(gp.name)
+            }
+            if (pa.failed) {
+                return dummyAliasDecl()
+            }
         }
         expect(pa, Tok.Assign)
         if (pa.failed) {
@@ -1210,7 +1216,7 @@ fn parseAlias(pa: Parser) -> AliasDecl {
         if (pa.failed) {
             return dummyAliasDecl()
         }
-        AliasDecl(name, Visibility.Default, ty, span)
+        AliasDecl(name, Visibility.Default, generics, ty, span)
 }
 
 fn parseType(pa: Parser) -> TypeExpr {

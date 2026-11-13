@@ -8,10 +8,12 @@ import { parse } from compiler.parsercore
 import { Resolver } from compiler.resolvebag
 import { resolve } from compiler.resolvecore
 
+// Used by the runtime test below; every other case builds its source inline.
+type Tags<T> = List<T>
+
 /// Parse + resolve + check one source string and return its error messages.
 /// A parse failure leaves `parse` returning `none`, so only the parse
-/// diagnostics are collected - which is what the generic-alias rejection test
-/// wants to observe.
+/// diagnostics are collected.
 fn checkSource(src: string) -> List<string> {
     let toks = Lexer(bytes(src), 0, 0, none, range(0), 0).run()
     let diags = DiagnosticSink()
@@ -138,9 +140,83 @@ test fn self_cycle_reports() {
     expect(hasContaining(msgs, "cyclic type alias")).toBe(true)
 }
 
-test fn generic_alias_is_rejected() {
-    let msgs = checkSource("type Pair<T> = List<T>\n")
-    expect(countContaining(msgs, "generic type aliases are not supported yet")).toBe(1)
+test fn generic_alias_expands() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("type Pair<T> = (T, T)\nfn main() " + ob + "\n let p: Pair<int> = (1, 2) \n let q: (int, int) = p \n " + cb)
+    expect(len(msgs)).toBe(0)
+}
+
+test fn generic_alias_in_container_position() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("type Tags<T> = List<T>\nfn main() " + ob + "\n let xs: Tags<int> = [1, 2] \n let ys: List<int> = xs \n let m: Map<string, Tags<int>> = Map<string, List<int>>() \n " + cb)
+    expect(len(msgs)).toBe(0)
+}
+
+test fn generic_alias_nests_with_reused_parameter_name() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("type Inner<T> = List<T>\ntype Outer<T> = Map<string, Inner<T>>\nfn main() " + ob + "\n let m: Outer<int> = Map<string, List<int>>() \n " + cb)
+    expect(len(msgs)).toBe(0)
+}
+
+test fn generic_alias_can_be_an_option() {
+    let ob = obrace()
+    let cb = cbrace()
+    let q = quote()
+    let msgs = checkSource("type Maybe<T> = T?\nfn main() " + ob + "\n let a: Maybe<string> = none \n let b: Maybe<string> = " + q + "x" + q + " \n " + cb)
+    expect(len(msgs)).toBe(0)
+}
+
+test fn generic_alias_accepts_a_function_generic_argument() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("type Wrap<T> = List<T>\nfn f<U>(xs: Wrap<U>) -> List<U> => xs\nfn main() " + ob + "\n let xs: Wrap<int> = [1] \n let ys = f(xs) \n let n: int = ys[0] \n " + cb)
+    expect(len(msgs)).toBe(0)
+}
+
+test fn generic_alias_in_class_field() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("type Pair<T> = (T, T)\nclass Box " + ob + "\n var p: Pair<int> \n constructor(p: Pair<int>) " + ob + "\n this.p = p \n " + cb + " \n " + cb + "\nfn main() " + ob + "\n let b = Box((1, 2)) \n " + cb)
+    expect(len(msgs)).toBe(0)
+}
+
+test fn generic_alias_wrong_arity_reports() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("type Pair<T> = (T, T)\nfn main() " + ob + "\n let p: Pair<int, string> = (1, 2) \n " + cb)
+    expect(hasContaining(msgs, "wrong number of type arguments for `Pair`")).toBe(true)
+}
+
+test fn generic_alias_requires_arguments() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("type Pair<T> = (T, T)\nfn main() " + ob + "\n let p: Pair = (1, 2) \n " + cb)
+    expect(hasContaining(msgs, "type alias `Pair` requires type arguments")).toBe(true)
+}
+
+test fn non_generic_alias_rejects_arguments() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("type A = int\nfn main() " + ob + "\n let x: A<string> = 1 \n " + cb)
+    expect(hasContaining(msgs, "type alias `A` is not generic")).toBe(true)
+}
+
+test fn generic_alias_cycle_reports() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("type A<T> = A<List<T>>\nfn main() " + ob + "\n let x: A<int> = 1 \n " + cb)
+    expect(hasContaining(msgs, "cyclic type alias `A`")).toBe(true)
+}
+
+test fn generic_alias_is_transparent_at_runtime() {
+    let xs: Tags<int> = [1, 2, 3]
+    expect(len(xs)).toBe(3)
+    expect(xs[1]).toBe(2)
+    expect(typeof(xs)).toBe("List<int>")
+    expect(sizeof(Tags<int>)).toBe(8)
 }
 
 test fn duplicate_alias_is_rejected() {
@@ -154,5 +230,15 @@ test fn alias_body_does_not_capture_use_site_generics() {
     // `T` is a generic of `f`, but the alias body resolves in an empty generic
     // context, so this is an unknown type rather than a silent `T`.
     let msgs = checkSource("type Alias = T\nfn f<T>(x: Alias) -> int => 0\nfn main() " + ob + " \n " + cb)
+    expect(hasContaining(msgs, "unknown type `T`")).toBe(true)
+}
+
+test fn alias_body_does_not_capture_an_outer_aliass_params() {
+    let ob = obrace()
+    let cb = cbrace()
+    // `B` is expanded while `A`'s expansion is live, but `T` is not one of
+    // `B`'s parameters: an alias body sees only its own bindings, so this must
+    // report rather than silently resolve to `A`'s `int`.
+    let msgs = checkSource("type A<T> = B\ntype B = T\nfn main() " + ob + "\n let x: A<int> = 1 \n " + cb)
     expect(hasContaining(msgs, "unknown type `T`")).toBe(true)
 }

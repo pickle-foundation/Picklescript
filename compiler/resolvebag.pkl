@@ -259,12 +259,12 @@ class ResolvedProgram {
     var globals: List<FieldInfo>
     var importAliases: Map<string, List<string>>
     var modulePath: List<string>
-    /// `type Name = Ty` declarations by name. The body stays unresolved so a
-    /// use site can resolve it in its own context (and so an alias may name a
-    /// type declared later in the file).
-    var aliases: Map<string, TypeExpr>
+    /// `type Name<T> = Ty` declarations by name. The body stays unresolved so
+    /// a use site can resolve it with its type arguments bound (and so an
+    /// alias may name a type declared later in the file).
+    var aliases: Map<string, TypeAliasDef>
 
-    constructor(types: Map<string, TypeTableEntry>, fns: Map<string, List<CallableInfo>>, consts: List<FieldInfo>, globals: List<FieldInfo>, importAliases: Map<string, List<string>>, modulePath: List<string>, aliases: Map<string, TypeExpr>) {
+    constructor(types: Map<string, TypeTableEntry>, fns: Map<string, List<CallableInfo>>, consts: List<FieldInfo>, globals: List<FieldInfo>, importAliases: Map<string, List<string>>, modulePath: List<string>, aliases: Map<string, TypeAliasDef>) {
         this.types = types
         this.fns = fns
         this.consts = consts
@@ -287,7 +287,7 @@ class Resolver {
     var globals: List<FieldInfo>
     var importAliases: Map<string, List<string>>
     var modulePath: List<string>
-    var aliases: Map<string, TypeExpr>
+    var aliases: Map<string, TypeAliasDef>
 
     constructor(diags: DiagnosticSink) {
         this.diags = diags
@@ -297,7 +297,7 @@ class Resolver {
         this.globals = List<FieldInfo>()
         this.importAliases = Map<string, List<string>>()
         this.modulePath = List<string>()
-        this.aliases = Map<string, TypeExpr>()
+        this.aliases = Map<string, TypeAliasDef>()
     }
 
 
@@ -339,20 +339,41 @@ class Resolver {
 
 }
 
+/// A top-level `type Name<T, U> = Ty` declaration. `params` holds the declared
+/// type-parameter names in order (empty for a plain alias) and `body` stays
+/// unresolved until a use site expands it, which is what lets an alias name a
+/// type declared later in the file.
+class TypeAliasDef {
+    var params: List<string>
+    var body: TypeExpr
+    var span: Span
+
+    constructor(params: List<string>, body: TypeExpr, span: Span) {
+        this.params = params
+        this.body = body
+        this.span = span
+    }
+}
+
 class TypeCtx {
     var diags: DiagnosticSink
     var types: Map<string, TypeTableEntry>
     var importAliases: Map<string, List<string>>
-    var aliases: Map<string, TypeExpr>
+    var aliases: Map<string, TypeAliasDef>
+    /// Type-parameter bindings of the aliases currently being expanded. The
+    /// body resolves against this map, so `type Pair<T> = (T, T)` used as
+    /// `Pair<int>` sees `int` for `T`.
+    var bindings: Map<string, Ty>
     /// Names currently being expanded, so a cycle is reported instead of
     /// recursing forever. Empty at the top of every public `resolveTy` call.
     var expanding: List<string>
 
-    constructor(diags: DiagnosticSink, types: Map<string, TypeTableEntry>, importAliases: Map<string, List<string>>, aliases: Map<string, TypeExpr>) {
+    constructor(diags: DiagnosticSink, types: Map<string, TypeTableEntry>, importAliases: Map<string, List<string>>, aliases: Map<string, TypeAliasDef>) {
         this.diags = diags
         this.types = types
         this.importAliases = importAliases
         this.aliases = aliases
+        this.bindings = Map<string, Ty>()
         this.expanding = List<string>()
     }
 
@@ -360,6 +381,16 @@ class TypeCtx {
         match (te.kind) {
             case TypeExprKind.Path(p) -> this.resolvePath(p, generics, te.span)
             case TypeExprKind.Generic(base, args) -> {
+                // `Alias<T>` binds the alias's parameters from the arguments
+                // and resolves its body; every other base is an ordinary
+                // generic type (`List<int>`, `Box<T>`).
+                if (let some(al) = this.aliasOf(base, generics)) {
+                    let argTys = List<Ty>()
+                    for (a in args) {
+                        argTys.push(this.resolveTy(a, generics))
+                    }
+                    return this.expandAlias(al, argTys, te.span)
+                }
                 let bare = this.resolveTy(base, generics)
                 let argTys = List<Ty>()
                 for (a in args) {
@@ -417,6 +448,9 @@ class TypeCtx {
             if (path[0] == "Stream") {
                 return Ty.Stream
             }
+            if (this.bindings.has(path[0])) {
+                return this.bindings[path[0]]
+            }
             for (g in generics) {
                 if (g == path[0]) {
                     return Ty.Var(g)
@@ -431,7 +465,7 @@ class TypeCtx {
                 return this.bareType(this.types[path[0]])
             }
             if (this.aliases.has(path[0])) {
-                return this.expandAlias(path[0], span)
+                return this.expandAlias(path[0], List<Ty>(), span)
             }
         } else if (this.importAliases.has(path[0])) {
             let last = path[len(path) - 1]
@@ -439,28 +473,92 @@ class TypeCtx {
                 return this.bareType(this.types[last])
             }
             if (this.aliases.has(last)) {
-                return this.expandAlias(last, span)
+                return this.expandAlias(last, List<Ty>(), span)
             }
         }
         this.diags.emit(Diagnostic.errorAt(span, "unknown type `" + renderPath(path) + "`").withCode("E0210").note("expected a class, struct, enum, interface, type alias, or built-in type"))
         Ty.Unknown
     }
 
-    /// Expand `type Name = Ty` by resolving its body. The body is resolved in
-    /// an empty generic context: an alias is a module-level declaration, so a
-    /// `T` at the use site must not leak into it. A cycle (`type A = B` /
-    /// `type B = A`) reports once, at the use site that closed the loop.
-    fn expandAlias(name: string, span: Span) -> Ty {
+    /// The alias a generic-instantiation base names, or `none` when `base`
+    /// is a built-in, a declared type, or a type parameter. Mirrors the name
+    /// visibility rules of `resolvePath`, so `Pair<int>` and an imported
+    /// `mod.Pair<int>` both find the alias.
+    fn aliasOf( base: TypeExpr, generics: List<string>) -> string? {
+        match (base.kind) {
+            case TypeExprKind.Path(p) -> {
+                if (len(p) == 0) {
+                    return none
+                }
+                if (len(p) == 1) {
+                    for (g in generics) {
+                        if (g == p[0]) {
+                            return none
+                        }
+                    }
+                    if (this.bindings.has(p[0]) || this.types.has(p[0])) {
+                        return none
+                    }
+                    if (this.aliases.has(p[0])) {
+                        return p[0]
+                    }
+                    return none
+                }
+                let last = p[len(p) - 1]
+                if (!this.importAliases.has(p[0])) {
+                    return none
+                }
+                if (this.types.has(last)) {
+                    return none
+                }
+                if (this.aliases.has(last)) {
+                    return last
+                }
+                none
+            }
+            case _ -> none
+        }
+    }
+
+    /// Expand `type Name<T> = Ty` with `args` bound to the declared
+    /// parameters. The body is resolved with no use-site generics: an alias is
+    /// a module-level declaration, so a `T` at the use site must not leak
+    /// into it. Bindings are scoped to this definition, not merged into the
+    /// caller's map: a body may only see its own parameters, so
+    /// `type A<T> = B` with `type B = T` reports `T` as unknown instead of
+    /// silently capturing `A`'s parameter. The previous map is restored on the
+    /// way out, which is what makes a nested expansion reuse a parameter name
+    /// safely. A cycle (`type A<T> = A<T>`) reports once, at the use site that
+    /// closed the loop.
+    fn expandAlias( name: string, args: List<Ty>, span: Span) -> Ty {
         for (e in this.expanding) {
             if (e == name) {
                 this.diags.emit(Diagnostic.errorAt(span, "cyclic type alias `" + name + "`").withCode("E0214"))
                 return Ty.Unknown
             }
         }
+        let def = this.aliases[name]
+        if (len(def.params) != len(args)) {
+            if (len(def.params) == 0) {
+                this.diags.emit(Diagnostic.errorAt(span, "type alias `" + name + "` is not generic").withCode("E0211"))
+            } else if (len(args) == 0) {
+                this.diags.emit(Diagnostic.errorAt(span, "type alias `" + name + "` requires type arguments").withCode("E0212").note("declared type parameters: " + renderList(def.params)))
+            } else {
+                this.diags.emit(Diagnostic.errorAt(span, "wrong number of type arguments for `" + name + "`: expected " + str(len(def.params)) + ", found " + str(len(args))).withCode("E0212").note("declared type parameters: " + renderList(def.params)))
+            }
+            return Ty.Unknown
+        }
+        let saved = this.bindings
+        this.bindings = Map<string, Ty>()
+        var i = 0
+        while (i < len(def.params)) {
+            this.bindings[def.params[i]] = args[i]
+            i = i + 1
+        }
         this.expanding.push(name)
-        let body = this.aliases[name]
-        let t = this.resolveTy(body, List<string>())
+        let t = this.resolveTy(def.body, List<string>())
         this.expanding.pop()
+        this.bindings = saved
         t
     }
 
