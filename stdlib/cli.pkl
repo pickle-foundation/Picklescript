@@ -1,0 +1,284 @@
+module std.cli
+
+/// Small, allocation-light command-line parser (`std.cli`).
+///
+/// Long options only: `--name` for a flag, `--name value` or `--name=value` for
+/// an option. A bare `--` ends option parsing and every later word is
+/// positional. `-h` / `--help` are always recognised without being declared, so
+/// a caller can do:
+///
+/// ```
+/// let spec = ArgSpec("count lines").flag("verbose", "chatty output")
+/// let got = parse(spec, argv())
+/// if (got.wantsHelp()) { print(helpText("count", spec)); return }
+/// if (!got.ok()) { printErr(got.errorText()); return }
+/// ```
+///
+/// Parsing never exits and never prints: errors accumulate in `Parsed.problems`
+/// so the caller owns the policy (and the tests can inspect them).
+
+/// What `parse` accepts. Build one with the fluent `flag`/`option` methods;
+/// declaration order is preserved for `helpText`.
+class ArgSpec {
+    /// `--name` boolean flags, mapped to their help text.
+    var flags: Map<string, string>
+    /// `--name VALUE` options, mapped to the value's metavar (`FILE`).
+    var options: Map<string, string>
+    /// Help text for each option, keyed like `options`.
+    var optionHelp: Map<string, string>
+    /// Declared positionals, in order.
+    var positionalNames: List<string>
+    /// Flag names in declaration order.
+    var flagOrder: List<string>
+    /// Option names in declaration order.
+    var optionOrder: List<string>
+    /// One-line summary shown at the top of `helpText` (`""` to omit).
+    var description: string
+
+    constructor(description: string) {
+        this.flags = Map<string, string>()
+        this.options = Map<string, string>()
+        this.optionHelp = Map<string, string>()
+        this.positionalNames = List<string>()
+        this.flagOrder = List<string>()
+        this.optionOrder = List<string>()
+        this.description = description
+    }
+
+    /// Declare a boolean flag. Declaring the same name twice keeps the first
+    /// help text and does not duplicate it in `helpText`.
+    fn flag(name: string, help: string) -> ArgSpec {
+        if (!this.flags.has(name)) {
+            this.flags[name] = help
+            this.flagOrder.push(name)
+        }
+        this
+    }
+
+    /// Declare an option that takes a value; `metavar` is how the value is
+    /// spelled in `helpText` (`FILE`, `N`, ...).
+    fn option(name: string, metavar: string, help: string) -> ArgSpec {
+        if (!this.options.has(name)) {
+            this.options[name] = metavar
+            this.optionHelp[name] = help
+            this.optionOrder.push(name)
+        }
+        this
+    }
+
+    /// Declare a positional, in order. Parsing rejects positionals beyond the
+    /// declared count; it does not require all of them to be present.
+    fn positional(name: string) -> ArgSpec {
+        this.positionalNames.push(name)
+        this
+    }
+}
+
+/// The result of `parse`. Query it with `flag`/`value`/`positional`; inspect
+/// `problems` (or `ok`) when the caller wants to report instead of trust.
+class Parsed {
+    var spec: ArgSpec
+    /// Names of flags that were present.
+    var flags: Map<string, bool>
+    /// Option values by name; a repeated option keeps the last value.
+    var values: Map<string, string>
+    /// Positionals in command-line order.
+    var positionalValues: List<string>
+    /// Human-readable problems, in the order they were found.
+    var problems: List<string>
+    /// `-h` or `--help` appeared.
+    var helpWanted: bool
+
+    constructor(spec: ArgSpec) {
+        this.spec = spec
+        this.flags = Map<string, bool>()
+        this.values = Map<string, string>()
+        this.positionalValues = List<string>()
+        this.problems = List<string>()
+        this.helpWanted = false
+    }
+
+    /// Was `--name` present?
+    fn flag(name: string) -> bool {
+        this.flags.has(name)
+    }
+
+    /// The value of `--name`, or `none` when the option was absent (or when
+    /// parsing stopped before reaching it).
+    fn value(name: string) -> string? {
+        this.values.get(name)
+    }
+
+    /// The `i`-th positional, or `none` when there are fewer.
+    fn positional(i: int) -> string? {
+        if (i < 0 || i >= len(this.positionalValues)) {
+            return none
+        }
+        this.positionalValues[i]
+    }
+
+    /// Every positional, in order.
+    fn positionals() -> List<string> {
+        this.positionalValues
+    }
+
+    /// `-h` / `--help` asked for the usage text.
+    fn wantsHelp() -> bool {
+        this.helpWanted
+    }
+
+    /// No problems were recorded.
+    fn ok() -> bool {
+        len(this.problems) == 0
+    }
+
+    /// All problems, one per line (empty when `ok`).
+    fn errorText() -> string {
+        var out = ""
+        var i = 0
+        while (i < len(this.problems)) {
+            if (i > 0) {
+                out += "\n"
+            }
+            out += this.problems[i]
+            i = i + 1
+        }
+        out
+    }
+
+    fn addProblem(message: string) {
+        this.problems.push(message)
+    }
+
+    fn addPositional(word: string) {
+        if (len(this.positionalValues) >= len(this.spec.positionalNames)) {
+            this.addProblem("unexpected argument `" + word + "`")
+            return
+        }
+        this.positionalValues.push(word)
+    }
+}
+
+/// Parse `argv` (program name excluded, as `std.os.argv` returns it) against
+/// `spec`.
+fn parse(spec: ArgSpec, argv: List<string>) -> Parsed {
+    let out = Parsed(spec)
+    var i = 0
+    var onlyPositional = false
+    while (i < len(argv)) {
+        let word = argv[i]
+        if (onlyPositional) {
+            out.addPositional(word)
+            i = i + 1
+        } else if (word == "--") {
+            onlyPositional = true
+            i = i + 1
+        } else if (word == "-h" || word == "--help") {
+            out.helpWanted = true
+            i = i + 1
+        } else if (word.startsWith("--")) {
+            i = parseLong(out, argv, i)
+        } else {
+            out.addPositional(word)
+            i = i + 1
+        }
+    }
+    out
+}
+
+/// Parse one `--name` / `--name=value` word at `argv[i]`; returns the index of
+/// the next word to read.
+fn parseLong(out: Parsed, argv: List<string>, i: int) -> int {
+    let word = argv[i]
+    let body = word.substring(2, len(word))
+    var name = body
+    var inline: string? = none
+    let eq = body.indexOf("=")
+    if (let some(k) = eq) {
+        name = body.substring(0, k)
+        inline = body.substring(k + 1, len(body))
+    }
+    if (len(name) == 0) {
+        out.addProblem("empty option name `--`")
+        return i + 1
+    }
+    if (out.spec.flags.has(name)) {
+        if (let some(_v) = inline) {
+            out.addProblem("flag `--" + name + "` does not take a value")
+        } else {
+            out.flags[name] = true
+        }
+        return i + 1
+    }
+    if (out.spec.options.has(name)) {
+        if (let some(v) = inline) {
+            out.values[name] = v
+            return i + 1
+        }
+        if (i + 1 >= len(argv)) {
+            out.addProblem("option `--" + name + "` needs a value")
+            return i + 1
+        }
+        out.values[name] = argv[i + 1]
+        return i + 2
+    }
+    out.addProblem("unknown option `--" + name + "`")
+    i + 1
+}
+
+/// Pad `s` with spaces to `width` bytes. Help lines are ASCII, so byte length
+/// is the column width here.
+fn padTo(s: string, width: int) -> string {
+    var out = s
+    while (len(out) < width) {
+        out += " "
+    }
+    out
+}
+
+/// `usage: prog [options] [input] [output]` - declared flags and options
+/// collapse into one `[options]` group, positionals keep their declared names.
+fn usageLine(prog: string, spec: ArgSpec) -> string {
+    var out = "usage: " + prog
+    if (len(spec.flagOrder) > 0 || len(spec.optionOrder) > 0) {
+        out += " [options]"
+    }
+    for (name in spec.positionalNames) {
+        out += " [" + name + "]"
+    }
+    out
+}
+
+/// The full help text: description, blank line, usage line, then one indented
+/// line per flag and option. Ends with a newline when any item is listed.
+fn helpText(prog: string, spec: ArgSpec) -> string {
+    var out = ""
+    if (len(spec.description) > 0) {
+        out += spec.description + "\n\n"
+    }
+    out += usageLine(prog, spec) + "\n"
+    if (len(spec.flagOrder) + len(spec.optionOrder) == 0) {
+        return out
+    }
+    out += "\n"
+    var width = 0
+    for (name in spec.flagOrder) {
+        let line = "  --" + name
+        if (len(line) > width) {
+            width = len(line)
+        }
+    }
+    for (name in spec.optionOrder) {
+        let line = "  --" + name + " " + spec.options[name]
+        if (len(line) > width) {
+            width = len(line)
+        }
+    }
+    for (name in spec.flagOrder) {
+        out += padTo("  --" + name, width + 2) + spec.flags[name] + "\n"
+    }
+    for (name in spec.optionOrder) {
+        out += padTo("  --" + name + " " + spec.options[name], width + 2) + spec.optionHelp[name] + "\n"
+    }
+    out
+}

@@ -1,0 +1,163 @@
+module std.cli_test
+
+import { ArgSpec, Parsed, parse, usageLine, helpText } from std.cli
+
+fn demo() -> ArgSpec {
+    ArgSpec("demo tool")
+        .flag("verbose", "chatty output")
+        .option("out", "FILE", "write here")
+        .positional("input")
+}
+
+fn words(items: List<string>) -> List<string> {
+    var out = List<string>()
+    for (w in items) {
+        out.push(w)
+    }
+    out
+}
+
+test fn no_arguments_is_ok() {
+    let got = parse(demo(), List<string>())
+    expect(got.ok()).toBe(true)
+    expect(got.flag("verbose")).toBe(false)
+    expect(len(got.positionals())).toBe(0)
+    if (let some(_v) = got.value("out")) {
+        expect(true).toBe(false)
+    } else {
+        expect(true).toBe(true)
+    }
+}
+
+test fn flags_are_boolean() {
+    let got = parse(demo(), words(["--verbose"]))
+    expect(got.ok()).toBe(true)
+    expect(got.flag("verbose")).toBe(true)
+}
+
+test fn option_takes_the_next_word() {
+    let got = parse(demo(), words(["--out", "file.txt"]))
+    expect(got.ok()).toBe(true)
+    if (let some(v) = got.value("out")) {
+        expect(v).toBe("file.txt")
+    } else {
+        expect(true).toBe(false)
+    }
+}
+
+test fn option_equals_form() {
+    let got = parse(demo(), words(["--out=file.txt"]))
+    expect(got.ok()).toBe(true)
+    if (let some(v) = got.value("out")) {
+        expect(v).toBe("file.txt")
+    } else {
+        expect(true).toBe(false)
+    }
+    let empty = parse(demo(), words(["--out="]))
+    if (let some(v) = empty.value("out")) {
+        expect(v).toBe("")
+    } else {
+        expect(true).toBe(false)
+    }
+}
+
+test fn positionals_keep_order() {
+    let spec = ArgSpec("sum").positional("a").positional("b")
+    let got = parse(spec, words(["1", "2"]))
+    expect(got.ok()).toBe(true)
+    expect(got.positional(0)).toBe("1")
+    expect(got.positional(1)).toBe("2")
+    if (let some(_v) = got.positional(2)) {
+        expect(true).toBe(false)
+    } else {
+        expect(true).toBe(true)
+    }
+}
+
+test fn double_dash_ends_option_parsing() {
+    let spec = ArgSpec("").flag("verbose", "").positional("first").positional("second")
+    let got = parse(spec, words(["--verbose", "--", "--out", "x"]))
+    expect(got.ok()).toBe(true)
+    expect(got.flag("verbose")).toBe(true)
+    let ps = got.positionals()
+    expect(len(ps)).toBe(2)
+    expect(ps[0]).toBe("--out")
+    expect(ps[1]).toBe("x")
+}
+
+test fn unknown_option_reports() {
+    let got = parse(demo(), words(["--wat"]))
+    expect(got.ok()).toBe(false)
+    expect(got.errorText()).toBe("unknown option `--wat`")
+}
+
+test fn missing_option_value_reports() {
+    let got = parse(demo(), words(["input.txt", "--out"]))
+    expect(got.ok()).toBe(false)
+    expect(got.errorText()).toBe("option `--out` needs a value")
+    expect(got.positionals()[0]).toBe("input.txt")
+}
+
+test fn extra_positional_reports() {
+    let got = parse(demo(), words(["a", "b"]))
+    expect(got.ok()).toBe(false)
+    expect(got.errorText()).toBe("unexpected argument `b`")
+}
+
+test fn flag_rejects_a_value() {
+    let got = parse(demo(), words(["--verbose=1"]))
+    expect(got.ok()).toBe(false)
+    expect(got.errorText()).toBe("flag `--verbose` does not take a value")
+}
+
+test fn help_is_always_recognised() {
+    let short = parse(demo(), words(["-h"]))
+    expect(short.ok()).toBe(true)
+    expect(short.wantsHelp()).toBe(true)
+    let long = parse(demo(), words(["--help"]))
+    expect(long.wantsHelp()).toBe(true)
+    let plain = parse(demo(), List<string>())
+    expect(plain.wantsHelp()).toBe(false)
+}
+
+test fn repeated_option_keeps_the_last_value() {
+    let got = parse(demo(), words(["--out", "a", "--out", "b"]))
+    expect(got.ok()).toBe(true)
+    if (let some(v) = got.value("out")) {
+        expect(v).toBe("b")
+    } else {
+        expect(true).toBe(false)
+    }
+}
+
+test fn usage_lists_options_and_positionals() {
+    expect(usageLine("demo", demo())).toBe("usage: demo [options] [input]")
+    let bare = ArgSpec("")
+    expect(usageLine("tool", bare)).toBe("usage: tool")
+    let onlyPos = ArgSpec("").positional("file")
+    expect(usageLine("tool", onlyPos)).toBe("usage: tool [file]")
+}
+
+test fn help_text_lists_declared_items() {
+    let text = helpText("demo", demo())
+    expect(text.contains( "demo tool")).toBe(true)
+    expect(text.contains( "usage: demo [options] [input]")).toBe(true)
+    expect(text.contains( "--verbose")).toBe(true)
+    expect(text.contains( "chatty output")).toBe(true)
+    expect(text.contains( "--out FILE")).toBe(true)
+    expect(text.contains( "write here")).toBe(true)
+}
+
+test fn help_text_omits_the_options_group_without_declarations() {
+    let text = helpText("tool", ArgSpec(""))
+    expect(text).toBe("usage: tool\n")
+}
+
+test fn problems_accumulate_in_order() {
+    let got = parse(demo(), words(["--one", "--two"]))
+    expect(got.ok()).toBe(false)
+    expect(len(got.problems)).toBe(2)
+    expect(got.problems[0]).toBe("unknown option `--one`")
+    expect(got.problems[1]).toBe("unknown option `--two`")
+    expect(got.errorText()).toBe("unknown option `--one`\nunknown option `--two`")
+}
