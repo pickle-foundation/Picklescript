@@ -1,0 +1,96 @@
+module compiler.target
+
+import { Ty } from compiler.ty
+
+/// One machine's data layout.
+///
+/// Every question of the form "how many bytes is a `T`?" goes through here, so
+/// a new target is a new `Target` value and, at most, a new call site - never a
+/// set of scattered literals in the checker and the emitter.
+///
+/// There is exactly one target today, `x86_64()`, and its numbers are the ones
+/// the code generator already assumes:
+///   * a slot holds one 64-bit register, so `int` and `float` are 8;
+///   * a `char` is a Unicode scalar (u32), so 4;
+///   * `bool` is one byte;
+///   * `byte` is the element width of `bytes()`, so 1;
+///   * every managed value (`string`, class, struct, enum, interface, `List`,
+///     `Map`, tuple, option, `Range`, `Stream`, closure) and every raw pointer
+///     or reference is a handle, so `ptrBytes`.
+///
+/// A 32-bit target (armv7, i686) changes `ptrBytes` to 4 and nothing else here.
+/// Linux and macOS on the same word size change *nothing* here - they change
+/// the OS seam (`runtime/abi_*.pkl`), the object writer, and the linker's CRT
+/// thunk tables (`isCrtImp`), not the layout.
+class Target {
+    var ptrBytes: int
+    var intBytes: int
+    var floatBytes: int
+    var charBytes: int
+    var boolBytes: int
+    var byteBytes: int
+
+    constructor(ptrBytes: int, intBytes: int, floatBytes: int, charBytes: int, boolBytes: int, byteBytes: int) {
+        this.ptrBytes = ptrBytes
+        this.intBytes = intBytes
+        this.floatBytes = floatBytes
+        this.charBytes = charBytes
+        this.boolBytes = boolBytes
+        this.byteBytes = byteBytes
+    }
+
+    /// Bytes one `t` occupies in a raw buffer or a `*t` slot, or -1 when `t`
+    /// has no raw representation (`void`, an unresolved type, a type variable).
+    fn sizeOf(t: Ty) -> int {
+        match (t) {
+            case Ty.Bool -> this.boolBytes
+            case Ty.Char -> this.charBytes
+            case Ty.Byte -> this.byteBytes
+            case Ty.Int -> this.intBytes
+            case Ty.Float -> this.floatBytes
+            case Ty.String -> this.ptrBytes
+            case Ty.Class(_, _) -> this.ptrBytes
+            case Ty.Struct(_, _) -> this.ptrBytes
+            case Ty.Enum(_, _) -> this.ptrBytes
+            case Ty.Interface(_, _) -> this.ptrBytes
+            case Ty.List(_) -> this.ptrBytes
+            case Ty.Map(_, _) -> this.ptrBytes
+            case Ty.Tuple(_) -> this.ptrBytes
+            case Ty.Range(_) -> this.ptrBytes
+            case Ty.Stream -> this.ptrBytes
+            case Ty.Fn(_, _) -> this.ptrBytes
+            case Ty.Option(_) -> this.ptrBytes
+            case Ty.Ptr(_) -> this.ptrBytes
+            case Ty.Ref(_) -> this.ptrBytes
+            case Ty.None -> this.ptrBytes
+            case Ty.Empty -> -1
+            case Ty.Unknown -> -1
+            case Ty.Var(_) -> -1
+        }
+    }
+}
+
+fn x86_64() -> Target {
+    Target(8, 8, 8, 4, 1, 1)
+}
+
+/// The target the compiler is building for. A future `--target` flag replaces
+/// this single call site.
+fn defaultTarget() -> Target {
+    x86_64()
+}
+
+/// The raw-buffer width of `t` in bytes, or -1 when it has none.
+fn sizeOfTy(t: Ty) -> int {
+    defaultTarget().sizeOf(t)
+}
+
+/// How an emitted object names a C runtime entry point (`memcpy`, `memset`).
+///
+/// PE/COFF reaches these through a `__imp_`-prefixed import symbol, which the
+/// port's PE link stage turns into a callable `jmp` thunk. ELF and Mach-O want
+/// the bare name and resolve it through their own relocations, so this stays a
+/// target seam instead of a literal in the emitter.
+fn crtCallSymbol(name: string) -> string {
+    "__imp_" + name
+}

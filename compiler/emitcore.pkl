@@ -12,6 +12,7 @@ import { CallableInfo, ClassTable, CtorInfo, entryGenerics, EnumTable, FieldInfo
 import { collectExprTypes } from compiler.checkcore
 import { containsStr, isNoneStr, spanKey, constIntIndex } from compiler.checkutil
 import * from compiler.ty
+import { sizeOfTy, crtCallSymbol } from compiler.target
 import { f64ToBits } from compiler.x64
 import * from compiler.emitutil
 
@@ -469,6 +470,17 @@ fn expr1(em: Emitter, e: Expr) -> int? {
             }
             case ExprKind.GenericCall(name, typeArgs) -> genericFnValue(em, e, name, typeArgs)
             case ExprKind.Cast(ex, ty, k) -> cast(em, e, ex, ty, k)
+            case ExprKind.SizeOf(ty) -> {
+                var n = -1
+                if (let some(t) = tyOf(em, ty.span)) {
+                    n = sizeOfTy(t)
+                }
+                if (n < 0) {
+                    bad(em, ty.span, "`sizeof` needs a sized type here")
+                    return none
+                }
+                intConst(em, n)
+            }
             case ExprKind.Unsafe(b) -> {
                 pushScope(em)
                 var r = blockValue(em, b)
@@ -4347,6 +4359,69 @@ case "print" | "println" -> {
                 // IR; the form simply re-types it as a raw `*int` for the
                 // caller. No runtime call, no copy.
                 return v
+            }
+            case "typeof" -> {
+                if (!(len(args) == 1)) {
+                    bad(em, e.span, "`typeof(x)` takes one argument")
+                    return none
+                }
+                var vt = Ty.Unknown
+                if (let some(t) = tyOf(em, args[0].value.span)) {
+                    vt = t
+                }
+                return strConst(em, bareName(vt))
+            }
+            case "memcpy" -> {
+                if (!(len(args) == 3)) {
+                    bad(em, e.span, "`memcpy(dst, src, n)` takes three arguments")
+                    return none
+                }
+                var d = -1
+                var s = -1
+                var n = -1
+                if (let some(v) = expr(em, args[0].value)) {
+                    d = v
+                } else {
+                    return none
+                }
+                if (let some(v) = expr(em, args[1].value)) {
+                    s = v
+                } else {
+                    return none
+                }
+                if (let some(v) = expr(em, args[2].value)) {
+                    n = v
+                } else {
+                    return none
+                }
+                externCallVoid(em, crtCallSymbol("memcpy"), [IrTy.Int, IrTy.Int, IrTy.Int], [d, s, n])
+                return unitTemp(em)
+            }
+            case "memset" -> {
+                if (!(len(args) == 3)) {
+                    bad(em, e.span, "`memset(dst, value, n)` takes three arguments")
+                    return none
+                }
+                var d = -1
+                var v2 = -1
+                var n2 = -1
+                if (let some(v) = expr(em, args[0].value)) {
+                    d = v
+                } else {
+                    return none
+                }
+                if (let some(v) = expr(em, args[1].value)) {
+                    v2 = v
+                } else {
+                    return none
+                }
+                if (let some(v) = expr(em, args[2].value)) {
+                    n2 = v
+                } else {
+                    return none
+                }
+                externCallVoid(em, crtCallSymbol("memset"), [IrTy.Int, IrTy.Int, IrTy.Int], [d, v2, n2])
+                return unitTemp(em)
             }
             case "free" -> {
                 if (!(len(args) == 1)) {

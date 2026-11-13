@@ -1,0 +1,177 @@
+module compiler.intrinsic_test
+
+// `sizeof` / `typeof` / `memcpy` / `memset` - the raw-memory intrinsics.
+
+import { checkProgram } from compiler.checkcore
+import { containsStr } from compiler.checkutil
+import { DiagnosticSink, Severity } from compiler.diag
+import { Lexer } from compiler.lexer
+import { parse } from compiler.parsercore
+import { Resolver } from compiler.resolvebag
+import { resolve } from compiler.resolvecore
+
+type UserId = int
+type Name = string
+
+class Box {
+    var n: int
+
+    constructor(n: int) {
+        this.n = n
+    }
+}
+
+/// Parse + resolve + check one source string and return its error messages.
+fn checkSource(src: string) -> List<string> {
+    let toks = Lexer(bytes(src), 0, 0, none, range(0), 0).run()
+    let diags = DiagnosticSink()
+    var out = List<string>()
+    if (let some(prog) = parse(toks, diags)) {
+        let r = Resolver(diags)
+        checkProgram(prog, resolve(r, prog), diags)
+    }
+    for (d in diags.diagnostics) {
+        if (d.severity == Severity.Error) {
+            out.push(d.message)
+        }
+    }
+    out
+}
+
+fn hasContaining(msgs: List<string>, needle: string) -> bool {
+    for (m in msgs) {
+        if (containsStr(m, needle)) {
+            return true
+        }
+    }
+    false
+}
+
+// `{` opens an interpolation, so a block brace in a source snippet has to be
+// assembled from a char code.
+fn obrace() -> string {
+    "{(123 as char)}"
+}
+
+fn cbrace() -> string {
+    "{(125 as char)}"
+}
+
+test fn sizeof_scalars_match_target_layout() {
+    expect(sizeof(bool)).toBe(1)
+    expect(sizeof(byte)).toBe(1)
+    expect(sizeof(char)).toBe(4)
+    expect(sizeof(int)).toBe(8)
+    expect(sizeof(float)).toBe(8)
+}
+
+test fn sizeof_handles_are_pointer_sized() {
+    expect(sizeof(string)).toBe(8)
+    expect(sizeof(List<int>)).toBe(8)
+    expect(sizeof(Map<string, int>)).toBe(8)
+    expect(sizeof(int?)).toBe(8)
+}
+
+test fn sizeof_user_types_are_handles() {
+    expect(sizeof(Box)).toBe(8)
+    expect(sizeof((int, int))).toBe(8)
+}
+
+test fn sizeof_follows_aliases() {
+    expect(sizeof(UserId)).toBe(8)
+    expect(sizeof(Name)).toBe(8)
+}
+
+test fn sizeof_is_a_constant_expression() {
+    let n = sizeof(int) * 2
+    expect(n).toBe(16)
+}
+
+test fn sizeof_unknown_type_reports() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("fn main() " + ob + "\n let n = sizeof(Nope) \n " + cb)
+    expect(hasContaining(msgs, "unknown type `Nope`")).toBe(true)
+}
+
+test fn sizeof_type_variable_reports() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("fn f<T>(x: T) " + ob + "\n let n = sizeof(T) \n " + cb)
+    expect(hasContaining(msgs, "`sizeof` needs a sized type here")).toBe(true)
+}
+
+test fn typeof_scalars() {
+    expect(typeof(true)).toBe("bool")
+    expect(typeof(1)).toBe("int")
+    expect(typeof(1.5)).toBe("float")
+    expect(typeof("x")).toBe("string")
+}
+
+test fn typeof_composites() {
+    expect(typeof([1, 2])).toBe("List<int>")
+    expect(typeof((1, 2))).toBe("(int, int)")
+    let m = Map<string, int>()
+    expect(typeof(m)).toBe("Map<string, int>")
+    let o: int? = none
+    expect(typeof(o)).toBe("int?")
+}
+
+test fn typeof_is_transparent_for_aliases() {
+    let id: UserId = 3
+    expect(typeof(id)).toBe("int")
+}
+
+test fn typeof_arity_reports() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("fn main() " + ob + "\n let s = typeof(1, 2) \n " + cb)
+    expect(hasContaining(msgs, "`typeof(x)` takes exactly one argument")).toBe(true)
+}
+
+test fn memcpy_copies_bytes() {
+    unsafe {
+        let src = alloc(int, 2)
+        let dst = alloc(int, 2)
+        src[0] = 42
+        src[1] = 7
+        dst[0] = 0
+        dst[1] = 0
+        memcpy(dst, src, 2 * sizeof(int))
+        expect(dst[0]).toBe(42)
+        expect(dst[1]).toBe(7)
+        free(src)
+        free(dst)
+    }
+}
+
+test fn memset_zeroes_bytes() {
+    unsafe {
+        let p = alloc(int, 1)
+        p[0] = 12345
+        memset(p, 0, sizeof(int))
+        expect(p[0]).toBe(0)
+        free(p)
+    }
+}
+
+test fn memcpy_requires_unsafe() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("fn f(p: *int, q: *int) " + ob + "\n memcpy(p, q, 8) \n " + cb)
+    expect(hasContaining(msgs, "may only be used inside an `unsafe` block")).toBe(true)
+}
+
+test fn memcpy_rejects_non_pointer_destination() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("fn f() " + ob + "\n unsafe " + ob + "\n memcpy(1, 2, 8) \n " + cb + " \n " + cb)
+    expect(hasContaining(msgs, "`memcpy` expects a pointer destination")).toBe(true)
+}
+
+test fn memcpy_arity_reports() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("fn f(p: *int) " + ob + "\n unsafe " + ob + "\n memcpy(p, p) \n " + cb + " \n " + cb)
+    expect(hasContaining(msgs, "`memcpy(dst, src, n)` takes three arguments")).toBe(true)
+}

@@ -1804,6 +1804,24 @@ fn parseCallArgsInternal(pa: Parser) -> List<CallArg> {
 }
 
 
+fn parseSizeOf(pa: Parser) -> Expr {
+        let start = span(pa)
+        bump(pa)
+        expect(pa, Tok.LParen)
+        if (pa.failed) {
+            return dummyExpr()
+        }
+        let ty = parseType(pa)
+        if (pa.failed) {
+            return dummyExpr()
+        }
+        expect(pa, Tok.RParen)
+        if (pa.failed) {
+            return dummyExpr()
+        }
+        Expr(start.to(prevSpan(pa)), ExprKind.SizeOf(ty))
+}
+
 fn parsePrimary(pa: Parser) -> Expr {
         let start = span(pa)
         let k = kind(pa)
@@ -1885,7 +1903,13 @@ fn parsePrimary(pa: Parser) -> Expr {
                     Expr(start.to(prevSpan(pa)), ExprKind.Ident("async"))
                 }
             }
-            case Tok.Ident(_) -> {
+            case Tok.Ident(name) -> {
+                // `sizeof(T)` takes a type, not an expression: `List<int>`,
+                // `int?`, and `(int, int)` are not parseable as call arguments.
+                // Special-cased here, the way `as`/`is` casts carry a type.
+                if (name == "sizeof" && peekAt(pa, 1) == Tok.LParen) {
+                    return parseSizeOf(pa)
+                }
                 let flavor = genericCallFlavor(pa)
                 var isGeneric = false
                 match (flavor) {
@@ -1895,11 +1919,11 @@ fn parsePrimary(pa: Parser) -> Expr {
                 if (isGeneric) {
                     return parseGenericCall(pa, start)
                 }
-                let name = expectIdent(pa, "expression")
+                let nm = expectIdent(pa, "expression")
                 if (pa.failed) {
                     return dummyExpr()
                 }
-                Expr(start.to(prevSpan(pa)), ExprKind.Ident(name))
+                Expr(start.to(prevSpan(pa)), ExprKind.Ident(nm))
             }
             case Tok.Task -> {
                 // `task { body }` — sugar for `thread_spawn(fn() { body })`,

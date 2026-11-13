@@ -3,6 +3,7 @@
 import * from compiler.ast
 import { Span, Diagnostic, DiagnosticSink } from compiler.diag
 import * from compiler.ty
+import { sizeOfTy } from compiler.target
 import { entryName } from compiler.resolvecore
 import * from compiler.resolvebag
 import * from compiler.checkbag
@@ -1217,6 +1218,7 @@ fn checkExprImpl(ck: Checker, e: Expr) -> Ty {
             case ExprKind.Binary(op, lhs, rhs) -> checkBinary(ck, e, op, lhs, rhs)
             case ExprKind.Unary(op, operand) -> checkUnary(ck, e, op, operand)
             case ExprKind.Cast(expr, ty, kind) -> checkCast(ck, e, expr, ty, kind)
+            case ExprKind.SizeOf(ty) -> checkSizeOf(ck, e, ty)
             case ExprKind.GenericCall(name, typeArgs) -> genericFnTy(ck, e, name, typeArgs)
             case _ -> Ty.Unknown
         }
@@ -1286,6 +1288,12 @@ fn checkCall(ck: Checker, e: Expr, callee: Expr, args: List<CallArg>) -> Ty {
             }
             if (bn == "alloc" || bn == "free") {
                 return checkRawBuiltin(ck, e, bn, args)
+            }
+            if ((bn == "memcpy" || bn == "memset") && !ck.resolved.fns.has(bn)) {
+                return checkRawBuiltin(ck, e, bn, args)
+            }
+            if (bn == "typeof" && !ck.resolved.fns.has(bn)) {
+                return checkTypeof(ck, e, args)
             }
             if (bn == "view") {
                 return checkView(ck, e, args)
@@ -1786,6 +1794,32 @@ fn checkView(ck: Checker, e: Expr, args: List<CallArg>) -> Ty {
         return Ty.Ptr(Ty.Int)
 }
 
+/// `sizeof(T)`: fold the target's layout width for `T` to an `int`. The
+/// resolved type is recorded at the type expression's span so the emitter can
+/// size it without a second alias pass.
+fn checkSizeOf(ck: Checker, e: Expr, ty: TypeExpr) -> Ty {
+        let t = resolvedFnTy(ck, ty, instantiatedGenerics(ck, ck.fnGenerics))
+        ck.types[spanKey(ty.span)] = t
+        if (sizeOfTy(t) < 0) {
+            err(ck, e.span, "`sizeof` needs a sized type here; `{bareName(t)}` has no raw representation")
+        }
+        Ty.Int
+}
+
+/// `typeof(x)`: a compile-time query yielding the static type of `x` as a
+/// canonical string. Transparent aliases report their underlying type.
+fn checkTypeof(ck: Checker, e: Expr, args: List<CallArg>) -> Ty {
+        if (len(args) != 1 || !isNoneStr(args[0].name) || args[0].spread) {
+            err(ck, e.span, "`typeof(x)` takes exactly one argument")
+            for (a in args) {
+                let _ = checkExpr(ck, a.value)
+            }
+            return Ty.String
+        }
+        let _ = checkExpr(ck, args[0].value)
+        Ty.String
+}
+
 fn checkRawBuiltin(ck: Checker, e: Expr, name: string, args: List<CallArg>) -> Ty {
         if (ck.unsafeDepth == 0) {
             err(ck, e.span, "`{name}` may only be used inside an `unsafe` block")
@@ -1834,6 +1868,46 @@ fn checkRawBuiltin(ck: Checker, e: Expr, name: string, args: List<CallArg>) -> T
                 err(ck, countArg.value.span, "`alloc` count must be an `int`")
             }
             return Ty.Ptr(inner)
+        }
+        // memcpy(dst, src, n) / memset(dst, value, n)
+        if (name == "memcpy" || name == "memset") {
+            if (len(args) != 3) {
+                if (name == "memcpy") {
+                    err(ck, e.span, "`memcpy(dst, src, n)` takes three arguments")
+                } else {
+                    err(ck, e.span, "`memset(dst, value, n)` takes three arguments")
+                }
+                for (a in args) {
+                    let _ = checkExpr(ck, a.value)
+                }
+                return Ty.Empty
+            }
+            let dt = checkExpr(ck, args[0].value)
+            match (dt) {
+                case Ty.Ptr(_) -> {}
+                case other -> {
+                    err(ck, args[0].value.span, "`{name}` expects a pointer destination, found `{bareName(other)}`")
+                }
+            }
+            if (name == "memcpy") {
+                let st = checkExpr(ck, args[1].value)
+                match (st) {
+                    case Ty.Ptr(_) -> {}
+                    case other -> {
+                        err(ck, args[1].value.span, "`memcpy` expects a pointer source, found `{bareName(other)}`")
+                    }
+                }
+            } else {
+                let vt = checkExpr(ck, args[1].value)
+                if (vt != Ty.Unknown && vt != Ty.Int) {
+                    err(ck, args[1].value.span, "`memset` fill value must be an `int`")
+                }
+            }
+            let nt = checkExpr(ck, args[2].value)
+            if (nt != Ty.Unknown && nt != Ty.Int) {
+                err(ck, args[2].value.span, "`{name}` byte count must be an `int`")
+            }
+            return Ty.Empty
         }
         // free(p)
         if (len(args) != 1) {
