@@ -835,6 +835,7 @@ var acc: int? = none
                 bad(em, span, "an or-pattern has no alternatives")
                 none
             }
+            case Pattern.Fields(_) -> constTemp(em, IrConst.Bool(true))
             case _ -> {
                 bad(em, span, "this match pattern is not lowered yet")
                 none
@@ -1133,6 +1134,37 @@ fn bindMatchValue(em: Emitter, p: Pattern, st: Ty, v: int, span: Span) -> bool {
                 true
             }
             case Pattern.Or(_) -> true
+            case Pattern.Fields(names) -> {
+                var cidO = classIdOf(em, st, span)
+                if (let none = cidO) {
+                    bad(em, span, "field destructuring requires a class or struct value")
+                    return false
+                }
+                var cid = 0
+                if (let some(c) = cidO) {
+                    cid = c
+                }
+                for (nm in names) {
+                    if (let some(slot) = instanceFieldIndex(em, cid, nm)) {
+                        var fty = fieldAt(em, cid, slot).ty
+                        var fvO = fieldRead(em, span, v, fty, slot)
+                        if (let none = fvO) {
+                            return false
+                        }
+                        var fv = 0
+                        if (let some(x) = fvO) {
+                            fv = x
+                        }
+                        if (!(bindPatternValue(em, Pattern.Binding(nm, none), fty, fv, span))) {
+                            return false
+                        }
+                    } else {
+                        bad(em, span, "no field `" + nm + "` on this value")
+                        return false
+                    }
+                }
+                true
+            }
         }
     }
 

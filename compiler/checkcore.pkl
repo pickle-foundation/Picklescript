@@ -769,6 +769,10 @@ fn checkForHeader(ck: Checker, header: ForHeader) {
                         }
                     }
                 }
+                match (pattern) {
+                    case Pattern.Fields(_) -> errNote(ck, sequence.span, "field destructuring is only allowed in a `let` binding", "bind a plain name in the `for` header, or destructure inside the loop body")
+                    case _ -> {}
+                }
                 bindPattern(ck, pattern, elemT, true, sequence.span)
             }
             case ForHeader.Range(init, cond, step) -> {
@@ -1084,6 +1088,25 @@ fn checkExpr(ck: Checker, e: Expr) -> Ty {
         t
 }
 
+/// The element type a list-literal entry contributes: a plain entry is its own
+/// type; a `...xs` spread contributes `xs`'s element type. Mirrors the element
+/// half of the `ExprKind::Array` arm in check.rs.
+fn checkArrayElemTy(ck: Checker, e: Expr) -> Ty {
+        match (e.kind) {
+            case ExprKind.Spread(inner) -> {
+                let lt = checkExpr(ck, inner)
+                match (lt) {
+                    case Ty.List(x) -> x
+                    case _ -> {
+                        errNote(ck, inner.span, "a spread element must be a `List`, found `{bareName(lt)}`", "spread a list into the list literal, as in `[0, ...xs]`")
+                        Ty.Unknown
+                    }
+                }
+            }
+            case _ -> checkExpr(ck, e)
+        }
+}
+
 fn checkExprImpl(ck: Checker, e: Expr) -> Ty {
         match (e.kind) {
             case ExprKind.Lit(Lit.String(parts)) -> stringTy(ck, parts)
@@ -1110,15 +1133,20 @@ fn checkExprImpl(ck: Checker, e: Expr) -> Ty {
                 if (len(parts) == 0) {
                     Ty.List(Ty.Unknown)
                 } else {
-                    let elem = checkExpr(ck, parts[0])
+                    let elem = checkArrayElemTy(ck, parts[0])
                     var i = 1
                     while (i < len(parts)) {
-                        let t = checkExpr(ck, parts[i])
+                        let t = checkArrayElemTy(ck, parts[i])
                         checkAssignable(ck, elem, t, parts[i].span, "array element")
                         i = i + 1
                     }
                     Ty.List(elem)
                 }
+            }
+            case ExprKind.Spread(inner) -> {
+                let _ = checkExpr(ck, inner)
+                err(ck, e.span, "a spread element is only allowed inside a list literal")
+                Ty.Unknown
             }
             case ExprKind.Map(pairs) -> {
                 if (len(pairs) == 0) {

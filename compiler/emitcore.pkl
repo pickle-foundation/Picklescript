@@ -489,6 +489,10 @@ fn expr1(em: Emitter, e: Expr) -> int? {
             }
             case ExprKind.Tuple(items) -> tupleLiteral(em, e, items)
             case ExprKind.Array(items) -> arrayLiteral(em, e, items)
+            case ExprKind.Spread(_) -> {
+                bad(em, e.span, "a spread element is only allowed inside a list literal")
+                none
+            }
             case ExprKind.Map(entries) -> mapLiteral(em, e, entries)
             case ExprKind.Range(_s, _e, _i) -> {
                 bad(em, e.span, "range values are not lowered yet")
@@ -10233,25 +10237,115 @@ fn arrayLiteral(em: Emitter, e: Expr, items: List<Expr>) -> int? {
             var cap = intConst(em, len(items))
             var list = externCallT1(em, "pickle_list_new", [IrTy.Int], IrTy.Ptr, [cap])
             for (it in items) {
-                var v = expr(em, it)
-                if (let some(v) = v) {
-                    var pushV = v
-                    if (!(rep.isPtr)) {
-                        var vTy = irty(em, it.span)
-                        if (let some(vTy) = vTy) {
-                            pushV = externCallT1(em, rep.boxSym, [vTy], IrTy.Ptr, [v])
+                match (it.kind) {
+                    case ExprKind.Spread(inner) -> {
+                        if (!(spreadPushList(em, list, rep, elemTy, inner, it.span))) {
+                            return none
+                        }
+                    }
+                    case _ -> {
+                        var v = expr(em, it)
+                        if (let some(v) = v) {
+                            var pushV = v
+                            if (!(rep.isPtr)) {
+                                var vTy = irty(em, it.span)
+                                if (let some(vTy) = vTy) {
+                                    pushV = externCallT1(em, rep.boxSym, [vTy], IrTy.Ptr, [v])
+                                } else {
+                                    return none
+                                }
+                            }
+                            externCallVoid(em, "pickle_list_push", [IrTy.Ptr, IrTy.Ptr], [list, pushV])
                         } else {
                             return none
                         }
                     }
-                    externCallVoid(em, "pickle_list_push", [IrTy.Ptr, IrTy.Ptr], [list, pushV])
-                } else {
-                    return none
                 }
             }
             return list
         }
         none
+    }
+
+    /// Append every element of a `...xs` spread onto an in-progress list
+    /// literal. The literal stores each element as its raw slot pointer, so a
+    /// spread can push the inner list's slots straight through once the two
+    /// element representations are known to line up. Mirrors the `...`-element
+    /// half of `array_literal` in emit.rs.
+fn spreadPushList(em: Emitter, list: int, rep: ElemRep, elemTy: Ty, inner: Expr, span: Span) -> bool {
+        var innerTy = Ty.Unknown
+        if (let some(t) = tyOf(em, inner.span)) {
+            innerTy = t
+        }
+        var innerElem = Ty.Unknown
+        var isInnerList = false
+        match (innerTy) {
+            case Ty.List(x) -> {
+                innerElem = x
+                isInnerList = true
+            }
+            case _ -> {}
+        }
+        if (!isInnerList) {
+            bad(em, span, "a spread element must be a `List`")
+            return false
+        }
+        var irepO = elemRep(em, innerElem, span)
+        if (let none = irepO) {
+            return false
+        }
+        var irep = ElemRep.ptr()
+        if (let some(re) = irepO) {
+            irep = re
+        }
+        if (!elemRepCompatible(em, irep, rep, elemTy, span)) {
+            bad(em, span, "spreading a list whose element representation differs from the literal's is not lowered yet")
+            return false
+        }
+        var spO = expr(em, inner)
+        if (let none = spO) {
+            return false
+        }
+        var spV = 0
+        if (let some(sv) = spO) {
+            spV = sv
+        }
+        var n = externCallT1(em, "pickle_list_len", [IrTy.Ptr], IrTy.Int, [spV])
+        var idxSlot = newSlot(em, IrTy.Int)
+        var lenSlot = newSlot(em, IrTy.Int)
+        var srcSlot = newSlot(em, IrTy.Ptr)
+        instr(em, IrInstr.StoreSlot(srcSlot, spV))
+        instr(em, IrInstr.StoreSlot(lenSlot, n))
+        var zero = temp(em)
+        instr(em, IrInstr.Const(zero, IrConst.Int(0)))
+        instr(em, IrInstr.StoreSlot(idxSlot, zero))
+        var condId = newBlock(em)
+        var bodyId = newBlock(em)
+        var nextId = newBlock(em)
+        var endId = newBlock(em)
+        term(em, IrTerm.Branch(condId))
+        em.cur = condId
+        var curT = load(em, idxSlot)
+        var endL = load(em, lenSlot)
+        var cmp = temp(em)
+        instr(em, IrInstr.BinOp(cmp, IrBinOp.Lt, curT, endL))
+        term(em, IrTerm.BranchIf(cmp, bodyId, endId))
+        em.cur = bodyId
+        var i2 = load(em, idxSlot)
+        var src = load(em, srcSlot)
+        var raw = externCallT1(em, "pickle_list_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [src, i2])
+        externCallVoid(em, "pickle_list_push", [IrTy.Ptr, IrTy.Ptr], [list, raw])
+        term(em, IrTerm.Branch(nextId))
+        em.cur = nextId
+        var c2 = load(em, idxSlot)
+        var one = temp(em)
+        instr(em, IrInstr.Const(one, IrConst.Int(1)))
+        var nxt = temp(em)
+        instr(em, IrInstr.BinOp(nxt, IrBinOp.Add, c2, one))
+        instr(em, IrInstr.StoreSlot(idxSlot, nxt))
+        term(em, IrTerm.Branch(condId))
+        em.cur = endId
+        true
     }
 
     /// `{ "k": v, ... }` map literal: build a `Map` by inserting each entry,
@@ -10862,7 +10956,7 @@ fn stmt1(em: Emitter, s: Stmt) -> bool {
                         }
                         true
                     }
-case Pattern.Tuple(_) -> {
+case Pattern.Tuple(_) | Pattern.Fields(_) -> {
                         if (let none = init) {
                             bad(em, span, "destructuring patterns require an initializer")
                             return false

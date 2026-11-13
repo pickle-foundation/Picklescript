@@ -1,4 +1,4 @@
-﻿﻿// checkutil - the checker utility layer carved one-way out of checkcore.
+﻿// checkutil - the checker utility layer carved one-way out of checkcore.
 // Closure by walker_scan.ps1: no member reaches the checkExpr/checkStmt spine,
 // checkcore imports the pool, and the pool imports nothing from checkcore.
 
@@ -376,6 +376,7 @@ fn patternIntroducesBinding(p: Pattern) -> bool {
             }
             any
         }
+        case Pattern.Fields(names) -> len(names) > 0
     }
 }
 
@@ -1390,6 +1391,28 @@ fn bindPattern(ck: Checker, p: Pattern, ty: Ty, mutable: bool, span: Span) {
                     bindPattern(ck, part, ty, mutable, span)
                 }
             }
+            case Pattern.Fields(names) -> {
+                var tkO = typeKey(ck, ty)
+                if (let none = tkO) {
+                    if (ty != Ty.Unknown) {
+                        errNote(ck, span, "field destructuring requires a class or struct value, found `{bareName(ty)}`", "`let \{x, y\} = obj` binds `obj`'s fields by name")
+                    }
+                } else {
+                    if (let some(tk) = tkO) {
+                        for (nm in names) {
+                            if (let some(f) = findField(ck, tk.name, nm, tk.args)) {
+                                if (f.isStatic) {
+                                    err(ck, span, "field `{nm}` is static and cannot be destructured from an instance")
+                                } else {
+                                    declare(ck, nm, subst(f.ty, tk.args), mutable)
+                                }
+                            } else {
+                                errNote(ck, span, "`{tk.name}` has no field `{nm}`", "field destructuring binds fields by their declared names")
+                            }
+                        }
+                    }
+                }
+            }
         }
 }
 
@@ -1905,6 +1928,9 @@ fn checkMatchPattern(ck: Checker, p: Pattern, st: Ty, span: Span) {
                 }
             }
             case Pattern.Literal(l) -> checkMatchLiteral(ck, l, st, span)
+            case Pattern.Fields(_) -> {
+                errNote(ck, span, "field destructuring is only allowed in a `let` binding", "`let \{x, y\} = obj` binds fields by name; a `match` arm cannot test a field pattern")
+            }
             case Pattern.Variant(path, payloads) -> {
                 if (len(path) == 1 && path[0] == "some") {
                     if (!isOption(st)) {

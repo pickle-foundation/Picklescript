@@ -1,0 +1,282 @@
+module compiler.destr_test
+
+import { checkProgram } from compiler.checkcore
+import { containsStr } from compiler.checkutil
+import { DiagnosticSink, Severity } from compiler.diag
+import { Lexer } from compiler.lexer
+import { parse } from compiler.parsercore
+import { Resolver } from compiler.resolvebag
+import { resolve } from compiler.resolvecore
+
+// ==== compile-diagnostic helpers ====
+
+/// Parse + resolve + check one source string and return its error messages.
+/// A parse failure leaves `parse` returning `none`, so only the parse
+/// diagnostics are collected.
+fn checkSource(src: string) -> List<string> {
+    let toks = Lexer(bytes(src), 0, 0, none, range(0), 0).run()
+    let diags = DiagnosticSink()
+    var out = List<string>()
+    if (let some(prog) = parse(toks, diags)) {
+        let r = Resolver(diags)
+        checkProgram(prog, resolve(r, prog), diags)
+    }
+    for (d in diags.diagnostics) {
+        if (d.severity == Severity.Error) {
+            out.push(d.message)
+        }
+    }
+    out
+}
+
+fn hasContaining(msgs: List<string>, needle: string) -> bool {
+    for (m in msgs) {
+        if (containsStr(m, needle)) {
+            return true
+        }
+    }
+    false
+}
+
+fn countContaining(msgs: List<string>, needle: string) -> int {
+    var n = 0
+    for (m in msgs) {
+        if (containsStr(m, needle)) {
+            n = n + 1
+        }
+    }
+    n
+}
+
+// Pickle has no `\"` escape and `{` opens an interpolation, so a source
+// snippet containing a quote or a brace is assembled from chars.
+fn quote() -> string {
+    "{(34 as char)}"
+}
+
+fn obrace() -> string {
+    "{(123 as char)}"
+}
+
+fn cbrace() -> string {
+    "{(125 as char)}"
+}
+
+// ==== runtime fixtures ====
+
+class Point {
+    var x: int
+    var y: int
+
+    constructor(x: int, y: int) {
+        this.x = x
+        this.y = y
+    }
+}
+
+struct Vec2 {
+    x: int
+    y: int
+}
+
+class Crate<T> {
+    var value: T
+}
+
+// ==== field destructuring: runtime ====
+
+test fn field_destructuring_binds_class_fields() {
+    let {x, y} = Point(3, 4)
+    expect(x).toBe(3)
+    expect(y).toBe(4)
+}
+
+test fn field_destructuring_binds_a_subset() {
+    let {y} = Point(3, 4)
+    expect(y).toBe(4)
+}
+
+test fn field_destructuring_allows_a_trailing_comma() {
+    let {x, y,} = Point(5, 6)
+    expect(x + y).toBe(11)
+}
+
+test fn field_destructuring_empty_binding_is_allowed() {
+    let {} = Point(1, 2)
+    expect(1).toBe(1)
+}
+
+test fn field_destructuring_on_a_struct() {
+    let {x, y} = Vec2(7, 8)
+    expect(x).toBe(7)
+    expect(y).toBe(8)
+}
+
+test fn field_destructuring_of_a_generic_class() {
+    let {value} = Crate<int>(9)
+    expect(value).toBe(9)
+}
+
+test fn field_destructuring_with_var_is_mutable() {
+    var {x, y} = Point(1, 2)
+    x = 10
+    expect(x).toBe(10)
+    expect(y).toBe(2)
+}
+
+test fn field_destructuring_reads_a_pointer_field() {
+    let {value} = Crate<string>("hello")
+    expect(value).toBe("hello")
+}
+
+test fn field_destructuring_inside_a_function() {
+    let sum = fieldSum(Point(2, 5))
+    expect(sum).toBe(7)
+}
+
+fn fieldSum(p: Point) -> int {
+    let {x, y} = p
+    x + y
+}
+
+// ==== list spread: runtime ====
+
+test fn list_spread_in_the_middle() {
+    let xs = [1, 2]
+    let ys = [0, ...xs, 3]
+    expect(len(ys)).toBe(4)
+    expect(ys[0]).toBe(0)
+    expect(ys[1]).toBe(1)
+    expect(ys[2]).toBe(2)
+    expect(ys[3]).toBe(3)
+}
+
+test fn list_spread_only_element() {
+    let xs = [1, 2, 3]
+    let ys = [...xs]
+    expect(len(ys)).toBe(3)
+    expect(ys[2]).toBe(3)
+}
+
+test fn list_spread_of_an_empty_list() {
+    let xs = List<int>()
+    let ys = [1, ...xs, 2]
+    expect(len(ys)).toBe(2)
+    expect(ys[0]).toBe(1)
+    expect(ys[1]).toBe(2)
+}
+
+test fn list_spread_of_strings() {
+    let xs = ["a", "b"]
+    let ys = [...xs, "c"]
+    expect(len(ys)).toBe(3)
+    expect(ys[0]).toBe("a")
+    expect(ys[2]).toBe("c")
+}
+
+test fn list_spread_of_floats() {
+    let xs = [1.5, 2.5]
+    let ys = [...xs]
+    expect(len(ys)).toBe(2)
+    expect(ys[1]).toBe(2.5)
+}
+
+test fn list_spread_of_several_lists() {
+    let a = [1]
+    let b = [2, 3]
+    let ys = [...a, ...b, 4]
+    expect(len(ys)).toBe(4)
+    expect(ys[0]).toBe(1)
+    expect(ys[3]).toBe(4)
+}
+
+test fn list_spread_of_a_spread_result() {
+    let xs = [1, 2]
+    let ys = [...[...xs, 3], 4]
+    expect(len(ys)).toBe(4)
+    expect(ys[2]).toBe(3)
+    expect(ys[3]).toBe(4)
+}
+
+test fn list_spread_does_not_share_the_source() {
+    let xs = [1, 2]
+    let ys = [...xs]
+    ys.push(99)
+    expect(len(xs)).toBe(2)
+    expect(len(ys)).toBe(3)
+}
+
+test fn list_spread_into_a_binding_annotated_as_list() {
+    let xs = [1, 2]
+    let ys: List<int> = [...xs]
+    expect(len(ys)).toBe(2)
+}
+
+test fn list_spread_inside_a_nested_list() {
+    let xs = [1, 2]
+    let ys = [[...xs], [3]]
+    expect(len(ys)).toBe(2)
+    expect(len(ys[0])).toBe(2)
+}
+
+// ==== field destructuring: diagnostics ====
+
+test fn unknown_field_reports() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("class P " + ob + "\n var x: int \n constructor() " + ob + "\n this.x = 0 \n " + cb + " \n " + cb + "\nfn main() " + ob + "\n let " + ob + "z" + cb + " = P() \n " + cb)
+    expect(hasContaining(msgs, "has no field `z`")).toBe(true)
+}
+
+test fn non_class_scrutinee_reports() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("fn main() " + ob + "\n let " + ob + "x" + cb + " = 5 \n " + cb)
+    expect(hasContaining(msgs, "field destructuring requires a class or struct value")).toBe(true)
+}
+
+test fn static_field_destructuring_reports() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("class S " + ob + "\n static var count: int = 0 \n var x: int \n constructor() " + ob + "\n this.x = 0 \n " + cb + " \n " + cb + "\nfn main() " + ob + "\n let " + ob + "count" + cb + " = S() \n " + cb)
+    expect(hasContaining(msgs, "is static and cannot be destructured")).toBe(true)
+}
+
+test fn match_arm_rejects_field_destructuring() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("class P " + ob + "\n var x: int \n constructor() " + ob + "\n this.x = 0 \n " + cb + " \n " + cb + "\nfn main() " + ob + "\n let p = P() \n let n = match (p) " + ob + "\n case " + ob + "x" + cb + " -> 1 \n case _ -> 0 \n " + cb + " \n " + cb)
+    expect(hasContaining(msgs, "only allowed in a `let` binding")).toBe(true)
+}
+
+test fn for_header_rejects_field_destructuring() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("class P " + ob + "\n var x: int \n constructor() " + ob + "\n this.x = 0 \n " + cb + " \n " + cb + "\nfn main() " + ob + "\n let ps = [P()] \n for (" + ob + "x" + cb + " in ps) " + ob + "\n " + cb + " \n " + cb)
+    expect(hasContaining(msgs, "only allowed in a `let` binding")).toBe(true)
+}
+
+// ==== list spread: diagnostics ====
+
+test fn spread_of_a_non_list_reports() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("fn main() " + ob + "\n let xs = [...5] \n " + cb)
+    expect(hasContaining(msgs, "a spread element must be a `List`")).toBe(true)
+}
+
+test fn spread_element_type_mismatch_reports() {
+    let ob = obrace()
+    let cb = cbrace()
+    let q = quote()
+    let msgs = checkSource("fn main() " + ob + "\n let xs = [1, ...[" + q + "a" + q + "]] \n " + cb)
+    expect(hasContaining(msgs, "array element")).toBe(true)
+}
+
+test fn spread_alone_of_a_non_list_reports() {
+    let ob = obrace()
+    let cb = cbrace()
+    let q = quote()
+    let msgs = checkSource("fn main() " + ob + "\n let xs = [..." + q + "ab" + q + "] \n " + cb)
+    expect(countContaining(msgs, "a spread element must be a `List`")).toBe(1)
+}

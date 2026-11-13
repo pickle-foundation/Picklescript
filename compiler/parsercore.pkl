@@ -1514,6 +1514,31 @@ fn parsePatternInner(pa: Parser) -> Pattern {
                     Pattern.Tuple(parts)
                 }
             }
+            case Tok.LBrace -> {
+                bump(pa)
+                let names = List<string>()
+                if (!at(pa, Tok.RBrace)) {
+                    while (true) {
+                        names.push(expectIdent(pa, "field name"))
+                        if (pa.failed) {
+                            return Pattern.Wildcard
+                        }
+                        if (eat(pa, Tok.Comma)) {
+                            continuationAfter(pa, Tok.Comma)
+                            if (at(pa, Tok.RBrace)) {
+                                break
+                            }
+                        } else {
+                            break
+                        }
+                    }
+                }
+                expect(pa, Tok.RBrace)
+                if (pa.failed) {
+                    return Pattern.Wildcard
+                }
+                Pattern.Fields(names)
+            }
             case _ -> {
                 let isName = isIdentTok(k) || isSomeStr(contextualIdent(k))
                 if (isName) {
@@ -1974,7 +1999,16 @@ fn parsePrimary(pa: Parser) -> Expr {
                     let elems = List<Expr>()
                     if (!at(pa, Tok.RBracket)) {
                         while (true) {
-                            elems.push(parseExpr(pa))
+                            let estart = span(pa)
+                            if (eat(pa, Tok.Ellipsis)) {
+                                let inner = parseExpr(pa)
+                                if (pa.failed) {
+                                    return dummyExpr()
+                                }
+                                elems.push(Expr(estart.to(inner.span), ExprKind.Spread(inner)))
+                            } else {
+                                elems.push(parseExpr(pa))
+                            }
                             if (pa.failed) {
                                 return dummyExpr()
                             }
