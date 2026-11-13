@@ -259,18 +259,23 @@ class ResolvedProgram {
     var globals: List<FieldInfo>
     var importAliases: Map<string, List<string>>
     var modulePath: List<string>
+    /// `type Name = Ty` declarations by name. The body stays unresolved so a
+    /// use site can resolve it in its own context (and so an alias may name a
+    /// type declared later in the file).
+    var aliases: Map<string, TypeExpr>
 
-    constructor(types: Map<string, TypeTableEntry>, fns: Map<string, List<CallableInfo>>, consts: List<FieldInfo>, globals: List<FieldInfo>, importAliases: Map<string, List<string>>, modulePath: List<string>) {
+    constructor(types: Map<string, TypeTableEntry>, fns: Map<string, List<CallableInfo>>, consts: List<FieldInfo>, globals: List<FieldInfo>, importAliases: Map<string, List<string>>, modulePath: List<string>, aliases: Map<string, TypeExpr>) {
         this.types = types
         this.fns = fns
         this.consts = consts
         this.globals = globals
         this.importAliases = importAliases
         this.modulePath = modulePath
+        this.aliases = aliases
     }
 
     fn resolveTy(te: TypeExpr, generics: List<string>, diags: DiagnosticSink) -> Ty {
-        TypeCtx(diags, this.types, this.importAliases).resolveTy(te, generics)
+        TypeCtx(diags, this.types, this.importAliases, this.aliases).resolveTy(te, generics)
     }
 }
 
@@ -282,6 +287,7 @@ class Resolver {
     var globals: List<FieldInfo>
     var importAliases: Map<string, List<string>>
     var modulePath: List<string>
+    var aliases: Map<string, TypeExpr>
 
     constructor(diags: DiagnosticSink) {
         this.diags = diags
@@ -291,6 +297,7 @@ class Resolver {
         this.globals = List<FieldInfo>()
         this.importAliases = Map<string, List<string>>()
         this.modulePath = List<string>()
+        this.aliases = Map<string, TypeExpr>()
     }
 
 
@@ -336,11 +343,17 @@ class TypeCtx {
     var diags: DiagnosticSink
     var types: Map<string, TypeTableEntry>
     var importAliases: Map<string, List<string>>
+    var aliases: Map<string, TypeExpr>
+    /// Names currently being expanded, so a cycle is reported instead of
+    /// recursing forever. Empty at the top of every public `resolveTy` call.
+    var expanding: List<string>
 
-    constructor(diags: DiagnosticSink, types: Map<string, TypeTableEntry>, importAliases: Map<string, List<string>>) {
+    constructor(diags: DiagnosticSink, types: Map<string, TypeTableEntry>, importAliases: Map<string, List<string>>, aliases: Map<string, TypeExpr>) {
         this.diags = diags
         this.types = types
         this.importAliases = importAliases
+        this.aliases = aliases
+        this.expanding = List<string>()
     }
 
     fn resolveTy( te: TypeExpr, generics: List<string>) -> Ty {
@@ -417,14 +430,38 @@ class TypeCtx {
             if (this.types.has(path[0])) {
                 return this.bareType(this.types[path[0]])
             }
+            if (this.aliases.has(path[0])) {
+                return this.expandAlias(path[0], span)
+            }
         } else if (this.importAliases.has(path[0])) {
             let last = path[len(path) - 1]
             if (this.types.has(last)) {
                 return this.bareType(this.types[last])
             }
+            if (this.aliases.has(last)) {
+                return this.expandAlias(last, span)
+            }
         }
-        this.diags.emit(Diagnostic.errorAt(span, "unknown type `" + renderPath(path) + "`").withCode("E0210").note("expected a class, struct, enum, interface, or built-in type"))
+        this.diags.emit(Diagnostic.errorAt(span, "unknown type `" + renderPath(path) + "`").withCode("E0210").note("expected a class, struct, enum, interface, type alias, or built-in type"))
         Ty.Unknown
+    }
+
+    /// Expand `type Name = Ty` by resolving its body. The body is resolved in
+    /// an empty generic context: an alias is a module-level declaration, so a
+    /// `T` at the use site must not leak into it. A cycle (`type A = B` /
+    /// `type B = A`) reports once, at the use site that closed the loop.
+    fn expandAlias(name: string, span: Span) -> Ty {
+        for (e in this.expanding) {
+            if (e == name) {
+                this.diags.emit(Diagnostic.errorAt(span, "cyclic type alias `" + name + "`").withCode("E0214"))
+                return Ty.Unknown
+            }
+        }
+        this.expanding.push(name)
+        let body = this.aliases[name]
+        let t = this.resolveTy(body, List<string>())
+        this.expanding.pop()
+        t
     }
 
     fn instantiate( bare: Ty, args: List<Ty>, span: Span) -> Ty {

@@ -345,7 +345,7 @@ fn recoverToItem(pa: Parser) {
 }
 
 fn startsItem(pa: Parser) -> bool {
-        startsItemToken(kind(pa)) || isTestFnAhead(pa)
+        startsItemToken(kind(pa)) || isTestFnAhead(pa) || isAliasAhead(pa)
 }
 
 
@@ -554,6 +554,13 @@ fn parseItem(pa: Parser) -> List<Item> {
             }
             i.visibility = visibility
             kind = ItemKind.Interface(i)
+        } else if (isAliasAhead(pa)) {
+            let a = parseAlias(pa)
+            if (pa.failed) {
+                return List<Item>()
+            }
+            a.visibility = visibility
+            kind = ItemKind.Alias(a)
         } else if (k == Tok.Const) {
             let c = parseConst(pa)
             if (pa.failed) {
@@ -567,7 +574,7 @@ fn parseItem(pa: Parser) -> List<Item> {
             }
             kind = ItemKind.Global(g)
         } else {
-            errHere(pa, "expected a declaration (class, fn, struct, enum, interface, const, var), found " + describeTok(kind(pa)))
+            errHere(pa, "expected a declaration (class, fn, struct, enum, interface, type, const, var), found " + describeTok(kind(pa)))
             return List<Item>()
         }
         let span = start.to(prevSpan(pa))
@@ -1168,6 +1175,42 @@ fn parseGlobal(pa: Parser) -> GlobalDecl {
             return dummyGlobalDecl()
         }
         GlobalDecl(name, Visibility.Default, ty, value, span)
+}
+
+/// `type Name = Ty` - a transparent alias. The right-hand side goes through the
+/// same `parseType` as any annotation, so an alias may name a pointer, option,
+/// tuple, function, generic, or another alias. Generic aliases (`type Pair<T> =
+/// ...`) are rejected for now: expanding one needs type-argument substitution
+/// in the resolver, which this shape deliberately does not do.
+///
+/// `type` is contextual, not a reserved word: it introduces an alias only when
+/// it sits at item position and is followed by a name (or a `<` we then reject).
+/// Existing code that uses `type` as a field or variable name keeps parsing.
+fn parseAlias(pa: Parser) -> AliasDecl {
+        let start = span(pa)
+        bump(pa) // `type`
+        let name = expectIdent(pa, "type alias name")
+        if (pa.failed) {
+            return dummyAliasDecl()
+        }
+        if (at(pa, Tok.Lt)) {
+            errHere(pa, "generic type aliases are not supported yet")
+            return dummyAliasDecl()
+        }
+        expect(pa, Tok.Assign)
+        if (pa.failed) {
+            return dummyAliasDecl()
+        }
+        let ty = parseType(pa)
+        if (pa.failed) {
+            return dummyAliasDecl()
+        }
+        let span = start.to(prevSpan(pa))
+        expectStmtEnd(pa)
+        if (pa.failed) {
+            return dummyAliasDecl()
+        }
+        AliasDecl(name, Visibility.Default, ty, span)
 }
 
 fn parseType(pa: Parser) -> TypeExpr {

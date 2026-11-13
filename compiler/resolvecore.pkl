@@ -116,6 +116,7 @@ fn resolve(rs: Resolver, prog: Program) -> ResolvedProgram {
         var pendingConst: List<ConstDecl> = List<ConstDecl>()
     var pendingGlobal: List<GlobalDecl> = List<GlobalDecl>()
         var pendingKind: List<ItemKindDecl> = List<ItemKindDecl>()
+        var pendingAlias: List<AliasDecl> = List<AliasDecl>()
 
         for (item in prog.items) {
             var name = ""
@@ -153,6 +154,10 @@ fn resolve(rs: Resolver, prog: Program) -> ResolvedProgram {
                     name = f.name
                     kind = none
                 }
+                case ItemKind.Alias(a) -> {
+                    name = a.name
+                    kind = none
+                }
             }
             if (nmap.has(name)) {
                 let first = nmap[name]
@@ -170,9 +175,18 @@ fn resolve(rs: Resolver, prog: Program) -> ResolvedProgram {
                     case ItemKind.Test(f) -> pendingFn.push(PendingFn(f, true))
                     case ItemKind.Const(c) -> pendingConst.push(c)
                     case ItemKind.Global(g) -> pendingGlobal.push(g)
+                    case ItemKind.Alias(a) -> pendingAlias.push(a)
                     case _ -> {}
                 }
             }
+        }
+
+        // Aliases are registered before anything resolves a type: `declareFn`
+        // resolves parameter and return types, and an alias body is only
+        // resolved lazily at its use sites, so registration order inside the
+        // file does not matter.
+        for (a in pendingAlias) {
+            rs.aliases[a.name] = a.ty
         }
 
         for (p in pendingFn) {
@@ -190,7 +204,7 @@ fn resolve(rs: Resolver, prog: Program) -> ResolvedProgram {
 
         postChecks(rs)
 
-        ResolvedProgram(rs.types, rs.fns, rs.consts, rs.globals, rs.importAliases, rs.modulePath)
+        ResolvedProgram(rs.types, rs.fns, rs.consts, rs.globals, rs.importAliases, rs.modulePath, rs.aliases)
 }
 
 fn registerKindShell(rs: Resolver, k: ItemKindDecl) {
@@ -528,7 +542,7 @@ fn inferGlobalTy(rs: Resolver, value: Expr) -> Ty {
 }
 
 fn typeCtx(rs: Resolver) -> TypeCtx {
-        TypeCtx(rs.diags, rs.types, rs.importAliases)
+        TypeCtx(rs.diags, rs.types, rs.importAliases, rs.aliases)
 }
 
 fn resolveTy(rs: Resolver, te: TypeExpr, generics: List<string>) -> Ty {

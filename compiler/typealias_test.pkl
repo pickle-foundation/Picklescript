@@ -1,0 +1,158 @@
+module compiler.typealias_test
+
+import { checkProgram } from compiler.checkcore
+import { containsStr } from compiler.checkutil
+import { DiagnosticSink, Severity } from compiler.diag
+import { Lexer } from compiler.lexer
+import { parse } from compiler.parsercore
+import { Resolver } from compiler.resolvebag
+import { resolve } from compiler.resolvecore
+
+/// Parse + resolve + check one source string and return its error messages.
+/// A parse failure leaves `parse` returning `none`, so only the parse
+/// diagnostics are collected - which is what the generic-alias rejection test
+/// wants to observe.
+fn checkSource(src: string) -> List<string> {
+    let toks = Lexer(bytes(src), 0, 0, none, range(0), 0).run()
+    let diags = DiagnosticSink()
+    var out = List<string>()
+    if (let some(prog) = parse(toks, diags)) {
+        let r = Resolver(diags)
+        checkProgram(prog, resolve(r, prog), diags)
+    }
+    for (d in diags.diagnostics) {
+        if (d.severity == Severity.Error) {
+            out.push(d.message)
+        }
+    }
+    out
+}
+
+fn countContaining(msgs: List<string>, needle: string) -> int {
+    var n = 0
+    for (m in msgs) {
+        if (containsStr(m, needle)) {
+            n = n + 1
+        }
+    }
+    n
+}
+
+/// A `let x: T` annotation is resolved twice (once by `checkStmtInner` and once
+/// by `bindPattern`), so a bad annotation reports the same error twice. That is
+/// older than type aliases and not what these tests are about, so they only
+/// require the diagnostic to be present.
+fn hasContaining(msgs: List<string>, needle: string) -> bool {
+    countContaining(msgs, needle) > 0
+}
+
+// Pickle has no `\"` escape and `{` opens an interpolation, so a source snippet
+// containing a quote or a brace has to be assembled from chars.
+fn quote() -> string {
+    "{(34 as char)}"
+}
+
+fn obrace() -> string {
+    "{(123 as char)}"
+}
+
+fn cbrace() -> string {
+    "{(125 as char)}"
+}
+
+test fn primitive_alias_is_transparent() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("type UserId = int\nfn main() " + ob + "\n let a: UserId = 1 \n let b: int = a \n " + cb)
+    expect(len(msgs)).toBe(0)
+}
+
+test fn primitive_alias_still_type_checks() {
+    let ob = obrace()
+    let cb = cbrace()
+    let q = quote()
+    let msgs = checkSource("type UserId = int\nfn main() " + ob + "\n let a: UserId = " + q + "nope" + q + " \n " + cb)
+    expect(countContaining(msgs, "type mismatch in initializer")).toBe(1)
+}
+
+test fn alias_chain_expands() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("type A = int\ntype B = A\ntype C = B\nfn main() " + ob + "\n let x: C = 1 \n let y: int = x \n " + cb)
+    expect(len(msgs)).toBe(0)
+}
+
+test fn alias_declared_after_use() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("fn main() " + ob + "\n let x: Later = 1 \n " + cb + "\ntype Later = int\n")
+    expect(len(msgs)).toBe(0)
+}
+
+test fn alias_in_generic_position() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("type UserId = int\nfn main() " + ob + "\n let xs: List<UserId> = [1, 2] \n let m: Map<string, UserId> = Map<string, int>() \n " + cb)
+    expect(len(msgs)).toBe(0)
+}
+
+test fn tuple_and_option_alias() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("type Pair = (int, int)\ntype MaybeId = int?\nfn main() " + ob + "\n let p: Pair = (1, 2) \n let o: MaybeId = 3 \n let e: MaybeId = none \n " + cb)
+    expect(len(msgs)).toBe(0)
+}
+
+test fn class_field_alias() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("type Id = int\nclass Box " + ob + "\n var v: Id \n constructor(v: Id) " + ob + "\n this.v = v \n " + cb + " \n " + cb + "\nfn main() " + ob + "\n let b = Box(1) \n let n: int = b.v \n " + cb)
+    expect(len(msgs)).toBe(0)
+}
+
+test fn alias_to_user_type() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("class Foo " + ob + " \n var n: int \n constructor() " + ob + "\n this.n = 0 \n " + cb + " \n " + cb + "\ntype Bar = Foo\nfn takes(b: Bar) -> Bar => b\nfn main() " + ob + "\n let f = Foo() \n let g = takes(f) \n let n: int = g.n \n " + cb)
+    expect(len(msgs)).toBe(0)
+}
+
+test fn unknown_alias_body_reports_at_use_site() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("type Bad = Nope\nfn main() " + ob + "\n let x: Bad = 1 \n " + cb)
+    expect(hasContaining(msgs, "unknown type `Nope`")).toBe(true)
+}
+
+test fn alias_cycle_reports() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("type A = B\ntype B = A\nfn main() " + ob + "\n let x: A = 1 \n " + cb)
+    expect(hasContaining(msgs, "cyclic type alias")).toBe(true)
+}
+
+test fn self_cycle_reports() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("type A = A\nfn main() " + ob + "\n let x: A = 1 \n " + cb)
+    expect(hasContaining(msgs, "cyclic type alias")).toBe(true)
+}
+
+test fn generic_alias_is_rejected() {
+    let msgs = checkSource("type Pair<T> = List<T>\n")
+    expect(countContaining(msgs, "generic type aliases are not supported yet")).toBe(1)
+}
+
+test fn duplicate_alias_is_rejected() {
+    let msgs = checkSource("type A = int\ntype A = string\n")
+    expect(countContaining(msgs, "duplicate declaration `A`")).toBe(1)
+}
+
+test fn alias_body_does_not_capture_use_site_generics() {
+    let ob = obrace()
+    let cb = cbrace()
+    // `T` is a generic of `f`, but the alias body resolves in an empty generic
+    // context, so this is an unknown type rather than a silent `T`.
+    let msgs = checkSource("type Alias = T\nfn f<T>(x: Alias) -> int => 0\nfn main() " + ob + " \n " + cb)
+    expect(hasContaining(msgs, "unknown type `T`")).toBe(true)
+}
