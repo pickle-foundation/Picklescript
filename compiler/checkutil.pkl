@@ -622,6 +622,39 @@ fn okTypes(ck: Checker, want: Ty, got: Ty) -> bool {
             }
             case _ -> {}
         }
+        // A union target accepts a single value whose type satisfies one of
+        // its members, and a union source when every source member does. A
+        // union is never assignable to a non-union target: narrow it with
+        // `is` / `as` first.
+        match (want) {
+            case Ty.Union(ws) -> {
+                match (got) {
+                    case Ty.Union(gs) -> {
+                        for (g in gs) {
+                            var matched = false
+                            for (w in ws) {
+                                if (okTypes(ck, w, g)) {
+                                    matched = true
+                                }
+                            }
+                            if (!matched) {
+                                return false
+                            }
+                        }
+                        return true
+                    }
+                    case _ -> {
+                        for (w in ws) {
+                            if (okTypes(ck, w, got)) {
+                                return true
+                            }
+                        }
+                        return false
+                    }
+                }
+            }
+            case _ -> {}
+        }
         // none -> T?
         if (isNone(got) && isOption(want)) {
             return true
@@ -2096,6 +2129,32 @@ if (isNumeric(fromTy) && isNumeric(toTy)) {
             if (castRelated(ck, fromTy, inner)) {
                 return true
             }
+        }
+        // A union is cast-related to a target when any member is. In the other
+        // direction, any member of the union target that is related to the
+        // source makes the cast legal. This terminates: neither recursion sees
+        // the same union pair again because each strips one union layer.
+        match (fromTy) {
+            case Ty.Union(ps) -> {
+                for (p in ps) {
+                    if (castRelated(ck, p, toTy)) {
+                        return true
+                    }
+                }
+                return false
+            }
+            case _ -> {}
+        }
+        match (toTy) {
+            case Ty.Union(ps) -> {
+                for (p in ps) {
+                    if (castRelated(ck, fromTy, p)) {
+                        return true
+                    }
+                }
+                return false
+            }
+            case _ -> {}
         }
         // Same-kind structural/type relations.
         var rel = false

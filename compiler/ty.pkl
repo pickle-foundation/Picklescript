@@ -24,6 +24,12 @@ enum Ty {
     Range(of: Ty)
     Ptr(of: Ty)
     Ref(of: Ty)
+    /// A canonical union such as `int | string`. Parts are flattened (never
+    /// another union), deduplicated, and sorted by `bareName`, so two spellings
+    /// of the same union compare equal with `tyEq`. A one-part union is
+    /// collapsed to that part by `unionOf`, so this variant always holds at
+    /// least two members.
+    Union(parts: List<Ty>)
 }
 
 fn isPrimitive(t: Ty) -> bool {
@@ -93,6 +99,106 @@ fn isNever(t: Ty) -> bool {
     t == Ty.Empty
 }
 
+fn isUnion(t: Ty) -> bool {
+    match (t) {
+        case Ty.Union(_) -> true
+        case _ -> false
+    }
+}
+
+/// The members of a union, or `none` for every other type. The list is the
+/// canonical one stored in the variant (flattened, deduplicated, sorted).
+fn unionParts(t: Ty) -> List<Ty>? {
+    match (t) {
+        case Ty.Union(ps) -> ps
+        case _ -> none
+    }
+}
+
+/// Build a canonical union from `ts`: flatten nested unions, drop members that
+/// are already present, and sort by `bareName`. A single remaining member is
+/// returned as-is (never wrapped), which keeps `int | int` equal to `int`.
+fn unionOf(ts: List<Ty>) -> Ty {
+    let flat = List<Ty>()
+    for (t in ts) {
+        match (t) {
+            case Ty.Union(inner) -> {
+                for (x in inner) {
+                    if (!tyIn(flat, x)) {
+                        flat.push(x)
+                    }
+                }
+            }
+            case _ -> {
+                if (!tyIn(flat, t)) {
+                    flat.push(t)
+                }
+            }
+        }
+    }
+    if (len(flat) == 0) {
+        return Ty.Unknown
+    }
+    if (len(flat) == 1) {
+        return flat[0]
+    }
+    sortByBareName(flat)
+    Ty.Union(flat)
+}
+
+fn tyIn(ts: List<Ty>, t: Ty) -> bool {
+    for (x in ts) {
+        if (tyEq(x, t)) {
+            return true
+        }
+    }
+    false
+}
+
+/// True when `u` is a union carrying a member equal to `part`.
+fn unionHas(u: Ty, part: Ty) -> bool {
+    match (u) {
+        case Ty.Union(ps) -> tyIn(ps, part)
+        case _ -> false
+    }
+}
+
+/// Insertion-sort `ts` (in place) by `bareName`, comparing strings byte-wise so
+/// the order does not depend on locale. Distinct spellings of the same name
+/// keep their relative order (`tyIn` has already removed true duplicates).
+fn sortByBareName(ts: List<Ty>) {
+    var i = 1
+    while (i < len(ts)) {
+        let cur = ts[i]
+        let key = bareName(cur)
+        var j = i - 1
+        while (j >= 0 && tyNameLess(key, bareName(ts[j]))) {
+            ts[j + 1] = ts[j]
+            j = j - 1
+        }
+        ts[j + 1] = cur
+        i = i + 1
+    }
+}
+
+/// Byte-wise `a < b`. Local to this module because `compiler.front` (which
+/// exports `strLt`) imports `compiler.ast`, so importing it here would close a
+/// cycle through `Ty`.
+fn tyNameLess(a: string, b: string) -> bool {
+    let ab = bytes(a)
+    let bb = bytes(b)
+    var i = 0
+    while (i < len(ab) && i < len(bb)) {
+        let x = ab[i] as int
+        let y = bb[i] as int
+        if (x != y) {
+            return x < y
+        }
+        i = i + 1
+    }
+    len(ab) < len(bb)
+}
+
 fn hasVar(t: Ty) -> bool {
     match (t) {
         case Ty.Var(_) -> true
@@ -108,6 +214,7 @@ fn hasVar(t: Ty) -> bool {
         case Ty.Tuple(a) -> anyHasVar(a)
         case Ty.Map(k, v) -> hasVar(k) || hasVar(v)
         case Ty.Fn(ps, r) -> anyHasVar(ps) || hasVar(r)
+        case Ty.Union(ps) -> anyHasVar(ps)
         case _ -> false
     }
 }
@@ -138,6 +245,7 @@ fn subst(t: Ty, map: Map<string, Ty>) -> Ty {
         case Ty.Range(x) -> Ty.Range(subst(x, map))
         case Ty.Ptr(x) -> Ty.Ptr(subst(x, map))
         case Ty.Ref(x) -> Ty.Ref(subst(x, map))
+        case Ty.Union(ps) -> unionOf(substTys(ps, map))
         case other -> other
     }
 }
@@ -164,6 +272,7 @@ fn kindName(t: Ty) -> string {
         case Ty.Stream -> "stream"
         case Ty.Fn(_, _) -> "function"
         case Ty.Option(_) -> "optional"
+        case Ty.Union(_) -> "union"
         case _ -> "type"
     }
 }
@@ -177,7 +286,7 @@ fn bareName(t: Ty) -> string {
         case Ty.Float -> "float"
         case Ty.String -> "string"
         case Ty.None -> "none"
-        case Ty.Option(x) -> bareName(x) + "?"
+        case Ty.Option(x) -> optName(x) + "?"
         case Ty.Class(n, args) -> bareGeneric(n, args)
         case Ty.Struct(n, args) -> bareGeneric(n, args)
         case Ty.Enum(n, args) -> bareGeneric(n, args)
@@ -193,6 +302,16 @@ fn bareName(t: Ty) -> string {
         case Ty.Range(x) -> "Range<" + bareName(x) + ">"
         case Ty.Ptr(x) -> "*" + bareName(x)
         case Ty.Ref(x) -> "&" + bareName(x)
+        case Ty.Union(parts) -> bareJoin(parts, " | ")
+    }
+}
+
+/// Render the payload of an optional. A union payload is parenthesized so
+/// `(int | string)?` cannot be read back as `int | string?`.
+fn optName(t: Ty) -> string {
+    match (t) {
+        case Ty.Union(_) -> "(" + bareName(t) + ")"
+        case _ -> bareName(t)
     }
 }
 
@@ -377,6 +496,10 @@ fn tyEq(a: Ty, b: Ty) -> bool {
         }
         case Ty.Ref(x) -> match (b) {
             case Ty.Ref(y) -> tyEq(x, y)
+            case _ -> false
+        }
+        case Ty.Union(ps) -> match (b) {
+            case Ty.Union(qs) -> tyListEq(ps, qs)
             case _ -> false
         }
     }

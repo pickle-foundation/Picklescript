@@ -233,7 +233,163 @@ fn combineCond(em: Emitter, isAnd: bool, a: int, b: int) -> int {
         load(em, res)
     }
 
+/// Class id of a union member's tagged representation, or `none` when the
+/// member is not testable by class id (an interface, a type variable).
+fn unionMemberTag(em: Emitter, t: Ty, span: Span) -> int? {
+        match (t) {
+            case Ty.String -> 0
+            case Ty.List(_) -> 1
+            case Ty.Range(_) -> 1
+            case Ty.Map(_, _) -> 2
+            case Ty.Int -> 3
+            case Ty.Byte -> 3
+            case Ty.Float -> 4
+            case Ty.Bool -> 5
+            case Ty.Char -> 6
+            case Ty.Enum(_, _) -> 7
+            case Ty.Tuple(_) -> 8
+            case Ty.Stream -> 9
+            case Ty.Class(_, _) -> classIdOf(em, t, span)
+            case Ty.Struct(_, _) -> classIdOf(em, t, span)
+            case _ -> none
+        }
+    }
+
+/// One `pickle_class_is` / `pickle_class_implements` test for `v` against the
+/// union member `m`, as a `bool` temp.
+fn unionMemberTest(em: Emitter, span: Span, v: int, m: Ty) -> int? {
+        if (let some(iface) = ifaceOf(m)) {
+            var ifaceId = ifaceIdFor(em, iface.name, iface.args, span)
+            if (let some(id) = ifaceId) {
+                var dc = intConst(em, id)
+                return externCallT1(em, "pickle_class_implements", [IrTy.Ptr, IrTy.Int], IrTy.Bool, [v, dc])
+            }
+            return none
+        }
+        if (let some(tag) = unionMemberTag(em, m, span)) {
+            var dc = intConst(em, tag)
+            return externCallT1(em, "pickle_class_is", [IrTy.Ptr, IrTy.Int], IrTy.Bool, [v, dc])
+        }
+        none
+    }
+
+/// True when `v` is any of `parts` (short-circuiting `||`).
+fn unionAnyTest(em: Emitter, span: Span, v: int, parts: List<Ty>) -> int? {
+        var acc = -1
+        for (p in parts) {
+            if (let some(t) = unionMemberTest(em, span, v, p)) {
+                if (acc < 0) {
+                    acc = t
+                } else {
+                    acc = combineCond(em, false, acc, t)
+                }
+            } else {
+                return none
+            }
+        }
+        if (acc < 0) {
+            return boolConst(em, false)
+        }
+        acc
+    }
+
+/// `as?` from a union value: the tagged pointer is already the option payload,
+/// so a matching member passes through and a miss stores null.
+fn unionCastToOption(em: Emitter, span: Span, v: int, inner: Ty) -> int? {
+        var cond = -1
+        if (let some(parts) = unionParts(inner)) {
+            var t = unionAnyTest(em, span, v, parts)
+            if (let some(tt) = t) {
+                cond = tt
+            } else {
+                return none
+            }
+        } else {
+            var t = unionMemberTest(em, span, v, inner)
+            if (let some(tt) = t) {
+                cond = tt
+            } else {
+                return none
+            }
+        }
+        var res = newSlot(em, IrTy.Ptr)
+        var okB = newBlock(em)
+        var badB = newBlock(em)
+        var join = newBlock(em)
+        term(em, IrTerm.BranchIf(cond, okB, badB))
+        em.cur = badB
+        var n = nullTemp(em)
+        if (let none = n) {
+            return none
+        }
+        var nId = 0
+        if (let some(nn) = n) {
+            nId = nn
+        }
+        instr(em, IrInstr.StoreSlot(res, nId))
+        term(em, IrTerm.Branch(join))
+        em.cur = okB
+        instr(em, IrInstr.StoreSlot(res, v))
+        term(em, IrTerm.Branch(join))
+        em.cur = join
+        load(em, res)
+    }
+
+/// `as` from a union value to a *single* member: the class cast panics on a
+/// miss, then scalars are unboxed by `optResolve`.
+fn unionCastToMember(em: Emitter, span: Span, v: int, to: Ty) -> int? {
+        if (let some(iface) = ifaceOf(to)) {
+            var ifaceId = ifaceIdFor(em, iface.name, iface.args, span)
+            if (let some(id) = ifaceId) {
+                var dc = intConst(em, id)
+                return externCallT1(em, "pickle_iface_cast", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [v, dc])
+            }
+            return none
+        }
+        if (let some(tag) = unionMemberTag(em, to, span)) {
+            var dc = intConst(em, tag)
+            var casted = externCallT1(em, "pickle_class_cast", [IrTy.Ptr, IrTy.Int], IrTy.Ptr, [v, dc])
+            return optResolve(em, casted, to, span)
+        }
+        bad(em, span, "`" + bareName(to) + "` is not a supported union cast target")
+        none
+    }
+
+/// `as` from a union value to a union target: pass through when the runtime tag
+/// is one of the target members, otherwise trap like a failed class cast.
+fn unionCastToUnion(em: Emitter, span: Span, v: int, parts: List<Ty>) -> int? {
+        var condO = unionAnyTest(em, span, v, parts)
+        if (let none = condO) {
+            return none
+        }
+        var cond = 0
+        if (let some(c) = condO) {
+            cond = c
+        }
+        var res = newSlot(em, IrTy.Ptr)
+        var okB = newBlock(em)
+        var badB = newBlock(em)
+        var join = newBlock(em)
+        term(em, IrTerm.BranchIf(cond, okB, badB))
+        em.cur = badB
+        externCallVoid(em, "pickle_panic_no_match", List<IrTy>(), List<int>())
+        term(em, IrTerm.Branch(join))
+        em.cur = okB
+        instr(em, IrInstr.StoreSlot(res, v))
+        term(em, IrTerm.Branch(join))
+        em.cur = join
+        load(em, res)
+    }
+
 fn castToOption(em: Emitter, span: Span, v: int, src: Ty, inner: Ty) -> int? {
+        var su = src
+        if (let some(si0) = innerOption(src)) {
+            su = si0
+        }
+        if (let some(parts) = unionParts(su)) {
+            let _ = parts
+            return unionCastToOption(em, span, v, inner)
+        }
         if (let some(si) = innerOption(src)) {
             if (tyEq(si, inner)) {
                 return v
@@ -327,6 +483,19 @@ if (tyEq(src, to)) {
               if ((isFnValue(src) && to == Ty.Int) || (src == Ty.Int && isFnValue(to))) {
                   return v
               }
+        // A union value is one tagged pointer word. Casting to a union boxes a
+        // scalar source and otherwise passes the pointer through; casting from
+        // a union to a single member checks the tag (panicking on a miss) and
+        // unboxes scalars.
+        if (let some(parts) = unionParts(to)) {
+            if (isUnion(src)) {
+                return unionCastToUnion(em, span, v, parts)
+            }
+            return optionWrap(em, v, src, span)
+        }
+        if (isUnion(src)) {
+            return unionCastToMember(em, span, v, to)
+        }
         if (isNumeric(src) && isNumeric(to)) {
             if ((src == Ty.Int || src == Ty.Byte) && (to == Ty.Int || to == Ty.Byte)) {
                 return v
@@ -962,6 +1131,7 @@ fn matchScrutineeIr(em: Emitter, st: Ty) -> IrTy? {
             case Ty.Map(_, _) -> IrTy.Ptr
             case Ty.Tuple(_) -> IrTy.Ptr
             case Ty.Range(_) -> IrTy.Ptr
+            case Ty.Union(_) -> IrTy.Ptr
             case _ -> none
         }
     }

@@ -1,0 +1,392 @@
+module compiler.union_test
+
+import { checkProgram } from compiler.checkcore
+import { containsStr } from compiler.checkutil
+import { DiagnosticSink, Severity } from compiler.diag
+import { Lexer } from compiler.lexer
+import { parse } from compiler.parsercore
+import { Resolver } from compiler.resolvebag
+import { resolve } from compiler.resolvecore
+
+// ==== compile-diagnostic helpers ====
+
+/// Parse + resolve + check one source string and return its error messages.
+fn checkSource(src: string) -> List<string> {
+    let toks = Lexer(bytes(src), 0, 0, none, range(0), 0).run()
+    let diags = DiagnosticSink()
+    var out = List<string>()
+    if (let some(prog) = parse(toks, diags)) {
+        let r = Resolver(diags)
+        checkProgram(prog, resolve(r, prog), diags)
+    }
+    for (d in diags.diagnostics) {
+        if (d.severity == Severity.Error) {
+            out.push(d.message)
+        }
+    }
+    out
+}
+
+fn hasContaining(msgs: List<string>, needle: string) -> bool {
+    for (m in msgs) {
+        if (containsStr(m, needle)) {
+            return true
+        }
+    }
+    false
+}
+
+fn countContaining(msgs: List<string>, needle: string) -> int {
+    var n = 0
+    for (m in msgs) {
+        if (containsStr(m, needle)) {
+            n = n + 1
+        }
+    }
+    n
+}
+
+// Pickle has no `\"` escape and `{` opens an interpolation, so a source
+// snippet containing a brace is assembled from chars.
+fn obrace() -> string {
+    "{(123 as char)}"
+}
+
+fn cbrace() -> string {
+    "{(125 as char)}"
+}
+
+// ==== runtime fixtures ====
+
+class Animal {
+    var nm: string
+
+    constructor(nm: string) {
+        this.nm = nm
+    }
+
+    fn name() -> string {
+        return this.nm
+    }
+}
+
+class Dog extends Animal {
+    constructor() {
+        super("dog")
+    }
+}
+
+interface Named {
+    fn label() -> string
+}
+
+class Tagged implements Named {
+    var t: string
+
+    constructor(t: string) {
+        this.t = t
+    }
+
+    fn label() -> string {
+        return this.t
+    }
+}
+
+struct Pt {
+    var x: int
+    var y: int
+}
+
+enum Color {
+    Red
+    Green
+}
+
+class Holder {
+    var v: int | string
+
+    constructor(v: int | string) {
+        this.v = v
+    }
+}
+
+// ==== union helpers under test ====
+
+fn describe(v: int | string) -> string {
+    if (v is int) {
+        return "int:" + str(v as int)
+    }
+    return "str:" + (v as string)
+}
+
+fn pick(k: int) -> int | string {
+    if (k == 0) {
+        return 5
+    }
+    return "five"
+}
+
+fn animalName(a: Animal | Dog) -> string {
+    let x = a as Animal
+    return x.name()
+}
+
+fn tryInt(v: int | string) -> string {
+    if (let some(n) = v as? int) {
+        return "got:" + str(n)
+    }
+    return "miss"
+}
+
+// ==== runtime: scalars ====
+
+test fn union_holds_an_int_or_a_string() {
+    let u: int | string = 5
+    expect(u is int).toBe(true)
+    expect(u is string).toBe(false)
+    expect(u as int).toBe(5)
+    let s: int | string = "hi"
+    expect(s is string).toBe(true)
+    expect(s is int).toBe(false)
+    expect(s as string).toBe("hi")
+}
+
+test fn union_assignment_switches_the_active_member() {
+    var u: int | string = 1
+    expect(u is int).toBe(true)
+    u = 2
+    expect(u as int).toBe(2)
+}
+
+test fn union_float_member_round_trips() {
+    var w: int | float = 1
+    expect(w is int).toBe(true)
+    w = 2.5
+    expect(w is float).toBe(true)
+    expect(w as float).toBe(2.5)
+}
+
+test fn union_bool_and_char_members_round_trip() {
+    var b: bool | char = false
+    expect(b is bool).toBe(true)
+    expect(b as bool).toBe(false)
+    b = 'x'
+    expect(b is char).toBe(true)
+    expect(b as char).toBe('x')
+}
+
+// ==== runtime: parameters, returns, fields ====
+
+test fn union_parameter_dispatches_on_the_tag() {
+    expect(describe(7)).toBe("int:7")
+    expect(describe("yo")).toBe("str:yo")
+}
+
+test fn union_return_value_carries_its_member() {
+    expect(pick(0) as int).toBe(5)
+    expect(pick(1) as string).toBe("five")
+}
+
+test fn union_field_accepts_each_member() {
+    let h = Holder("x")
+    expect(h.v as string).toBe("x")
+    h.v = 3
+    expect(h.v as int).toBe(3)
+}
+
+test fn union_field_constructs_from_an_int() {
+    let h = Holder(9)
+    expect(h.v is int).toBe(true)
+    expect(h.v as int).toBe(9)
+}
+
+// ==== runtime: reference members ====
+
+test fn union_class_member_casts_to_the_ancestor() {
+    let a: Animal | Dog = Dog()
+    expect(a is Dog).toBe(true)
+    expect(animalName(a)).toBe("dog")
+}
+
+test fn union_interface_member_is_testable() {
+    let t: int | Named = Tagged("t1")
+    expect(t is Named).toBe(true)
+    expect((t as Named).label()).toBe("t1")
+}
+
+test fn union_struct_member_is_testable() {
+    let p: Pt | int = Pt(1, 2)
+    expect(p is Pt).toBe(true)
+    let q = p as Pt
+    expect(q.x + q.y).toBe(3)
+}
+
+test fn union_enum_member_is_testable() {
+    let c: Color | int = Color.Green
+    expect(c is Color).toBe(true)
+    expect(c is int).toBe(false)
+}
+
+test fn union_list_member_is_testable() {
+    let l: List<int> | int = [1, 2, 3]
+    expect(l is List<int>).toBe(true)
+    expect(len(l as List<int>)).toBe(3)
+}
+
+test fn union_map_member_is_testable() {
+    var m: Map<string, int> | bool = Map<string, int>()
+    expect(m is bool).toBe(false)
+    m = true
+    expect(m is bool).toBe(true)
+    expect(m as bool).toBe(true)
+}
+
+// ==== runtime: casts and widening ====
+
+test fn try_as_reports_a_hit_and_a_miss() {
+    expect(tryInt(9)).toBe("got:9")
+    expect(tryInt("nope")).toBe("miss")
+}
+
+test fn a_narrow_union_widens_into_a_wider_one() {
+    let narrow: int | string = 1
+    let wide: int | string | float = narrow
+    expect(wide is int).toBe(true)
+    expect(wide as int).toBe(1)
+}
+
+test fn a_union_casts_to_another_union() {
+    let wide: int | string | float = 1
+    let back = wide as (int | float)
+    expect(back is int).toBe(true)
+    expect(back as int).toBe(1)
+}
+
+test fn a_non_union_value_tests_against_a_union_target() {
+    expect(5 is (int | string)).toBe(true)
+    expect("s" is (int | string)).toBe(true)
+    expect(Dog() is (Animal | int)).toBe(true)
+}
+
+test fn an_option_of_a_union_holds_none_or_a_member() {
+    let o: (int | string)? = none
+    if (let none = o) {
+        expect(true).toBe(true)
+    }
+    let o2: (int | string)? = "z"
+    if (let some(x) = o2) {
+        expect(x as string).toBe("z")
+    }
+    expect(o is int).toBe(false)
+}
+
+// ==== diagnostics ====
+
+test fn a_union_binding_accepts_every_member() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("fn main() " + ob + "\n let a: int | string = 1 \n let b: int | string = \"s\" \n let c: int | string | float = 1.5 \n " + cb)
+    expect(len(msgs)).toBe(0)
+}
+
+test fn a_union_binding_rejects_an_unrelated_member() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("fn main() " + ob + "\n let a: int | string = 1.5 \n " + cb)
+    expect(hasContaining(msgs, "type mismatch in initializer")).toBe(true)
+}
+
+test fn a_union_argument_rejects_an_unrelated_member() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("fn take(v: int | string) -> int " + ob + "\n 1 \n " + cb + "\nfn main() " + ob + "\n take(true) \n " + cb)
+    expect(hasContaining(msgs, "type mismatch in argument")).toBe(true)
+}
+
+test fn a_union_return_rejects_an_unrelated_member() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("fn f() -> int | string " + ob + "\n return 1.5 \n " + cb)
+    expect(hasContaining(msgs, "type mismatch in return value")).toBe(true)
+}
+
+test fn a_union_value_does_not_assign_to_one_member() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("fn main() " + ob + "\n let a: int | string = 1 \n let b: int = a \n " + cb)
+    expect(hasContaining(msgs, "type mismatch in initializer")).toBe(true)
+}
+
+test fn void_cannot_be_a_union_member() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("fn main() " + ob + "\n let a: int | void = 1 \n " + cb)
+    expect(hasContaining(msgs, "invalid union member")).toBe(true)
+    expect(hasContaining(msgs, "`void` cannot be a union member")).toBe(true)
+}
+
+test fn an_option_cannot_be_a_union_member() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("fn main() " + ob + "\n let a: int | int? = 1 \n " + cb)
+    expect(hasContaining(msgs, "invalid union member")).toBe(true)
+}
+
+test fn a_function_value_cannot_be_a_union_member() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("fn main() " + ob + "\n let a: int | fn() -> int = 1 \n " + cb)
+    expect(hasContaining(msgs, "invalid union member")).toBe(true)
+}
+
+test fn an_impossible_is_test_reports() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("class A " + ob + "\n " + cb + "\nfn main() " + ob + "\n let a = A() \n let b = a is (int | string) \n " + cb)
+    expect(hasContaining(msgs, "can never succeed")).toBe(true)
+}
+
+test fn an_unrelated_union_cast_reports() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("fn main() " + ob + "\n let a: int | string = 1 \n let b = a as bool \n " + cb)
+    expect(hasContaining(msgs, "cannot cast")).toBe(true)
+}
+
+// ==== aliases and spelling ====
+
+test fn a_type_alias_may_name_a_union() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("type Num = int | float\nfn main() " + ob + "\n let a: Num = 1 \n let b: Num = 1.5 \n " + cb)
+    expect(len(msgs)).toBe(0)
+}
+
+test fn a_repeated_member_collapses_to_the_member() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("type Once = int | int\nfn main() " + ob + "\n let a: Once = 1 \n " + cb)
+    expect(len(msgs)).toBe(0)
+}
+
+test fn an_option_of_a_parenthesized_union_parses() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("fn main() " + ob + "\n let a: (int | string)? = none \n let b: (int | string)? = 3 \n let c: (int | string)? = \"s\" \n " + cb)
+    expect(len(msgs)).toBe(0)
+}
+
+test fn an_option_member_without_parens_reports() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("fn main() " + ob + "\n let a: int | string? = \"s\" \n " + cb)
+    expect(hasContaining(msgs, "`string?` cannot be a union member")).toBe(true)
+}
+
+test fn a_union_cast_target_keeps_bit_or_without_parens() {
+    let ob = obrace()
+    let cb = cbrace()
+    // `a as int | 2` is `(a as int) | 2`, not a union cast target.
+    let msgs = checkSource("fn main() " + ob + "\n let a: int | string = 1 \n let b = (a as int) | 2 \n " + cb)
+    expect(len(msgs)).toBe(0)
+}

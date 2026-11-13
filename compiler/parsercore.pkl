@@ -1242,6 +1242,31 @@ fn parseAlias(pa: Parser) -> AliasDecl {
 
 fn parseType(pa: Parser) -> TypeExpr {
         let start = span(pa)
+        let first = parseTypeSuffix(pa)
+        if (pa.failed) {
+            return dummyType()
+        }
+        if (!at(pa, Tok.Pipe)) {
+            return first
+        }
+        let parts = List<TypeExpr>()
+        parts.push(first)
+        while (eat(pa, Tok.Pipe)) {
+            let next = parseTypeSuffix(pa)
+            if (pa.failed) {
+                return dummyType()
+            }
+            parts.push(next)
+        }
+        TypeExpr(start.to(prevSpan(pa)), TypeExprKind.Union(parts))
+}
+
+/// One union member: a prefix type with any trailing `?` option markers. Kept
+/// separate from `parseType` so `|` is only consumed where a type expression
+/// is actually expected (not in a cast target, where `a as int | b` must keep
+/// the bit-or reading).
+fn parseTypeSuffix(pa: Parser) -> TypeExpr {
+        let start = span(pa)
         var ty = parseTypePrefix(pa)
         if (pa.failed) {
             return dummyType()
@@ -1259,7 +1284,7 @@ fn parseTypePrefix(pa: Parser) -> TypeExpr {
         let k = kind(pa)
         if (k == Tok.Star) {
             bump(pa)
-            let inner = parseType(pa)
+            let inner = parseTypeSuffix(pa)
             if (pa.failed) {
                 return dummyType()
             }
@@ -1267,7 +1292,7 @@ fn parseTypePrefix(pa: Parser) -> TypeExpr {
             TypeExpr(span, TypeExprKind.Pointer(inner))
         } else if (k == Tok.Amp) {
             bump(pa)
-            let inner = parseType(pa)
+            let inner = parseTypeSuffix(pa)
             if (pa.failed) {
                 return dummyType()
             }
@@ -1689,7 +1714,7 @@ fn parseBinary(pa: Parser, minPrec: int) -> Expr {
                 } else if (isAs) {
                     castKind = CastKind.As
                 }
-                let ty = parseType(pa)
+                let ty = parseTypeSuffix(pa)
                 if (pa.failed) {
                     return dummyExpr()
                 }

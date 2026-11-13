@@ -1396,6 +1396,32 @@ fn castIs(em: Emitter, e: Expr, operand: Expr, src: Ty, dst: Ty) -> int? {
         if (isNumeric(baseSrc) && isNumeric(baseDst)) {
             return boolConst(em, false)
         }
+        // `x is (A | B)`: box a scalar source (the tag lives in the object
+        // header) and test the value against every target member, short-circuit
+        // OR. An option source is already a tagged pointer, null included.
+        if (let some(parts) = unionParts(baseDst)) {
+            var seeded = vId
+            if (let none = srcOpt) {
+                var w = optionWrap(em, vId, baseSrc, e.span)
+                if (let none = w) {
+                    return none
+                }
+                if (let some(ww) = w) {
+                    seeded = ww
+                }
+            }
+            return unionAnyTest(em, e.span, seeded, parts)
+        }
+        // `x is T` where `x` is a union: one tag test for the single target.
+        if (let some(parts) = unionParts(baseSrc)) {
+            let _ = parts
+            var test = unionMemberTest(em, e.span, vId, baseDst)
+            if (let some(t) = test) {
+                return t
+            }
+            bad(em, e.span, "`" + bareName(dst) + "` is not a testable union member")
+            return none
+        }
         var srcRef = userClassId(em, baseSrc)
         var dstRef = userClassId(em, baseDst)
         if (let some(sr) = srcRef) {
@@ -10891,15 +10917,30 @@ fn stmt1(em: Emitter, s: Stmt) -> bool {
                         if (let some(pt) = patTy) {
                             annot = pt
                         }
-                        var annOption = false
+                        var annWide = false
                         if (let some(at) = annot) {
+                            var direct = false
                             match (at.kind) {
-                                case TypeExprKind.Option(_) -> annOption = true
+                                case TypeExprKind.Option(_) -> direct = true
+                                case TypeExprKind.Union(_) -> direct = true
                                 case _ -> {}
+                            }
+                            if (direct) {
+                                annWide = true
+                            } else {
+                                // An alias may hide an option or a union
+                                // (`type V = int | string`). Resolve with a
+                                // throwaway sink: the checker already reported
+                                // anything wrong with this annotation, and a
+                                // second pass must not duplicate diagnostics.
+                                let at2 = em.resolved.resolveTy(at, em.fnGenerics, DiagnosticSink())
+                                if (isUnion(at2) || isOption(at2)) {
+                                    annWide = true
+                                }
                             }
                         }
                         var slotTy = IrTy.Ptr
-                        if (annOption) {
+                        if (annWide) {
                             slotTy = IrTy.Ptr
                         } else {
                             if (let some(i) = init) {

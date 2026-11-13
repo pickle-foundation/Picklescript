@@ -435,6 +435,25 @@ class TypeCtx {
             case TypeExprKind.Pointer(inner) -> Ty.Ptr(this.resolveTy(inner, generics))
             case TypeExprKind.Ref(inner) -> Ty.Ref(this.resolveTy(inner, generics))
             case TypeExprKind.Infer -> Ty.Unknown
+            case TypeExprKind.Union(parts) -> {
+                // Each written member is resolved on its own and then
+                // canonicalized (flatten aliases, dedupe, sort). Members
+                // without a runtime representation in a single pointer word
+                // are rejected here so the checker and emitter never see them.
+                let tys = List<Ty>()
+                for (part in parts) {
+                    let t = this.resolveTy(part, generics)
+                    if (unionMemberOk(t)) {
+                        tys.push(t)
+                    } else if (!(t == Ty.Unknown)) {
+                        this.diags.emit(Diagnostic.errorAt(part.span, "invalid union member: `" + bareName(t) + "` cannot be a union member").withCode("E0230").note("union members may be primitives, classes, structs, enums, interfaces, lists, maps, tuples, ranges, streams, or type parameters"))
+                    }
+                }
+                if (len(tys) == 0) {
+                    return Ty.Unknown
+                }
+                unionOf(tys)
+            }
         }
     }
 
@@ -705,6 +724,24 @@ fn varsOf(gs: List<string>) -> List<Ty> {
         i = i + 1
     }
     out
+}
+
+/// Whether `t` may appear as a member of a union. A union is one tagged
+/// pointer word, so each member must itself have a pointer/boxed
+/// representation: that rules out `none`, `void`, an outer option (spell it
+/// `(T | U)?` instead), raw pointers, references, function values, and an
+/// unresolved type.
+fn unionMemberOk(t: Ty) -> bool {
+    match (t) {
+        case Ty.None -> false
+        case Ty.Empty -> false
+        case Ty.Unknown -> false
+        case Ty.Option(_) -> false
+        case Ty.Ptr(_) -> false
+        case Ty.Ref(_) -> false
+        case Ty.Fn(_, _) -> false
+        case _ -> true
+    }
 }
 
 fn primitive(name: string) -> Ty? {
