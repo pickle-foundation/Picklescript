@@ -982,8 +982,16 @@ fn checkMethodBody(ck: Checker, md: MethodDecl, table: ClassTable) {
                 checkAssignable(ck, pt, dt, p.span, "default argument")
             }
         }
-        if (let some(body) = md.body) {
-            checkFnBody(ck, body)
+        if (md.isAbstract) {
+            if (!table.isAbstract) {
+                ck.diags.emit(Diagnostic.errorAt(md.span, "abstract method `" + md.name + "` cannot be declared in non-abstract class `" + table.name + "`").withCode("E0228"))
+            }
+        } else {
+            if (let some(body) = md.body) {
+                checkFnBody(ck, body)
+            } else {
+                ck.diags.emit(Diagnostic.errorAt(md.span, "non-abstract method `" + md.name + "` must have a body"))
+            }
         }
         ck.retTy = Ty.Empty
         ck.fnGenerics = List<string>()
@@ -1533,6 +1541,10 @@ fn checkCall(ck: Checker, e: Expr, callee: Expr, args: List<CallArg>) -> Ty {
                     gt.push(resolvedFnTy(ck, te, copyStrList(ck.fnGenerics)))
                 }
                 if (let some(table) = classTable(ck, gName)) {
+                    if (table.isAbstract) {
+                        ck.diags.emit(Diagnostic.errorAt(e.span, "cannot instantiate abstract class `" + gName + "`").withCode("E0229"))
+                        return Ty.Unknown
+                    }
                     if (len(gt) != len(table.generics)) {
                         err(ck, e.span, "`{gName}` takes {len(table.generics)} type argument(s), found {len(gt)}")
                         return Ty.Unknown
@@ -1607,6 +1619,10 @@ fn checkCall(ck: Checker, e: Expr, callee: Expr, args: List<CallArg>) -> Ty {
                     }
                 }
                 if (let some(c) = classTable(ck, cname)) {
+                    if (c.isAbstract) {
+                        ck.diags.emit(Diagnostic.errorAt(e.span, "cannot instantiate abstract class `" + cname + "`").withCode("E0229"))
+                        return Ty.Unknown
+                    }
                     if (let some(ctor) = c.ctor) {
                         var cps = List<Ty>()
                         for (p in ctor.params) {

@@ -1,0 +1,304 @@
+module compiler.abstract_test
+
+import { checkProgram } from compiler.checkcore
+import { containsStr } from compiler.checkutil
+import { DiagnosticSink, Severity } from compiler.diag
+import { Lexer } from compiler.lexer
+import { parse } from compiler.parsercore
+import { Resolver } from compiler.resolvebag
+import { resolve } from compiler.resolvecore
+
+// ==== compile-diagnostic helpers ====
+
+/// Parse + resolve + check one source string and return its error messages.
+fn checkSource(src: string) -> List<string> {
+    let toks = Lexer(bytes(src), 0, 0, none, range(0), 0).run()
+    let diags = DiagnosticSink()
+    var out = List<string>()
+    if (let some(prog) = parse(toks, diags)) {
+        let r = Resolver(diags)
+        checkProgram(prog, resolve(r, prog), diags)
+    }
+    for (d in diags.diagnostics) {
+        if (d.severity == Severity.Error) {
+            out.push(d.message)
+        }
+    }
+    out
+}
+
+fn hasContaining(msgs: List<string>, needle: string) -> bool {
+    for (m in msgs) {
+        if (containsStr(m, needle)) {
+            return true
+        }
+    }
+    false
+}
+
+fn countContaining(msgs: List<string>, needle: string) -> int {
+    var n = 0
+    for (m in msgs) {
+        if (containsStr(m, needle)) {
+            n = n + 1
+        }
+    }
+    n
+}
+
+// Pickle has no `\"` escape and `{` opens an interpolation, so a source
+// snippet containing a brace is assembled from chars.
+fn obrace() -> string {
+    "{(123 as char)}"
+}
+
+fn cbrace() -> string {
+    "{(125 as char)}"
+}
+
+// ==== runtime fixtures ====
+
+abstract class Shape {
+    abstract fn area() -> int
+
+    fn doubleArea() -> int {
+        return this.area() * 2
+    }
+}
+
+class Square extends Shape {
+    var side: int
+
+    constructor(side: int) {
+        this.side = side
+    }
+
+    override fn area() -> int {
+        return this.side * this.side
+    }
+}
+
+class Rect extends Shape {
+    var w: int
+    var h: int
+
+    constructor(w: int, h: int) {
+        this.w = w
+        this.h = h
+    }
+
+    override fn area() -> int {
+        return this.w * this.h
+    }
+}
+
+final class Sealed {
+    var v: int
+
+    constructor(v: int) {
+        this.v = v
+    }
+}
+
+class WithFinalMethod {
+    final fn magic() -> int {
+        return 7
+    }
+}
+
+abstract class Scaler {
+    abstract fn scale(k: int) -> int
+
+    abstract fn tag() -> string
+
+    fn twice(k: int) -> int {
+        return this.scale(this.scale(k))
+    }
+}
+
+class Doubler extends Scaler {
+    var factor: int
+
+    constructor(factor: int) {
+        this.factor = factor
+    }
+
+    override fn scale(k: int) -> int {
+        return this.factor * k
+    }
+
+    override fn tag() -> string {
+        return "doubler"
+    }
+}
+
+// An abstract base may carry state and a constructor; a subclass forwards to
+// it through `super` exactly as it would to a concrete base.
+abstract class Named {
+    var label: string
+
+    constructor(label: string) {
+        this.label = label
+    }
+
+    abstract fn shout() -> string
+
+    fn describe() -> string {
+        return this.label + ":" + this.shout()
+    }
+}
+
+class Loud extends Named {
+    constructor(label: string) {
+        super(label)
+    }
+
+    override fn shout() -> string {
+        return "HI"
+    }
+}
+
+// `abstract` and `final` are contextual keywords: only a modifier position
+// treats them specially, so both remain usable as ordinary names.
+class Names {
+    var final: int
+    var abstract: int
+
+    constructor() {
+        this.final = 1
+        this.abstract = 2
+    }
+}
+
+// ==== abstract dispatch: runtime ====
+
+test fn abstract_dispatch_through_a_base_binding() {
+    let s: Shape = Square(3)
+    expect(s.area()).toBe(9)
+}
+
+test fn concrete_method_on_an_abstract_base_dispatches() {
+    let r: Shape = Rect(2, 3)
+    expect(r.doubleArea()).toBe(12)
+}
+
+test fn abstract_method_with_parameters_dispatches() {
+    let d: Scaler = Doubler(2)
+    expect(d.twice(3)).toBe(12)
+    expect(d.tag()).toBe("doubler")
+}
+
+test fn abstract_methods_share_the_base_constructor() {
+    let n: Named = Loud("x")
+    expect(n.describe()).toBe("x:HI")
+}
+
+test fn abstract_dispatch_through_a_homogeneous_list() {
+    let shapes = List<Shape>()
+    shapes.push(Square(2))
+    shapes.push(Rect(2, 3))
+    expect(shapes[0].area()).toBe(4)
+    expect(shapes[1].area()).toBe(6)
+}
+
+// ==== final classes and methods: runtime ====
+
+test fn final_class_is_instantiable() {
+    expect(Sealed(5).v).toBe(5)
+}
+
+test fn final_method_is_callable() {
+    expect(WithFinalMethod().magic()).toBe(7)
+}
+
+// ==== contextual keywords ====
+
+test fn abstract_and_final_are_ordinary_field_names() {
+    let n = Names()
+    expect(n.final).toBe(1)
+    expect(n.abstract).toBe(2)
+}
+
+test fn final_is_an_ordinary_local_name() {
+    let final = 5
+    expect(final).toBe(5)
+}
+
+// ==== diagnostics ====
+
+test fn cannot_instantiate_an_abstract_class() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("abstract class A " + ob + "\n fn m() -> int => 1 \n " + cb + "\nfn main() " + ob + "\n let a = A() \n " + cb)
+    expect(hasContaining(msgs, "cannot instantiate abstract class")).toBe(true)
+}
+
+test fn extending_a_final_class_reports() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("final class A " + ob + "\n " + cb + "\nclass B extends A " + ob + "\n " + cb)
+    expect(hasContaining(msgs, "cannot extend final class")).toBe(true)
+}
+
+test fn overriding_a_final_method_reports() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("class A " + ob + "\n final fn m() -> int => 1 \n " + cb + "\nclass B extends A " + ob + "\n override fn m() -> int => 2 \n " + cb)
+    expect(hasContaining(msgs, "cannot override final method")).toBe(true)
+}
+
+test fn missing_abstract_implementation_reports() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("abstract class A " + ob + "\n abstract fn m() -> int \n " + cb + "\nclass B extends A " + ob + "\n " + cb)
+    expect(hasContaining(msgs, "does not implement inherited abstract method")).toBe(true)
+}
+
+test fn abstract_method_outside_an_abstract_class_reports() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("class A " + ob + "\n abstract fn m() -> int \n " + cb)
+    expect(hasContaining(msgs, "cannot be declared in non-abstract class")).toBe(true)
+}
+
+test fn abstract_method_with_a_body_reports() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("abstract class A " + ob + "\n abstract fn m() -> int => 1 \n " + cb)
+    expect(countContaining(msgs, "an `abstract` method cannot have a body")).toBe(1)
+}
+
+test fn abstract_and_final_on_one_method_reports() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("abstract class A " + ob + "\n abstract final fn m() -> int \n " + cb)
+    expect(hasContaining(msgs, "cannot be both `abstract` and `final`")).toBe(true)
+}
+
+test fn abstract_and_final_on_one_class_reports() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("abstract final class A " + ob + "\n " + cb)
+    expect(hasContaining(msgs, "a class cannot be both `abstract` and `final`")).toBe(true)
+}
+
+test fn final_on_a_struct_reports() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("final struct A " + ob + "\n " + cb)
+    expect(hasContaining(msgs, "is only allowed on a class or a class method")).toBe(true)
+}
+
+test fn abstract_classes_may_skip_implementation() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("abstract class A " + ob + "\n abstract fn m() -> int \n " + cb + "\nabstract class B extends A " + ob + "\n abstract fn n() -> int \n " + cb)
+    expect(len(msgs)).toBe(0)
+}
+
+test fn a_concrete_class_may_implement_every_abstract() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("abstract class A " + ob + "\n abstract fn m() -> int \n " + cb + "\nclass B extends A " + ob + "\n override fn m() -> int => 1 \n " + cb)
+    expect(len(msgs)).toBe(0)
+}

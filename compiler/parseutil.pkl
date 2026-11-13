@@ -472,7 +472,7 @@ fn dummyFnDecl() -> FnDecl {
 }
 
 fn dummyMethodDecl() -> MethodDecl {
-    MethodDecl("x", Span(0, 0), Visibility.Default, false, false, false, false, none, List<GenericParam>(), List<Param>(), none, none)
+    MethodDecl("x", Span(0, 0), Visibility.Default, false, false, false, false, none, List<GenericParam>(), List<Param>(), none, none, false, false)
 }
 
 fn dummyConstDecl() -> ConstDecl {
@@ -488,7 +488,7 @@ fn dummyAliasDecl() -> AliasDecl {
    }
 
 fn dummyClassDecl() -> ClassDecl {
-    ClassDecl("x", Span(0, 0), Visibility.Default, List<GenericParam>(), none, List<TypeExpr>(), List<ClassMember>())
+    ClassDecl("x", Span(0, 0), Visibility.Default, List<GenericParam>(), none, List<TypeExpr>(), List<ClassMember>(), false, false)
 }
 
 fn dummyEnumDecl() -> EnumDecl {
@@ -694,6 +694,74 @@ fn isTestFnAhead(pa: Parser) -> bool {
             case Tok.Ident(n) -> n == "test" && optTokIs(peekNonNl(pa, 1), Tok.Fn)
             case _ -> false
         }
+}
+
+/// Is the current token the identifier `word`? `abstract` and `final` are
+/// contextual: reserved only where a modifier can appear, so `var final: int`
+/// and `final` as a field name keep parsing as ordinary identifiers.
+fn atIdentWord(pa: Parser, word: string) -> bool {
+        match (kind(pa)) {
+            case Tok.Ident(n) -> n == word
+            case _ -> false
+        }
+}
+
+/// `abstract class` / `final class` at item position.
+fn classModifierAhead(pa: Parser, word: string) -> bool {
+        if (!atIdentWord(pa, word)) {
+            return false
+        }
+        // `abstract final class` is caught here so the pair can be reported;
+        // any other modifier run that still lands on `class` counts too.
+        var i = 1
+        while (i < 8) {
+            let k = peekAt(pa, i)
+            if (k == Tok.Class) {
+                return true
+            }
+            match (k) {
+                case Tok.Public -> {}
+                case Tok.Private -> {}
+                case Tok.Protected -> {}
+                case Tok.Ident(n) -> {
+                    if (!(n == "abstract") && !(n == "final")) {
+                        return false
+                    }
+                }
+                case _ -> { return false }
+            }
+            i = i + 1
+        }
+        false
+}
+
+/// Inside a class body: after a run of modifiers, does this still land on
+/// `fn` or `operator`? `abstract static fn m()` and `final override fn m()`
+/// both count; `abstract: int` (a field) does not.
+fn memberModifierAhead(pa: Parser) -> bool {
+        var i = 1
+        while (i < 8) {
+            let k = peekAt(pa, i)
+            if (k == Tok.Fn || k == Tok.Operator) {
+                return true
+            }
+            match (k) {
+                case Tok.Public -> {}
+                case Tok.Private -> {}
+                case Tok.Protected -> {}
+                case Tok.Static -> {}
+                case Tok.Async -> {}
+                case Tok.Override -> {}
+                case Tok.Ident(n) -> {
+                    if (!(n == "abstract") && !(n == "final")) {
+                        return false
+                    }
+                }
+                case _ -> { return false }
+            }
+            i = i + 1
+        }
+        false
 }
 
 /// `type Name = Ty` at item position. `type` stays an ordinary identifier

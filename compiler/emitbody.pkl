@@ -264,6 +264,33 @@ case FnSource.MethodTrampoline(span, target, pts, rt, branches) -> {
                     em.owner = ownerFor(em, fid, table.name)
                     buildMethodBody(em, table, md, info2)
                 }
+                case FnSource.AbstractStub(span, ret) -> {
+                    // The stub is a real function: it keeps the method's calling
+                    // convention (leading `this` for instance methods) so a call
+                    // site marshals into it exactly as it would a body, then
+                    // traps. Params are declared here, not by `declareParams`,
+                    // because the caller slot must be synthetic.
+                    if (let some(i) = em.finfo.get(fid)) {
+                        if (!i.isStatic) {
+                            em.fslots.push(IrTy.Ptr)
+                            em.fparams.push(IrParam("this", IrTy.Ptr))
+                        }
+                        for (p in i.params) {
+                            var ir = IrTy.Ptr
+                            if (let some(r0) = mapTy(em, p.ty, p.span)) {
+                                ir = r0
+                            }
+                            em.fslots.push(ir)
+                            em.fparams.push(IrParam(p.name, ir))
+                        }
+                    }
+                    var m = mapTy(em, ret, span)
+                    if (let some(r) = m) {
+                        em.fret = r
+                    }
+                    externCallVoid(em, "pickle_panic_abstract", List<IrTy>(), List<int>())
+                    term(em, IrTerm.Unreachable)
+                }
                 case FnSource.AsyncFn(f, hidden) -> {
                     var infoOpt3: CallableInfo? = none
                     if (let some(i) = em.finfo.get(fid)) {

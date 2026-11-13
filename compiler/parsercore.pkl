@@ -468,6 +468,8 @@ fn parseItem(pa: Parser) -> List<Item> {
 
         var visibility = Visibility.Default
         var isTest = false
+        var isAbstractClass = false
+        var isFinalClass = false
 
         while (true) {
             let k = kind(pa)
@@ -480,9 +482,28 @@ fn parseItem(pa: Parser) -> List<Item> {
             } else if (k == Tok.Protected) {
                 bump(pa)
                 visibility = Visibility.Protected
+            } else if (classModifierAhead(pa, "abstract")) {
+                bump(pa)
+                isAbstractClass = true
+            } else if (classModifierAhead(pa, "final")) {
+                bump(pa)
+                isFinalClass = true
             } else {
                 break
             }
+        }
+
+        if (isAbstractClass && isFinalClass) {
+            errHere(pa, "a class cannot be both `abstract` and `final`")
+            return List<Item>()
+        }
+        if (atIdentWord(pa, "abstract") || atIdentWord(pa, "final")) {
+            var w = "abstract"
+            if (atIdentWord(pa, "final")) {
+                w = "final"
+            }
+            errHere(pa, "`" + w + "` is only allowed on a class or a class method")
+            return List<Item>()
         }
 
         if (isTestFnAhead(pa)) {
@@ -520,14 +541,14 @@ fn parseItem(pa: Parser) -> List<Item> {
                 kind = ItemKind.Fn(f)
             }
         } else if (k == Tok.Class) {
-            let c = parseTypeDecl(pa, true)
+            let c = parseTypeDecl(pa, true, isAbstractClass, isFinalClass)
             if (pa.failed) {
                 return List<Item>()
             }
             c.visibility = visibility
             kind = ItemKind.Class(c)
         } else if (k == Tok.Struct) {
-            let c = parseTypeDecl(pa, false)
+            let c = parseTypeDecl(pa, false, false, false)
             if (pa.failed) {
                 return List<Item>()
             }
@@ -2508,7 +2529,7 @@ fn parseMatch(pa: Parser) -> Expr {
         Expr(span, ExprKind.Match(scrutinee, arms))
 }
 
-fn parseTypeDecl(pa: Parser, isClass: bool) -> ClassDecl {
+fn parseTypeDecl(pa: Parser, isClass: bool, isAbstract: bool, isFinal: bool) -> ClassDecl {
         let start = span(pa)
         bump(pa) // class | struct
         var what = "struct name"
@@ -2561,7 +2582,7 @@ fn parseTypeDecl(pa: Parser, isClass: bool) -> ClassDecl {
             return dummyClassDecl()
         }
         let span = start.to(prevSpan(pa))
-        ClassDecl(name, span, Visibility.Default, generics, extends, implements, members)
+        ClassDecl(name, span, Visibility.Default, generics, extends, implements, members, isAbstract, isFinal)
 }
 
 fn parseEnum(pa: Parser) -> EnumDecl {
@@ -2709,7 +2730,7 @@ fn parseInterface(pa: Parser) -> InterfaceDecl {
             }
             let k = kind(pa)
             if (k == Tok.Fn) {
-                let m = parseMethod(pa, false)
+                let m = parseMethod(pa, false, false, false)
                 if (pa.failed) {
                     return dummyInterfaceDecl()
                 }
@@ -2806,6 +2827,8 @@ fn parseClassMember(pa: Parser) -> ClassMember {
         var isOverride = false
         var isConst = false
         var isAsync = false
+        var isAbstract = false
+        var isFinal = false
 
         while (true) {
             let k = kind(pa)
@@ -2830,6 +2853,12 @@ fn parseClassMember(pa: Parser) -> ClassMember {
             } else if (k == Tok.Override) {
                 bump(pa)
                 isOverride = true
+            } else if (atIdentWord(pa, "abstract") && memberModifierAhead(pa)) {
+                bump(pa)
+                isAbstract = true
+            } else if (atIdentWord(pa, "final") && memberModifierAhead(pa)) {
+                bump(pa)
+                isFinal = true
             } else if (k == Tok.Const) {
                 bump(pa)
                 isConst = true
@@ -2906,7 +2935,7 @@ fn parseClassMember(pa: Parser) -> ClassMember {
         }
 
         if (k == Tok.Fn) {
-            var m = parseMethod(pa, isOverride)
+            var m = parseMethod(pa, isOverride, isAbstract, isFinal)
             if (pa.failed) {
                 return dummyClassMember()
             }
@@ -2917,7 +2946,7 @@ fn parseClassMember(pa: Parser) -> ClassMember {
         }
 
         if (k == Tok.Operator && isOperatorSymbol(peekAt(pa, 1))) {
-            let opm = parseOperatorMethod(pa, start, isOverride)
+            let opm = parseOperatorMethod(pa, start, isOverride, isAbstract, isFinal)
             if (pa.failed) {
                 return dummyClassMember()
             }
@@ -3091,7 +3120,7 @@ fn parsePropertyAccessor(pa: Parser) -> PropertyAccessor {
         PropertyAccessor.Expr(dummyExpr())
 }
 
-fn parseMethod(pa: Parser, isOverride: bool) -> MethodDecl {
+fn parseMethod(pa: Parser, isOverride: bool, isAbstract: bool, isFinal: bool) -> MethodDecl {
         let start = span(pa)
         expect(pa, Tok.Fn)
         if (pa.failed) {
@@ -3118,7 +3147,17 @@ fn parseMethod(pa: Parser, isOverride: bool) -> MethodDecl {
             return dummyMethodDecl()
         }
         let span = start.to(prevSpan(pa))
-        MethodDecl(name, span, Visibility.Default, false, isOverride, false, false, none, generics, params, returnTy, body)
+        if (isAbstract && isFinal) {
+            errAt(pa, span, "a method cannot be both `abstract` and `final`")
+        }
+        var hasBody = false
+        if (let some(_) = body) {
+            hasBody = true
+        }
+        if (isAbstract && hasBody) {
+            errAt(pa, span, "an `abstract` method cannot have a body")
+        }
+        MethodDecl(name, span, Visibility.Default, false, isOverride, false, false, none, generics, params, returnTy, body, isAbstract, isFinal)
 }
 
 fn parseOptionalBody(pa: Parser) -> FnBody? {
@@ -3139,7 +3178,7 @@ fn parseOptionalBody(pa: Parser) -> FnBody? {
         none
 }
 
-fn parseOperatorMethod(pa: Parser, start: Span, isOverride: bool) -> MethodDecl {
+fn parseOperatorMethod(pa: Parser, start: Span, isOverride: bool, isAbstract: bool, isFinal: bool) -> MethodDecl {
         expect(pa, Tok.Operator)
         if (pa.failed) {
             return dummyMethodDecl()
@@ -3212,5 +3251,5 @@ fn parseOperatorMethod(pa: Parser, start: Span, isOverride: bool) -> MethodDecl 
             return dummyMethodDecl()
         }
         let span = start.to(prevSpan(pa))
-        MethodDecl(op, span, Visibility.Default, false, isOverride, false, false, op, generics, params, returnTy, body)
+        MethodDecl(op, span, Visibility.Default, false, isOverride, false, false, op, generics, params, returnTy, body, isAbstract, isFinal)
 }

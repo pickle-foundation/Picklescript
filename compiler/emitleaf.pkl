@@ -157,7 +157,7 @@ fn registerAsyncFn(em: Emitter, f: FnDecl, isTest: bool, attrs: List<Attribute>,
             htys.push(p.ty)
         }
         em.fsource[hidden] = FnSource.AsyncBody(f, htys, info.ret)
-        var hiddenInfo = CallableInfo(info.name, info.span, info.visibility, info.isAsync, info.isStatic, info.isOverride, info.isAbstract, info.operator, info.generics, List<ParamInfo>(), info.ret)
+        var hiddenInfo = CallableInfo(info.name, info.span, info.visibility, info.isAsync, info.isStatic, info.isOverride, info.isAbstract, info.isFinal, info.operator, info.generics, List<ParamInfo>(), info.ret)
         em.finfo[hidden] = hiddenInfo
         var wfid = len(em.irModule.funcs)
         em.irModule.funcsByName[f.name] = wfid
@@ -195,7 +195,7 @@ fn registerAsyncMethod(em: Emitter, cname: string, table: ClassTable, md: Method
             stem = "pkl_" + cname + "_" + md.name
         }
         var hidden = pushClassFunc(em, cname + "." + md.name + ".future", stem + suffix + "__future", FnSource.AsyncMethodBody(table, md, pty, info.ret, info.isStatic))
-        var hiddenInfo = CallableInfo(info.name, info.span, info.visibility, info.isAsync, info.isStatic, info.isOverride, info.isAbstract, info.operator, info.generics, List<ParamInfo>(), info.ret)
+        var hiddenInfo = CallableInfo(info.name, info.span, info.visibility, info.isAsync, info.isStatic, info.isOverride, info.isAbstract, info.isFinal, info.operator, info.generics, List<ParamInfo>(), info.ret)
         em.finfo[hidden] = hiddenInfo
         em.fidOwner[hidden] = cid
         if (let some(s) = map) {
@@ -778,7 +778,10 @@ fn maybeRegisterClass(em: Emitter, name: string, members: List<ClassMember>, tab
                     if (let none = md.body) {
                         noBody = true
                     }
-                    if (noBody || !(len(md.generics) == 0)) {
+                    if (!(len(md.generics) == 0)) {
+                        continue
+                    }
+                    if (noBody && !md.isAbstract) {
                         continue
                     }
                     var info: CallableInfo? = none
@@ -798,6 +801,23 @@ fn maybeRegisterClass(em: Emitter, name: string, members: List<ClassMember>, tab
                             }
                         }
                         if (skip) {
+                            continue
+                        }
+                        if (md.isAbstract) {
+                            var symbol = ""
+                            if (inf.isStatic) {
+                                symbol = "pkl_" + name + "_sm_" + md.name
+                            } else {
+                                symbol = "pkl_" + name + "_" + md.name
+                            }
+                            var mid = pushClassFunc(em, name + "." + md.name, symbol, FnSource.AbstractStub(md.span, inf.ret))
+                            em.finfo[mid] = inf
+                            var ps = List<Ty>()
+                            for (p in inf.params) {
+                                ps.push(p.ty)
+                            }
+                            em.srcParamTys[mid] = ps
+                            methodDef(em, cid, md.name, mid, inf.isStatic)
                             continue
                         }
                         if (md.isAsync) {
@@ -1625,7 +1645,7 @@ fn registerClosureClass(em: Emitter, captureCount: int, span: Span) -> int? {
             fields.push(FieldInfo(fname, Visibility.Private, false, false, false, false, Ty.Int, span))
             fl = fl + 1
         }
-        var table = ClassTable(name2, span, Visibility.Private, List<string>(), none, List<Ty>(), fields, List<CallableInfo>(), List<PropertyInfo>(), none, List<NamedCtorInfo>(), List<FieldInfo>())
+        var table = ClassTable(name2, span, Visibility.Private, List<string>(), none, List<Ty>(), fields, List<CallableInfo>(), List<PropertyInfo>(), none, List<NamedCtorInfo>(), List<FieldInfo>(), false, false)
         var cid2 = PICKLE_CLASS_USER_BASE + em.cidSalt + len(em.classes)
         em.closureTables[name2] = table
         em.classByName[name2] = cid2
@@ -2029,7 +2049,7 @@ fn registerClassInstantiation(em: Emitter, name: string, args: List<Ty>, span: S
             for (p in m.params) {
                 nps.push(ParamInfo(p.name, subst(p.ty, map), p.hasDefault, p.rest, p.span))
             }
-            stabMethods.push(CallableInfo(m.name, m.span, m.visibility, m.isAsync, m.isStatic, m.isOverride, m.isAbstract, m.operator, m.generics, nps, subst(m.ret, map)))
+            stabMethods.push(CallableInfo(m.name, m.span, m.visibility, m.isAsync, m.isStatic, m.isOverride, m.isAbstract, m.isFinal, m.operator, m.generics, nps, subst(m.ret, map)))
         }
         var stabProps = List<PropertyInfo>()
         for (p in table.properties) {
@@ -2043,7 +2063,7 @@ fn registerClassInstantiation(em: Emitter, name: string, args: List<Ty>, span: S
             }
             stabCtor = CtorInfo(c.span, c.visibility, nps2)
         }
-        var stable = ClassTable(display, table.span, table.visibility, table.generics, none, List<Ty>(), stabFields, stabMethods, stabProps, stabCtor, List<NamedCtorInfo>(), List<FieldInfo>())
+        var stable = ClassTable(display, table.span, table.visibility, table.generics, none, List<Ty>(), stabFields, stabMethods, stabProps, stabCtor, List<NamedCtorInfo>(), List<FieldInfo>(), table.isAbstract, table.isFinal)
         var ctorDecl: ConstructorDecl? = none
         for (m in ms) {
             match (m) {
@@ -2071,7 +2091,11 @@ fn registerClassInstantiation(em: Emitter, name: string, args: List<Ty>, span: S
                     if (md.isOverride || !(len(md.generics) == 0)) {
                         continue
                     }
+                    var noBody = false
                     if (let none = md.body) {
+                        noBody = true
+                    }
+                    if (noBody && !md.isAbstract) {
                         continue
                     }
                     var minfo: CallableInfo? = none
@@ -2094,6 +2118,25 @@ var m2 = seedCallableInfo()
                         }
                     }
                     if (hasDefRest) {
+                        continue
+                    }
+                    if (md.isAbstract) {
+                        var tref = "pkl_" + name + "_" + md.name + "_" + suffix
+                        if (m2.isStatic) {
+                            tref = "pkl_" + name + "_sm_" + md.name + "_" + suffix
+                        }
+                        var symbol = uniqSymbol(em, tref)
+                        var mid = pushClassFunc(em, display + "." + md.name, symbol, FnSource.AbstractStub(md.span, m2.ret))
+                        em.finfo[mid] = m2
+                        var mtys = List<Ty>()
+                        for (p in m2.params) {
+                            mtys.push(p.ty)
+                        }
+                        em.srcParamTys[mid] = mtys
+                        em.methodIds[pairKey(str(cid), md.name)] = MethodRef(mid, m2.isStatic)
+                        em.instantonSubst[mid] = map
+                        em.fidOwner[mid] = cid
+                        em.fidGenerics[mid] = table.generics
                         continue
                     }
                     if (md.isAsync) {

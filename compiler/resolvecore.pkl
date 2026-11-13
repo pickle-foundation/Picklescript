@@ -229,7 +229,7 @@ fn declareFn(rs: Resolver, f: FnDecl, isTest: bool) {
         let generics = genericsOfDecl(f.generics)
         let params = resolveParams(rs, f.params, generics)
         let ret = resolveRet(rs, f.returnTy, generics)
-        let c = CallableInfo(f.name, f.span, f.visibility, f.isAsync, true, false, false, none, generics, params, ret)
+        let c = CallableInfo(f.name, f.span, f.visibility, f.isAsync, true, false, false, false, none, generics, params, ret)
         if (rs.fns.has(f.name)) {
             rs.fns[f.name].push(c)
         } else {
@@ -664,12 +664,12 @@ fn initExprTy(rs: Resolver, e: Expr, generics: List<string>) -> Ty? {
 
 fn registerClassShell(rs: Resolver, c: ClassDecl) {
         let generics = genericsOfDecl(c.generics)
-        rs.types[c.name] = TypeTableEntry.Class(ClassTable(c.name, c.span, c.visibility, generics, none, List<Ty>(), List<FieldInfo>(), List<CallableInfo>(), List<PropertyInfo>(), none, List<NamedCtorInfo>(), List<FieldInfo>()))
+        rs.types[c.name] = TypeTableEntry.Class(ClassTable(c.name, c.span, c.visibility, generics, none, List<Ty>(), List<FieldInfo>(), List<CallableInfo>(), List<PropertyInfo>(), none, List<NamedCtorInfo>(), List<FieldInfo>(), c.isAbstract, c.isFinal))
 }
 
 fn registerStructShell(rs: Resolver, s: StructDecl) {
         let generics = genericsOfDecl(s.generics)
-        rs.types[s.name] = TypeTableEntry.Struct(ClassTable(s.name, s.span, s.visibility, generics, none, List<Ty>(), List<FieldInfo>(), List<CallableInfo>(), List<PropertyInfo>(), none, List<NamedCtorInfo>(), List<FieldInfo>()))
+        rs.types[s.name] = TypeTableEntry.Struct(ClassTable(s.name, s.span, s.visibility, generics, none, List<Ty>(), List<FieldInfo>(), List<CallableInfo>(), List<PropertyInfo>(), none, List<NamedCtorInfo>(), List<FieldInfo>(), false, false))
 }
 
 fn registerEnumShell(rs: Resolver, e: EnumDecl) {
@@ -823,7 +823,7 @@ fn resolveClassMembers(rs: Resolver, members: List<ClassMember>, generics: List<
                 case ClassMember.Method(md) -> {
                     recordMember(rs, seen, className, md.name, md.span)
                     let mg = genericsOfDecl(md.generics)
-                    methods.push(CallableInfo(md.name, md.span, md.visibility, md.isAsync, md.isStatic, md.isOverride, if (let some(_) = md.body) { false } else { true }, md.operator, mg, resolveParams(rs, md.params, generics), resolveRet(rs, md.returnTy, generics)))
+                    methods.push(CallableInfo(md.name, md.span, md.visibility, md.isAsync, md.isStatic, md.isOverride, md.isAbstract, md.isFinal, md.operator, mg, resolveParams(rs, md.params, generics), resolveRet(rs, md.returnTy, generics)))
                 }
                 case ClassMember.Constructor(cd) -> {
                     let info = CtorInfo(cd.span, cd.visibility, resolveParams(rs, cd.params, generics))
@@ -884,6 +884,21 @@ fn postChecks(rs: Resolver) {
                     checkInheritance(rs, c, parent)
                 }
             }
+            // E0227: a concrete class must implement every inherited abstract method.
+            if (!c.isAbstract) {
+                let inherited = collectInheritedAbstracts(rs, c, List<string>())
+                for (a in inherited) {
+                    var implemented = false
+                    for (m in c.methods) {
+                        if (m.name == a.name) {
+                            implemented = true
+                        }
+                    }
+                    if (!implemented) {
+                        rs.diags.emit(Diagnostic.errorAt(c.span, "class `" + c.name + "` does not implement inherited abstract method `" + a.name + "`").withCode("E0227"))
+                    }
+                }
+            }
         }
 }
 
@@ -892,6 +907,9 @@ fn checkInheritance(rs: Resolver, c: ClassTable, parent: string) {
             case some(e) -> match (e) {
                 case TypeTableEntry.Class(pclass) -> {
                     let pname = pclass.name
+                    if (pclass.isFinal) {
+                        rs.diags.emit(Diagnostic.errorAt(c.span, "class `" + c.name + "` cannot extend final class `" + pname + "`").withCode("E0225"))
+                    }
                     let parentMethods = collectMethodsRec(rs, pname, List<string>())
                     for (m in c.methods) {
                         var found: MethodSig? = none
@@ -903,6 +921,10 @@ fn checkInheritance(rs: Resolver, c: ClassTable, parent: string) {
                         if (let some(pm) = found) {
                             if (pm.isStatic != m.isStatic) {
                                 rs.diags.emit(Diagnostic.errorAt(m.span, "`" + c.name + " `" + m.name + "` is `" + (if (m.isStatic) { "static" } else { "instance" }) + "` but `" + pname + "." + pm.name + "` is an " + (if (pm.isStatic) { "static" } else { "instance" }) + " method; a redeclaration must keep the same kind").withCode("E0224"))
+                                continue
+                            }
+                            if (pm.isFinal) {
+                                rs.diags.emit(Diagnostic.errorAt(m.span, "method `" + m.name + "` cannot override final method `" + pname + "." + pm.name + "`").withCode("E0226"))
                                 continue
                             }
                         }
@@ -931,6 +953,64 @@ fn checkInheritance(rs: Resolver, c: ClassTable, parent: string) {
         }
 }
 
+/// Abstract instance methods inherited by `c` that `c` does not itself declare.
+/// Walks the parent chain; a redeclaration in a descendant (even abstract)
+/// satisfies ancestors, so we seed `seen` with `c`'s own method names and stop
+/// looking further up for any name already seen.
+fn collectInheritedAbstracts(rs: Resolver, c: ClassTable, visited: List<string>) -> List<MethodSig> {
+        var out = List<MethodSig>()
+        var seen = List<string>()
+        for (m in c.methods) {
+            seen.push(m.name)
+        }
+        var cur = ""
+        var done = true
+        if (let some(ext) = c.extends) {
+            if (let some(n) = named(ext)) {
+                cur = n
+                done = false
+            }
+        }
+        while (!done) {
+            if (anyStr(visited, cur)) {
+                done = true
+            } else {
+                visited.push(cur)
+                var parentName = ""
+                var hasParent = false
+                match (rs.types.get(cur)) {
+                    case some(e) -> match (e) {
+                        case TypeTableEntry.Class(t) -> {
+                            for (m in t.methods) {
+                                if (!m.isStatic && m.isAbstract && !anyStr(seen, m.name)) {
+                                    seen.push(m.name)
+                                    out.push(MethodSig(m.name, m.params, m.ret, m.isStatic, m.isAbstract, m.isFinal))
+                                }
+                                if (!anyStr(seen, m.name)) {
+                                    seen.push(m.name)
+                                }
+                            }
+                            if (let some(ext) = t.extends) {
+                                if (let some(n) = named(ext)) {
+                                    parentName = n
+                                    hasParent = true
+                                }
+                            }
+                        }
+                        case _ -> {}
+                    }
+                    case none -> {}
+                }
+                if (hasParent) {
+                    cur = parentName
+                } else {
+                    done = true
+                }
+            }
+        }
+        out
+}
+
 fn collectMethodsRec(rs: Resolver, cls: string, visited: List<string>) -> List<MethodSig> {
         if (anyStr(visited, cls)) {
             return List<MethodSig>()
@@ -941,7 +1021,7 @@ fn collectMethodsRec(rs: Resolver, cls: string, visited: List<string>) -> List<M
             case some(e) -> match (e) {
                 case TypeTableEntry.Class(t) -> {
                     for (m in t.methods) {
-                        out.push(MethodSig(m.name, m.params, m.ret, m.isStatic))
+                        out.push(MethodSig(m.name, m.params, m.ret, m.isStatic, m.isAbstract, m.isFinal))
                     }
                     if (let some(ext) = t.extends) {
                         if (let some(parent) = named(ext)) {
