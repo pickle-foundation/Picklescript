@@ -347,7 +347,9 @@ if (-not $rtlibCand) {
             kind = "result"; exitOnly = $false
             exe = $pklcTestAbs; argv = @($f.FullName, $rtlibAbs)
             capture = (Join-Path $g10dirAbs ("g10_" + $f.BaseName + ".txt"))
-            budget = 180
+            # Hang check, not a perf gate (see battery_lite.ps1): the 700+ test
+            # corpus has modules at >2 minutes under parallel load.
+            budget = 600
         }
     }
     $g10r = Invoke-GateShards $g10items (Join-Path $g10dirAbs "g10.spec") (Join-Path $g10dirAbs "g10res")

@@ -120,7 +120,11 @@ if ($SkipRuntime) {
             kind = "result"; exitOnly = $false
             exe = $pklcTestAbs; argv = @($f.FullName, $rtlibAbs)
             capture = (Join-Path $gdir ("lite_g10_" + $f.BaseName + ".txt"))
-            budget = 180
+            # Hang check, not a perf gate. The runtime corpus has grown past 700
+            # tests and `abi_threads_test` already measures 127s under 8 workers;
+            # 180s killed healthy `abi_map_test` runs (exit=124, passed=0). A real
+            # hang lasts forever, so 600s still catches it while leaving headroom.
+            budget = 600
         }
     }
     $g10r = Invoke-LiteShards $g10items (Join-Path $gdir "lite_g10.spec") (Join-Path $gdir "lite_g10res")
