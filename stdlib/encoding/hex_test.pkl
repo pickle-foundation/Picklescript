@@ -1,0 +1,74 @@
+module std.encoding.hex_test
+
+import { encode, encodeUpper, decode, encodeString, decodeString, isValid } from std.encoding.hex
+
+fn d(text: string) -> List<byte> {
+    match (decode(text)) {
+        case some(b) -> b
+        case none -> bytes("")
+    }
+}
+
+test fn encodes_both_cases() {
+    let raw: List<byte> = [0 as byte, 1 as byte, 15 as byte, 16 as byte, 171 as byte, 255 as byte]
+    expect(encode(raw)).toBe("00010f10abff")
+    expect(encodeUpper(raw)).toBe("00010F10ABFF")
+}
+
+test fn empty_input_and_output() {
+    expect(encode(bytes(""))).toBe("")
+    expect(decode("")).toEqual(bytes(""))
+    expect(isValid("")).toBe(true)
+}
+
+test fn decodes_either_case() {
+    let raw: List<byte> = [0 as byte, 255 as byte]
+    let mixed: List<byte> = [171 as byte, 205 as byte]
+    expect(d("00ff")).toEqual(raw)
+    expect(d("00FF")).toEqual(raw)
+    expect(d("aBcD")).toEqual(mixed)
+}
+
+test fn malformed_input_is_rejected() {
+    expect(isValid("0")).toBe(false)
+    expect(isValid("abc")).toBe(false)
+    expect(isValid("zz")).toBe(false)
+    expect(isValid("0g")).toBe(false)
+    expect(isValid("0x12")).toBe(false)
+    expect(isValid("ab cd")).toBe(false)
+}
+
+test fn round_trips_all_byte_values() {
+    let all = bytes("")
+    var v = 0
+    while (v < 256) {
+        all.push(v as byte)
+        v = v + 1
+    }
+    expect(decode(encode(all))).toEqual(all)
+    expect(decode(encodeUpper(all))).toEqual(all)
+}
+
+test fn string_conveniences() {
+    expect(encodeString("hello")).toBe("68656c6c6f")
+    match (decodeString("68656c6c6f")) {
+        case some(s) -> expect(s).toBe("hello")
+        case none -> expect(true).toBe(false)
+    }
+    match (decodeString("not hex")) {
+        case some(s) -> {
+            let _ = s
+            expect(true).toBe(false)
+        }
+        case none -> expect(true).toBe(true)
+    }
+}
+
+test fn utf8_bytes_round_trip() {
+    let eacute: List<byte> = [0xC3 as byte, 0xA9 as byte]
+    expect(encode(eacute)).toBe("c3a9")
+    match (decodeString("c3a9")) {
+        case some(s) -> expect(s).toBe(str(eacute))
+        case none -> expect(true).toBe(false)
+    }
+}

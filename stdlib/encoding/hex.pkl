@@ -1,0 +1,87 @@
+module std.encoding.hex
+
+// Hexadecimal encoding and decoding (base 16).
+//
+// `encode` emits lowercase digits; `encodeUpper` emits uppercase ones. `decode`
+// accepts either case and returns `none` for an odd number of digits or a
+// character outside `0-9a-fA-F`. `encodeString`/`decodeString` are the UTF-8
+// conveniences, and `isValid` is a `decode(...) != none` probe.
+
+import { StringBuilder } from std.text.stringbuilder
+
+const LOWER: string = "0123456789abcdef"
+const UPPER: string = "0123456789ABCDEF"
+
+/// Lowercase hex for `data`.
+fn encode(data: List<byte>) -> string {
+    encodeAlphabet(data, LOWER)
+}
+
+/// Uppercase hex for `data`.
+fn encodeUpper(data: List<byte>) -> string {
+    encodeAlphabet(data, UPPER)
+}
+
+fn encodeAlphabet(data: List<byte>, alphabet: string) -> string {
+    let sb = StringBuilder()
+    for (b in data) {
+        let v = b as int
+        sb.appendByte(alphabet[v >> 4])
+        sb.appendByte(alphabet[v % 16])
+    }
+    sb.toString()
+}
+
+/// Decode hex; `none` for odd length or a non-hex character.
+fn decode(text: string) -> List<byte>? {
+    let n = len(text)
+    if (n % 2 != 0) {
+        return none
+    }
+    let out = bytes("")
+    var i = 0
+    while (i < n) {
+        let hi = hexValue(text[i] as int)
+        let lo = hexValue(text[i + 1] as int)
+        if (hi < 0 || lo < 0) {
+            return none
+        }
+        out.push((hi * 16 + lo) as byte)
+        i = i + 2
+    }
+    out
+}
+
+fn hexValue(cp: int) -> int {
+    if (cp >= 48 && cp <= 57) {
+        return cp - 48
+    }
+    if (cp >= 97 && cp <= 102) {
+        return cp - 97 + 10
+    }
+    if (cp >= 65 && cp <= 70) {
+        return cp - 65 + 10
+    }
+    -1
+}
+
+/// `true` when `decode` accepts `text`.
+fn isValid(text: string) -> bool {
+    match (decode(text)) {
+        case some(_) -> true
+        case none -> false
+    }
+}
+
+/// Hex of the UTF-8 bytes of `text`.
+fn encodeString(text: string) -> string {
+    encode(bytes(text))
+}
+
+/// Decode hex and render the bytes as a UTF-8 string.
+fn decodeString(text: string) -> string? {
+    match (decode(text)) {
+        case some(b) -> str(b)
+        case none -> none
+    }
+}
