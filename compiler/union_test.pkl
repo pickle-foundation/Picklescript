@@ -483,6 +483,82 @@ test fn an_implicit_field_assignment_adopts_the_field_type() {
     expect(b.items[1] as string).toBe("nine")
 }
 
+// ==== runtime: nested literals, generic calls, mixed spreads ====
+
+fn grabUnion<T>(x: T) -> T {
+    x
+}
+
+fn countUnion<T>(xs: List<T>) -> int {
+    len(xs)
+}
+
+fn threeUnion(a: int | string, b: int | string, c: int | string) -> int {
+    if (a is int) {
+        return 3
+    }
+    return 0
+}
+
+test fn a_generic_call_with_an_explicit_union_argument_boxes_scalars() {
+    let u = grabUnion<int | string>(7)
+    expect(u is int).toBe(true)
+    expect(u as int).toBe(7)
+    let s = grabUnion<int | string>("s")
+    expect(s is string).toBe(true)
+    expect(s as string).toBe("s")
+}
+
+test fn an_explicit_generic_union_argument_adopts_a_container_literal() {
+    expect(countUnion<int | string>([1, "x"])).toBe(2)
+}
+
+test fn an_inferred_generic_argument_may_be_a_union() {
+    let xs: List<int | string> = [1, "x"]
+    expect(countUnion(xs)).toBe(2)
+}
+
+test fn a_nested_list_literal_adopts_the_annotation() {
+    let xss: List<List<int | string>> = [[1, "x"], [2]]
+    expect(len(xss)).toBe(2)
+    expect(xss[0][0] as int).toBe(1)
+    expect(xss[0][1] as string).toBe("x")
+    expect(xss[1][0] as int).toBe(2)
+}
+
+test fn a_nested_map_value_literal_adopts_the_annotation() {
+    let m: Map<string, List<int | string>> = {"a": [1, "x"]}
+    expect(m["a"][0] as int).toBe(1)
+    expect(m["a"][1] as string).toBe("x")
+}
+
+test fn a_list_of_map_literals_adopts_the_annotation() {
+    let ms: List<Map<string, int | string>> = [{"a": 1}, {"b": "z"}]
+    expect(ms[0]["a"] as int).toBe(1)
+    expect(ms[1]["b"] as string).toBe("z")
+}
+
+test fn a_scalar_list_spreads_into_a_union_list() {
+    let xs: List<int> = [1, 2]
+    let u: List<int | string> = [0, ...xs]
+    expect(len(u)).toBe(3)
+    expect(u[0] as int).toBe(0)
+    expect(u[1] as int).toBe(1)
+    expect(u[2] as int).toBe(2)
+}
+
+test fn a_string_list_still_spreads_into_a_union_list() {
+    let ys: List<string> = ["y"]
+    let u: List<int | string> = [1, ...ys]
+    expect(u[0] as int).toBe(1)
+    expect(u[1] as string).toBe("y")
+}
+
+test fn a_scalar_list_spreads_into_union_parameters() {
+    let xs: List<int> = [1, 2, 3]
+    expect(threeUnion(...xs)).toBe(3)
+}
+
 // ==== diagnostics ====
 
 test fn a_union_binding_accepts_every_member() {
@@ -617,6 +693,35 @@ test fn an_unannotated_literal_keeps_monomorphic_inference() {
     let cb = cbrace()
     let q = quote()
     let msgs = checkSource("fn main() " + ob + "\n let xs = [1, " + q + "x" + q + "] \n " + cb)
+    expect(hasContaining(msgs, "type mismatch in array element")).toBe(true)
+}
+
+test fn a_nested_union_literal_still_rejects_a_non_member() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("fn main() " + ob + "\n let xss: List<List<int | string>> = [[1, true]] \n " + cb)
+    expect(hasContaining(msgs, "type mismatch in array element")).toBe(true)
+}
+
+test fn a_nested_union_map_still_rejects_a_non_member() {
+    let ob = obrace()
+    let cb = cbrace()
+    let q = quote()
+    let msgs = checkSource("fn main() " + ob + "\n let m: Map<string, List<int | string>> = " + ob + q + "a" + q + ": [1, true]" + cb + " \n " + cb)
+    expect(hasContaining(msgs, "type mismatch in array element")).toBe(true)
+}
+
+test fn a_nested_non_union_literal_keeps_monomorphic_inference() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("fn main() " + ob + "\n let xss: List<List<int>> = [[1], [2.5]] \n " + cb)
+    expect(hasContaining(msgs, "type mismatch in array element")).toBe(true)
+}
+
+test fn a_spread_of_a_non_member_list_still_reports() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("fn main() " + ob + "\n let xs: List<float> = [1.5] \n let u: List<int | string> = [...xs] \n " + cb)
     expect(hasContaining(msgs, "type mismatch in array element")).toBe(true)
 }
 

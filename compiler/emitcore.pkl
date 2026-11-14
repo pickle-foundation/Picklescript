@@ -9821,6 +9821,17 @@ fn genericFnCall(em: Emitter, e: Expr, info: CallableInfo, argTys: List<Ty>, arg
                     case _ -> {}
                 }
             }
+            // A union parameter is also one pointer word: a scalar argument must
+            // be boxed into that word here, exactly as the plain call path does
+            // for its `IrTy.Ptr` parameters. Without this a generic instantiation
+            // like `grab<int | string>(7)` passed the raw integer where the callee
+            // dereferenced a pointer (access violation).
+            var isUnionParam = false
+            if (let some(sr3) = srcO) {
+                if (isUnion(sr3)) {
+                    isUnionParam = true
+                }
+            }
             var t = -1
             if (let some(tv) = borrowArg(em, srcO, a)) {
                 t = tv
@@ -9828,7 +9839,7 @@ fn genericFnCall(em: Emitter, e: Expr, info: CallableInfo, argTys: List<Ty>, arg
                 return none
             }
             var finalT = t
-            if (!isRef && isOpt) {
+            if (!isRef && (isOpt || isUnionParam)) {
                 var vt = Ty.Unknown
                 if (let some(gvt) = tyOf(em, a.value.span)) {
                     vt = gvt

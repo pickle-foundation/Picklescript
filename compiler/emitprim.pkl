@@ -333,6 +333,23 @@ fn elemRepCompatible(em: Emitter, src: ElemRep, dst: ElemRep, dstTy: Ty, span: S
                 }
                 false
             }
+            case Ty.Union(ps) -> {
+                // A union slot is one pointer word too, and a scalar member is
+                // stored there as its box (the same `pickle_box_*` the source
+                // list already holds), so a scalar source list may spread into
+                // it when some member has the same scalar representation:
+                // `let xs: List<int> = [1]; let u: List<int | string> = [...xs]`.
+                // A different scalar family (`List<float>` into `List<int | ...>`)
+                // still bails - the box would carry the wrong class id.
+                for (m in ps) {
+                    if (let some(mrep) = elemRep(em, m, span)) {
+                        if (elemRepSame(src, mrep)) {
+                            return true
+                        }
+                    }
+                }
+                false
+            }
             case _ -> false
         }
     }
