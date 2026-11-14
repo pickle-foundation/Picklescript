@@ -1174,7 +1174,7 @@ fn checkExprImpl(ck: Checker, e: Expr) -> Ty {
                 }
             }
             case ExprKind.Super -> superTy(ck, e)
-            case ExprKind.Block(b) -> checkBlock(ck, b)
+            case ExprKind.Block(b) -> checkBlockExpecting(ck, b, hint)
             case ExprKind.Tuple(parts) -> {
                 var ts = List<Ty>()
                 for (p in parts) {
@@ -1331,8 +1331,8 @@ fn checkExprImpl(ck: Checker, e: Expr) -> Ty {
                 let t = checkLambda(ck, e, params, returnTy, isAsync, body)
                 t
             }
-            case ExprKind.If(cond, thenBlock, elseExpr) -> checkIf(ck, e, cond, thenBlock, elseExpr)
-            case ExprKind.Match(scrutinee, arms) -> checkMatch(ck, e, scrutinee, arms)
+            case ExprKind.If(cond, thenBlock, elseExpr) -> checkIf(ck, e, cond, thenBlock, elseExpr, hint)
+            case ExprKind.Match(scrutinee, arms) -> checkMatch(ck, e, scrutinee, arms, hint)
             case ExprKind.Call(callee, args) -> checkCall(ck, e, callee, args)
             case ExprKind.Member(object, name) -> checkMember(ck, e, object, name)
             case ExprKind.Index(object, index) -> checkIndex(ck, e, object, index)
@@ -3222,8 +3222,74 @@ fn checkUnary(ck: Checker, e: Expr, op: UnOp, operand: Expr) -> Ty {
         }
 }
 
+/// The declared type of an assignment target, resolved quietly: no diagnostics
+/// and no checking of the target's own subexpressions. It exists only so a list
+/// or map literal on the right-hand side of `xs = [1, "x"]` can adopt the
+/// target's union element type (see `checkExprExpecting`). Anything this cannot
+/// resolve without side effects yields `Ty.Unknown`, and the literal keeps the
+/// inference it would have had before.
+fn assignTargetHint(ck: Checker, target: Expr) -> Ty {
+        match (target.kind) {
+            case ExprKind.Ident(name) -> {
+                if (let some(l) = lookup(ck, name)) {
+                    return l.ty
+                }
+                for (g in ck.resolved.globals) {
+                    if (g.name == name) {
+                        return g.ty
+                    }
+                }
+                if (let some(st) = ck.selfTy) {
+                    if (let some(tk) = typeKey(ck, st)) {
+                        if (let some(f) = findField(ck, tk.name, name, tk.args)) {
+                            return f.ty
+                        }
+                    }
+                }
+                Ty.Unknown
+            }
+            case ExprKind.Member(object, name) -> {
+                var ot = Ty.Unknown
+                match (object.kind) {
+                    case ExprKind.Ident(n) -> {
+                        // `Type.field = v` / `Type.prop = v`, else an instance
+                        // held in a local of a class type.
+                        if (let some(entry) = ck.resolved.types.get(n)) {
+                            let gname = entryName(entry)
+                            if (let some(f) = findField(ck, gname, name, Map<string, Ty>())) {
+                                return f.ty
+                            }
+                            if (let some(p) = findProperty(ck, gname, name)) {
+                                return p.ty
+                            }
+                        }
+                        if (let some(l) = lookup(ck, n)) {
+                            ot = l.ty
+                        }
+                    }
+                    case ExprKind.This -> {
+                        if (let some(st) = ck.selfTy) {
+                            ot = st
+                        }
+                    }
+                    case _ -> {}
+                }
+                if (let some(tk) = typeKey(ck, ot)) {
+                    if (let some(f) = findField(ck, tk.name, name, tk.args)) {
+                        return f.ty
+                    }
+                    if (let some(p) = findProperty(ck, tk.name, name)) {
+                        return subst(p.ty, tk.args)
+                    }
+                }
+                Ty.Unknown
+            }
+            case _ -> Ty.Unknown
+        }
+}
+
 fn checkAssign(ck: Checker, e: Expr, target: Expr, value: Expr) -> Ty {
-        let vt = checkExpr(ck, value)
+        let vt = checkExprExpecting(ck, value, assignTargetHint(ck, target))
         let movedFrom = manualMoveSource(ck, value)
         match (target.kind) {
             case ExprKind.Ident(name) -> {
@@ -4376,7 +4442,7 @@ fn checkCurrentDir(ck: Checker, e: Expr, args: List<CallArg>) -> Ty {
         Ty.Option(Ty.String)
 }
 
-fn checkIf(ck: Checker, e: Expr, cond: IfCond, thenBlock: Block, elseExpr: Expr?) -> Ty {
+fn checkIf(ck: Checker, e: Expr, cond: IfCond, thenBlock: Block, elseExpr: Expr?, want: Ty) -> Ty {
         // For `if (let pattern = value)` the binding stays in scope for the
         // then-block only: a failing pattern skips the binding entirely, so
         // the else branch must not see it.
@@ -4397,7 +4463,7 @@ fn checkIf(ck: Checker, e: Expr, cond: IfCond, thenBlock: Block, elseExpr: Expr?
         // bits, so a value moved on one path is treated as moved afterwards
         // without falsely rejecting a move that happens on both paths.
         let before = captureMoved(ck)
-        let tt = checkBlock(ck, thenBlock)
+        let tt = checkBlockExpecting(ck, thenBlock, want)
         var after = captureMoved(ck)
         if (bindScope) {
             popScope(ck)
@@ -4405,7 +4471,7 @@ fn checkIf(ck: Checker, e: Expr, cond: IfCond, thenBlock: Block, elseExpr: Expr?
         let _ = e.span
         if (let some(elseE) = elseExpr) {
             setMoved(ck, before)
-            let et = checkExpr(ck, elseE)
+            let et = checkExprExpecting(ck, elseE, want)
             let afterElse = captureMoved(ck)
             unionMoved(ck, after, afterElse)
             if (tt != Ty.Empty && et != Ty.Empty) {
@@ -4424,7 +4490,7 @@ fn checkIf(ck: Checker, e: Expr, cond: IfCond, thenBlock: Block, elseExpr: Expr?
         }
 }
 
-fn checkMatch(ck: Checker, e: Expr, scrutinee: Expr, arms: List<MatchArm>) -> Ty {
+fn checkMatch(ck: Checker, e: Expr, scrutinee: Expr, arms: List<MatchArm>, want: Ty) -> Ty {
         let st = checkExpr(ck, scrutinee)
         var result = Ty.Empty
         let before = captureMoved(ck)
@@ -4437,7 +4503,7 @@ fn checkMatch(ck: Checker, e: Expr, scrutinee: Expr, arms: List<MatchArm>) -> Ty
             if (let some(g) = arm.guard) {
                 checkBoolCond(ck, g)
             }
-            let bt = checkExpr(ck, arm.body)
+            let bt = checkExprExpecting(ck, arm.body, want)
             popScope(ck)
             let afterArm = captureMoved(ck)
             if (let some(acc) = merged) {

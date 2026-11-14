@@ -418,6 +418,71 @@ test fn a_field_initializer_adopts_the_field_type() {
     expect(h.values[1] as string).toBe("five")
 }
 
+test fn a_reassignment_adopts_the_binding_type() {
+    var xs: List<int | string> = [1, "x"]
+    xs = [2, "y"]
+    expect(xs[0] as int).toBe(2)
+    expect(xs[1] as string).toBe("y")
+}
+
+test fn an_if_expression_tail_adopts_the_annotation() {
+    let xs: List<int | string> = if (1 == 1) { [1, "a"] } else { [] }
+    expect(xs[0] as int).toBe(1)
+    expect(xs[1] as string).toBe("a")
+}
+
+test fn a_match_arm_adopts_the_annotation() {
+    let xs: List<int | string> = match (0) {
+        case 0 -> [2, "two"]
+        case _ -> [3]
+    }
+    expect(len(xs)).toBe(2)
+    expect(xs[0] as int).toBe(2)
+    expect(xs[1] as string).toBe("two")
+}
+
+test fn a_block_expression_tail_adopts_the_annotation() {
+    let xs: List<int | string> = {
+        let a = "b"
+        [4, a]
+    }
+    expect(xs[0] as int).toBe(4)
+    expect(xs[1] as string).toBe("b")
+}
+
+test fn a_field_assignment_adopts_the_field_type() {
+    let h = UnionHolder()
+    h.values = [7, "seven"]
+    expect(h.values[0] as int).toBe(7)
+    expect(h.values[1] as string).toBe("seven")
+}
+
+class UnionBox {
+    var items: List<int | string> = []
+
+    fn resetThis() {
+        this.items = [8, "eight"]
+    }
+
+    fn resetImplicit() {
+        items = [9, "nine"]
+    }
+}
+
+test fn a_this_field_assignment_adopts_the_field_type() {
+    let b = UnionBox()
+    b.resetThis()
+    expect(b.items[0] as int).toBe(8)
+    expect(b.items[1] as string).toBe("eight")
+}
+
+test fn an_implicit_field_assignment_adopts_the_field_type() {
+    let b = UnionBox()
+    b.resetImplicit()
+    expect(b.items[0] as int).toBe(9)
+    expect(b.items[1] as string).toBe("nine")
+}
+
 // ==== diagnostics ====
 
 test fn a_union_binding_accepts_every_member() {
@@ -552,5 +617,22 @@ test fn an_unannotated_literal_keeps_monomorphic_inference() {
     let cb = cbrace()
     let q = quote()
     let msgs = checkSource("fn main() " + ob + "\n let xs = [1, " + q + "x" + q + "] \n " + cb)
+    expect(hasContaining(msgs, "type mismatch in array element")).toBe(true)
+}
+
+test fn a_reassigned_literal_still_rejects_a_non_member() {
+    let ob = obrace()
+    let cb = cbrace()
+    let msgs = checkSource("fn main() " + ob + "\n var xs: List<int | string> = [1] \n xs = [1, 2.5] \n " + cb)
+    expect(hasContaining(msgs, "type mismatch in array element")).toBe(true)
+}
+
+test fn a_reassigned_non_union_literal_keeps_monomorphic_inference() {
+    let ob = obrace()
+    let cb = cbrace()
+    let q = quote()
+    // With union adoption this would be `List<int | string>`; a non-union
+    // target keeps monomorphic inference, so the two entries conflict.
+    let msgs = checkSource("fn main() " + ob + "\n var xs: List<int> = [1] \n xs = [1, " + q + "x" + q + "] \n " + cb)
     expect(hasContaining(msgs, "type mismatch in array element")).toBe(true)
 }
