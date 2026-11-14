@@ -1,0 +1,200 @@
+module std.collections.lru
+
+/// A fixed-capacity least-recently-used cache over parallel `List`s (key
+/// equality via `==`; linear lookup). Two typed proto-values stage the empty
+/// backing lists because a bare `[]` infers `List<?>`. The key list is kept in
+/// least-to-most-recent order: reads and writes move a key to the end, and a
+/// new entry past capacity evicts the key at the front.
+class LruCache<K, V> {
+    var keys: List<K>
+    var values: List<V>
+    var limit: int
+    var evicted: int
+
+    constructor(keyProto: K, valueProto: V, capacity: int) {
+        this.keys = [keyProto]
+        this.keys.remove(0)
+        this.values = [valueProto]
+        this.values.remove(0)
+        this.limit = capacity
+        this.evicted = 0
+        if (this.limit < 1) {
+            this.limit = 1
+        }
+    }
+
+    /// The configured capacity (never below 1).
+    fn capacity() -> int {
+        this.limit
+    }
+
+    /// Number of entries currently held.
+    fn size() -> int {
+        len(this.keys)
+    }
+
+    /// Whether the cache is empty.
+    fn isEmpty() -> bool {
+        len(this.keys) == 0
+    }
+
+    /// How many entries have been evicted since construction or `resetStats`.
+    fn evictions() -> int {
+        this.evicted
+    }
+
+    /// Clear the eviction counter (entries are kept).
+    fn resetStats() {
+        this.evicted = 0
+    }
+
+    /// Index of `k` in the ordered key list, or -1 when absent.
+    fn _indexOf(k: K) -> int {
+        var i = 0
+        while (i < len(this.keys)) {
+            if (this.keys[i] == k) {
+                return i
+            }
+            i = i + 1
+        }
+        -1
+    }
+
+    /// Move the entry at `i` to the most-recently-used end.
+    fn _touch(i: int) {
+        if (i == len(this.keys) - 1) {
+            return
+        }
+        let k = this.keys[i]
+        let v = this.values[i]
+        this.keys.remove(i)
+        this.values.remove(i)
+        this.keys.push(k)
+        this.values.push(v)
+    }
+
+    /// Whether `k` is present without changing its recency.
+    fn has(k: K) -> bool {
+        this._indexOf(k) >= 0
+    }
+
+    /// The value for `k`, marking it most recently used; `none` when absent.
+    fn get(k: K) -> V? {
+        let i = this._indexOf(k)
+        if (i < 0) {
+            return none
+        }
+        this._touch(i)
+        this.values[len(this.values) - 1]
+    }
+
+    /// The value for `k` without changing its recency; `none` when absent.
+    fn peek(k: K) -> V? {
+        let i = this._indexOf(k)
+        if (i < 0) {
+            return none
+        }
+        this.values[i]
+    }
+
+    /// Mark `k` most recently used; `false` when absent.
+    fn touch(k: K) -> bool {
+        let i = this._indexOf(k)
+        if (i < 0) {
+            return false
+        }
+        this._touch(i)
+        true
+    }
+
+    /// Insert or update `k`, marking it most recently used. When this grows the
+    /// cache past capacity, the least recently used entry is dropped and its
+    /// value returned; otherwise the result is `none` (an update of an existing
+    /// key is not an eviction).
+    fn put(k: K, v: V) -> V? {
+        let i = this._indexOf(k)
+        if (i >= 0) {
+            this.values[i] = v
+            this._touch(i)
+            return none
+        }
+        this.keys.push(k)
+        this.values.push(v)
+        if (len(this.keys) <= this.limit) {
+            return none
+        }
+        let gone = this.values[0]
+        this.keys.remove(0)
+        this.values.remove(0)
+        this.evicted = this.evicted + 1
+        gone
+    }
+
+    /// Remove `k`; `false` when absent. Does not count as an eviction.
+    fn remove(k: K) -> bool {
+        let i = this._indexOf(k)
+        if (i < 0) {
+            return false
+        }
+        this.keys.remove(i)
+        this.values.remove(i)
+        true
+    }
+
+    /// Drop every entry (the eviction counter is kept).
+    fn clear() {
+        if (len(this.keys) == 0) {
+            return
+        }
+        let k = this.keys[0]
+        let v = this.values[0]
+        this.keys = [k]
+        this.keys.remove(0)
+        this.values = [v]
+        this.values.remove(0)
+    }
+
+    /// The key that would be evicted next; `none` when empty.
+    fn oldestKey() -> K? {
+        if (len(this.keys) == 0) {
+            return none
+        }
+        this.keys[0]
+    }
+
+    /// The most recently used key; `none` when empty.
+    fn newestKey() -> K? {
+        if (len(this.keys) == 0) {
+            return none
+        }
+        this.keys[len(this.keys) - 1]
+    }
+
+    /// Keys from least to most recently used (fresh copy).
+    fn keyList() -> List<K> {
+        if (len(this.keys) == 0) {
+            return this.keys
+        }
+        var out: List<K> = [this.keys[0]]
+        var i = 1
+        while (i < len(this.keys)) {
+            out.push(this.keys[i])
+            i = i + 1
+        }
+        out
+    }
+
+    /// Values in matching recency order (fresh copy).
+    fn valueList() -> List<V> {
+        if (len(this.values) == 0) {
+            return this.values
+        }
+        var out: List<V> = [this.values[0]]
+        var i = 1
+        while (i < len(this.values)) {
+            out.push(this.values[i])
+            i = i + 1
+        }
+        out
+    }
+}

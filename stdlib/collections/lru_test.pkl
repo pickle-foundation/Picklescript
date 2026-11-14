@@ -1,0 +1,170 @@
+module std.collections.lru_test
+
+import { LruCache } from std.collections.lru
+
+test fn capacity_is_at_least_one() {
+    let c = LruCache<int, string>(0, "", 0)
+    expect(c.capacity()).toBe(1)
+    expect(c.size()).toBe(0)
+    expect(c.isEmpty()).toBe(true)
+    let d = LruCache<int, string>(0, "", -5)
+    expect(d.capacity()).toBe(1)
+    let e = LruCache<int, string>(0, "", 3)
+    expect(e.capacity()).toBe(3)
+}
+
+test fn put_and_get_round_trip() {
+    let c = LruCache<int, string>(0, "", 2)
+    expect(c.put(1, "a")).toBe(none)
+    expect(c.put(2, "b")).toBe(none)
+    expect(c.size()).toBe(2)
+    expect(c.has(1)).toBe(true)
+    expect(c.has(3)).toBe(false)
+    match (c.get(1)) {
+    case some(v) -> expect(v).toBe("a")
+    case none -> expect(true).toBe(false)
+    }
+    match (c.get(9)) {
+    case some(_) -> expect(true).toBe(false)
+    case none -> expect(true).toBe(true)
+    }
+}
+
+test fn get_marks_a_key_as_recent() {
+    let c = LruCache<int, string>(0, "", 2)
+    c.put(1, "a")
+    c.put(2, "b")
+    c.get(1)
+    match (c.put(3, "c")) {
+    case some(v) -> expect(v).toBe("b")
+    case none -> expect(true).toBe(false)
+    }
+    expect(c.has(1)).toBe(true)
+    expect(c.has(2)).toBe(false)
+    expect(c.size()).toBe(2)
+}
+
+test fn peek_does_not_change_recency() {
+    let c = LruCache<int, string>(0, "", 2)
+    c.put(1, "a")
+    c.put(2, "b")
+    match (c.peek(1)) {
+    case some(v) -> expect(v).toBe("a")
+    case none -> expect(true).toBe(false)
+    }
+    match (c.put(3, "c")) {
+    case some(v) -> expect(v).toBe("a")
+    case none -> expect(true).toBe(false)
+    }
+    expect(c.has(1)).toBe(false)
+    expect(c.has(2)).toBe(true)
+}
+
+test fn updating_an_existing_key_does_not_evict() {
+    let c = LruCache<int, string>(0, "", 2)
+    c.put(1, "a")
+    c.put(2, "b")
+    expect(c.put(1, "z")).toBe(none)
+    expect(c.size()).toBe(2)
+    expect(c.evictions()).toBe(0)
+    match (c.get(1)) {
+    case some(v) -> expect(v).toBe("z")
+    case none -> expect(true).toBe(false)
+    }
+    expect(len(c.keyList())).toBe(2)
+}
+
+test fn evictions_are_counted_and_resettable() {
+    let c = LruCache<int, string>(0, "", 2)
+    c.put(1, "a")
+    c.put(2, "b")
+    c.put(3, "c")
+    c.put(4, "d")
+    expect(c.evictions()).toBe(2)
+    c.resetStats()
+    expect(c.evictions()).toBe(0)
+    expect(c.size()).toBe(2)
+}
+
+test fn remove_is_not_an_eviction() {
+    let c = LruCache<int, string>(0, "", 2)
+    c.put(1, "a")
+    expect(c.remove(1)).toBe(true)
+    expect(c.remove(1)).toBe(false)
+    expect(c.size()).toBe(0)
+    expect(c.evictions()).toBe(0)
+}
+
+test fn oldest_and_newest_follow_touch() {
+    let c = LruCache<int, string>(0, "", 3)
+    c.put(1, "a")
+    c.put(2, "b")
+    c.put(3, "c")
+    match (c.oldestKey()) {
+    case some(k) -> expect(k).toBe(1)
+    case none -> expect(true).toBe(false)
+    }
+    match (c.newestKey()) {
+    case some(k) -> expect(k).toBe(3)
+    case none -> expect(true).toBe(false)
+    }
+    expect(c.touch(1)).toBe(true)
+    expect(c.touch(8)).toBe(false)
+    match (c.oldestKey()) {
+    case some(k) -> expect(k).toBe(2)
+    case none -> expect(true).toBe(false)
+    }
+    match (c.newestKey()) {
+    case some(k) -> expect(k).toBe(1)
+    case none -> expect(true).toBe(false)
+    }
+}
+
+test fn lists_expose_least_to_most_recent() {
+    let c = LruCache<string, string>("", "", 3)
+    c.put("a", "1")
+    c.put("b", "2")
+    c.put("c", "3")
+    c.get("a")
+    let ks = c.keyList()
+    expect(ks[0]).toBe("b")
+    expect(ks[1]).toBe("c")
+    expect(ks[2]).toBe("a")
+    let vs = c.valueList()
+    expect(vs[0]).toBe("2")
+    expect(vs[2]).toBe("1")
+}
+
+test fn clear_empties_entries_but_keeps_stats() {
+    let c = LruCache<int, string>(0, "", 2)
+    c.put(1, "a")
+    c.put(2, "b")
+    c.put(3, "c")
+    c.clear()
+    expect(c.size()).toBe(0)
+    expect(c.isEmpty()).toBe(true)
+    expect(c.capacity()).toBe(2)
+    expect(c.evictions()).toBe(1)
+    c.put(4, "d")
+    expect(c.size()).toBe(1)
+    match (c.get(4)) {
+    case some(v) -> expect(v).toBe("d")
+    case none -> expect(true).toBe(false)
+    }
+}
+
+test fn capacity_one_keeps_only_the_newest() {
+    let c = LruCache<int, string>(0, "", 1)
+    c.put(1, "a")
+    match (c.put(2, "b")) {
+    case some(v) -> expect(v).toBe("a")
+    case none -> expect(true).toBe(false)
+    }
+    expect(c.size()).toBe(1)
+    expect(c.has(1)).toBe(false)
+    expect(c.has(2)).toBe(true)
+    match (c.oldestKey()) {
+    case some(k) -> expect(k).toBe(2)
+    case none -> expect(true).toBe(false)
+    }
+}
