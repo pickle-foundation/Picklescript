@@ -784,12 +784,14 @@ if (rep.isPtr) {
         dst
     }
 
-fn listStore(em: Emitter, obj: int, idx: int, rep: ElemRep, elem: Ty, v: int) -> int? {
+fn listStore(em: Emitter, obj: int, idx: int, rep: ElemRep, elem: Ty, v: int, span: Span) -> int? {
+        var boxO = elemStoreValue(em, span, v, elem, rep)
+        if (let none = boxO) {
+            return none
+        }
         var boxed = 0
-        if (rep.isPtr) {
-            boxed = v
-        } else {
-            boxed = externCallT1(em, rep.boxSym, [elemIr(elem)], IrTy.Ptr, [v])
+        if (let some(b) = boxO) {
+            boxed = b
         }
         externCallVoid(em, "pickle_list_set", [IrTy.Ptr, IrTy.Int, IrTy.Ptr], [obj, idx, boxed])
         0
@@ -2584,6 +2586,44 @@ fn boxForStore(em: Emitter, rep: ElemRep, v: int, vTy: IrTy) -> int? {
             return v
         }
         externCallT1(em, rep.boxSym, [vTy], IrTy.Ptr, [v])
+    }
+
+    /// The word a container slot stores for a value of type `vTy` when the
+    /// element/key type is `elem`. Scalar elements are boxed and managed ones
+    /// pass through; a union element boxes its scalar members into the union's
+    /// tagged word (via `optionWrap`), so `List<int | string>.push(1)` stores
+    /// a tagged box rather than the raw integer word.
+fn elemStoreValue(em: Emitter, span: Span, v: int, elem: Ty, rep: ElemRep) -> int? {
+        if (isUnion(elem)) {
+            var uvt = Ty.Unknown
+            if (let some(t) = tyOf(em, span)) {
+                uvt = t
+            } else {
+                bad(em, span, "no inferred type available for this expression")
+                return none
+            }
+            match (uvt) {
+                case Ty.Unknown -> {
+                    bad(em, span, "cannot store an untyped expression in a union container")
+                    return none
+                }
+                case _ -> {}
+            }
+            return optionWrap(em, v, uvt, span)
+        }
+        var vt = elem
+        if (let some(t) = tyOf(em, span)) {
+            vt = t
+        }
+        var packedO = packForPointerBoundary(em, rep, v, vt, span)
+        if (let none = packedO) {
+            return none
+        }
+        var packed = 0
+        if (let some(p) = packedO) {
+            packed = p
+        }
+        boxForStore(em, rep, packed, elemIr(elem))
     }
 
 fn packMapKey(em: Emitter, rep: ElemRep, v: int, vt: Ty, span: Span) -> int? {

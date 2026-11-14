@@ -2246,7 +2246,7 @@ fn indexAssign(em: Emitter, e: Expr, op: AssignOp, object: Expr, index: Expr, va
             if (let some(vv) = vO) {
                 v = vv
             }
-            var ok = listStore(em, obj, idx, rep, elem, v)
+            var ok = listStore(em, obj, idx, rep, elem, v, value.span)
             if (let none = ok) {
                 return none
             }
@@ -2275,7 +2275,7 @@ if (rep.isPtr) {
             if (let some(d) = dstO) {
                 dst = d
             }
-            var ok = listStore(em, obj, idx, rep, elem, dst)
+            var ok = listStore(em, obj, idx, rep, elem, dst, value.span)
             if (let none = ok) {
                 return none
             }
@@ -2359,16 +2359,12 @@ var kTy = kty
             if (let some(vv) = vO) {
                 v = vv
             }
-            var vTy = IrTy.Int
-            if (let some(t) = irty(em, value.span)) {
-                vTy = t
-            }
-            var boxedO = boxForStore(em, vrep, v, vTy)
-            if (let none = boxedO) {
+            var boxO = elemStoreValue(em, value.span, v, vty, vrep)
+            if (let none = boxO) {
                 return none
             }
             var boxed = 0
-            if (let some(b) = boxedO) {
+            if (let some(b) = boxO) {
                 boxed = b
             }
             externCallVoid(em, "pickle_map_set", [IrTy.Ptr, IrTy.Ptr, IrTy.Ptr], [obj, key, boxed])
@@ -5726,14 +5722,13 @@ var k = expr(em, args[0].value)
                                     var d = expr(em, args[1].value)
                                     if (let some(d) = d) {
                                         if (let some(vrep) = vr) {
-                                            var dv = d
-                                            if (!(vrep.isPtr)) {
-                                                var dt = irty(em, args[1].value.span)
-                                                if (let some(dt) = dt) {
-                                                    dv = externCallT1(em, vrep.boxSym, [dt], IrTy.Ptr, [d])
-                                                } else {
-                                                    return none
-                                                }
+                                            var dO = elemStoreValue(em, args[1].value.span, d, mapV, vrep)
+                                            if (let none = dO) {
+                                                return none
+                                            }
+                                            var dv = 0
+                                            if (let some(dvId) = dO) {
+                                                dv = dvId
                                             }
                                             var raw = externCallT1(em, "pickle_map_get_boxed", [IrTy.Ptr, IrTy.Ptr, IrTy.Ptr], IrTy.Ptr, [obj, key, dv])
                                             if (vrep.isPtr) {
@@ -6717,14 +6712,13 @@ fn listMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List<C
                     if (let some(rep) = rp) {
                         var v = expr(em, args[0].value)
                         if (let some(v) = v) {
-                            var pushV = v
-                            if (!(rep.isPtr)) {
-                                var vt = irty(em, args[0].value.span)
-                                if (let some(vt) = vt) {
-                                    pushV = externCallT1(em, rep.boxSym, [vt], IrTy.Ptr, [v])
-                                } else {
-                                    return none
-                                }
+                            var pushO = elemStoreValue(em, args[0].value.span, v, elem, rep)
+                            if (let none = pushO) {
+                                return none
+                            }
+                            var pushV = 0
+                            if (let some(pv) = pushO) {
+                                pushV = pv
                             }
                             externCallVoid(em, "pickle_list_push", [IrTy.Ptr, IrTy.Ptr], [obj, pushV])
                             return unitTemp(em)
@@ -6778,14 +6772,13 @@ fn listMethodCall(em: Emitter, e: Expr, object: Expr, name: string, args: List<C
                         if (let some(index) = index) {
                             var v = expr(em, args[1].value)
                             if (let some(v) = v) {
-                                var insV = v
-                                if (!(rep.isPtr)) {
-                                    var vt = irty(em, args[1].value.span)
-                                    if (let some(vt) = vt) {
-                                        insV = externCallT1(em, rep.boxSym, [vt], IrTy.Ptr, [v])
-                                    } else {
-                                        return none
-                                    }
+                                var insO = elemStoreValue(em, args[1].value.span, v, elem, rep)
+                                if (let none = insO) {
+                                    return none
+                                }
+                                var insV = 0
+                                if (let some(iv) = insO) {
+                                    insV = iv
                                 }
                                 externCallVoid(em, "pickle_list_insert", [IrTy.Ptr, IrTy.Int, IrTy.Ptr], [obj, index, insV])
                                 return unitTemp(em)
@@ -10272,14 +10265,13 @@ fn arrayLiteral(em: Emitter, e: Expr, items: List<Expr>) -> int? {
                     case _ -> {
                         var v = expr(em, it)
                         if (let some(v) = v) {
-                            var pushV = v
-                            if (!(rep.isPtr)) {
-                                var vTy = irty(em, it.span)
-                                if (let some(vTy) = vTy) {
-                                    pushV = externCallT1(em, rep.boxSym, [vTy], IrTy.Ptr, [v])
-                                } else {
-                                    return none
-                                }
+                            var pushO = elemStoreValue(em, it.span, v, elemTy, rep)
+                            if (let none = pushO) {
+                                return none
+                            }
+                            var pushV = 0
+                            if (let some(pv) = pushO) {
+                                pushV = pv
                             }
                             externCallVoid(em, "pickle_list_push", [IrTy.Ptr, IrTy.Ptr], [list, pushV])
                         } else {
@@ -10412,14 +10404,13 @@ for (entry in entries) {
                         if (let some(key) = keyO) {
                             var vt = expr(em, entry.value)
                                 if (let some(vt) = vt) {
-                                    var boxed = vt
-                                    if (!(vrep.isPtr)) {
-                                        var vTy = irty(em, entry.value.span)
-                                        if (let some(vTy) = vTy) {
-                                            boxed = externCallT1(em, vrep.boxSym, [vTy], IrTy.Ptr, [vt])
-                                        } else {
-                                            return none
-                                        }
+                                    var boxO = elemStoreValue(em, entry.value.span, vt, vty, vrep)
+                                    if (let none = boxO) {
+                                        return none
+                                    }
+                                    var boxed = 0
+                                    if (let some(b) = boxO) {
+                                        boxed = b
                                     }
                                     externCallVoid(em, "pickle_map_set", [IrTy.Ptr, IrTy.Ptr, IrTy.Ptr], [mp, key, boxed])
 } else {
