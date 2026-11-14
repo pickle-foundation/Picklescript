@@ -3692,6 +3692,37 @@ fn checkClamp(ck: Checker, e: Expr, args: List<CallArg>) -> Ty {
         t
 }
 
+/// True when every member of a union stringifies through `pickle_union_str`: the
+/// scalar kinds plus `string` (already text) and `List<byte>`. `byte` is allowed
+/// even though a bare `str(byte)` is not, because a `byte` box carries the same
+/// class id as an `int` box and prints as its numeric value.
+///
+/// Shared with the emitter (`unionStrOk` in `emitcore`) so the checker and the
+/// lowering agree on exactly which union members are printable.
+fn strUnionOk(ps: List<Ty>) -> bool {
+    for (p in ps) {
+        var ok = false
+        match (p) {
+            case Ty.Int -> ok = true
+            case Ty.Byte -> ok = true
+            case Ty.Float -> ok = true
+            case Ty.Bool -> ok = true
+            case Ty.Char -> ok = true
+            case Ty.String -> ok = true
+            case Ty.List(inner) -> {
+                if (inner == Ty.Byte) {
+                    ok = true
+                }
+            }
+            case _ -> {}
+        }
+        if (!ok) {
+            return false
+        }
+    }
+    true
+}
+
 fn checkStr(ck: Checker, e: Expr, args: List<CallArg>) -> Ty {
         if (len(args) != 1 || !isNoneStr(args[0].name) || args[0].spread) {
             err(ck, e.span, "`str(x)` takes exactly one argument")
@@ -3712,6 +3743,14 @@ fn checkStr(ck: Checker, e: Expr, args: List<CallArg>) -> Ty {
                     Ty.String
                 } else {
                     err(ck, args[0].value.span, "`str` requires an `int`, `float`, `bool`, `char`, or `List<byte>` argument")
+                    Ty.Unknown
+                }
+            }
+            case Ty.Union(ps) -> {
+                if (strUnionOk(ps)) {
+                    Ty.String
+                } else {
+                    err(ck, args[0].value.span, "`str` cannot stringify `{bareName(at)}`")
                     Ty.Unknown
                 }
             }
@@ -3762,6 +3801,11 @@ fn checkFormat(ck: Checker, e: Expr, args: List<CallArg>) -> Ty {
                 case Ty.Unknown -> {}
                 case Ty.List(inner) -> {
                     if (!(inner == Ty.Byte)) {
+                        err(ck, args[i].value.span, "`format` cannot stringify `{bareName(at)}`")
+                    }
+                }
+                case Ty.Union(ps) -> {
+                    if (!strUnionOk(ps)) {
                         err(ck, args[i].value.span, "`format` cannot stringify `{bareName(at)}`")
                     }
                 }

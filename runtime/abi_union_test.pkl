@@ -1,0 +1,155 @@
+module runtime.abi_union_test
+
+/// Behavioral tests for the union ABI helpers. Unions are port-only (`runtime/src`
+/// has no union module), so the expectations here are the semantics the
+/// compiler's union lowering promises: `str()` prints the stored member exactly
+/// the way `str(x)` would print it, and `==` compares scalars, strings, and enums
+/// by value while containers and class instances keep identity semantics.
+
+import { abiUnionStr, abiUnionEq } from runtime.abi_union
+import { abiBoxI64, abiBoxBool, abiBoxChar, abiBoxF64 } from runtime.abi_box
+import { abiStrFromI64, abiStrFromBool, abiStrFromChar, abiStrFromList, abiStrCmp } from runtime.abi_string
+import { abiStrFromF64 } from runtime.abi_float
+import { abiListNew, abiListPush } from runtime.abi_list
+import { enumNew, abiEnumSetField, abiEnumTag } from runtime.abi_enum
+
+fn sameText(a: *int, b: *int) -> bool {
+    return abiStrCmp(a, b) == 0
+}
+
+fn sameObject(a: *int, b: *int) -> bool {
+    unsafe {
+        return (a as int) == (b as int)
+    }
+}
+
+// ==== pickle_union_str ====
+
+test fn str_prints_a_boxed_int() {
+    expect(sameText(abiUnionStr(abiBoxI64(42)), abiStrFromI64(42))).toBe(true)
+}
+
+test fn str_prints_a_boxed_negative_int() {
+    expect(sameText(abiUnionStr(abiBoxI64(0 - 7)), abiStrFromI64(0 - 7))).toBe(true)
+}
+
+test fn str_prints_a_boxed_byte_as_a_number() {
+    // `byte` and `int` share the box-int class id, so a byte member prints its
+    // numeric value.
+    var v = abiUnionStr(abiBoxI64(200))
+    expect(sameText(v, abiStrFromI64(200))).toBe(true)
+    // A wrong dispatch onto the char path would print the character here.
+    expect(sameText(v, abiStrFromChar(200))).toBe(false)
+}
+
+test fn str_prints_a_boxed_float() {
+    expect(sameText(abiUnionStr(abiBoxF64(1.5)), abiStrFromF64(1.5))).toBe(true)
+}
+
+test fn str_prints_a_boxed_bool() {
+    var v = abiUnionStr(abiBoxBool(true))
+    expect(sameText(v, abiStrFromBool(true))).toBe(true)
+    // A wrong dispatch onto the int path would print "1" instead of "true".
+    expect(sameText(v, abiStrFromI64(1))).toBe(false)
+}
+
+test fn str_prints_a_boxed_char() {
+    expect(sameText(abiUnionStr(abiBoxChar(65)), abiStrFromChar(65))).toBe(true)
+}
+
+test fn str_passes_a_string_member_through() {
+    var s = abiStrFromI64(7)
+    expect(sameObject(abiUnionStr(s), s)).toBe(true)
+}
+
+test fn str_prints_a_byte_list_member() {
+    let l = abiListNew(2)
+    abiListPush(l, abiBoxI64(65))
+    abiListPush(l, abiBoxI64(66))
+    var v = abiUnionStr(l)
+    expect(sameText(v, abiStrFromList(l))).toBe(true)
+    expect(sameText(v, abiStrFromChar(65))).toBe(false)
+}
+
+// ==== pickle_union_eq ====
+
+test fn eq_compares_boxed_ints_by_value() {
+    // The identity fast path must not be what makes this true: two boxes of the
+    // same small value are distinct objects.
+    var a = abiBoxI64(1)
+    var b = abiBoxI64(1)
+    expect(sameObject(a, b)).toBe(false)
+    expect(abiUnionEq(a, b)).toBe(true)
+}
+
+test fn eq_rejects_different_boxed_ints() {
+    expect(abiUnionEq(abiBoxI64(1), abiBoxI64(2))).toBe(false)
+}
+
+test fn eq_compares_boxed_floats_by_value() {
+    expect(abiUnionEq(abiBoxF64(2.5), abiBoxF64(2.5))).toBe(true)
+    expect(abiUnionEq(abiBoxF64(2.5), abiBoxF64(0 - 2.5))).toBe(false)
+}
+
+test fn eq_compares_boxed_bools_by_value() {
+    expect(abiUnionEq(abiBoxBool(true), abiBoxBool(true))).toBe(true)
+    expect(abiUnionEq(abiBoxBool(true), abiBoxBool(false))).toBe(false)
+}
+
+test fn eq_compares_boxed_chars_by_value() {
+    expect(abiUnionEq(abiBoxChar(97), abiBoxChar(97))).toBe(true)
+    expect(abiUnionEq(abiBoxChar(97), abiBoxChar(98))).toBe(false)
+}
+
+test fn eq_never_mixes_member_classes() {
+    // Both sides hold "one" in some sense; equal class ids are the precondition
+    // for a value compare, so this is false rather than `true` from a numeric
+    // comparison of the payload words.
+    expect(abiUnionEq(abiBoxI64(1), abiBoxBool(true))).toBe(false)
+    expect(abiUnionEq(abiBoxChar(1), abiBoxI64(1))).toBe(false)
+    expect(abiUnionEq(abiBoxI64(1), abiStrFromI64(1))).toBe(false)
+}
+
+test fn eq_compares_strings_by_content() {
+    var a = abiStrFromI64(1234)
+    var b = abiStrFromI64(1234)
+    expect(sameObject(a, b)).toBe(false)
+    expect(abiUnionEq(a, b)).toBe(true)
+    expect(abiUnionEq(a, abiStrFromI64(1235))).toBe(false)
+}
+
+test fn eq_fast_paths_identity() {
+    var only = abiBoxF64(2.5)
+    expect(abiUnionEq(only, only)).toBe(true)
+    var list = abiListNew(0)
+    expect(abiUnionEq(list, list)).toBe(true)
+}
+
+test fn eq_keeps_identity_semantics_for_lists() {
+    // `==` on two `List<T>` operands is identity, and a union member keeps that.
+    var a = abiListNew(1)
+    var b = abiListNew(1)
+    abiListPush(a, abiBoxI64(3))
+    abiListPush(b, abiBoxI64(3))
+    expect(abiUnionEq(a, b)).toBe(false)
+}
+
+test fn eq_compares_enums_structurally() {
+    var a = enumNew(1, 1)
+    var b = enumNew(1, 1)
+    abiEnumSetField(a, 0, abiBoxI64(3))
+    abiEnumSetField(b, 0, abiBoxI64(3))
+    expect(abiEnumTag(a)).toBe(1)
+    expect(abiUnionEq(a, b)).toBe(true)
+}
+
+test fn eq_distinguishes_enum_tags_and_fields() {
+    var a = enumNew(1, 0)
+    var b = enumNew(2, 0)
+    expect(abiUnionEq(a, b)).toBe(false)
+    var c = enumNew(1, 1)
+    var d = enumNew(1, 1)
+    abiEnumSetField(c, 0, abiBoxI64(3))
+    abiEnumSetField(d, 0, abiBoxI64(4))
+    expect(abiUnionEq(c, d)).toBe(false)
+}

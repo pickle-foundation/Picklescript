@@ -9,7 +9,7 @@ import { Span, Diagnostic, DiagnosticSink } from compiler.diag
 import { IrBlock, IrFunc, IrGlobal, IrModule, IrParam, IrTy, emptyModule, irTyStr, irxParseFloat } from compiler.ir
 import { CallableInfo, ClassTable, CtorInfo, entryGenerics, EnumTable, FieldInfo, ParamInfo, PropertyInfo, ResolvedProgram, TypeTableEntry } from compiler.resolvebag
 
-import { collectExprTypes } from compiler.checkcore
+import { collectExprTypes, strUnionOk } from compiler.checkcore
 import { containsStr, isNoneStr, spanKey, constIntIndex } from compiler.checkutil
 import * from compiler.ty
 import { sizeOfTy, crtCallSymbol } from compiler.target
@@ -244,6 +244,17 @@ import * from compiler.emitmatch
 
     /// Fold a string temp list with `pickle_str_concat`. Mirrors `concat_strs`.
 
+/// True when `t` is a union whose every member `pickle_union_str` can print.
+/// Mirrors `checkcore.strUnionOk`, which is the checker's half of the same
+/// decision; the emitter still re-checks because string interpolation never
+/// reaches that checker path.
+fn unionStrOk(t: Ty) -> bool {
+    match (t) {
+        case Ty.Union(ps) -> strUnionOk(ps)
+        case _ -> { return false }
+    }
+}
+
     /// Lower a string literal: plain text becomes a `Const Str` temp;
     /// interpolated sub-expressions are stringified with the `pickle_str_from_*`
     /// helpers and concatenated. Mirrors `string_literal` in emit.rs.
@@ -272,7 +283,23 @@ fn stringLiteral(em: Emitter, parts: List<StrPart>) -> int? {
                             case _ -> {}
                         }
                     }
-                    if (isByte) {
+                    var unionTy: Ty? = none
+                    if (let some(ut) = tyOf(em, e.span)) {
+                        if (isUnion(ut)) {
+                            unionTy = ut
+                        }
+                    }
+                    var unionVal = false
+                    if (let some(ut2) = unionTy) {
+                        unionVal = true
+                        if (!unionStrOk(ut2)) {
+                            bad(em, e.span, "interpolation of `" + bareName(ut2) + "` is not lowered yet")
+                            return none
+                        }
+                    }
+                    if (unionVal) {
+                        vx = externCallT1(em, "pickle_union_str", [IrTy.Ptr], IrTy.Str, [vx])
+                    } else if (isByte) {
                         vx = externCallT1(em, "pickle_str_from_byte", [IrTy.Int], IrTy.Str, [vx])
                     } else {
                         var kind = -1
@@ -342,6 +369,19 @@ fn formatArgStr(em: Emitter, e: Expr) -> int? {
             v = vv
         } else {
             return none
+        }
+        var unionTy: Ty? = none
+        if (let some(ut) = tyOf(em, e.span)) {
+            if (isUnion(ut)) {
+                unionTy = ut
+            }
+        }
+        if (let some(ut2) = unionTy) {
+            if (!unionStrOk(ut2)) {
+                bad(em, e.span, "`format` cannot stringify `" + bareName(ut2) + "`")
+                return none
+            }
+            return externCallT1(em, "pickle_union_str", [IrTy.Ptr], IrTy.Str, [v])
         }
         var isByteList = false
         if (let some(gt) = tyOf(em, e.span)) {
@@ -1052,6 +1092,16 @@ fn binary(em: Emitter, e: Expr, op: BinOp, lhs: Expr, rhs: Expr) -> int? {
                 case _ -> {}
             }
         }
+        var bothUnion = false
+        if (let some(l) = lt) {
+            if (isUnion(l)) {
+                if (let some(r) = rt) {
+                    if (isUnion(r)) {
+                        bothUnion = true
+                    }
+                }
+            }
+        }
         match (op) {
             case BinOp.And | BinOp.Or -> {
                 return logic(em, e, op, lhs, rhs)
@@ -1169,6 +1219,34 @@ case BinOp.Range | BinOp.RangeIncl -> {
                         bId = v
                     }
                     var eq = externCallT1(em, "pickle_enum_eq", [IrTy.Ptr, IrTy.Ptr], IrTy.Bool, [aId, bId])
+                    if (op == BinOp.Eq) {
+                        return eq
+                    }
+                    var dst = temp(em)
+                    instr(em, IrInstr.UnOp(dst, IrUnOp.Not, eq))
+                    return dst
+                }
+                if ((op == BinOp.Eq || op == BinOp.Ne) && bothUnion) {
+                    var a = expr(em, lhs)
+                    if (let none = a) {
+                        return none
+                    }
+                    var b = expr(em, rhs)
+                    if (let none = b) {
+                        return none
+                    }
+                    var aId = 0
+                    if (let some(v) = a) {
+                        aId = v
+                    }
+                    var bId = 0
+                    if (let some(v) = b) {
+                        bId = v
+                    }
+                    // Boxed members are distinct objects, so a raw pointer
+                    // compare would call `1 == 1` false. `pickle_union_eq`
+                    // unwraps by runtime class instead.
+                    var eq = externCallT1(em, "pickle_union_eq", [IrTy.Ptr, IrTy.Ptr], IrTy.Bool, [aId, bId])
                     if (op == BinOp.Eq) {
                         return eq
                     }
@@ -4774,6 +4852,19 @@ case "print" | "println" -> {
                         }
                         case _ -> {}
                     }
+                }
+                var strUnionTy: Ty? = none
+                if (let some(ut) = tyOf(em, args[0].value.span)) {
+                    if (isUnion(ut)) {
+                        strUnionTy = ut
+                    }
+                }
+                if (let some(ut2) = strUnionTy) {
+                    if (!unionStrOk(ut2)) {
+                        bad(em, e.span, "`str` cannot stringify `" + bareName(ut2) + "`")
+                        return none
+                    }
+                    return externCallT1(em, "pickle_union_str", [IrTy.Ptr], IrTy.Str, [v])
                 }
                 if (isByteList) {
                     return externCallT1(em, "pickle_str_from_list", [IrTy.Ptr], IrTy.Str, [v])

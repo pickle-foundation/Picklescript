@@ -1,0 +1,110 @@
+module runtime.abi_union
+
+/// Union-value ABI bodies. Unions are a port-only feature (the native compiler
+/// has no union types), so this module has no `runtime/src/*.rs` counterpart.
+///
+/// A union is one word - a managed `*int` - whose object header names the class
+/// of the member actually stored. Every member is either already a pointer
+/// (`string`, `List<byte>`, a class instance, an enum, ...) or is boxed by the
+/// compiler through `runtime.abi_box` (`int`/`byte` -> 3, `float` -> 4,
+/// `bool` -> 5, `char` -> 6). That is what lets `str()` and `==` dispatch on
+/// `classOf` at run time without any extra tag word.
+///
+/// The class id is coarse - `int` and `byte` share 3, `List` and `Range` share
+/// 1, every enum is 7 - which is fine for stringification (a `byte` prints like
+/// an `int`) but bounds how precisely `pickle_union_eq` can tell members apart.
+/// See the enum note on `abiUnionEq`.
+
+import { PICKLE_CLASS_STRING, PICKLE_CLASS_LIST, PICKLE_CLASS_ENUM, PICKLE_CLASS_BOX_INT, PICKLE_CLASS_BOX_FLOAT, PICKLE_CLASS_BOX_BOOL, PICKLE_CLASS_BOX_CHAR } from runtime.object
+import { classOf, isNull, ptrEq, abiEnumEq } from runtime.abi_enum
+import { abiStrCmp, abiStrFromI64, abiStrFromBool, abiStrFromChar, abiStrFromList } from runtime.abi_string
+import { abiStrFromF64 } from runtime.abi_float
+import { abiUnboxI64, abiUnboxBool, abiUnboxChar, abiUnboxF64 } from runtime.abi_box
+
+/// Stringify a union value by its runtime class. Mirrors what `str(x)` does for
+/// each scalar member, plus a `string` member passing through unchanged and a
+/// `List<byte>` member going through `pickle_str_from_list`.
+///
+/// The checker only accepts a union whose members are all stringifiable, so the
+/// class switch covers every reachable object: 3 (int/byte), 4 (float), 5
+/// (bool), 6 (char), 0 (string), 1 (`List<byte>`). Anything else is a compiler
+/// bug rather than a program error - the fallback prints `0` instead of reading
+/// through a foreign layout, matching the way the port's other unreachable ABI
+/// paths stay total.
+///
+/// GAP - a null union value dereferences in `classOf`. A union member cannot be
+/// `none` or an `Option` (the checker rejects both), so no checked program can
+/// carry one. Same missing null-pointer primitive as the rest of the ABI.
+#[symbol("pickle_union_str")]
+fn abiUnionStr(v: *int) -> *int {
+    var c = classOf(v)
+    if (c == PICKLE_CLASS_STRING) {
+        return v
+    }
+    if (c == PICKLE_CLASS_BOX_INT) {
+        return abiStrFromI64(abiUnboxI64(v))
+    }
+    if (c == PICKLE_CLASS_BOX_FLOAT) {
+        return abiStrFromF64(abiUnboxF64(v))
+    }
+    if (c == PICKLE_CLASS_BOX_BOOL) {
+        return abiStrFromBool(abiUnboxBool(v))
+    }
+    if (c == PICKLE_CLASS_BOX_CHAR) {
+        return abiStrFromChar(abiUnboxChar(v))
+    }
+    if (c == PICKLE_CLASS_LIST) {
+        return abiStrFromList(v)
+    }
+    return abiStrFromI64(0)
+}
+
+/// Equality of two union values. Identity is checked first (`a == b` on the same
+/// variable, or `a == a`), then members of different runtime classes are never
+/// equal, then equal classes compare by value where the member is a scalar, a
+/// `string`, or an enum. Everything else - lists, maps, tuples, ranges, class
+/// instances, structs - keeps the language's identity semantics, so two distinct
+/// objects of the same class are unequal.
+///
+/// This fixes the silent bug where `==` on two union-typed operands fell through
+/// to a raw pointer compare on the boxed representation: `let u: int | string =
+/// 1; let w: int | string = 1; u == w` was `false` because the two boxes are
+/// distinct objects.
+///
+/// GAP - an enum object records its class id (7) and variant tag, but not which
+/// declared enum it belongs to, so a union spanning two enum types compares
+/// `A.X` and `B.X` structurally and reports them equal when the tag, field count,
+/// and field values coincide. Carrying the enum's type id would need a second
+/// header word, which the native layout does not have either.
+#[symbol("pickle_union_eq")]
+fn abiUnionEq(a: *int, b: *int) -> bool {
+    if (ptrEq(a, b)) {
+        return true
+    }
+    if (isNull(a) || isNull(b)) {
+        return false
+    }
+    var c = classOf(a)
+    if (c != classOf(b)) {
+        return false
+    }
+    if (c == PICKLE_CLASS_BOX_INT) {
+        return abiUnboxI64(a) == abiUnboxI64(b)
+    }
+    if (c == PICKLE_CLASS_BOX_FLOAT) {
+        return abiUnboxF64(a) == abiUnboxF64(b)
+    }
+    if (c == PICKLE_CLASS_BOX_BOOL) {
+        return abiUnboxBool(a) == abiUnboxBool(b)
+    }
+    if (c == PICKLE_CLASS_BOX_CHAR) {
+        return abiUnboxChar(a) == abiUnboxChar(b)
+    }
+    if (c == PICKLE_CLASS_STRING) {
+        return abiStrCmp(a, b) == 0
+    }
+    if (c == PICKLE_CLASS_ENUM) {
+        return abiEnumEq(a, b)
+    }
+    return false
+}
