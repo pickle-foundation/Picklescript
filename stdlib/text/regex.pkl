@@ -1,0 +1,1144 @@
+module std.text.regex
+
+// A small regular-expression engine with a pike VM, so matching is iterative
+// and never recurses on the input. Supported syntax:
+//
+//   literals            `.` (any scalar but LF)      `^` `$` (start/end)
+//   classes             `[abc]`, `[a-z]`, `[^...]`  `\d \D \w \W \s \S`
+//   groups              `(...)` (capturing)          `(?:...)` (grouping only)
+//   alternation         `a|b`
+//   quantifiers         `*` `+` `?` `{m}` `{m,}` `{m,n}`, each with a lazy
+//                       `?` form
+//   escapes             `\n \t \r \\ \. \* ...` and `\u{HEX}`
+//
+// Everything is code-point aware: `.` matches one Unicode scalar, classes test
+// code points, and offsets reported by matches are UTF-8 byte offsets (so a
+// match's substring is always valid UTF-8). Malformed UTF-8 in the subject is
+// matched byte-by-byte instead of failing the match.
+//
+// Semantics follow the usual backtracking engines for ordering: quantifiers are
+// greedy unless suffixed with `?`, alternation tries the left branch first, and
+// `find` returns the leftmost match with the highest-priority (greedy) extent.
+// The pike VM records the first match at each step and lets only
+// higher-priority threads overtake it, which gives that ordering without
+// exponential backtracking.
+//
+// Not supported: lookahead/lookbehind, backreferences, word boundaries `\b`,
+// inline flags, named groups, and case-insensitive matching. An unsupported
+// construct makes `compile` return `none` rather than silently matching
+// something else.
+
+import { decodeCp, nextOffset } from std.text.utf8
+
+/// One instruction of the compiled program. `RSplit` tries `a` before `b`.
+enum RegexOp {
+    RChar(cp: int)
+    RAny
+    RClass(negate: bool, ranges: List<int>)
+    RSplit(a: int, b: int)
+    RJmp(to: int)
+    RSave(slot: int)
+    RBegin
+    REnd
+    RMatch
+}
+
+/// A parsed pattern node. Children are lists so the shape stays friendly to the
+/// Rust reference's enum lowering.
+enum RegexNode {
+    NChar(cp: int)
+    NAny
+    NClass(negate: bool, ranges: List<int>)
+    NSeq(items: List<RegexNode>)
+    NAlt(items: List<RegexNode>)
+    NRepeat(body: List<RegexNode>, low: int, high: int, greedy: bool)
+    NGroup(body: List<RegexNode>, index: int)
+    NBegin
+    NEnd
+}
+
+/// A pike-VM thread: a program counter plus the capture slots it has filled.
+class Thread {
+    var pc: int
+    var caps: List<int>
+
+    constructor(pc: int, caps: List<int>) {
+        this.pc = pc
+        this.caps = caps
+    }
+}
+
+/// A typed empty list of nodes.
+fn emptyNodes() -> List<RegexNode> {
+    var out: List<RegexNode> = [RegexNode.NAny]
+    out.remove(0)
+    out
+}
+
+/// A typed empty list of ops.
+fn emptyOps() -> List<RegexOp> {
+    var out: List<RegexOp> = [RegexOp.RMatch]
+    out.remove(0)
+    out
+}
+
+/// A typed empty list of threads.
+fn emptyThreads() -> List<Thread> {
+    var out: List<Thread> = [Thread(0, [0])]
+    out.remove(0)
+    out
+}
+
+/// A typed empty list of matches.
+fn emptyMatches() -> List<Match> {
+    var out: List<Match> = [Match("", [0], 0)]
+    out.remove(0)
+    out
+}
+
+/// A typed empty list of intervals (flattened low/high pairs).
+fn emptyRanges() -> List<int> {
+    var out: List<int> = [0]
+    out.remove(0)
+    out
+}
+
+/// A typed empty list of strings.
+fn emptyStrings() -> List<string> {
+    var out: List<string> = [""]
+    out.remove(0)
+    out
+}
+
+/// A typed empty list of ints.
+fn emptyInts() -> List<int> {
+    var out: List<int> = [0]
+    out.remove(0)
+    out
+}
+
+/// `n` false flags.
+fn freshFlags(n: int) -> List<bool> {
+    var out: List<bool> = [false]
+    out.remove(0)
+    var i = 0
+    while (i < n) {
+        out.push(false)
+        i = i + 1
+    }
+    out
+}
+
+/// Fill a capture-slot list with `value`.
+fn filledSlots(n: int, value: int) -> List<int> {
+    var out = emptyInts()
+    var i = 0
+    while (i < n) {
+        out.push(value)
+        i = i + 1
+    }
+    out
+}
+
+/// A copy of `xs`.
+fn copyInts(xs: List<int>) -> List<int> {
+    var out = emptyInts()
+    for (x in xs) {
+        out.push(x)
+    }
+    out
+}
+
+/// Append the interval `lo..hi` to a flattened range list.
+fn pushRange(ranges: List<int>, lo: int, hi: int) {
+    ranges.push(lo)
+    ranges.push(hi)
+}
+
+/// Whether `cp` lies in one of the flattened `ranges` intervals.
+fn inRanges(ranges: List<int>, cp: int) -> bool {
+    var i = 0
+    while (i + 1 < len(ranges)) {
+        if (cp >= ranges[i] && cp <= ranges[i + 1]) {
+            return true
+        }
+        i = i + 2
+    }
+    false
+}
+
+/// The scalar at byte offset `i`, or the raw byte when the sequence is
+/// malformed, or -1 at or beyond the end.
+fn cpAt(bs: List<byte>, i: int) -> int {
+    if (i < 0 || i >= len(bs)) {
+        return -1
+    }
+    match (decodeCp(bs, i)) {
+    case some(c) -> c
+    case none -> bs[i] as int
+    }
+}
+
+/// The offset after the scalar (or byte) at `i`.
+fn stepPos(bs: List<byte>, i: int) -> int {
+    if (i < 0 || i >= len(bs)) {
+        return len(bs)
+    }
+    match (decodeCp(bs, i)) {
+    case some(_) -> {
+        let n = nextOffset(bs, i)
+        if (n <= i || n > len(bs)) {
+            return i + 1
+        }
+        n
+    }
+    case none -> i + 1
+    }
+}
+
+/// The byte slice `[lo, hi)` of `s`, clamped and safe for any offsets.
+fn sliceBytes(s: string, lo: int, hi: int) -> string {
+    let bs = bytes(s)
+    var a = lo
+    var b = hi
+    if (a < 0) {
+        a = 0
+    }
+    if (b > len(bs)) {
+        b = len(bs)
+    }
+    if (a >= b) {
+        return ""
+    }
+    var out = bytes("")
+    var i = a
+    while (i < b) {
+        out.push(bs[i])
+        i = i + 1
+    }
+    str(out)
+}
+
+/// Parse a non-negative decimal body of a `{m,n}` quantifier; -1 on overflow.
+fn parseCount(bs: List<byte>, startAt: int) -> int {
+    var n = 0
+    var i = startAt
+    var digits = 0
+    while (i < len(bs) && (bs[i] as int) >= 48 && (bs[i] as int) <= 57) {
+        n = n * 10 + ((bs[i] as int) - 48)
+        digits = digits + 1
+        if (digits > 6) {
+            return -1
+        }
+        i = i + 1
+    }
+    n
+}
+
+/// Whether `hex` (lowercase or uppercase, 1..6 digits) is a valid scalar
+/// escape body; the value or -1.
+fn hexScalar(hex: string) -> int {
+    let bs = bytes(hex)
+    if (len(bs) == 0 || len(bs) > 6) {
+        return -1
+    }
+    var n = 0
+    var i = 0
+    while (i < len(bs)) {
+        let b = bs[i] as int
+        var d = -1
+        if (b >= 48 && b <= 57) {
+            d = b - 48
+        } else if (b >= 97 && b <= 102) {
+            d = b - 87
+        } else if (b >= 65 && b <= 70) {
+            d = b - 55
+        }
+        if (d < 0) {
+            return -1
+        }
+        n = n * 16 + d
+        i = i + 1
+    }
+    if (n > 0x10FFFF) {
+        return -1
+    }
+    if (n >= 0xD800 && n <= 0xDFFF) {
+        return -1
+    }
+    n
+}
+
+/// Recursive-descent pattern parser producing a node tree. `fail` records the
+/// first syntax error; every retry-friendly function returns a scratch node.
+class PatternParser {
+    var bs: List<byte>
+    var i: int
+    var fail: bool
+    var groupCount: int
+
+    constructor(pattern: string) {
+        this.bs = bytes(pattern)
+        this.i = 0
+        this.fail = false
+        this.groupCount = 0
+    }
+
+    /// The scalar at the cursor, or -1 at end.
+    fn at() -> int {
+        cpAt(this.bs, this.i)
+    }
+
+    /// Consume and return the scalar at the cursor.
+    fn bump() -> int {
+        let c = this.at()
+        if (c < 0) {
+            return -1
+        }
+        this.i = stepPos(this.bs, this.i)
+        c
+    }
+
+    /// Whether the cursor is on an ASCII digit.
+    fn digitHere() -> bool {
+        let c = this.at()
+        c >= 48 && c <= 57
+    }
+
+    /// The whole pattern; `fail` is set when input remains unconsumed.
+    fn parsePattern() -> RegexNode {
+        let root = this.parseAlt()
+        if (this.i < len(this.bs)) {
+            this.fail = true
+        }
+        root
+    }
+
+    /// `seq ('|' seq)*`.
+    fn parseAlt() -> RegexNode {
+        var items = emptyNodes()
+        items.push(this.parseSeq())
+        while (!this.fail && this.at() == 124) {
+            this.bump()
+            items.push(this.parseSeq())
+        }
+        if (len(items) == 1) {
+            return items[0]
+        }
+        RegexNode.NAlt(items)
+    }
+
+    /// A run of quantified atoms, stopping at `|`, `)` or end.
+    fn parseSeq() -> RegexNode {
+        var items = emptyNodes()
+        while (!this.fail) {
+            let c = this.at()
+            if (c < 0 || c == 124 || c == 41) {
+                break
+            }
+            let atom = this.parseAtom()
+            if (this.fail) {
+                break
+            }
+            items.push(this.parseQuant(atom))
+        }
+        if (len(items) == 1) {
+            return items[0]
+        }
+        RegexNode.NSeq(items)
+    }
+
+    /// An atom plus an optional quantifier.
+    fn parseQuant(atom: RegexNode) -> RegexNode {
+        let c = this.at()
+        if (c == 42) {
+            this.bump()
+            return this.finishQuant(atom, 0, -1)
+        }
+        if (c == 43) {
+            this.bump()
+            return this.finishQuant(atom, 1, -1)
+        }
+        if (c == 63) {
+            this.bump()
+            return this.finishQuant(atom, 0, 1)
+        }
+        if (c == 123) {
+            this.bump()
+            if (!this.digitHere()) {
+                this.fail = true
+                return atom
+            }
+            let lo = parseCount(this.bs, this.i)
+            if (lo < 0) {
+                this.fail = true
+                return atom
+            }
+            while (this.digitHere()) {
+                this.bump()
+            }
+            var hi = lo
+            if (this.at() == 44) {
+                this.bump()
+                if (this.digitHere()) {
+                    hi = parseCount(this.bs, this.i)
+                    if (hi < 0) {
+                        this.fail = true
+                        return atom
+                    }
+                    while (this.digitHere()) {
+                        this.bump()
+                    }
+                } else {
+                    hi = -1
+                }
+            }
+            if (this.at() != 125) {
+                this.fail = true
+                return atom
+            }
+            this.bump()
+            if (hi >= 0 && hi < lo) {
+                this.fail = true
+                return atom
+            }
+            if (lo > 200 || hi > 200) {
+                this.fail = true
+                return atom
+            }
+            return this.finishQuant(atom, lo, hi)
+        }
+        atom
+    }
+
+    /// Attach `low..high` to `atom`, honoring a trailing lazy `?`.
+    fn finishQuant(atom: RegexNode, low: int, high: int) -> RegexNode {
+        var greedy = true
+        if (this.at() == 63) {
+            this.bump()
+            greedy = false
+        }
+        var body = emptyNodes()
+        body.push(atom)
+        RegexNode.NRepeat(body, low, high, greedy)
+    }
+
+    /// One atom: group, class, anchor, escape, or literal.
+    fn parseAtom() -> RegexNode {
+        let c = this.at()
+        if (c < 0) {
+            this.fail = true
+            return RegexNode.NAny
+        }
+        if (c == 40) {
+            this.bump()
+            var capture = true
+            if (this.at() == 63) {
+                this.bump()
+                if (this.at() == 58) {
+                    this.bump()
+                    capture = false
+                } else {
+                    this.fail = true
+                    return RegexNode.NAny
+                }
+            }
+            var idx = 0
+            if (capture) {
+                this.groupCount = this.groupCount + 1
+                idx = this.groupCount
+            }
+            let inner = this.parseAlt()
+            if (this.at() != 41) {
+                this.fail = true
+                return inner
+            }
+            this.bump()
+            if (!capture) {
+                return inner
+            }
+            var body = emptyNodes()
+            body.push(inner)
+            return RegexNode.NGroup(body, idx)
+        }
+        if (c == 91) {
+            return this.parseClass()
+        }
+        if (c == 46) {
+            this.bump()
+            return RegexNode.NAny
+        }
+        if (c == 94) {
+            this.bump()
+            return RegexNode.NBegin
+        }
+        if (c == 36) {
+            this.bump()
+            return RegexNode.NEnd
+        }
+        if (c == 92) {
+            this.bump()
+            return this.parseEscape()
+        }
+        if (c == 41 || c == 124 || c == 42 || c == 43 || c == 63 || c == 123 || c == 125) {
+            this.fail = true
+            return RegexNode.NAny
+        }
+        this.bump()
+        RegexNode.NChar(c)
+    }
+
+    /// A non-class escape: a literal scalar, or a class node for `\d`/`\w`/`\s`
+    /// and their negations.
+    fn parseEscape() -> RegexNode {
+        var ranges = emptyRanges()
+        let cp = this.parseEscapeInto(ranges)
+        if (cp == 0 - 2) {
+            return RegexNode.NAny
+        }
+        if (cp == 0 - 3) {
+            return RegexNode.NClass(true, ranges)
+        }
+        if (cp >= 0) {
+            return RegexNode.NChar(cp)
+        }
+        RegexNode.NClass(false, ranges)
+    }
+
+    /// Parse the body after a backslash. Returns a literal scalar, -1 when the
+    /// escape appended intervals to `ranges`, or -2 on an unsupported escape.
+    fn parseEscapeInto(ranges: List<int>) -> int {
+        let e = this.bump()
+        if (e < 0) {
+            this.fail = true
+            return 0 - 2
+        }
+        if (e == 100) {
+            pushRange(ranges, 48, 57)
+            return -1
+        }
+        if (e == 68) {
+            pushRange(ranges, 48, 57)
+            return 0 - 3
+        }
+        if (e == 119) {
+            pushRange(ranges, 48, 57)
+            pushRange(ranges, 65, 90)
+            pushRange(ranges, 95, 95)
+            pushRange(ranges, 97, 122)
+            return -1
+        }
+        if (e == 115) {
+            pushRange(ranges, 9, 13)
+            pushRange(ranges, 32, 32)
+            return -1
+        }
+        if (e == 87) {
+            pushRange(ranges, 48, 57)
+            pushRange(ranges, 65, 90)
+            pushRange(ranges, 95, 95)
+            pushRange(ranges, 97, 122)
+            return 0 - 3
+        }
+        if (e == 83) {
+            pushRange(ranges, 9, 13)
+            pushRange(ranges, 32, 32)
+            return 0 - 3
+        }
+        if (e == 110) {
+            return 10
+        }
+        if (e == 116) {
+            return 9
+        }
+        if (e == 114) {
+            return 13
+        }
+        if (e == 102) {
+            return 12
+        }
+        if (e == 118) {
+            return 11
+        }
+        if (e == 48) {
+            return 0
+        }
+        if (e == 117) {
+            if (this.at() != 123) {
+                this.fail = true
+                return 0 - 2
+            }
+            this.bump()
+            var hex = ""
+            while (this.at() != 125 && !this.fail) {
+                let h = this.at()
+                if (h < 0) {
+                    this.fail = true
+                    return 0 - 2
+                }
+                hex = hex + "{h as char}"
+                this.bump()
+            }
+            if (this.at() != 125) {
+                this.fail = true
+                return 0 - 2
+            }
+            this.bump()
+            let cp = hexScalar(hex)
+            if (cp < 0) {
+                this.fail = true
+                return 0 - 2
+            }
+            return cp
+        }
+        if (e == 46 || e == 42 || e == 43 || e == 63 || e == 40 || e == 41) {
+            return e
+        }
+        if (e == 91 || e == 93 || e == 123 || e == 125 || e == 124 || e == 94 || e == 36) {
+            return e
+        }
+        if (e == 92 || e == 47 || e == 45) {
+            return e
+        }
+        this.fail = true
+        0 - 2
+    }
+
+    /// A bracket class. `]` is literal in the first position, and a trailing
+    /// `-` is literal, matching the common engines.
+    fn parseClass() -> RegexNode {
+        this.bump()
+        var negate = false
+        if (this.at() == 94) {
+            negate = true
+            this.bump()
+        }
+        var ranges = emptyRanges()
+        var first = true
+        while (!this.fail) {
+            let c = this.at()
+            if (c < 0) {
+                this.fail = true
+                break
+            }
+            if (c == 93 && !first) {
+                this.bump()
+                break
+            }
+            first = false
+            var lo = 0
+            if (c == 92) {
+                this.bump()
+                let r = this.parseEscapeInto(ranges)
+                if (r == 0 - 2 || r == 0 - 3) {
+                    this.fail = true
+                    break
+                }
+                if (r < 0) {
+                    continue
+                }
+                lo = r
+            } else {
+                this.bump()
+                lo = c
+            }
+            if (this.at() == 45) {
+                this.bump()
+                let nc = this.at()
+                if (nc >= 0 && nc != 93) {
+                    var hi = 0
+                    if (nc == 92) {
+                        this.bump()
+                        let r2 = this.parseEscapeInto(ranges)
+                        if (r2 < 0) {
+                            this.fail = true
+                            break
+                        }
+                        hi = r2
+                    } else {
+                        this.bump()
+                        hi = nc
+                    }
+                    if (hi < lo) {
+                        this.fail = true
+                        break
+                    }
+                    pushRange(ranges, lo, hi)
+                    continue
+                }
+                pushRange(ranges, lo, lo)
+                pushRange(ranges, 45, 45)
+                continue
+            }
+            pushRange(ranges, lo, lo)
+        }
+        if (this.fail) {
+            return RegexNode.NAny
+        }
+        RegexNode.NClass(negate, ranges)
+    }
+}
+
+/// A compiled regular expression.
+class Regex {
+    var ops: List<RegexOp>
+    var groups: int
+
+    constructor(ops: List<RegexOp>, groups: int) {
+        this.ops = ops
+        this.groups = groups
+    }
+
+    /// The number of capturing groups (not counting the whole match).
+    fn groupCount() -> int {
+        this.groups
+    }
+
+    /// Append an op and return its program counter.
+    fn add(op: RegexOp) -> int {
+        this.ops.push(op)
+        len(this.ops) - 1
+    }
+
+    /// The next program counter.
+    fn here() -> int {
+        len(this.ops)
+    }
+
+    /// Overwrite the op at `pc`.
+    fn patch(pc: int, op: RegexOp) {
+        this.ops[pc] = op
+    }
+
+    /// Emit `node` at the end of the program.
+    fn emit(node: RegexNode) {
+        match (node) {
+        case RegexNode.NChar(cp) -> this.add(RegexOp.RChar(cp))
+        case RegexNode.NAny -> this.add(RegexOp.RAny)
+        case RegexNode.NClass(negate, ranges) -> this.add(RegexOp.RClass(negate, ranges))
+        case RegexNode.NSeq(items) -> {
+            for (item in items) {
+                this.emit(item)
+            }
+        }
+        case RegexNode.NAlt(items) -> this.emitAlt(items)
+        case RegexNode.NRepeat(body, low, high, greedy) -> this.emitRepeat(body[0], low, high, greedy)
+        case RegexNode.NGroup(body, index) -> {
+            this.add(RegexOp.RSave(index * 2))
+            this.emit(body[0])
+            this.add(RegexOp.RSave(index * 2 + 1))
+        }
+        case RegexNode.NBegin -> this.add(RegexOp.RBegin)
+        case RegexNode.NEnd -> this.add(RegexOp.REnd)
+        }
+    }
+
+    /// Alternation as a right-leaning chain of splits, left branch first.
+    fn emitAlt(items: List<RegexNode>) {
+        if (len(items) == 1) {
+            this.emit(items[0])
+            return
+        }
+        var rest = emptyNodes()
+        var k = 1
+        while (k < len(items)) {
+            rest.push(items[k])
+            k = k + 1
+        }
+        let splitAt = this.add(RegexOp.RSplit(0, 0))
+        let left = this.here()
+        this.emit(items[0])
+        let jmpAt = this.add(RegexOp.RJmp(0))
+        let right = this.here()
+        this.patch(splitAt, RegexOp.RSplit(left, right))
+        this.emitAlt(rest)
+        this.patch(jmpAt, RegexOp.RJmp(this.here()))
+    }
+
+    /// Bounded and unbounded quantifiers, greedy or lazy.
+    fn emitRepeat(body: RegexNode, low: int, high: int, greedy: bool) {
+        var k = 0
+        while (k < low) {
+            this.emit(body)
+            k = k + 1
+        }
+        if (high < 0) {
+            let splitAt = this.add(RegexOp.RSplit(0, 0))
+            let bodyStart = this.here()
+            this.emit(body)
+            this.add(RegexOp.RJmp(splitAt))
+            let after = this.here()
+            if (greedy) {
+                this.patch(splitAt, RegexOp.RSplit(bodyStart, after))
+            } else {
+                this.patch(splitAt, RegexOp.RSplit(after, bodyStart))
+            }
+            return
+        }
+        var splits = emptyInts()
+        var n = high - low
+        var j = 0
+        while (j < n) {
+            splits.push(this.add(RegexOp.RSplit(0, 0)))
+            this.emit(body)
+            j = j + 1
+        }
+        let after = this.here()
+        var q = 0
+        while (q < len(splits)) {
+            let pc = splits[q]
+            if (greedy) {
+                this.patch(pc, RegexOp.RSplit(pc + 1, after))
+            } else {
+                this.patch(pc, RegexOp.RSplit(after, pc + 1))
+            }
+            q = q + 1
+        }
+    }
+
+    /// Follow epsilon transitions at `pc`, appending runnable threads in
+    /// priority order. `bsLen` anchors `$`; `visited` breaks epsilon cycles.
+    fn addThread(list: List<Thread>, pc: int, pos: int, caps: List<int>, visited: List<bool>, bsLen: int) {
+        if (pc < 0 || pc >= len(this.ops)) {
+            return
+        }
+        if (visited[pc]) {
+            return
+        }
+        visited[pc] = true
+        match (this.ops[pc]) {
+        case RegexOp.RJmp(to) -> this.addThread(list, to, pos, caps, visited, bsLen)
+        case RegexOp.RSplit(a, b) -> {
+            this.addThread(list, a, pos, caps, visited, bsLen)
+            this.addThread(list, b, pos, caps, visited, bsLen)
+        }
+        case RegexOp.RSave(slot) -> {
+            var next = copyInts(caps)
+            next[slot] = pos
+            this.addThread(list, pc + 1, pos, next, visited, bsLen)
+        }
+        case RegexOp.RBegin -> {
+            if (pos == 0) {
+                this.addThread(list, pc + 1, pos, caps, visited, bsLen)
+            }
+        }
+        case RegexOp.REnd -> {
+            if (pos == bsLen) {
+                this.addThread(list, pc + 1, pos, caps, visited, bsLen)
+            }
+        }
+        case _ -> list.push(Thread(pc, caps))
+        }
+    }
+
+    /// Captures for a match starting at byte offset `start`, or `none`.
+    fn matchAt(bs: List<byte>, start: int) -> List<int>? {
+        let slots = this.groups * 2 + 2
+        var clist = emptyThreads()
+        var visited = freshFlags(len(this.ops))
+        this.addThread(clist, 0, start, filledSlots(slots, -1), visited, len(bs))
+        var pos = start
+        var matched: List<int>? = none
+        while (len(clist) > 0) {
+            var nlist = emptyThreads()
+            var nvisited = freshFlags(len(this.ops))
+            var next = stepPos(bs, pos)
+            var i = 0
+            while (i < len(clist)) {
+                let t = clist[i]
+                match (this.ops[t.pc]) {
+                case RegexOp.RMatch -> {
+                    matched = t.caps
+                    break
+                }
+                case RegexOp.RChar(cp) -> {
+                    if (pos < len(bs) && cpAt(bs, pos) == cp) {
+                        this.addThread(nlist, t.pc + 1, next, t.caps, nvisited, len(bs))
+                    }
+                }
+                case RegexOp.RAny -> {
+                    let c = cpAt(bs, pos)
+                    if (pos < len(bs) && c != 10) {
+                        this.addThread(nlist, t.pc + 1, next, t.caps, nvisited, len(bs))
+                    }
+                }
+                case RegexOp.RClass(negate, ranges) -> {
+                    let c = cpAt(bs, pos)
+                    if (pos < len(bs) && (inRanges(ranges, c) != negate)) {
+                        this.addThread(nlist, t.pc + 1, next, t.caps, nvisited, len(bs))
+                    }
+                }
+                case _ -> {}
+                }
+                i = i + 1
+            }
+            if (len(nlist) == 0) {
+                break
+            }
+            clist = nlist
+            pos = next
+        }
+        matched
+    }
+
+    /// The leftmost match at or after byte offset `from`; `none` when nothing
+    /// matches.
+    fn findFrom(text: string, startAt: int) -> Match? {
+        let bs = bytes(text)
+        var start = startAt
+        if (start < 0) {
+            start = 0
+        }
+        while (start <= len(bs)) {
+            let caps = this.matchAt(bs, start)
+            if (let some(c) = caps) {
+                return Match(text, c, this.groups)
+            }
+            if (start >= len(bs)) {
+                break
+            }
+            start = stepPos(bs, start)
+        }
+        none
+    }
+
+    /// The leftmost match; `none` when nothing matches.
+    fn find(text: string) -> Match? {
+        this.findFrom(text, 0)
+    }
+
+    /// Whether the pattern matches anywhere in `text`.
+    fn isMatch(text: string) -> bool {
+        match (this.find(text)) {
+        case some(_) -> true
+        case none -> false
+        }
+    }
+
+    /// Every non-overlapping match, left to right. An empty match advances one
+    /// scalar so the scan always terminates.
+    fn findAll(text: string) -> List<Match> {
+        let bs = bytes(text)
+        var out = emptyMatches()
+        var search = 0
+        while (search <= len(bs)) {
+            var found = false
+            if (let some(hit) = this.findFrom(text, search)) {
+                found = true
+                out.push(hit)
+                let b = hit.finish()
+                if (b > search) {
+                    search = b
+                } else {
+                    if (b >= len(bs)) {
+                        return out
+                    }
+                    search = stepPos(bs, b)
+                }
+            }
+            if (!found) {
+                return out
+            }
+        }
+        out
+    }
+
+    /// Replace every match with `template`, where `$0` is the whole match and
+    /// `$1`.. are groups. A group that did not participate expands to the
+    /// empty string, and `$` not followed by digits stays literal.
+    fn replace(text: string, template: string) -> string {
+        let bs = bytes(text)
+        var out = ""
+        var pos = 0
+        var search = 0
+        var done = false
+        while (!done) {
+            var found = false
+            if (let some(hit) = this.findFrom(text, search)) {
+                found = true
+                let a = hit.begin()
+                let b = hit.finish()
+                out = out + sliceBytes(text, pos, a) + expandTemplate(template, hit)
+                pos = b
+                if (b > a) {
+                    search = b
+                } else {
+                    if (b >= len(bs)) {
+                        done = true
+                    } else {
+                        search = stepPos(bs, b)
+                        out = out + sliceBytes(text, b, search)
+                        pos = search
+                    }
+                }
+            }
+            if (!found) {
+                done = true
+            }
+        }
+        out + sliceBytes(text, pos, len(bs))
+    }
+
+    /// Split `text` on non-empty matches. An empty match never cuts the text.
+    fn split(text: string) -> List<string> {
+        let bs = bytes(text)
+        var out = emptyStrings()
+        var pos = 0
+        var search = 0
+        var running = true
+        while (running && search <= len(bs)) {
+            var found = false
+            if (let some(hit) = this.findFrom(text, search)) {
+                found = true
+                let a = hit.begin()
+                let b = hit.finish()
+                if (b > a) {
+                    out.push(sliceBytes(text, pos, a))
+                    pos = b
+                    search = b
+                } else {
+                    if (b >= len(bs)) {
+                        running = false
+                    } else {
+                        search = stepPos(bs, b)
+                    }
+                }
+            }
+            if (!found) {
+                running = false
+            }
+        }
+        out.push(sliceBytes(text, pos, len(bs)))
+        out
+    }
+}
+
+/// Expand a replacement template against one match.
+fn expandTemplate(template: string, hit: Match) -> string {
+    let bs = bytes(template)
+    var out = ""
+    var i = 0
+    while (i < len(bs)) {
+        let c = cpAt(bs, i)
+        let next = stepPos(bs, i)
+        if (c != 36) {
+            out = out + sliceBytes(template, i, next)
+            i = next
+            continue
+        }
+        var j = next
+        var digits = 0
+        var value = 0
+        while (j < len(bs)) {
+            let d = cpAt(bs, j)
+            if (d < 48 || d > 57) {
+                break
+            }
+            value = value * 10 + (d - 48)
+            j = stepPos(bs, j)
+            digits = digits + 1
+        }
+        if (digits == 0) {
+            out = out + "$"
+            i = next
+        } else if (value <= hit.groups()) {
+            match (hit.group(value)) {
+            case some(g) -> out = out + g
+            case none -> {}
+            }
+            i = j
+        } else {
+            out = out + sliceBytes(template, i, j)
+            i = j
+        }
+    }
+    out
+}
+
+/// Compile `pattern`; `none` on any unsupported or malformed construct.
+fn compile(pattern: string) -> Regex? {
+    let p = PatternParser(pattern)
+    let root = p.parsePattern()
+    if (p.fail) {
+        return none
+    }
+    let re = Regex(emptyOps(), p.groupCount)
+    re.add(RegexOp.RSave(0))
+    re.emit(root)
+    re.add(RegexOp.RSave(1))
+    if (len(re.ops) > 100000) {
+        return none
+    }
+    re.add(RegexOp.RMatch)
+    re
+}
+
+/// One match: the subject plus the capture-slot offsets.
+class Match {
+    var source: string
+    var caps: List<int>
+    var total: int
+
+    constructor(source: string, caps: List<int>, groups: int) {
+        this.source = source
+        this.caps = caps
+        this.total = groups
+    }
+
+    /// The number of capturing groups (not counting the whole match).
+    fn groups() -> int {
+        this.total
+    }
+
+    /// The whole match's start offset in bytes.
+    fn begin() -> int {
+        this.caps[0]
+    }
+
+    /// The whole match's end offset in bytes.
+    fn finish() -> int {
+        this.caps[1]
+    }
+
+    /// The whole match.
+    fn text() -> string {
+        sliceBytes(this.source, this.caps[0], this.caps[1])
+    }
+
+    /// The start offset of group `i`; `none` when the group is out of range or
+    /// did not participate.
+    fn startOf(i: int) -> int? {
+        if (i < 0 || i > this.total) {
+            return none
+        }
+        let at = this.caps[i * 2]
+        if (at < 0) {
+            return none
+        }
+        at
+    }
+
+    /// The end offset of group `i`; `none` when out of range or unmatched.
+    fn endOf(i: int) -> int? {
+        if (i < 0 || i > this.total) {
+            return none
+        }
+        let at = this.caps[i * 2 + 1]
+        if (at < 0) {
+            return none
+        }
+        at
+    }
+
+    /// Group `i`'s text; `none` when out of range or unmatched. Group `0` is
+    /// the whole match.
+    fn group(i: int) -> string? {
+        match (this.startOf(i)) {
+        case none -> none
+        case some(a) -> match (this.endOf(i)) {
+            case none -> none
+            case some(b) -> sliceBytes(this.source, a, b)
+        }
+        }
+    }
+}

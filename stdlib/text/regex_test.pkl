@@ -1,0 +1,246 @@
+module std.text.regex_test
+
+import { compile, Regex, emptyOps } from std.text.regex
+
+fn mustCompile(pattern: string) -> Regex {
+    match (compile(pattern)) {
+    case some(re) -> re
+    case none -> {
+        expect(false).toBe(true)
+        Regex(emptyOps(), 0)
+    }
+    }
+}
+
+fn at(re: Regex, text: string) -> string {
+    match (re.find(text)) {
+    case some(m) -> "{m.begin()}:{m.finish()}:{m.text()}"
+    case none -> "<none>"
+    }
+}
+
+fn textOf(re: Regex, text: string) -> string {
+    match (re.find(text)) {
+    case some(m) -> m.text()
+    case none -> "<none>"
+    }
+}
+
+fn groupOf(re: Regex, text: string, i: int) -> string {
+    match (re.find(text)) {
+    case some(m) -> match (m.group(i)) {
+        case some(s) -> s
+        case none -> "<none>"
+    }
+    case none -> "<no-match>"
+    }
+}
+
+test fn literal_finds_the_leftmost_occurrence() {
+    let re = mustCompile("abc")
+    expect(at(re, "xxabcxx")).toBe("2:5:abc")
+    expect(re.isMatch("xxabcxx")).toBe(true)
+    expect(re.isMatch("ab")).toBe(false)
+    expect(re.groupCount()).toBe(0)
+}
+
+test fn escaped_metacharacters_are_literals() {
+    expect(textOf(mustCompile("\\."), "a.b")).toBe(".")
+    expect(textOf(mustCompile("\\*"), "2*3")).toBe("*")
+    expect(textOf(mustCompile("\\("), "f(x)")).toBe("(")
+    expect(textOf(mustCompile("\\["), "[x]")).toBe("[")
+    expect(textOf(mustCompile("a\\|b"), "a|b")).toBe("a|b")
+}
+
+test fn dot_matches_one_scalar_but_not_newline() {
+    let re = mustCompile(".")
+    expect(at(re, "é")).toBe("0:2:é")
+    expect(re.isMatch("\n")).toBe(false)
+    expect(re.isMatch("\r")).toBe(true)
+    let pair = mustCompile(".{{2}}")
+    expect(at(pair, "é日")).toBe("0:5:é日")
+}
+
+test fn anchors_bind_to_the_text_ends() {
+    expect(mustCompile("^ab").isMatch("abc")).toBe(true)
+    expect(mustCompile("^ab").isMatch("zab")).toBe(false)
+    expect(mustCompile("bc$").isMatch("abc")).toBe(true)
+    expect(mustCompile("bc$").isMatch("abcd")).toBe(false)
+    expect(mustCompile("^abc$").isMatch("abc")).toBe(true)
+    expect(mustCompile("^abc$").isMatch("abcd")).toBe(false)
+}
+
+test fn classes_and_ranges() {
+    expect(textOf(mustCompile("[a-z]+"), "12abc34")).toBe("abc")
+    expect(textOf(mustCompile("[^0-9]+"), "12abc34")).toBe("abc")
+    expect(textOf(mustCompile("[abc]+"), "xxcabz")).toBe("cab")
+    expect(textOf(mustCompile("[a-cx-z]+"), "zabq")).toBe("zab")
+    expect(textOf(mustCompile("[^a]+"), "aabbb")).toBe("bbb")
+}
+
+test fn class_escapes() {
+    expect(textOf(mustCompile("\\d+"), "ab123cd")).toBe("123")
+    expect(textOf(mustCompile("\\w+"), "  a_1  ")).toBe("a_1")
+    expect(textOf(mustCompile("\\s+"), "a \t\nb")).toBe(" \t\n")
+    expect(textOf(mustCompile("\\D+"), "12ab34")).toBe("ab")
+    expect(textOf(mustCompile("\\S+"), "  ab cd ")).toBe("ab")
+    expect(textOf(mustCompile("\\W+"), "ab  \tcd")).toBe("  \t")
+}
+
+test fn quantifiers_greedy_and_lazy() {
+    expect(textOf(mustCompile("a*"), "aaab")).toBe("aaa")
+    expect(at(mustCompile("a*"), "baa")).toBe("0:0:")
+    expect(textOf(mustCompile("a+"), "baa")).toBe("aa")
+    expect(at(mustCompile("a?"), "b")).toBe("0:0:")
+    expect(textOf(mustCompile("a{{2,3}}"), "aaaa")).toBe("aaa")
+    expect(textOf(mustCompile("a{{2,}}"), "aaaa")).toBe("aaaa")
+    expect(textOf(mustCompile("a{{2}}"), "aaaa")).toBe("aa")
+    expect(textOf(mustCompile("a+?"), "aaa")).toBe("a")
+    expect(textOf(mustCompile("a{{1,3}}?"), "aaa")).toBe("a")
+    expect(textOf(mustCompile("ab{{0}}c"), "ac")).toBe("ac")
+}
+
+test fn alternation_prefers_the_left_branch() {
+    expect(textOf(mustCompile("cat|dog"), "a dog and cat")).toBe("dog")
+    expect(textOf(mustCompile("a|ab"), "ab")).toBe("a")
+    expect(textOf(mustCompile("ab|a"), "ab")).toBe("ab")
+    expect(textOf(mustCompile("(ab|cd)+"), "abcdab")).toBe("abcdab")
+}
+
+test fn captures_expose_groups() {
+    let re = mustCompile("^([a-z]+)-(\\d+)$")
+    expect(re.groupCount()).toBe(2)
+    expect(groupOf(re, "item-42", 0)).toBe("item-42")
+    expect(groupOf(re, "item-42", 1)).toBe("item")
+    expect(groupOf(re, "item-42", 2)).toBe("42")
+    match (re.find("item-42")) {
+    case some(m) -> {
+        expect(m.begin()).toBe(0)
+        expect(m.finish()).toBe(7)
+        match (m.startOf(2)) {
+        case some(a) -> expect(a).toBe(5)
+        case none -> expect(true).toBe(false)
+        }
+        match (m.endOf(2)) {
+        case some(b) -> expect(b).toBe(7)
+        case none -> expect(true).toBe(false)
+        }
+    }
+    case none -> expect(true).toBe(false)
+    }
+    expect(groupOf(re, "item-42", 3)).toBe("<none>")
+}
+
+test fn optional_group_can_be_unmatched() {
+    let re = mustCompile("^(a)?(b)$")
+    expect(groupOf(re, "b", 1)).toBe("<none>")
+    expect(groupOf(re, "b", 2)).toBe("b")
+    match (re.find("b")) {
+    case some(m) -> match (m.startOf(1)) {
+        case some(_) -> expect(true).toBe(false)
+        case none -> expect(true).toBe(true)
+    }
+    case none -> expect(true).toBe(false)
+    }
+    expect(groupOf(re, "ab", 1)).toBe("a")
+}
+
+test fn nested_groups_are_numbered_by_open_paren() {
+    let re = mustCompile("((a)(b))")
+    expect(re.groupCount()).toBe(3)
+    expect(groupOf(re, "xab", 0)).toBe("ab")
+    expect(groupOf(re, "xab", 1)).toBe("ab")
+    expect(groupOf(re, "xab", 2)).toBe("a")
+    expect(groupOf(re, "xab", 3)).toBe("b")
+}
+
+test fn non_capturing_groups_do_not_count() {
+    let re = mustCompile("(?:ab)+c")
+    expect(re.groupCount()).toBe(0)
+    expect(textOf(re, "xxababc")).toBe("ababc")
+}
+
+test fn replace_substitutes_groups() {
+    let re = mustCompile("(\\w+)@(\\w+)")
+    expect(re.replace("a@b c@d", "$2@$1")).toBe("b@a d@c")
+    expect(re.replace("nobody here", "$1")).toBe("nobody here")
+    let one = mustCompile("(a)|(b)")
+    expect(one.replace("a", "[$2]")).toBe("[]")
+    expect(one.replace("b", "[$1]")).toBe("[]")
+    let lit = mustCompile("a")
+    expect(lit.replace("a", "$$")).toBe("$$")
+    expect(lit.replace("a", "x$Y")).toBe("x$Y")
+    expect(lit.replace("a", "cost $5")).toBe("cost $5")
+}
+
+test fn find_all_lists_every_match() {
+    let re = mustCompile("\\d+")
+    let ms = re.findAll("a1b22c333")
+    expect(len(ms)).toBe(3)
+    expect(ms[0].text()).toBe("1")
+    expect(ms[0].begin()).toBe(1)
+    expect(ms[1].text()).toBe("22")
+    expect(ms[2].text()).toBe("333")
+}
+
+test fn split_cuts_on_nonempty_matches() {
+    let ws = mustCompile("\\s+")
+    let parts = ws.split("a  b\tc")
+    expect(len(parts)).toBe(3)
+    expect(parts[0]).toBe("a")
+    expect(parts[1]).toBe("b")
+    expect(parts[2]).toBe("c")
+    let comma = mustCompile(",")
+    let xs = comma.split("a,b,,c")
+    expect(len(xs)).toBe(4)
+    expect(xs[2]).toBe("")
+    expect(comma.split("abc")[0]).toBe("abc")
+    expect(len(comma.split("abc"))).toBe(1)
+}
+
+test fn empty_pattern_matches_at_every_position() {
+    let re = mustCompile("")
+    expect(re.isMatch("")).toBe(true)
+    expect(at(re, "abc")).toBe("0:0:")
+    let ms = re.findAll("ab")
+    expect(len(ms)).toBe(3)
+    expect(ms[0].begin()).toBe(0)
+    expect(ms[1].begin()).toBe(1)
+    expect(ms[2].begin()).toBe(2)
+}
+
+test fn invalid_patterns_return_none() {
+    let bad: List<string> = ["(", "[a", "a{{2,1}}", "*", "\\q", "(?=a)", "a{{201}}", "[z-a]", "a**", "a)", "\\u{{zz}}"]
+    var i = 0
+    while (i < len(bad)) {
+        match (compile(bad[i])) {
+        case some(_) -> expect(bad[i]).toBe("<this pattern should not compile>")
+        case none -> expect(true).toBe(true)
+        }
+        i = i + 1
+    }
+    expect(mustCompile("a{{0,200}}").isMatch("")).toBe(true)
+}
+
+test fn unicode_offsets_are_byte_offsets() {
+    let re = mustCompile("é")
+    expect(at(re, "aébc")).toBe("1:3:é")
+    let any = mustCompile(".")
+    expect(at(any, "日")).toBe("0:3:日")
+    expect(textOf(mustCompile(".+"), "日本語")).toBe("日本語")
+}
+
+test fn classes_test_code_points() {
+    expect(textOf(mustCompile("[^a]+"), "aé日")).toBe("é日")
+    expect(mustCompile("\\w+").isMatch("é")).toBe(false)
+    expect(mustCompile("[é]+").isMatch("café")).toBe(true)
+    expect(textOf(mustCompile("[\\u{{65}}-\\u{{67}}]+"), "xxefg")).toBe("efg")
+}
+
+test fn matches_can_be_reused_across_subjects() {
+    let re = mustCompile("(\\d+)-(\\d+)")
+    expect(groupOf(re, "1-2", 2)).toBe("2")
+    expect(groupOf(re, "10-20", 1)).toBe("10")
+    expect(re.replace("3-4 5-6", "$1+$2")).toBe("3+4 5+6")
+    expect(re.isMatch("no digits")).toBe(false)
+}
