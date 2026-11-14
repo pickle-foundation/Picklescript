@@ -1,0 +1,451 @@
+module std.encoding.toml_test
+
+import { Toml, parse, typeOf, asStr, asInt, asBool, field, at, size, keysOf } from std.encoding.toml
+
+// Small accessor helpers so the assertions read like the document they check.
+// Sentinels make a missing key or a type mismatch show up as a readable
+// failure instead of an unrelated compile error.
+
+fn kindAt(t: Toml, k: string) -> string {
+    var out = "<missing>"
+    if (let some(v) = field(t, k)) {
+        out = typeOf(v)
+    }
+    out
+}
+
+fn strAt(t: Toml, k: string) -> string {
+    var out = "<missing>"
+    if (let some(v) = field(t, k)) {
+        out = "<not-string>"
+        if (let some(s) = asStr(v)) {
+            out = s
+        }
+    }
+    out
+}
+
+fn intAt(t: Toml, k: string) -> int {
+    var out = 0 - 999999
+    if (let some(v) = field(t, k)) {
+        if (let some(n) = asInt(v)) {
+            out = n
+        }
+    }
+    out
+}
+
+fn boolAt(t: Toml, k: string) -> bool {
+    var out = false
+    if (let some(v) = field(t, k)) {
+        if (let some(b) = asBool(v)) {
+            out = b
+        }
+    }
+    out
+}
+
+fn sizeAt(t: Toml, k: string) -> int {
+    var out = 0 - 1
+    if (let some(v) = field(t, k)) {
+        out = size(v)
+    }
+    out
+}
+
+fn elemKindAt(t: Toml, k: string, i: int) -> string {
+    var out = "<missing>"
+    if (let some(v) = field(t, k)) {
+        if (let some(x) = at(v, i)) {
+            out = typeOf(x)
+        }
+    }
+    out
+}
+
+fn elemStrAt(t: Toml, k: string, i: int) -> string {
+    var out = "<missing>"
+    if (let some(v) = field(t, k)) {
+        if (let some(x) = at(v, i)) {
+            out = "<not-string>"
+            if (let some(s) = asStr(x)) {
+                out = s
+            }
+        }
+    }
+    out
+}
+
+fn elemIntAt(t: Toml, k: string, i: int) -> int {
+    var out = 0 - 999999
+    if (let some(v) = field(t, k)) {
+        if (let some(x) = at(v, i)) {
+            if (let some(n) = asInt(x)) {
+                out = n
+            }
+        }
+    }
+    out
+}
+
+fn hasStr(xs: List<string>, s: string) -> bool {
+    var i = 0
+    while (i < len(xs)) {
+        if (xs[i] == s) {
+            return true
+        }
+        i = i + 1
+    }
+    false
+}
+
+test fn empty_document_is_an_empty_root_table() {
+    match (parse("")) {
+    case some(root) -> {
+        expect(typeOf(root)).toBe("table")
+        expect(size(root)).toBe(0)
+        expect(len(keysOf(root))).toBe(0)
+    }
+    case none -> expect(true).toBe(false)
+    }
+    match (parse("\n\n# only a comment\n\n")) {
+    case some(root) -> expect(size(root)).toBe(0)
+    case none -> expect(true).toBe(false)
+    }
+}
+
+test fn scalars_keep_their_types() {
+    let doc = "title = \"TOML\"\ncount = 3\nenabled = true\n"
+    match (parse(doc)) {
+    case some(root) -> {
+        expect(kindAt(root, "title")).toBe("string")
+        expect(strAt(root, "title")).toBe("TOML")
+        expect(kindAt(root, "count")).toBe("int")
+        expect(intAt(root, "count")).toBe(3)
+        expect(kindAt(root, "enabled")).toBe("bool")
+        expect(boolAt(root, "enabled")).toBe(true)
+        expect(size(root)).toBe(3)
+    }
+    case none -> expect(true).toBe(false)
+    }
+}
+
+test fn comments_and_blank_lines_are_skipped() {
+    let doc = "# top\na = 1 # trailing\n\n# middle\nb = \"x # not a comment\"\n"
+    match (parse(doc)) {
+    case some(root) -> {
+        expect(intAt(root, "a")).toBe(1)
+        expect(strAt(root, "b")).toBe("x # not a comment")
+        expect(size(root)).toBe(2)
+    }
+    case none -> expect(true).toBe(false)
+    }
+}
+
+test fn strings_honor_escapes_and_literals() {
+    let doc = "nl = \"a\\nb\"\ntab = \"a\\tb\"\nquote = \"a\\\"b\"\nback = \"a\\\\b\"\nlit = 'a\\nb'\n"
+    match (parse(doc)) {
+    case some(root) -> {
+        expect(strAt(root, "nl")).toBe("a\nb")
+        expect(strAt(root, "tab")).toBe("a\tb")
+        expect(strAt(root, "quote")).toBe("a\"b")
+        expect(strAt(root, "back")).toBe("a\\b")
+        expect(strAt(root, "lit")).toBe("a\\nb")
+        expect(size(root)).toBe(5)
+    }
+    case none -> expect(true).toBe(false)
+    }
+}
+
+test fn signed_integers() {
+    let doc = "pos = +42\nneg = -7\nzero = 0\n"
+    match (parse(doc)) {
+    case some(root) -> {
+        expect(kindAt(root, "pos")).toBe("int")
+        expect(intAt(root, "pos")).toBe(42)
+        expect(intAt(root, "neg")).toBe(-7)
+        expect(intAt(root, "zero")).toBe(0)
+    }
+    case none -> expect(true).toBe(false)
+    }
+}
+
+test fn booleans() {
+    let doc = "yes = true\nno = false\n"
+    match (parse(doc)) {
+    case some(root) -> {
+        expect(kindAt(root, "yes")).toBe("bool")
+        expect(boolAt(root, "yes")).toBe(true)
+        expect(kindAt(root, "no")).toBe("bool")
+        expect(boolAt(root, "no")).toBe(false)
+    }
+    case none -> expect(true).toBe(false)
+    }
+}
+
+test fn arrays_including_nested_and_multi_line() {
+    let doc = "empty = []\nnums = [1, 2, 3]\nnested = [1, [2, 3], \"x\"]\nmulti = [\n  1, # one\n  2,\n]\n"
+    match (parse(doc)) {
+    case some(root) -> {
+        expect(kindAt(root, "empty")).toBe("array")
+        expect(sizeAt(root, "empty")).toBe(0)
+        expect(sizeAt(root, "nums")).toBe(3)
+        expect(elemIntAt(root, "nums", 0)).toBe(1)
+        expect(elemIntAt(root, "nums", 2)).toBe(3)
+        expect(elemKindAt(root, "nested", 0)).toBe("int")
+        expect(elemKindAt(root, "nested", 1)).toBe("array")
+        expect(elemStrAt(root, "nested", 2)).toBe("x")
+        expect(sizeAt(root, "multi")).toBe(2)
+        expect(elemIntAt(root, "multi", 1)).toBe(2)
+    }
+    case none -> expect(true).toBe(false)
+    }
+}
+
+test fn a_nested_array_keeps_its_elements() {
+    let doc = "nested = [1, [2, 3], \"x\"]\n"
+    match (parse(doc)) {
+    case some(root) -> {
+        match (field(root, "nested")) {
+        case some(outer) -> {
+            match (at(outer, 1)) {
+            case some(inner) -> {
+                expect(typeOf(inner)).toBe("array")
+                expect(size(inner)).toBe(2)
+                match (at(inner, 0)) {
+                case some(x) -> match (asInt(x)) {
+                    case some(n) -> expect(n).toBe(2)
+                    case none -> expect(true).toBe(false)
+                }
+                case none -> expect(true).toBe(false)
+                }
+            }
+            case none -> expect(true).toBe(false)
+            }
+        }
+        case none -> expect(true).toBe(false)
+        }
+    }
+    case none -> expect(true).toBe(false)
+    }
+}
+
+test fn table_headers_group_keys() {
+    let doc = "top = 1\n\n[server]\nhost = \"localhost\"\nport = 8080\n"
+    match (parse(doc)) {
+    case some(root) -> {
+        expect(intAt(root, "top")).toBe(1)
+        expect(kindAt(root, "server")).toBe("table")
+        match (field(root, "server")) {
+        case some(s) -> {
+            expect(strAt(s, "host")).toBe("localhost")
+            expect(intAt(s, "port")).toBe(8080)
+            expect(size(s)).toBe(2)
+        }
+        case none -> expect(true).toBe(false)
+        }
+        let ks = keysOf(root)
+        expect(len(ks)).toBe(2)
+        expect(hasStr(ks, "top")).toBe(true)
+        expect(hasStr(ks, "server")).toBe(true)
+    }
+    case none -> expect(true).toBe(false)
+    }
+}
+
+test fn nested_table_headers() {
+    let doc = "[a]\nx = 1\n\n[a.b]\ny = 2\n\n[a.b.c]\nz = 3\n"
+    match (parse(doc)) {
+    case some(root) -> {
+        expect(kindAt(root, "a")).toBe("table")
+        match (field(root, "a")) {
+        case some(a) -> {
+            expect(intAt(a, "x")).toBe(1)
+            expect(kindAt(a, "b")).toBe("table")
+            match (field(a, "b")) {
+            case some(b) -> {
+                expect(intAt(b, "y")).toBe(2)
+                expect(kindAt(b, "c")).toBe("table")
+                match (field(b, "c")) {
+                case some(c) -> expect(intAt(c, "z")).toBe(3)
+                case none -> expect(true).toBe(false)
+                }
+            }
+            case none -> expect(true).toBe(false)
+            }
+        }
+        case none -> expect(true).toBe(false)
+        }
+    }
+    case none -> expect(true).toBe(false)
+    }
+}
+
+test fn dotted_keys_create_tables() {
+    let doc = "a.b = 1\nc.d.e = 2\n"
+    match (parse(doc)) {
+    case some(root) -> {
+        expect(kindAt(root, "a")).toBe("table")
+        expect(kindAt(root, "c")).toBe("table")
+        match (field(root, "a")) {
+        case some(a) -> expect(intAt(a, "b")).toBe(1)
+        case none -> expect(true).toBe(false)
+        }
+        match (field(root, "c")) {
+        case some(c) -> match (field(c, "d")) {
+            case some(d) -> expect(intAt(d, "e")).toBe(2)
+            case none -> expect(true).toBe(false)
+        }
+        case none -> expect(true).toBe(false)
+        }
+    }
+    case none -> expect(true).toBe(false)
+    }
+}
+
+test fn duplicate_keys_are_rejected() {
+    match (parse("a = 1\na = 2\n")) {
+    case some(_) -> expect(true).toBe(false)
+    case none -> expect(true).toBe(true)
+    }
+    match (parse("a.b = 1\na.b = 2\n")) {
+    case some(_) -> expect(true).toBe(false)
+    case none -> expect(true).toBe(true)
+    }
+}
+
+test fn malformed_documents_parse_to_none() {
+    let docs: List<string> = ["a = 1.5", "a = 1 b = 2", "a", "a =", "a = \"open", "[a", "[[a]]", "\"a\" = 1", "a = [1, 2", "= 1", "a = 1979-05-27", "a = 0x10", "a = nope", "a = {{ b = 1 }}"]
+    var i = 0
+    while (i < len(docs)) {
+        match (parse(docs[i])) {
+        case some(v) -> expect(typeOf(v)).toBe("document should not parse")
+        case none -> expect(true).toBe(true)
+        }
+        i = i + 1
+    }
+}
+
+test fn keys_expose_every_key() {
+    let doc = "b = 1\na = 2\nc = 3\n\n[z]\nq = 1\np = 2\n"
+    match (parse(doc)) {
+    case some(root) -> {
+        let ks = keysOf(root)
+        expect(len(ks)).toBe(4)
+        expect(hasStr(ks, "b")).toBe(true)
+        expect(hasStr(ks, "a")).toBe(true)
+        expect(hasStr(ks, "c")).toBe(true)
+        expect(hasStr(ks, "z")).toBe(true)
+        match (field(root, "z")) {
+        case some(z) -> {
+            let zk = keysOf(z)
+            expect(len(zk)).toBe(2)
+            expect(hasStr(zk, "q")).toBe(true)
+            expect(hasStr(zk, "p")).toBe(true)
+        }
+        case none -> expect(true).toBe(false)
+        }
+    }
+    case none -> expect(true).toBe(false)
+    }
+}
+
+test fn non_ascii_text_survives() {
+    let doc = "name = \"café\"\ngreet = \"日本語\"\npath = 'C:\\Users\\café'\n"
+    match (parse(doc)) {
+    case some(root) -> {
+        expect(strAt(root, "name")).toBe("café")
+        expect(strAt(root, "greet")).toBe("日本語")
+        expect(strAt(root, "path")).toBe("C:\\Users\\café")
+    }
+    case none -> expect(true).toBe(false)
+    }
+}
+
+test fn accessors_reject_wrong_types() {
+    let doc = "s = \"x\"\ni = 1\nb = true\narr = [1]\n"
+    match (parse(doc)) {
+    case some(root) -> {
+        expect(kindAt(root, "missing")).toBe("<missing>")
+        match (field(root, "s")) {
+        case some(v) -> {
+            expect(typeOf(v)).toBe("string")
+            match (asInt(v)) {
+            case some(_) -> expect(true).toBe(false)
+            case none -> expect(true).toBe(true)
+            }
+            match (asBool(v)) {
+            case some(_) -> expect(true).toBe(false)
+            case none -> expect(true).toBe(true)
+            }
+            match (field(v, "x")) {
+            case some(_) -> expect(true).toBe(false)
+            case none -> expect(true).toBe(true)
+            }
+            match (at(v, 0)) {
+            case some(_) -> expect(true).toBe(false)
+            case none -> expect(true).toBe(true)
+            }
+            expect(size(v)).toBe(0)
+        }
+        case none -> expect(true).toBe(false)
+        }
+        match (field(root, "i")) {
+        case some(v) -> match (asStr(v)) {
+            case some(_) -> expect(true).toBe(false)
+            case none -> expect(true).toBe(true)
+        }
+        case none -> expect(true).toBe(false)
+        }
+        match (field(root, "arr")) {
+        case some(v) -> {
+            expect(size(v)).toBe(1)
+            expect(len(keysOf(v))).toBe(0)
+            match (at(v, 1)) {
+            case some(_) -> expect(true).toBe(false)
+            case none -> expect(true).toBe(true)
+            }
+            match (at(v, 0 - 1)) {
+            case some(_) -> expect(true).toBe(false)
+            case none -> expect(true).toBe(true)
+            }
+        }
+        case none -> expect(true).toBe(false)
+        }
+    }
+    case none -> expect(true).toBe(false)
+    }
+}
+
+test fn at_and_size_cover_arrays_and_tables() {
+    let doc = "arr = [10, 20]\n[t]\nk = 1\n"
+    match (parse(doc)) {
+    case some(root) -> {
+        expect(size(root)).toBe(2)
+        match (field(root, "arr")) {
+        case some(a) -> {
+            expect(size(a)).toBe(2)
+            match (at(a, 1)) {
+            case some(x) -> match (asInt(x)) {
+                case some(n) -> expect(n).toBe(20)
+                case none -> expect(true).toBe(false)
+            }
+            case none -> expect(true).toBe(false)
+            }
+        }
+        case none -> expect(true).toBe(false)
+        }
+        match (field(root, "t")) {
+        case some(t) -> {
+            expect(typeOf(t)).toBe("table")
+            expect(size(t)).toBe(1)
+            let tk = keysOf(t)
+            expect(len(tk)).toBe(1)
+            expect(tk[0]).toBe("k")
+        }
+        case none -> expect(true).toBe(false)
+        }
+    }
+    case none -> expect(true).toBe(false)
+    }
+}
