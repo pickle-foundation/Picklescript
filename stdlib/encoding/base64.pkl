@@ -1,0 +1,203 @@
+module std.encoding.base64
+
+// Base64 (RFC 4648) encoding and decoding.
+//
+// `encode` emits the standard alphabet with `=` padding; `decode` accepts the
+// standard alphabet with or without padding and returns `none` for malformed
+// input (an out-of-alphabet character, a stray `=` that is not trailing, or a
+// padding count inconsistent with the data length). The decoder is lenient
+// about the unused low bits of the final group: they do not have to be zero.
+//
+// `encodeUrl`/`decodeUrl` use the URL-safe alphabet (`-` and `_`). `encodeUrl`
+// omits padding; `decodeUrl` accepts padded and unpadded input and also the
+// standard `+`/`/` spellings.
+//
+// The API is byte-oriented. `encodeString`/`decodeString` are the string
+// conveniences; `decodeString` renders the decoded bytes as UTF-8 via `str`,
+// so invalid UTF-8 is replaced rather than rejected.
+
+import { StringBuilder } from std.text.stringbuilder
+
+const STD_ALPHABET: string = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+const URL_ALPHABET: string = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+/// Encode `data` with the standard alphabet and `=` padding.
+fn encode(data: List<byte>) -> string {
+    encodeAlphabet(data, STD_ALPHABET, true)
+}
+
+/// Encode `data` with the URL-safe alphabet (`-`, `_`) and no padding.
+fn encodeUrl(data: List<byte>) -> string {
+    encodeAlphabet(data, URL_ALPHABET, false)
+}
+
+fn encodeAlphabet(data: List<byte>, alphabet: string, pad: bool) -> string {
+    let sb = StringBuilder()
+    let n = len(data)
+    var i = 0
+    while (i + 3 <= n) {
+        let b0 = data[i] as int
+        let b1 = data[i + 1] as int
+        let b2 = data[i + 2] as int
+        sb.appendByte(alphabet[b0 >> 2])
+        sb.appendByte(alphabet[((b0 % 4) * 16) + (b1 >> 4)])
+        sb.appendByte(alphabet[((b1 % 16) * 4) + (b2 >> 6)])
+        sb.appendByte(alphabet[b2 % 64])
+        i = i + 3
+    }
+    let rem = n - i
+    if (rem == 1) {
+        let b0 = data[i] as int
+        sb.appendByte(alphabet[b0 >> 2])
+        sb.appendByte(alphabet[(b0 % 4) * 16])
+        if (pad) {
+            sb.appendByte(61 as byte)
+            sb.appendByte(61 as byte)
+        }
+    } else if (rem == 2) {
+        let b0 = data[i] as int
+        let b1 = data[i + 1] as int
+        sb.appendByte(alphabet[b0 >> 2])
+        sb.appendByte(alphabet[((b0 % 4) * 16) + (b1 >> 4)])
+        sb.appendByte(alphabet[(b1 % 16) * 4])
+        if (pad) {
+            sb.appendByte(61 as byte)
+        }
+    }
+    sb.toString()
+}
+
+/// Decode standard-alphabet base64; `none` when the input is malformed.
+fn decode(text: string) -> List<byte>? {
+    decodeAlphabet(text, false)
+}
+
+/// Decode URL-safe base64; `none` when the input is malformed.
+fn decodeUrl(text: string) -> List<byte>? {
+    decodeAlphabet(text, true)
+}
+
+fn decodeAlphabet(text: string, url: bool) -> List<byte>? {
+    let n = len(text)
+    var end = n
+    while (end > 0 && ((text[end - 1] as int) == 61)) {
+        end = end - 1
+    }
+    let padCount = n - end
+    let rem = end % 4
+    if (rem == 1) {
+        return none
+    }
+    if (padCount > 0) {
+        let need = (4 - rem) % 4
+        if (padCount != need) {
+            return none
+        }
+    }
+    let out = bytes("")
+    var i = 0
+    while (i + 4 <= end) {
+        let v0 = b64Value(text[i] as int, url)
+        let v1 = b64Value(text[i + 1] as int, url)
+        let v2 = b64Value(text[i + 2] as int, url)
+        let v3 = b64Value(text[i + 3] as int, url)
+        if (v0 < 0 || v1 < 0 || v2 < 0 || v3 < 0) {
+            return none
+        }
+        let t = v0 * 262144 + v1 * 4096 + v2 * 64 + v3
+        out.push(((t >> 16) % 256) as byte)
+        out.push(((t >> 8) % 256) as byte)
+        out.push((t % 256) as byte)
+        i = i + 4
+    }
+    let tail = end - i
+    if (tail == 2) {
+        let v0 = b64Value(text[i] as int, url)
+        let v1 = b64Value(text[i + 1] as int, url)
+        if (v0 < 0 || v1 < 0) {
+            return none
+        }
+        out.push(((v0 * 4) + (v1 >> 4)) as byte)
+    } else if (tail == 3) {
+        let v0 = b64Value(text[i] as int, url)
+        let v1 = b64Value(text[i + 1] as int, url)
+        let v2 = b64Value(text[i + 2] as int, url)
+        if (v0 < 0 || v1 < 0 || v2 < 0) {
+            return none
+        }
+        let t = v0 * 1024 + v1 * 16 + (v2 >> 2)
+        out.push(((t >> 8) % 256) as byte)
+        out.push((t % 256) as byte)
+    }
+    out
+}
+
+fn b64Value(cp: int, url: bool) -> int {
+    if (cp >= 65 && cp <= 90) {
+        return cp - 65
+    }
+    if (cp >= 97 && cp <= 122) {
+        return cp - 97 + 26
+    }
+    if (cp >= 48 && cp <= 57) {
+        return cp - 48 + 52
+    }
+    if (cp == 43 || cp == 47) {
+        if (cp == 43) {
+            return 62
+        }
+        return 63
+    }
+    if (cp == 45 || cp == 95) {
+        if (!url) {
+            return -1
+        }
+        if (cp == 45) {
+            return 62
+        }
+        return 63
+    }
+    -1
+}
+
+/// `true` when `decode` accepts `text`.
+fn isValid(text: string) -> bool {
+    match (decode(text)) {
+        case some(_) -> true
+        case none -> false
+    }
+}
+
+/// `true` when `decodeUrl` accepts `text`.
+fn isValidUrl(text: string) -> bool {
+    match (decodeUrl(text)) {
+        case some(_) -> true
+        case none -> false
+    }
+}
+
+/// Base64 of the UTF-8 bytes of `text`.
+fn encodeString(text: string) -> string {
+    encode(bytes(text))
+}
+
+/// URL-safe base64 of the UTF-8 bytes of `text` (no padding).
+fn encodeStringUrl(text: string) -> string {
+    encodeUrl(bytes(text))
+}
+
+/// Decode standard base64 and render the bytes as a UTF-8 string.
+fn decodeString(text: string) -> string? {
+    match (decode(text)) {
+        case some(b) -> str(b)
+        case none -> none
+    }
+}
+
+/// Decode URL-safe base64 and render the bytes as a UTF-8 string.
+fn decodeStringUrl(text: string) -> string? {
+    match (decodeUrl(text)) {
+        case some(b) -> str(b)
+        case none -> none
+    }
+}

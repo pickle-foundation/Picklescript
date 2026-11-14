@@ -1,0 +1,132 @@
+module std.encoding.base64_test
+
+import { encode, decode, encodeUrl, decodeUrl, encodeString, encodeStringUrl,
+         decodeString, decodeStringUrl, isValid, isValidUrl } from std.encoding.base64
+
+fn d(text: string) -> List<byte> {
+    match (decode(text)) {
+        case some(b) -> b
+        case none -> bytes("")
+    }
+}
+
+fn du(text: string) -> List<byte> {
+    match (decodeUrl(text)) {
+        case some(b) -> b
+        case none -> bytes("")
+    }
+}
+
+test fn rfc4648_encode_vectors() {
+    expect(encodeString("")).toBe("")
+    expect(encodeString("f")).toBe("Zg==")
+    expect(encodeString("fo")).toBe("Zm8=")
+    expect(encodeString("foo")).toBe("Zm9v")
+    expect(encodeString("foob")).toBe("Zm9vYg==")
+    expect(encodeString("fooba")).toBe("Zm9vYmE=")
+    expect(encodeString("foobar")).toBe("Zm9vYmFy")
+}
+
+test fn rfc4648_decode_vectors() {
+    expect(d("")).toEqual(bytes(""))
+    expect(d("Zg==")).toEqual(bytes("f"))
+    expect(d("Zm8=")).toEqual(bytes("fo"))
+    expect(d("Zm9v")).toEqual(bytes("foo"))
+    expect(d("Zm9vYg==")).toEqual(bytes("foob"))
+    expect(d("Zm9vYmE=")).toEqual(bytes("fooba"))
+    expect(d("Zm9vYmFy")).toEqual(bytes("foobar"))
+}
+
+test fn unpadded_input_is_accepted() {
+    expect(d("Zg")).toEqual(bytes("f"))
+    expect(d("Zm8")).toEqual(bytes("fo"))
+    expect(d("Zm9vYg")).toEqual(bytes("foob"))
+    expect(d("Zm9vYmE")).toEqual(bytes("fooba"))
+    expect(isValid("Zg")).toBe(true)
+    expect(isValid("Zm9vYg")).toBe(true)
+}
+
+test fn malformed_input_is_rejected() {
+    expect(isValid("a")).toBe(false)
+    expect(isValid("Zg=")).toBe(false)
+    expect(isValid("Zg===")).toBe(false)
+    expect(isValid("=Zg=")).toBe(false)
+    expect(isValid("Zg==Zg==")).toBe(false)
+    expect(isValid("Zm9v=")).toBe(false)
+    expect(isValid("Z=m=")).toBe(false)
+    expect(isValid("Zm9$")).toBe(false)
+    expect(isValid("Zg==")).toBe(true)
+    expect(isValid("Zm9v")).toBe(true)
+    expect(isValid("")).toBe(true)
+}
+
+test fn url_safe_alphabet() {
+    let raw: List<byte> = [251 as byte, 255 as byte]
+    expect(encode(raw)).toBe("+/8=")
+    expect(encodeUrl(raw)).toBe("-_8")
+    expect(d(encode(raw))).toEqual(raw)
+    expect(du("-_8")).toEqual(raw)
+    expect(du("-_8=")).toEqual(raw)
+    expect(du("+/8=")).toEqual(raw)
+    expect(isValid("-_8")).toBe(false)
+    expect(isValidUrl("-_8")).toBe(true)
+    expect(isValidUrl("+/8=")).toBe(true)
+}
+
+test fn round_trips_every_single_byte() {
+    var v = 0
+    while (v < 256) {
+        let one: List<byte> = [v as byte]
+        expect(d(encode(one))).toEqual(one)
+        expect(du(encodeUrl(one))).toEqual(one)
+        v = v + 1
+    }
+}
+
+test fn round_trips_every_three_byte_group() {
+    var v = 0
+    while (v < 256) {
+        let three: List<byte> = [v as byte, (255 - v) as byte, ((v * 7) % 256) as byte]
+        expect(d(encode(three))).toEqual(three)
+        expect(du(encodeUrl(three))).toEqual(three)
+        v = v + 1
+    }
+}
+
+test fn round_trips_all_byte_values() {
+    let all = bytes("")
+    var v = 0
+    while (v < 256) {
+        all.push(v as byte)
+        v = v + 1
+    }
+    expect(encode(all)).toBe("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w==")
+    expect(d(encode(all))).toEqual(all)
+}
+
+test fn string_conveniences() {
+    expect(encodeStringUrl("hello")).toBe("aGVsbG8")
+    match (decodeString(encodeString("hello"))) {
+        case some(s) -> expect(s).toBe("hello")
+        case none -> expect(true).toBe(false)
+    }
+    match (decodeStringUrl("aGVsbG8")) {
+        case some(s) -> expect(s).toBe("hello")
+        case none -> expect(true).toBe(false)
+    }
+    match (decodeString("not base64!")) {
+        case some(s) -> {
+            let _ = s
+            expect(true).toBe(false)
+        }
+        case none -> expect(true).toBe(true)
+    }
+}
+
+test fn utf8_bytes_round_trip() {
+    let eacute: List<byte> = [0xC3 as byte, 0xA9 as byte]
+    match (decodeString(encode(eacute))) {
+        case some(s) -> expect(s).toBe(str(eacute))
+        case none -> expect(true).toBe(false)
+    }
+}
