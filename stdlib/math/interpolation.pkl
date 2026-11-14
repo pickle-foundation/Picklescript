@@ -1,0 +1,201 @@
+module std.math.interpolation
+
+// Dependency-free interpolation helpers for `float` scalars.
+//
+// Everything here is plain arithmetic (no transcendental functions), so the
+// results are exact for the values that are exact in binary and are identical
+// across implementations. `t` is generally expected in `[0, 1]`; the easing
+// functions and `clamp01` clamp it, while `lerp`/`bezier` deliberately
+// extrapolate when `t` is outside the unit interval.
+//
+// Edge cases: `inverseLerp` returns 0 when the input range is empty, `remap`
+// uses `outMin` as the result of an empty input range, and `smoothstep` /
+// `smootherstep` return 0 when the two edges coincide. `linear` clamps `t` to
+// `[0, 1]` and returns `none` for an empty list.
+
+/// Linear interpolation between `a` and `b`; `t = 0` is `a`, `t = 1` is `b`.
+fn lerp(a: float, b: float, t: float) -> float {
+    a + (b - a) * t
+}
+
+/// The `t` that produces `v` between `a` and `b`; 0 when `a == b`.
+fn inverseLerp(a: float, b: float, v: float) -> float {
+    if (a == b) {
+        return 0.0
+    }
+    (v - a) / (b - a)
+}
+
+/// Clamp `t` to `[0, 1]`.
+fn clamp01(t: float) -> float {
+    if (t < 0.0) {
+        return 0.0
+    }
+    if (t > 1.0) {
+        return 1.0
+    }
+    t
+}
+
+/// A hard step: 0 below `edge`, 1 at or above it.
+fn step(edge: float, x: float) -> float {
+    if (x < edge) {
+        return 0.0
+    }
+    1.0
+}
+
+/// Cubic Hermite smoothstep from `edge0` to `edge1`; 0 when the edges coincide.
+fn smoothstep(edge0: float, edge1: float, x: float) -> float {
+    if (edge0 == edge1) {
+        return 0.0
+    }
+    let t = clamp01((x - edge0) / (edge1 - edge0))
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Quintic Hermite smoothstep (zero first and second derivatives at the ends);
+/// 0 when the edges coincide.
+fn smootherstep(edge0: float, edge1: float, x: float) -> float {
+    if (edge0 == edge1) {
+        return 0.0
+    }
+    let t = clamp01((x - edge0) / (edge1 - edge0))
+    t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+}
+
+/// Quadratic ease-in on a clamped `t`.
+fn easeInQuad(t: float) -> float {
+    let x = clamp01(t)
+    x * x
+}
+
+/// Quadratic ease-out on a clamped `t`.
+fn easeOutQuad(t: float) -> float {
+    let x = clamp01(t)
+    x * (2.0 - x)
+}
+
+/// Quadratic ease-in-out on a clamped `t`.
+fn easeInOutQuad(t: float) -> float {
+    let x = clamp01(t)
+    if (x < 0.5) {
+        return 2.0 * x * x
+    }
+    1.0 - 2.0 * (1.0 - x) * (1.0 - x)
+}
+
+/// Cubic ease-in on a clamped `t`.
+fn easeInCubic(t: float) -> float {
+    let x = clamp01(t)
+    x * x * x
+}
+
+/// Cubic ease-out on a clamped `t`.
+fn easeOutCubic(t: float) -> float {
+    let x = clamp01(t)
+    let y = 1.0 - x
+    1.0 - y * y * y
+}
+
+/// Cubic ease-in-out on a clamped `t`.
+fn easeInOutCubic(t: float) -> float {
+    let x = clamp01(t)
+    if (x < 0.5) {
+        return 4.0 * x * x * x
+    }
+    let y = 1.0 - x
+    1.0 - 4.0 * y * y * y
+}
+
+/// Bilinear blend of the four corners `v00`, `v10`, `v01`, `v11`, where the
+/// first index selects `x` and the second `y`.
+fn bilerp(v00: float, v10: float, v01: float, v11: float, tx: float, ty: float) -> float {
+    let bottom = lerp(v00, v10, tx)
+    let top = lerp(v01, v11, tx)
+    lerp(bottom, top, ty)
+}
+
+/// Trilinear blend of the eight corners, where the first index selects `x`,
+/// the second `y`, and the third `z`.
+fn trilerp(
+    v000: float, v100: float, v010: float, v110: float,
+    v001: float, v101: float, v011: float, v111: float,
+    tx: float, ty: float, tz: float,
+) -> float {
+    let z0 = bilerp(v000, v100, v010, v110, tx, ty)
+    let z1 = bilerp(v001, v101, v011, v111, tx, ty)
+    lerp(z0, z1, tz)
+}
+
+/// Quadratic Bezier at `t` with control points `a`, `b`, `c`.
+fn bezier2(a: float, b: float, c: float, t: float) -> float {
+    let u = 1.0 - t
+    u * u * a + 2.0 * u * t * b + t * t * c
+}
+
+/// Cubic Bezier at `t` with control points `a`, `b`, `c`, `d`.
+fn bezier3(a: float, b: float, c: float, d: float, t: float) -> float {
+    let u = 1.0 - t
+    u * u * u * a + 3.0 * u * u * t * b + 3.0 * u * t * t * c + t * t * t * d
+}
+
+/// Catmull-Rom spline at `t` on the segment between `p1` and `p2`, with `p0`
+/// and `p3` as the neighboring samples. `t = 0` is `p1`, `t = 1` is `p2`.
+fn catmullRom(p0: float, p1: float, p2: float, p3: float, t: float) -> float {
+    let t2 = t * t
+    let t3 = t2 * t
+    0.5 * ((2.0 * p1) + (p2 - p0) * t + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2 + (3.0 * p1 - p0 - 3.0 * p2 + p3) * t3)
+}
+
+/// Map `v` from the input range to the output range, extrapolating outside the
+/// input range. An empty input range yields `outMin`.
+fn remap(v: float, inMin: float, inMax: float, outMin: float, outMax: float) -> float {
+    if (inMin == inMax) {
+        return outMin
+    }
+    outMin + (v - inMin) * (outMax - outMin) / (inMax - inMin)
+}
+
+/// Like `remap`, but clamp `v` to the input range first.
+fn remapClamped(v: float, inMin: float, inMax: float, outMin: float, outMax: float) -> float {
+    var x = v
+    if (inMin < inMax) {
+        if (x < inMin) {
+            x = inMin
+        }
+        if (x > inMax) {
+            x = inMax
+        }
+    } else if (inMax < inMin) {
+        if (x > inMin) {
+            x = inMin
+        }
+        if (x < inMax) {
+            x = inMax
+        }
+    }
+    remap(x, inMin, inMax, outMin, outMax)
+}
+
+/// Interpolate a sample list at `t` in `[0, 1]` (clamped), treating the samples
+/// as evenly spaced from the first to the last. `none` for an empty list.
+fn linear(xs: List<float>, t: float) -> float? {
+    if (len(xs) == 0) {
+        return none
+    }
+    if (len(xs) == 1) {
+        return xs[0]
+    }
+    let x = clamp01(t)
+    let scaled = x * ((len(xs) - 1) as float)
+    var i = scaled as int
+    if (i >= len(xs) - 1) {
+        return xs[len(xs) - 1]
+    }
+    if (i < 0) {
+        i = 0
+    }
+    let frac = scaled - (i as float)
+    lerp(xs[i], xs[i + 1], frac)
+}
