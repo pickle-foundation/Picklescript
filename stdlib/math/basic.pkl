@@ -1,0 +1,189 @@
+module std.math.basic
+
+// Basic numeric helpers that the language does not provide as builtins.
+//
+// The language has `+ - * / % **` and the `abs`/`min`/`max`/`clamp` builtins,
+// but no rounding, no NaN/infinity classification, and no integer number
+// theory. This module fills those gaps for finite and non-finite floats and
+// for `int`.
+//
+// Rounding (`floor`, `ceil`, `trunc`, `round`) returns a `float`, like the
+// input, and passes NaN and the infinities through unchanged. The
+// implementation is the documented int round-trip (a truncating `as int` cast
+// plus a one-step correction), so it is exact for every finite magnitude below
+// 2^53 and leaves larger magnitudes untouched - they are already integers.
+// `round` rounds halves away from zero.
+//
+// `gcd`/`lcm`/`isqrt` work on `int`. `gcd` is always non-negative,
+// `gcd(0, 0)` is `0`, `lcm` is `0` when either argument is `0`, and `isqrt`
+// returns the floor of the square root and `0` for a negative argument.
+// `floorDiv`/`floorMod` round the quotient toward negative infinity, so the
+// remainder always has the divisor's sign (`-7 floorDiv 2 == -4`,
+// `-7 floorMod 2 == 1`); `/` and `%` truncate toward zero.
+
+/// `2^53`: every finite f64 at least this large is already an integer.
+const TWO_POW_53: float = 9007199254740992.0
+
+/// `true` when `x` is NaN.
+fn isNan(x: float) -> bool {
+    x != x
+}
+
+/// `true` when `x` is `+inf` or `-inf`.
+fn isInfinite(x: float) -> bool {
+    let inf = 1.0 / 0.0
+    x == inf || x == (0.0 - inf)
+}
+
+/// `true` when `x` is neither NaN nor infinite.
+fn isFinite(x: float) -> bool {
+    !isNan(x) && !isInfinite(x)
+}
+
+/// Whether `x` is an exact integer (and finite).
+fn isIntegral(x: float) -> bool {
+    if (!isFinite(x)) {
+        return false
+    }
+    if (x >= TWO_POW_53 || x <= 0.0 - TWO_POW_53) {
+        return true
+    }
+    x == trunc(x)
+}
+
+/// The largest integer not greater than `x`, as a `float`.
+fn floor(x: float) -> float {
+    if (!isFinite(x)) {
+        return x
+    }
+    if (x >= TWO_POW_53 || x <= 0.0 - TWO_POW_53) {
+        return x
+    }
+    let t = (x as int) as float
+    if (t > x) {
+        return t - 1.0
+    }
+    t
+}
+
+/// The smallest integer not less than `x`, as a `float`.
+fn ceil(x: float) -> float {
+    if (!isFinite(x)) {
+        return x
+    }
+    if (x >= TWO_POW_53 || x <= 0.0 - TWO_POW_53) {
+        return x
+    }
+    let t = (x as int) as float
+    if (t < x) {
+        return t + 1.0
+    }
+    t
+}
+
+/// `x` with its fractional part dropped (rounds toward zero).
+fn trunc(x: float) -> float {
+    if (!isFinite(x)) {
+        return x
+    }
+    if (x >= TWO_POW_53 || x <= 0.0 - TWO_POW_53) {
+        return x
+    }
+    (x as int) as float
+}
+
+/// The fractional part of `x` (`x - trunc(x)`), which has `x`'s sign.
+fn frac(x: float) -> float {
+    x - trunc(x)
+}
+
+/// `x` rounded to the nearest integer, with halves away from zero.
+fn round(x: float) -> float {
+    let t = trunc(x)
+    let f = x - t
+    if (f >= 0.5) {
+        return t + 1.0
+    }
+    if (f <= 0.0 - 0.5) {
+        return t - 1.0
+    }
+    t
+}
+
+/// `-1`, `0`, or `1` according to `x`'s sign; `0` for both zeroes and NaN.
+fn sign(x: float) -> int {
+    if (x > 0.0) {
+        return 1
+    }
+    if (x < 0.0) {
+        return 0 - 1
+    }
+    0
+}
+
+/// The greatest common divisor of `|a|` and `|b|`; `gcd(0, 0)` is `0`.
+fn gcd(a: int, b: int) -> int {
+    var x = a
+    var y = b
+    if (x < 0) {
+        x = 0 - x
+    }
+    if (y < 0) {
+        y = 0 - y
+    }
+    while (y != 0) {
+        let r = x % y
+        x = y
+        y = r
+    }
+    x
+}
+
+/// The least common multiple of `|a|` and `|b|`, or `0` when either is `0`.
+fn lcm(a: int, b: int) -> int {
+    if (a == 0 || b == 0) {
+        return 0
+    }
+    let d = gcd(a, b)
+    var x = a / d
+    if (x < 0) {
+        x = 0 - x
+    }
+    var y = b
+    if (y < 0) {
+        y = 0 - y
+    }
+    x * y
+}
+
+/// The floor of the square root of `n`, or `0` when `n` is negative.
+fn isqrt(n: int) -> int {
+    if (n <= 0) {
+        return 0
+    }
+    if (n < 4) {
+        return 1
+    }
+    var x = n / 2 + 1
+    var y = (x + n / x) / 2
+    while (y < x) {
+        x = y
+        y = (x + n / x) / 2
+    }
+    x
+}
+
+/// `a / b` rounded toward negative infinity. `b` must not be `0`.
+fn floorDiv(a: int, b: int) -> int {
+    let q = a / b
+    let r = a % b
+    if ((r < 0 && b > 0) || (r > 0 && b < 0)) {
+        return q - 1
+    }
+    q
+}
+
+/// The remainder of `floorDiv(a, b)`; its sign follows `b`. `b` must not be `0`.
+fn floorMod(a: int, b: int) -> int {
+    a - floorDiv(a, b) * b
+}
