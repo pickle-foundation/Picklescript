@@ -1,0 +1,176 @@
+module std.logging_test
+
+import { Level, Record, Logger, levelRank, levelName, parseLevel } from std.logging
+
+fn expectLevel(x: Level?, want: Level) {
+    match (x) {
+    case some(v) -> expect(levelRank(v)).toBe(levelRank(want))
+    case none -> expect(true).toBe(false)
+    }
+}
+
+test fn levels_have_names_and_ranks() {
+    expect(levelName(Level.Debug)).toBe("DEBUG")
+    expect(levelName(Level.Info)).toBe("INFO")
+    expect(levelName(Level.Warn)).toBe("WARN")
+    expect(levelName(Level.Error)).toBe("ERROR")
+    expect(levelRank(Level.Debug)).toBe(0)
+    expect(levelRank(Level.Info)).toBe(1)
+    expect(levelRank(Level.Warn)).toBe(2)
+    expect(levelRank(Level.Error)).toBe(3)
+}
+
+test fn parse_level_accepts_any_case() {
+    expectLevel(parseLevel("debug"), Level.Debug)
+    expectLevel(parseLevel("INFO"), Level.Info)
+    expectLevel(parseLevel("Warn"), Level.Warn)
+    expectLevel(parseLevel("eRrOr"), Level.Error)
+}
+
+test fn parse_level_rejects_unknown_words() {
+    match (parseLevel("trace")) {
+    case some(_) -> expect(true).toBe(false)
+    case none -> expect(true).toBe(true)
+    }
+    match (parseLevel("")) {
+    case some(_) -> expect(true).toBe(false)
+    case none -> expect(true).toBe(true)
+    }
+}
+
+test fn threshold_filters_verbose_levels() {
+    let lg = Logger(Level.Info)
+    expect(lg.debug("hidden")).toBe(false)
+    expect(lg.info("one")).toBe(true)
+    expect(lg.warn("two")).toBe(true)
+    expect(lg.error("three")).toBe(true)
+    expect(lg.count()).toBe(3)
+    expect(lg.dropped()).toBe(1)
+    expect(lg.isEmpty()).toBe(false)
+}
+
+test fn suppressed_messages_are_counted() {
+    let lg = Logger(Level.Warn)
+    expect(lg.enabled(Level.Info)).toBe(false)
+    expect(lg.enabled(Level.Warn)).toBe(true)
+    expect(lg.debug("a")).toBe(false)
+    expect(lg.info("b")).toBe(false)
+    expect(lg.dropped()).toBe(2)
+    expect(lg.count()).toBe(0)
+    expect(lg.isEmpty()).toBe(true)
+}
+
+test fn sequence_numbers_are_consecutive() {
+    let lg = Logger(Level.Debug)
+    lg.debug("zero")
+    lg.debug("hidden? no")
+    lg.info("two")
+    let rs = lg.records()
+    expect(len(rs)).toBe(3)
+    expect(rs[0].sequence).toBe(0)
+    expect(rs[1].sequence).toBe(1)
+    expect(rs[2].sequence).toBe(2)
+}
+
+test fn count_and_count_of() {
+    let lg = Logger(Level.Debug)
+    lg.debug("d")
+    lg.info("i")
+    lg.info("i2")
+    lg.warn("w")
+    lg.error("e")
+    expect(lg.count()).toBe(5)
+    expect(lg.countOf(Level.Debug)).toBe(1)
+    expect(lg.countOf(Level.Info)).toBe(2)
+    expect(lg.countOf(Level.Warn)).toBe(1)
+    expect(lg.countOf(Level.Error)).toBe(1)
+}
+
+test fn last_returns_the_newest_record() {
+    let lg = Logger(Level.Debug)
+    match (lg.last()) {
+    case some(_) -> expect(true).toBe(false)
+    case none -> expect(true).toBe(true)
+    }
+    lg.info("first")
+    lg.error("latest")
+    match (lg.last()) {
+    case some(r) -> {
+        expect(r.message).toBe("latest")
+        expect(r.name()).toBe("ERROR")
+    }
+    case none -> expect(true).toBe(false)
+    }
+}
+
+test fn records_is_a_copy() {
+    let lg = Logger(Level.Debug)
+    lg.info("kept")
+    let rs = lg.records()
+    rs.push(Record(Level.Debug, "extra", 99))
+    expect(len(rs)).toBe(2)
+    expect(lg.count()).toBe(1)
+    expect(lg.records()[0].message).toBe("kept")
+}
+
+test fn texts_and_formatted_render_lines() {
+    let lg = Logger(Level.Info)
+    expect(lg.formatted()).toBe("")
+    lg.info("ready")
+    lg.warn("careful")
+    let ts = lg.texts()
+    expect(len(ts)).toBe(2)
+    expect(ts[0]).toBe("[INFO] ready")
+    expect(ts[1]).toBe("[WARN] careful")
+    expect(lg.formatted()).toBe("[INFO] ready\n[WARN] careful")
+}
+
+test fn threshold_change_applies_forward() {
+    let lg = Logger(Level.Info)
+    lg.debug("dropped early")
+    lg.setThreshold(Level.Debug)
+    expect(levelRank(lg.threshold())).toBe(0)
+    expect(lg.debug("kept now")).toBe(true)
+    lg.setThreshold(Level.Error)
+    expect(lg.info("dropped late")).toBe(false)
+    expect(lg.count()).toBe(1)
+    expect(lg.dropped()).toBe(2)
+}
+
+test fn an_error_logger_keeps_only_errors() {
+    let lg = Logger(Level.Error)
+    lg.debug("d")
+    lg.info("i")
+    lg.warn("w")
+    lg.error("e")
+    expect(lg.count()).toBe(1)
+    expect(lg.dropped()).toBe(3)
+    expect(lg.texts()[0]).toBe("[ERROR] e")
+}
+
+test fn clear_resets_records_and_counters() {
+    let lg = Logger(Level.Warn)
+    lg.info("suppressed")
+    lg.warn("kept")
+    expect(lg.clear())
+    expect(lg.count()).toBe(0)
+    expect(lg.dropped()).toBe(0)
+    expect(levelRank(lg.threshold())).toBe(2)
+    lg.warn("after reset")
+    expect(lg.records()[0].sequence).toBe(0)
+}
+
+test fn messages_keep_unicode_and_newlines() {
+    let lg = Logger(Level.Debug)
+    lg.info("café 日本語")
+    lg.warn("line one\nline two")
+    expect(lg.texts()[0]).toBe("[INFO] café 日本語")
+    expect(lg.texts()[1]).toBe("[WARN] line one\nline two")
+}
+
+test fn record_text_has_no_trailing_newline() {
+    let r = Record(Level.Info, "hello", 7)
+    expect(r.text()).toBe("[INFO] hello")
+    expect(r.name()).toBe("INFO")
+    expect(r.sequence).toBe(7)
+}

@@ -1,0 +1,252 @@
+module std.logging
+
+// A small, dependency-free logger with levels, an in-memory record list, and
+// deterministic output.
+//
+// The logger never reads the clock. A record carries the severity, the message,
+// and a monotonically increasing sequence number, so tests and fixtures can
+// pin exact output. It writes nowhere on its own: callers inspect `records()`,
+// `texts()`, or `formatted()` and decide what to do (print, persist, forward).
+// That keeps the module usable from a compiler pipeline, a test, or a console
+// tool without hidden I/O.
+//
+// The threshold is the lowest severity that is kept. `setThreshold` changes it
+// at run time and filters going forward; records already kept stay. Suppressed
+// messages are counted (`dropped`) so a caller can see that filtering happened.
+//
+// Rendering is the compact `"[LEVEL] message"` form with uppercase level names
+// and no timestamp, so a golden file is stable across platforms and clock
+// settings.
+
+/// Severity levels, ordered from most to least verbose.
+enum Level {
+    Debug
+    Info
+    Warn
+    Error
+}
+
+/// The numeric rank of a level (Debug 0 .. Error 3).
+fn levelRank(level: Level) -> int {
+    match (level) {
+    case Level.Debug -> 0
+    case Level.Info -> 1
+    case Level.Warn -> 2
+    case Level.Error -> 3
+    }
+}
+
+/// The uppercase name used in rendered output.
+fn levelName(level: Level) -> string {
+    match (level) {
+    case Level.Debug -> "DEBUG"
+    case Level.Info -> "INFO"
+    case Level.Warn -> "WARN"
+    case Level.Error -> "ERROR"
+    }
+}
+
+/// ASCII-lowercase a level word (`Warn` and `warn` both parse).
+fn lowerAscii(s: string) -> string {
+    let bs = bytes(s)
+    var out = bytes("")
+    var i = 0
+    while (i < len(bs)) {
+        let b = bs[i] as int
+        if (b >= 65 && b <= 90) {
+            out.push((b + 32) as byte)
+        } else {
+            out.push(bs[i])
+        }
+        i = i + 1
+    }
+    str(out)
+}
+
+/// Parse a level name case-insensitively; `none` for an unknown word.
+fn parseLevel(text: string) -> Level? {
+    let w = lowerAscii(text)
+    if (w == "debug") {
+        return Level.Debug
+    }
+    if (w == "info") {
+        return Level.Info
+    }
+    if (w == "warn") {
+        return Level.Warn
+    }
+    if (w == "error") {
+        return Level.Error
+    }
+    none
+}
+
+/// One kept log line: severity, message, and the order it was accepted in.
+class Record {
+    var level: Level
+    var message: string
+    var sequence: int
+
+    constructor(level: Level, message: string, sequence: int) {
+        this.level = level
+        this.message = message
+        this.sequence = sequence
+    }
+
+    /// The uppercase level name.
+    fn name() -> string {
+        levelName(this.level)
+    }
+
+    /// The `"[LEVEL] message"` form (no trailing newline).
+    fn text() -> string {
+        "[" + levelName(this.level) + "] " + this.message
+    }
+}
+
+/// An in-memory logger. `Logger(Level.Info)` keeps Info and above.
+class Logger {
+    var minLevel: Level
+    var items: List<Record>
+    var next: int
+    var suppressed: int
+
+    constructor(threshold: Level) {
+        this.minLevel = threshold
+        this.items = [Record(Level.Debug, "", 0)]
+        this.items.remove(0)
+        this.next = 0
+        this.suppressed = 0
+    }
+
+    /// The current threshold (the lowest kept severity).
+    fn threshold() -> Level {
+        this.minLevel
+    }
+
+    /// Replace the threshold; affects messages logged from now on.
+    fn setThreshold(threshold: Level) {
+        this.minLevel = threshold
+    }
+
+    /// Whether a message at `level` would be kept.
+    fn enabled(level: Level) -> bool {
+        levelRank(level) >= levelRank(this.minLevel)
+    }
+
+    /// Record `message` at `level` when enabled. Returns whether it was kept.
+    fn log(level: Level, message: string) -> bool {
+        if (!this.enabled(level)) {
+            this.suppressed = this.suppressed + 1
+            return false
+        }
+        this.items.push(Record(level, message, this.next))
+        this.next = this.next + 1
+        true
+    }
+
+    /// `log(Level.Debug, message)`.
+    fn debug(message: string) -> bool {
+        this.log(Level.Debug, message)
+    }
+
+    /// `log(Level.Info, message)`.
+    fn info(message: string) -> bool {
+        this.log(Level.Info, message)
+    }
+
+    /// `log(Level.Warn, message)`.
+    fn warn(message: string) -> bool {
+        this.log(Level.Warn, message)
+    }
+
+    /// `log(Level.Error, message)`.
+    fn error(message: string) -> bool {
+        this.log(Level.Error, message)
+    }
+
+    /// How many messages have been recorded.
+    fn count() -> int {
+        len(this.items)
+    }
+
+    /// Whether nothing has been recorded.
+    fn isEmpty() -> bool {
+        len(this.items) == 0
+    }
+
+    /// How many messages were dropped by the threshold since construction or
+    /// `clear`.
+    fn dropped() -> int {
+        this.suppressed
+    }
+
+    /// How many kept messages have severity `level`.
+    fn countOf(level: Level) -> int {
+        var n = 0
+        for (r in this.items) {
+            if (levelRank(r.level) == levelRank(level)) {
+                n = n + 1
+            }
+        }
+        n
+    }
+
+    /// The recorded entries in acceptance order (a fresh list; the records
+    /// themselves are shared).
+    fn records() -> List<Record> {
+        var out: List<Record> = [Record(Level.Debug, "", 0)]
+        out.remove(0)
+        for (r in this.items) {
+            out.push(r)
+        }
+        out
+    }
+
+    /// The most recently kept record; `none` when empty.
+    fn last() -> Record? {
+        if (len(this.items) == 0) {
+            return none
+        }
+        this.items[len(this.items) - 1]
+    }
+
+    /// Every kept line in `"[LEVEL] message"` form.
+    fn texts() -> List<string> {
+        var out: List<string> = [""]
+        out.remove(0)
+        for (r in this.items) {
+            out.push(r.text())
+        }
+        out
+    }
+
+    /// The kept lines joined with LF (no trailing newline); `""` when empty.
+    fn formatted() -> string {
+        var out = ""
+        var i = 0
+        while (i < len(this.items)) {
+            if (i > 0) {
+                out = out + "\n"
+            }
+            out = out + this.items[i].text()
+            i = i + 1
+        }
+        out
+    }
+
+    /// Drop every record, reset the sequence counter, and reset the dropped
+    /// count. The threshold is kept.
+    fn clear() {
+        if (len(this.items) == 0) {
+            this.next = 0
+            this.suppressed = 0
+            return
+        }
+        let keep = this.items[0]
+        this.items = [keep]
+        this.items.remove(0)
+        this.next = 0
+        this.suppressed = 0
+    }
+}
