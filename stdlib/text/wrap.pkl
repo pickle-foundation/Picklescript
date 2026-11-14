@@ -1,0 +1,185 @@
+module std.text.wrap
+
+// Greedy word wrapping over Unicode scalars.
+//
+// Widths count scalars, not bytes, so `café` is four columns wide. Words are
+// never split: one that is longer than the available width occupies its own
+// (overflowing) line rather than slicing through a UTF-8 sequence, and a run of
+// ASCII whitespace collapses to one space. Existing LF boundaries are kept, and
+// an empty document wraps to zero lines while an empty line wraps to `""`.
+//
+// `wrapIndented` adds a first-line prefix and a continuation prefix, which is
+// what a bullet list or a quoted reply needs.
+
+import { splitLines } from std.text.diff
+import { scalarCount } from std.text.utf8
+
+/// Whether `b` is ASCII whitespace.
+fn isSpace(b: int) -> bool {
+    b == 32 || b == 9 || b == 10 || b == 13 || b == 11 || b == 12
+}
+
+/// The scalars of `s` (used for display-ish widths).
+fn widthOf(s: string) -> int {
+    scalarCount(bytes(s))
+}
+
+/// Split `text` into non-empty words on runs of ASCII whitespace.
+fn words(text: string) -> List<string> {
+    let bs = bytes(text)
+    var out: List<string> = [""]
+    out.remove(0)
+    var word = bytes("")
+    var i = 0
+    while (i < len(bs)) {
+        let b = bs[i] as int
+        if (isSpace(b)) {
+            if (len(word) > 0) {
+                out.push(str(word))
+                word = bytes("")
+            }
+        } else {
+            word.push(b as byte)
+        }
+        i = i + 1
+    }
+    if (len(word) > 0) {
+        out.push(str(word))
+    }
+    out
+}
+
+/// Wrap one line (no LF expected) to at most `width` scalars, breaking only
+/// between words. A word longer than the width is kept whole. `width` below 1
+/// is treated as 1. An empty or whitespace-only line yields `[""]`.
+fn wrapLine(line: string, width: int) -> List<string> {
+    var w = width
+    if (w < 1) {
+        w = 1
+    }
+    let ts = words(line)
+    var out: List<string> = [""]
+    out.remove(0)
+    if (len(ts) == 0) {
+        out.push("")
+        return out
+    }
+    var cur = ts[0]
+    var i = 1
+    while (i < len(ts)) {
+        let t = ts[i]
+        if (widthOf(cur) + 1 + widthOf(t) <= w) {
+            cur = cur + " " + t
+        } else {
+            out.push(cur)
+            cur = t
+        }
+        i = i + 1
+    }
+    out.push(cur)
+    out
+}
+
+/// Wrap every LF-delimited line of `text`; the result is one flat list of
+/// output lines (source line boundaries are preserved as breaks).
+fn wrap(text: string, width: int) -> List<string> {
+    let src = splitLines(text)
+    var out: List<string> = [""]
+    out.remove(0)
+    var i = 0
+    while (i < len(src)) {
+        let part = wrapLine(src[i], width)
+        var j = 0
+        while (j < len(part)) {
+            out.push(part[j])
+            j = j + 1
+        }
+        i = i + 1
+    }
+    out
+}
+
+/// Wrap one line with a `first` prefix on its first output line and `rest` on
+/// continuations. The prefix counts against `width`; the effective body width
+/// is at least 1. An empty line still yields the `first` prefix.
+fn wrapIndentedLine(line: string, width: int, first: string, rest: string) -> List<string> {
+    let ts = words(line)
+    var out: List<string> = [""]
+    out.remove(0)
+    if (len(ts) == 0) {
+        out.push(first)
+        return out
+    }
+    var prefix = first
+    var cur = ""
+    var i = 0
+    while (i < len(ts)) {
+        let t = ts[i]
+        var avail = width - widthOf(prefix)
+        if (avail < 1) {
+            avail = 1
+        }
+        if (widthOf(cur) == 0) {
+            cur = t
+        } else if (widthOf(cur) + 1 + widthOf(t) <= avail) {
+            cur = cur + " " + t
+        } else {
+            out.push(prefix + cur)
+            prefix = rest
+            cur = t
+        }
+        i = i + 1
+    }
+    out.push(prefix + cur)
+    out
+}
+
+/// Like `wrap`, with a hanging indent: `first` prefixes each source line's
+/// first output line and `rest` prefixes its continuations.
+fn wrapIndented(text: string, width: int, first: string, rest: string) -> List<string> {
+    let src = splitLines(text)
+    var out: List<string> = [""]
+    out.remove(0)
+    var i = 0
+    while (i < len(src)) {
+        let part = wrapIndentedLine(src[i], width, first, rest)
+        var j = 0
+        while (j < len(part)) {
+            out.push(part[j])
+            j = j + 1
+        }
+        i = i + 1
+    }
+    out
+}
+
+/// `wrap` joined with LF (no trailing newline). Empty input stays empty.
+fn fill(text: string, width: int) -> string {
+    let lines = wrap(text, width)
+    var i = 1
+    var out = ""
+    if (len(lines) > 0) {
+        out = lines[0]
+    }
+    while (i < len(lines)) {
+        out = out + "\n" + lines[i]
+        i = i + 1
+    }
+    out
+}
+
+/// Collapse every run of whitespace (including newlines) to one space and trim
+/// the ends.
+fn unwrap(text: string) -> string {
+    let ts = words(text)
+    var out = ""
+    var i = 0
+    while (i < len(ts)) {
+        if (i > 0) {
+            out = out + " "
+        }
+        out = out + ts[i]
+        i = i + 1
+    }
+    out
+}
