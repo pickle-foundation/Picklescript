@@ -1,0 +1,119 @@
+module std.text.diff_test
+
+import { splitLines, diffLines, formatDiff, hasChanges, editDistance } from std.text.diff
+
+test fn splits_lf_and_crlf_documents() {
+    expect(len(splitLines(""))).toBe(0)
+    expect(len(splitLines("a\nb"))).toBe(2)
+    expect(len(splitLines("a\n"))).toBe(1)
+    expect(len(splitLines("\n"))).toBe(1)
+    let crlf = splitLines("a\r\nb\r\n")
+    expect(len(crlf)).toBe(2)
+    expect(crlf[0]).toBe("a")
+    expect(crlf[1]).toBe("b")
+    let blanks = splitLines("a\n\nb")
+    expect(len(blanks)).toBe(3)
+    expect(blanks[1]).toBe("")
+}
+
+test fn identical_text_has_no_changes() {
+    let d = diffLines("x\ny\n", "x\ny")
+    expect(len(d)).toBe(2)
+    expect(d[0].tag).toBe("  ")
+    expect(d[0].text).toBe("x")
+    expect(d[1].tag).toBe("  ")
+    expect(d[1].text).toBe("y")
+    expect(hasChanges(d)).toBe(false)
+}
+
+test fn detects_a_deleted_line() {
+    let d = diffLines("a\nb\nc", "a\nc")
+    expect(len(d)).toBe(3)
+    expect(d[0].tag).toBe("  ")
+    expect(d[1].tag).toBe("- ")
+    expect(d[1].text).toBe("b")
+    expect(d[2].tag).toBe("  ")
+    expect(hasChanges(d)).toBe(true)
+}
+
+test fn detects_an_inserted_line() {
+    let d = diffLines("a\nc", "a\nb\nc")
+    expect(len(d)).toBe(3)
+    expect(d[1].tag).toBe("+ ")
+    expect(d[1].text).toBe("b")
+}
+
+test fn replacement_lists_deletes_before_inserts() {
+    let d = diffLines("a\nb", "a\nx")
+    expect(len(d)).toBe(3)
+    expect(d[0].tag).toBe("  ")
+    expect(d[1].tag).toBe("- ")
+    expect(d[1].text).toBe("b")
+    expect(d[2].tag).toBe("+ ")
+    expect(d[2].text).toBe("x")
+}
+
+test fn formats_a_compact_diff() {
+    expect(formatDiff(diffLines("a\nb", "a\nx"))).toBe("  a\n- b\n+ x")
+    expect(formatDiff(diffLines("", ""))).toBe("")
+    expect(formatDiff(diffLines("", "a"))).toBe("+ a")
+    expect(formatDiff(diffLines("a\nb", ""))).toBe("- a\n- b")
+}
+
+test fn trailing_newline_is_not_a_line() {
+    let d = diffLines("a", "a\n")
+    expect(len(d)).toBe(1)
+    expect(d[0].tag).toBe("  ")
+    expect(hasChanges(d)).toBe(false)
+    let crlf = diffLines("a\r\nb\r\n", "a\nb")
+    expect(len(crlf)).toBe(2)
+    expect(hasChanges(crlf)).toBe(false)
+}
+
+test fn duplicate_lines_diff_by_count() {
+    let d = diffLines("a\na\nb", "a\nb")
+    var del = 0
+    var same = 0
+    for (x in d) {
+        if (x.tag == "- ") {
+            del = del + 1
+            expect(x.text).toBe("a")
+        } else if (x.tag == "  ") {
+            same = same + 1
+        }
+    }
+    expect(del).toBe(1)
+    expect(same).toBe(2)
+    expect(len(d)).toBe(3)
+}
+
+test fn edit_distance_basics() {
+    expect(editDistance("", "")).toBe(0)
+    expect(editDistance("abc", "abc")).toBe(0)
+    expect(editDistance("", "abc")).toBe(3)
+    expect(editDistance("abc", "")).toBe(3)
+    expect(editDistance("kitten", "sitting")).toBe(3)
+    expect(editDistance("flaw", "lawn")).toBe(2)
+    expect(editDistance("lawn", "flaw")).toBe(2)
+}
+
+test fn edit_distance_counts_scalars_not_bytes() {
+    expect(editDistance("café", "cafe")).toBe(1)
+    expect(editDistance("é", "e")).toBe(1)
+    expect(editDistance("日本", "日")).toBe(1)
+    expect(editDistance("日", "日本")).toBe(1)
+    expect(editDistance("naïve", "naive")).toBe(1)
+}
+
+test fn edit_distance_is_symmetric() {
+    let pairs: List<string> = ["", "a", "abc", "kitten", "café", "xyz"]
+    var i = 0
+    while (i < len(pairs)) {
+        var j = 0
+        while (j < len(pairs)) {
+            expect(editDistance(pairs[i], pairs[j])).toBe(editDistance(pairs[j], pairs[i]))
+            j = j + 1
+        }
+        i = i + 1
+    }
+}

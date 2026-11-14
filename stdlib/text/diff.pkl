@@ -1,0 +1,287 @@
+module std.text.diff
+
+// Text differencing: line splitting, LCS-based line diffs, and Levenshtein
+// edit distance over Unicode scalar values.
+//
+// `splitLines` splits at LF and drops a CR immediately before it, so CRLF and
+// LF documents produce the same lines; a trailing LF does not add an empty
+// final line (`"a\n"` is one line) while a blank line inside the text does
+// (`"a\n\n"` is `["a", ""]`).
+//
+// `diffLines` compares two documents line by line with a longest-common-
+// subsequence table. Each changed block emits its deletions before its
+// insertions, unchanged lines are tagged with two spaces, and `format`
+// prefixes every line with its tag (`"  "`, `"- "`, `"+"`) and joins with LF
+// (no trailing newline), so the result reads like a compact unified diff.
+//
+// `editDistance` is the classic Levenshtein distance over Unicode scalar
+// values, so one accented letter counts as one edit even though it is two
+// UTF-8 bytes.
+//
+// Line diffs use an O(n*m) table; that is fine for source-sized inputs and
+// keeps the implementation dependency-free.
+
+import { StringBuilder } from std.text.stringbuilder
+import { decodeStr, nextOffset } from std.text.utf8
+
+/// One diff entry: a two-character tag and the line it applies to.
+class DiffLine {
+    var tag: string
+    var text: string
+
+    constructor(tag: string, text: string) {
+        this.tag = tag
+        this.text = text
+    }
+}
+
+/// Split `text` into lines at LF, dropping a CR before each LF.
+fn splitLines(text: string) -> List<string> {
+    let out: List<string> = [""]
+    out.remove(0)
+    let bs = bytes(text)
+    let n = len(bs)
+    var start = 0
+    var i = 0
+    while (i < n) {
+        if ((bs[i] as int) == 0x0A) {
+            out.push(lineAt(bs, start, i))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if (start < n) {
+        out.push(lineAt(bs, start, n))
+    }
+    out
+}
+
+/// Whether `diffs` contains at least one insertion or deletion.
+fn hasChanges(diffs: List<DiffLine>) -> bool {
+    for (d in diffs) {
+        if (d.tag != "  ") {
+            return true
+        }
+    }
+    false
+}
+
+/// An LCS line diff between `before` and `after`.
+fn diffLines(before: string, after: string) -> List<DiffLine> {
+    let a = splitLines(before)
+    let b = splitLines(after)
+    let n = len(a)
+    let m = len(b)
+    let dp = emptyTable(n + 1, m + 1)
+    var i = 1
+    while (i <= n) {
+        var j = 1
+        while (j <= m) {
+            if (a[i - 1] == b[j - 1]) {
+                dp[i][j] = dp[i - 1][j - 1] + 1
+            } else if (dp[i - 1][j] >= dp[i][j - 1]) {
+                dp[i][j] = dp[i - 1][j]
+            } else {
+                dp[i][j] = dp[i][j - 1]
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let out: List<DiffLine> = [DiffLine("", "")]
+    out.remove(0)
+    i = n
+    var j = m
+    while (i > 0 && j > 0) {
+        if (a[i - 1] == b[j - 1]) {
+            out.push(DiffLine("  ", a[i - 1]))
+            i = i - 1
+            j = j - 1
+        } else if (dp[i - 1][j] >= dp[i][j - 1]) {
+            out.push(DiffLine("- ", a[i - 1]))
+            i = i - 1
+        } else {
+            out.push(DiffLine("+ ", b[j - 1]))
+            j = j - 1
+        }
+    }
+    while (i > 0) {
+        out.push(DiffLine("- ", a[i - 1]))
+        i = i - 1
+    }
+    while (j > 0) {
+        out.push(DiffLine("+ ", b[j - 1]))
+        j = j - 1
+    }
+    reverse(out)
+    orderBlocks(out)
+    out
+}
+
+/// `diffs` as `tag + line` records joined with LF (no trailing newline). Tags
+/// are `"  "` (unchanged), `"- "` (deleted), and `"+ "` (inserted).
+fn formatDiff(diffs: List<DiffLine>) -> string {
+    let sb = StringBuilder()
+    var first = true
+    for (d in diffs) {
+        if (!first) {
+            sb.append("\n")
+        }
+        first = false
+        sb.append(d.tag)
+        sb.append(d.text)
+    }
+    sb.toString()
+}
+
+/// Levenshtein distance between `a` and `b`, measured in Unicode scalars.
+fn editDistance(a: string, b: string) -> int {
+    let x = scalarsOf(a)
+    let y = scalarsOf(b)
+    let n = len(x)
+    let m = len(y)
+    if (n == 0) {
+        return m
+    }
+    if (m == 0) {
+        return n
+    }
+    var prev: List<int> = [0]
+    prev.remove(0)
+    var j = 0
+    while (j <= m) {
+        prev.push(j)
+        j = j + 1
+    }
+    var i = 1
+    while (i <= n) {
+        let row: List<int> = [i]
+        j = 1
+        while (j <= m) {
+            var cost = 1
+            if (x[i - 1] == y[j - 1]) {
+                cost = 0
+            }
+            let del = prev[j] + 1
+            let ins = row[j - 1] + 1
+            let sub = prev[j - 1] + cost
+            var best = del
+            if (ins < best) {
+                best = ins
+            }
+            if (sub < best) {
+                best = sub
+            }
+            row.push(best)
+            j = j + 1
+        }
+        prev = row
+        i = i + 1
+    }
+    prev[m]
+}
+
+/// The Unicode scalar values of `s`.
+fn scalarsOf(s: string) -> List<int> {
+    let out: List<int> = [0]
+    out.remove(0)
+    let bs = bytes(s)
+    var i = 0
+    while (i < len(bs)) {
+        match (decodeStr(s, i)) {
+            case some(cp) -> out.push(cp)
+            case none -> out.push(bs[i] as int)
+        }
+        i = nextOffset(bs, i)
+    }
+    out
+}
+
+fn lineAt(bs: List<byte>, start: int, end: int) -> string {
+    var hi = end
+    if (hi > start && (bs[hi - 1] as int) == 0x0D) {
+        hi = hi - 1
+    }
+    let out = bytes("")
+    var i = start
+    while (i < hi) {
+        out.push(bs[i])
+        i = i + 1
+    }
+    str(out)
+}
+
+fn emptyTable(rows: int, cols: int) -> List<List<int>> {
+    let first = [0]
+    first.remove(0)
+    var c = 0
+    while (c < cols) {
+        first.push(0)
+        c = c + 1
+    }
+    let table: List<List<int>> = [first]
+    table.remove(0)
+    var r = 0
+    while (r < rows) {
+        let row = [0]
+        row.remove(0)
+        c = 0
+        while (c < cols) {
+            row.push(0)
+            c = c + 1
+        }
+        table.push(row)
+        r = r + 1
+    }
+    table
+}
+
+fn reverse(diffs: List<DiffLine>) {
+    var lo = 0
+    var hi = len(diffs) - 1
+    while (lo < hi) {
+        let tmp = diffs[lo]
+        diffs[lo] = diffs[hi]
+        diffs[hi] = tmp
+        lo = lo + 1
+        hi = hi - 1
+    }
+}
+
+/// Reorder every changed block so its deletions precede its insertions.
+fn orderBlocks(diffs: List<DiffLine>) {
+    let n = len(diffs)
+    var i = 0
+    while (i < n) {
+        if (diffs[i].tag == "  ") {
+            i = i + 1
+            continue
+        }
+        var end = i
+        while (end < n && diffs[end].tag != "  ") {
+            end = end + 1
+        }
+        let block: List<DiffLine> = [DiffLine("", "")]
+        block.remove(0)
+        var k = i
+        while (k < end) {
+            if (diffs[k].tag == "- ") {
+                block.push(diffs[k])
+            }
+            k = k + 1
+        }
+        k = i
+        while (k < end) {
+            if (diffs[k].tag == "+ ") {
+                block.push(diffs[k])
+            }
+            k = k + 1
+        }
+        k = 0
+        while (k < len(block)) {
+            diffs[i + k] = block[k]
+            k = k + 1
+        }
+        i = end
+    }
+}
