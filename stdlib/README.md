@@ -11,10 +11,13 @@ Seeds (see `docs/08-stdlib.md`, office `port/` tracker):
   battery — see `tools/diff/port/`). The lexer seed is now legacy: the port's
   flat `pickle/compiler/{lexer,parser,resolve,check,emit}.pkl` slices took
   over lexing/parsing/checking, and this tree is where `std.*`/`runtime.*`
-  seeds live (`text/{utf8,stringbuilder,format}`, `collections/*`, `fs`, `os`,
-  `json`, `io`, `process`, `test`).
-- `collections/` — `List`/`Map` wrappers plus `Set`, `Deque`, `Vec`
-- `fs/`, `os/`, `math/`, `time/`, `test/` — planned (see the plan doc)
+  seeds live (`text/{utf8,stringbuilder,format,lexer,ccm}`, `collections/*`,
+  `encoding/{base64,csv,hex,url}`, `math/basic`, `fs`, `os`, `json`, `io`,
+  `process`, `test`, `time`, `thread`).
+- `collections/` — `List`/`Map` wrappers plus `Set`, `Multiset`, `Deque`,
+  `Vec`, `BitSet`
+- `fs/`, `os/`, `time/`, `test/` — shipped flat (`fs.pkl`, `os.pkl`, ...);
+  `math/` starts with `basic.pkl` (see the plan doc)
 
 Status (2026-09-26): the whole `stdlib/**/*_test.pkl` tree (14 files) is gated
 by **GATE11** in `tools/battery_full.ps1` — the ported test driver must run

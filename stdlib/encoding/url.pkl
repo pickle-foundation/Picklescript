@@ -1,0 +1,213 @@
+module std.encoding.url
+
+// Percent-encoding (RFC 3986) and `application/x-www-form-urlencoded`
+// helpers over UTF-8 text.
+//
+// `encode` percent-encodes every byte outside the unreserved set
+// (`A-Z a-z 0-9 - . _ ~`), so it is the right spelling for a path segment or a
+// query key/value. `encodePath` additionally keeps `/`, for a whole path.
+// `encodeForm` follows the form convention instead: a space becomes `+` and a
+// literal `+` becomes `%2B`. Escapes use uppercase hex digits.
+//
+// `decode` reverses `encode` and `decodeForm` reverses `encodeForm` (`+` becomes
+// a space). Both are strict: a `%` not followed by two hex digits makes the
+// whole input invalid and yields `none`, so a caller can never silently get
+// half-decoded text. A `+` is left alone by `decode`, and `%20` is a space for
+// both spellings.
+//
+// `parseQuery` splits a query string into ordered `Param` pairs with form
+// decoding, keeping duplicates and order (`a=1&b=2&a=3` yields three params);
+// a segment without `=` has an empty value, and empty segments (`&&`) are
+// skipped. `buildQuery` is the inverse. Both are strict through the decode
+// rule above. (`Param` is a class rather than a tuple because tuple element
+// indexing is a port-only feature; the Rust reference cannot compile it, so a
+// tuple-returning module would lose its GATE11 golden.)
+
+import { StringBuilder } from std.text.stringbuilder
+
+const HEX_DIGITS: string = "0123456789ABCDEF"
+
+/// One query parameter: a decoded name and value, in order.
+class Param {
+    var name: string
+    var value: string
+
+    constructor(name: string, value: string) {
+        this.name = name
+        this.value = value
+    }
+}
+
+/// Percent-encode `text`, leaving only the unreserved characters.
+fn encode(text: string) -> string {
+    encodeWith(text, false, false)
+}
+
+/// Percent-encode `text`, leaving the unreserved characters and `/`.
+fn encodePath(text: string) -> string {
+    encodeWith(text, true, false)
+}
+
+/// Form-encode `text` (space as `+`, literal `+` as `%2B`).
+fn encodeForm(text: string) -> string {
+    encodeWith(text, false, true)
+}
+
+fn encodeWith(text: string, keepSlash: bool, form: bool) -> string {
+    let sb = StringBuilder()
+    for (b in bytes(text)) {
+        let c = b as int
+        if (isUnreserved(c)) {
+            sb.appendByte(b)
+        } else if (keepSlash && c == 0x2F) {
+            sb.appendByte(b)
+        } else if (form && c == 0x20) {
+            sb.appendByte(0x2B as byte)
+        } else {
+            sb.appendByte(0x25 as byte)
+            sb.appendByte(HEX_DIGITS[c >> 4])
+            sb.appendByte(HEX_DIGITS[c % 16])
+        }
+    }
+    sb.toString()
+}
+
+/// Decode percent escapes; `none` for a malformed escape.
+fn decode(text: string) -> string? {
+    decodeWith(text, false)
+}
+
+/// Decode percent escapes and form `+`; `none` for a malformed escape.
+fn decodeForm(text: string) -> string? {
+    decodeWith(text, true)
+}
+
+fn decodeWith(text: string, form: bool) -> string? {
+    let bs = bytes(text)
+    let out = bytes("")
+    var i = 0
+    while (i < len(bs)) {
+        let c = bs[i] as int
+        if (form && c == 0x2B) {
+            out.push(0x20 as byte)
+            i = i + 1
+            continue
+        }
+        if (c != 0x25) {
+            out.push(bs[i])
+            i = i + 1
+            continue
+        }
+        if (i + 2 >= len(bs)) {
+            return none
+        }
+        let hi = hexValue(bs[i + 1] as int)
+        let lo = hexValue(bs[i + 2] as int)
+        if (hi < 0 || lo < 0) {
+            return none
+        }
+        out.push((hi * 16 + lo) as byte)
+        i = i + 3
+    }
+    str(out)
+}
+
+/// `true` when `decode` accepts `text`.
+fn isValid(text: string) -> bool {
+    match (decode(text)) {
+        case some(_) -> true
+        case none -> false
+    }
+}
+
+/// Split a form-encoded query string into ordered params; `none` for a
+/// malformed escape.
+fn parseQuery(text: string) -> List<Param>? {
+    let out: List<Param> = [Param("", "")]
+    out.remove(0)
+    let bs = bytes(text)
+    var i = 0
+    while (i < len(bs)) {
+        var j = i
+        while (j < len(bs) && (bs[j] as int) != 0x26) {
+            j = j + 1
+        }
+        if (j > i) {
+            var k = i
+            while (k < j && (bs[k] as int) != 0x3D) {
+                k = k + 1
+            }
+            var rawVal = ""
+            if (k < j) {
+                rawVal = bytesToString(bs, k + 1, j)
+            }
+            match (decodeForm(bytesToString(bs, i, k))) {
+                case some(name) -> {
+                    match (decodeForm(rawVal)) {
+                        case some(value) -> out.push(Param(name, value))
+                        case none -> {
+                            return none
+                        }
+                    }
+                }
+                case none -> {
+                    return none
+                }
+            }
+        }
+        i = j + 1
+    }
+    out
+}
+
+/// Join `params` into a form-encoded query string.
+fn buildQuery(params: List<Param>) -> string {
+    let sb = StringBuilder()
+    var first = true
+    for (p in params) {
+        if (!first) {
+            sb.append("&")
+        }
+        first = false
+        sb.append(encodeForm(p.name))
+        sb.append("=")
+        sb.append(encodeForm(p.value))
+    }
+    sb.toString()
+}
+
+fn bytesToString(bs: List<byte>, lo: int, hi: int) -> string {
+    let out = bytes("")
+    var i = lo
+    while (i < hi) {
+        out.push(bs[i])
+        i = i + 1
+    }
+    str(out)
+}
+
+fn isUnreserved(c: int) -> bool {
+    if (c >= 0x41 && c <= 0x5A) {
+        return true
+    }
+    if (c >= 0x61 && c <= 0x7A) {
+        return true
+    }
+    if (c >= 0x30 && c <= 0x39) {
+        return true
+    }
+    c == 0x2D || c == 0x2E || c == 0x5F || c == 0x7E
+}
+
+fn hexValue(cp: int) -> int {
+    if (cp >= 0x30 && cp <= 0x39) {
+        return cp - 0x30
+    }
+    if (cp >= 0x61 && cp <= 0x66) {
+        return cp - 0x61 + 10
+    }
+    if (cp >= 0x41 && cp <= 0x46) {
+        return cp - 0x41 + 10
+    }
+    0 - 1
+}

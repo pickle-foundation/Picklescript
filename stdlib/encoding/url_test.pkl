@@ -1,0 +1,136 @@
+module std.encoding.url_test
+
+import { encode, encodePath, encodeForm, decode, decodeForm, isValid,
+         parseQuery, buildQuery, Param } from std.encoding.url
+
+fn d(text: string) -> string {
+    match (decode(text)) {
+        case some(s) -> s
+        case none -> "<decode error>"
+    }
+}
+
+fn df(text: string) -> string {
+    match (decodeForm(text)) {
+        case some(s) -> s
+        case none -> "<decode error>"
+    }
+}
+
+fn pairs(text: string) -> List<Param> {
+    match (parseQuery(text)) {
+        case some(p) -> p
+        case none -> [Param("", "<parse error>")]
+    }
+}
+
+test fn unreserved_characters_pass_through() {
+    expect(encode("")).toBe("")
+    expect(encode("AZaz09-._~")).toBe("AZaz09-._~")
+    expect(isValid("")).toBe(true)
+}
+
+test fn reserved_characters_are_escaped() {
+    expect(encode("a b")).toBe("a%20b")
+    expect(encode("a/b?c=d&e")).toBe("a%2Fb%3Fc%3Dd%26e")
+    expect(encode("%")).toBe("%25")
+    expect(encode("#")).toBe("%23")
+    expect(encode("+")).toBe("%2B")
+}
+
+test fn utf8_text_is_encoded_bytewise() {
+    expect(encode("café")).toBe("caf%C3%A9")
+    expect(encode("é")).toBe("%C3%A9")
+    expect(encode("日")).toBe("%E6%97%A5")
+}
+
+test fn paths_keep_slashes() {
+    expect(encodePath("/a b/c")).toBe("/a%20b/c")
+    expect(encodePath("/")).toBe("/")
+}
+
+test fn form_encoding_uses_plus_for_space() {
+    expect(encodeForm("a b+c")).toBe("a+b%2Bc")
+    expect(encodeForm("a=b&c")).toBe("a%3Db%26c")
+}
+
+test fn decoding_reverses_each_spelling() {
+    expect(d("a%20b")).toBe("a b")
+    expect(d("caf%C3%A9")).toBe("café")
+    expect(d("a+b")).toBe("a+b")
+    expect(df("a+b")).toBe("a b")
+    expect(df("a%2Bb")).toBe("a+b")
+    expect(df("a%20b")).toBe("a b")
+}
+
+test fn malformed_escapes_are_rejected() {
+    expect(isValid("%")).toBe(false)
+    expect(isValid("%2")).toBe(false)
+    expect(isValid("%GG")).toBe(false)
+    expect(isValid("a%2")).toBe(false)
+    expect(isValid("%2G")).toBe(false)
+    expect(isValid("%25")).toBe(true)
+    expect(d("%2541")).toBe("%41")
+}
+
+test fn encode_decode_round_trips() {
+    let raw: List<string> = ["", "abc", "a b/c?d=e&f", "café 日", "100%", "a+b", "~._-"]
+    for (s in raw) {
+        expect(d(encode(s))).toBe(s)
+        expect(df(encodeForm(s))).toBe(s)
+        expect(d(encodePath(s))).toBe(s)
+    }
+}
+
+test fn query_parsing_keeps_order_and_duplicates() {
+    let p = pairs("a=1&b=2&a=3")
+    expect(len(p)).toBe(3)
+    expect(p[0].name).toBe("a")
+    expect(p[0].value).toBe("1")
+    expect(p[1].name).toBe("b")
+    expect(p[1].value).toBe("2")
+    expect(p[2].name).toBe("a")
+    expect(p[2].value).toBe("3")
+}
+
+test fn query_decoding_and_empty_values() {
+    let p = pairs("q=hello+world&flag&x=%2B")
+    expect(len(p)).toBe(3)
+    expect(p[0].value).toBe("hello world")
+    expect(p[1].name).toBe("flag")
+    expect(p[1].value).toBe("")
+    expect(p[2].value).toBe("+")
+    expect(len(pairs(""))).toBe(0)
+    expect(len(pairs("&&"))).toBe(0)
+}
+
+test fn query_round_trips() {
+    let p: List<Param> = [Param("a", "1"), Param("q", "hello world"), Param("sym", "+&="), Param("", "empty key")]
+    let q = buildQuery(p)
+    let back = pairs(q)
+    expect(len(back)).toBe(len(p))
+    var i = 0
+    while (i < len(p)) {
+        expect(back[i].name).toBe(p[i].name)
+        expect(back[i].value).toBe(p[i].value)
+        i = i + 1
+    }
+}
+
+test fn malformed_query_is_rejected() {
+    match (parseQuery("a=%2")) {
+        case some(_) -> expect(true).toBe(false)
+        case none -> expect(true).toBe(true)
+    }
+    match (parseQuery("a=%GG")) {
+        case some(_) -> expect(true).toBe(false)
+        case none -> expect(true).toBe(true)
+    }
+}
+
+test fn empty_query_round_trip() {
+    let p: List<Param> = [Param("", "")]
+    p.remove(0)
+    expect(buildQuery(p)).toBe("")
+    expect(len(pairs(""))).toBe(0)
+}
