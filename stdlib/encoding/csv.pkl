@@ -1,0 +1,210 @@
+module std.encoding.csv
+
+// CSV (RFC 4180) parsing and writing.
+//
+// `parse(text)` splits a CSV document into records (rows) of fields, or
+// returns `none` when the document is malformed. Records end at LF or CRLF (a
+// lone CR is rejected); the last record may omit its terminator. A field is
+// either bare - it runs up to the next `,`, line break, or end of input and
+// never contains a quote - or quoted: it starts with `"`, ends at the next
+// unescaped `"`, and may contain commas, doubled quotes (`""`), and line
+// breaks. Bare and quoted fields mix freely. A line break inside a quoted
+// field (LF, CRLF, or a lone CR) is normalised to LF, and completely empty
+// lines are skipped.
+//
+// `stringify(rows)` emits every record with an LF terminator, quoting a field
+// only when it must: it contains a comma, quote, or line break, or it is the
+// lone empty field of its record (otherwise an empty record would parse back
+// as a skipped line). `stringifyCrlf` is the same with CRLF terminators.
+// Every record is terminated, so `parse(stringify(rows))` round-trips apart
+// from the line-break normalisation above.
+
+import { StringBuilder } from std.text.stringbuilder
+
+class Parser {
+    var bs: List<byte>
+    var i: int
+
+    constructor(text: string) {
+        this.bs = bytes(text)
+        this.i = 0
+    }
+
+    /// Whether the cursor is past the last byte.
+    fn eof() -> bool {
+        this.i >= len(this.bs)
+    }
+
+    /// The byte at the cursor as `int`, or -1 at end of input.
+    fn peek() -> int {
+        if (this.eof()) {
+            return -1
+        }
+        this.bs[this.i] as int
+    }
+
+    /// Consume and return the byte at the cursor as `int`, or -1.
+    fn take() -> int {
+        let c = this.peek()
+        if (c >= 0) {
+            this.i = this.i + 1
+        }
+        c
+    }
+
+    /// Consume one LF or CRLF, returning false for a lone CR or anything else.
+    fn takeLineEnd() -> bool {
+        let c = this.take()
+        if (c == 0x0A) {
+            return true
+        }
+        if (c != 0x0D) {
+            return false
+        }
+        this.take() == 0x0A
+    }
+
+    /// Read one field; `none` on a syntax error.
+    fn readField() -> string? {
+        let sb = StringBuilder()
+        if (this.peek() == 0x22) {
+            this.take()
+            while (true) {
+                let d = this.take()
+                if (d < 0) {
+                    return none
+                }
+                if (d == 0x22) {
+                    if (this.peek() == 0x22) {
+                        this.take()
+                        sb.appendByte(0x22 as byte)
+                        continue
+                    }
+                    return sb.toString()
+                }
+                if (d == 0x0D) {
+                    if (this.peek() == 0x0A) {
+                        this.take()
+                    }
+                    sb.appendByte(0x0A as byte)
+                    continue
+                }
+                sb.appendByte(d as byte)
+            }
+        }
+        while (true) {
+            let d = this.peek()
+            if (d < 0 || d == 0x2C || d == 0x0A || d == 0x0D) {
+                return sb.toString()
+            }
+            if (d == 0x22) {
+                return none
+            }
+            sb.appendByte(d as byte)
+            this.take()
+        }
+    }
+
+    /// Read one record (its terminator included); `none` on a syntax error.
+    fn readRecord() -> List<string>? {
+        let fields: List<string> = [""]
+        fields.remove(0)
+        while (true) {
+            match (this.readField()) {
+                case some(f) -> fields.push(f)
+                case none -> {
+                    return none
+                }
+            }
+            let c = this.peek()
+            if (c == 0x2C) {
+                this.take()
+                continue
+            }
+            if (c < 0) {
+                return fields
+            }
+            if (!this.takeLineEnd()) {
+                return none
+            }
+            return fields
+        }
+    }
+}
+
+/// Parse a CSV document into records; `none` when it is malformed.
+fn parse(text: string) -> List<List<string>>? {
+    let p = Parser(text)
+    let rows: List<List<string>> = [[""]]
+    rows.remove(0)
+    while (!p.eof()) {
+        let c = p.peek()
+        if (c == 0x0A || c == 0x0D) {
+            if (!p.takeLineEnd()) {
+                return none
+            }
+            continue
+        }
+        match (p.readRecord()) {
+            case some(r) -> rows.push(r)
+            case none -> {
+                return none
+            }
+        }
+    }
+    rows
+}
+
+/// The CSV text of `rows`, one LF-terminated record per row.
+fn stringify(rows: List<List<string>>) -> string {
+    writeRows(rows, "\n")
+}
+
+/// The CSV text of `rows`, one CRLF-terminated record per row.
+fn stringifyCrlf(rows: List<List<string>>) -> string {
+    writeRows(rows, "\r\n")
+}
+
+fn writeRows(rows: List<List<string>>, eol: string) -> string {
+    let out = StringBuilder()
+    for (row in rows) {
+        var col = 0
+        for (f in row) {
+            if (col > 0) {
+                out.appendByte(0x2C as byte)
+            }
+            writeField(out, f, len(row) == 1)
+            col = col + 1
+        }
+        out.append(eol)
+    }
+    out.toString()
+}
+
+fn writeField(out: StringBuilder, f: string, lone: bool) {
+    if (needsQuotes(f, lone)) {
+        out.appendByte(0x22 as byte)
+        for (b in bytes(f)) {
+            if ((b as int) == 0x22) {
+                out.appendByte(0x22 as byte)
+            }
+            out.appendByte(b)
+        }
+        out.appendByte(0x22 as byte)
+    } else {
+        out.append(f)
+    }
+}
+
+fn needsQuotes(f: string, lone: bool) -> bool {
+    if (lone && len(f) == 0) {
+        return true
+    }
+    for (b in bytes(f)) {
+        let c = b as int
+        if (c == 0x2C || c == 0x22 || c == 0x0A || c == 0x0D) {
+            return true
+        }
+    }
+    false
+}

@@ -1,0 +1,95 @@
+module std.encoding.csv_test
+
+import { parse, stringify, stringifyCrlf } from std.encoding.csv
+
+fn rows(text: string) -> List<List<string>> {
+    match (parse(text)) {
+        case some(r) -> r
+        case none -> [["<parse error>"]]
+    }
+}
+
+fn ok(text: string) -> bool {
+    match (parse(text)) {
+        case some(_) -> true
+        case none -> false
+    }
+}
+
+test fn plain_records() {
+    expect(rows("a,b\nc,d\n")).toEqual([["a", "b"], ["c", "d"]])
+    expect(rows("a,b")).toEqual([["a", "b"]])
+    expect(rows("a,b\r\nc,d")).toEqual([["a", "b"], ["c", "d"]])
+    expect(rows("single\n")).toEqual([["single"]])
+    expect(rows("a,b,")).toEqual([["a", "b", ""]])
+    expect(rows(",,\n")).toEqual([["", "", ""]])
+}
+
+test fn quoted_fields() {
+    expect(rows("\"a,b\",c\n")).toEqual([["a,b", "c"]])
+    expect(rows("\"a\"\"b\"\n")).toEqual([["a\"b"]])
+    expect(rows("\"\"\n")).toEqual([[""]])
+    expect(rows("\"\",x\n")).toEqual([["", "x"]])
+    expect(rows("\"a\",\"b\",\"c\"")).toEqual([["a", "b", "c"]])
+}
+
+test fn quoted_line_breaks_are_normalised() {
+    expect(rows("\"a\nb\",c\n")).toEqual([["a\nb", "c"]])
+    expect(rows("\"a\r\nb\"\n")).toEqual([["a\nb"]])
+    expect(rows("\"a\rb\"\n")).toEqual([["a\nb"]])
+}
+
+test fn empty_lines_are_skipped() {
+    expect(rows("\n\na,b\n\n")).toEqual([["a", "b"]])
+    expect(rows("\r\n\r\na\n")).toEqual([["a"]])
+}
+
+test fn empty_input_has_no_records() {
+    match (parse("")) {
+        case some(r) -> expect(len(r)).toBe(0)
+        case none -> expect(true).toBe(false)
+    }
+}
+
+test fn malformed_input_is_rejected() {
+    expect(ok("a\"b\n")).toBe(false)
+    expect(ok("\"a\"x\n")).toBe(false)
+    expect(ok("\"a\n")).toBe(false)
+    expect(ok("a\rb\n")).toBe(false)
+    expect(ok("a\r")).toBe(false)
+    expect(ok("a,b\r\nc,d")).toBe(true)
+    expect(ok("\"\"")).toBe(true)
+}
+
+test fn stringify_quotes_only_when_needed() {
+    expect(stringify([["a", "b,c", "d\"e", "f\ng"]])).toBe("a,\"b,c\",\"d\"\"e\",\"f\ng\"\n")
+}
+
+test fn lone_empty_field_is_quoted() {
+    expect(stringify([[""]])).toBe("\"\"\n")
+    expect(stringify([["", "x"]])).toBe(",x\n")
+    expect(rows(stringify([[""]]))).toEqual([[""]])
+}
+
+test fn crlf_writer() {
+    expect(stringifyCrlf([["a", "b"], ["c"]])).toBe("a,b\r\nc\r\n")
+}
+
+test fn round_trips() {
+    let data: List<List<string>> = [["a", "b"], ["", ""], ["x,y", "q\"r"], ["line\nbreak"]]
+    expect(rows(stringify(data))).toEqual(data)
+    expect(rows(stringifyCrlf(data))).toEqual(data)
+    expect(rows(stringify([["a\rb"]]))).toEqual([["a\nb"]])
+}
+
+test fn empty_row_list_writes_nothing() {
+    let none_rows: List<List<string>> = [[""]]
+    none_rows.remove(0)
+    expect(stringify(none_rows)).toBe("")
+    expect(stringifyCrlf(none_rows)).toBe("")
+}
+
+test fn utf8_text_passes_through() {
+    expect(stringify([["héllo", "wörld"]])).toBe("héllo,wörld\n")
+    expect(rows("héllo,wörld\n")).toEqual([["héllo", "wörld"]])
+}
