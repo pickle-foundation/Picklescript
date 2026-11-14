@@ -1,0 +1,190 @@
+module std.collections.bitset
+
+// A fixed-size bit set: `BitSet(n)` holds `n` bits indexed `0 .. n - 1`,
+// stored densest-first in a `List<byte>` (eight bits per byte). The bits beyond
+// `n` in the last byte are kept zero at all times, so `toBytes` yields exactly
+// `(n + 7) / 8` bytes and `count` never sees padding.
+//
+// Indices outside `[0, n)` are ignored by the mutators and read as `false` by
+// `get`, so a size check never panics. `nextSetBit`/`nextClearBit` take a start
+// position and return `-1` when no such bit exists at or after it. `toString`
+// renders bit 0 first, so `BitSet(4)` with bits 0 and 3 set is `"1001"`.
+// A zero-size set is both empty and full (`count() == bitCount() == 0`).
+
+import { StringBuilder } from std.text.stringbuilder
+
+class BitSet {
+    var nbits: int
+    var words: List<byte>
+
+    constructor(nbits: int) {
+        var n = nbits
+        if (n < 0) {
+            n = 0
+        }
+        this.nbits = n
+        this.words = bytes("")
+        var i = 0
+        while (i < byteCountOf(n)) {
+            this.words.push(0 as byte)
+            i = i + 1
+        }
+    }
+
+    /// The number of bits this set holds.
+    fn bitCount() -> int {
+        this.nbits
+    }
+
+    /// The number of bytes backing the set (`(bitCount() + 7) / 8`).
+    fn byteCount() -> int {
+        len(this.words)
+    }
+
+    /// The bit at `i`; `false` when `i` is outside the set.
+    fn get(i: int) -> bool {
+        if (i < 0 || i >= this.nbits) {
+            return false
+        }
+        let word = this.words[i / 8] as int
+        (word & (1 << (i % 8))) != 0
+    }
+
+    /// Set the bit at `i` (ignored when outside the set).
+    fn set(i: int) {
+        this.setTo(i, true)
+    }
+
+    /// Clear the bit at `i` (ignored when outside the set).
+    fn clear(i: int) {
+        this.setTo(i, false)
+    }
+
+    /// Set the bit at `i` to `v` (ignored when `i` is outside the set).
+    fn setTo(i: int, v: bool) {
+        if (i < 0 || i >= this.nbits) {
+            return
+        }
+        let w = i / 8
+        let mask = 1 << (i % 8)
+        let word = this.words[w] as int
+        var next = word & (255 - mask)
+        if (v) {
+            next = next + mask
+        }
+        this.words[w] = next as byte
+    }
+
+    /// Toggle the bit at `i` (ignored when outside the set).
+    fn flip(i: int) {
+        this.setTo(i, !this.get(i))
+    }
+
+    /// Clear every bit.
+    fn clearAll() {
+        var i = 0
+        while (i < len(this.words)) {
+            this.words[i] = 0 as byte
+            i = i + 1
+        }
+    }
+
+    /// Set every bit.
+    fn setAll() {
+        var i = 0
+        while (i < this.nbits) {
+            this.set(i)
+            i = i + 1
+        }
+    }
+
+    /// Toggle every bit.
+    fn flipAll() {
+        var i = 0
+        while (i < this.nbits) {
+            this.flip(i)
+            i = i + 1
+        }
+    }
+
+    /// The number of set bits.
+    fn count() -> int {
+        var n = 0
+        var i = 0
+        while (i < this.nbits) {
+            if (this.get(i)) {
+                n = n + 1
+            }
+            i = i + 1
+        }
+        n
+    }
+
+    /// Whether no bit is set.
+    fn isEmpty() -> bool {
+        this.count() == 0
+    }
+
+    /// Whether every bit is set (true for a zero-size set).
+    fn isFull() -> bool {
+        this.count() == this.nbits
+    }
+
+    /// The index of the first set bit at or after `start`, or `-1`.
+    fn nextSetBit(start: int) -> int {
+        var i = start
+        if (i < 0) {
+            i = 0
+        }
+        while (i < this.nbits) {
+            if (this.get(i)) {
+                return i
+            }
+            i = i + 1
+        }
+        0 - 1
+    }
+
+    /// The index of the first clear bit at or after `start`, or `-1`.
+    fn nextClearBit(start: int) -> int {
+        var i = start
+        if (i < 0) {
+            i = 0
+        }
+        while (i < this.nbits) {
+            if (!this.get(i)) {
+                return i
+            }
+            i = i + 1
+        }
+        0 - 1
+    }
+
+    /// A fresh copy of the backing bytes (trailing padding bits are zero).
+    fn toBytes() -> List<byte> {
+        var out = bytes("")
+        for (b in this.words) {
+            out.push(b)
+        }
+        out
+    }
+
+    /// The bits as `'0'`/`'1'` characters, bit 0 first.
+    fn toString() -> string {
+        let sb = StringBuilder()
+        var i = 0
+        while (i < this.nbits) {
+            if (this.get(i)) {
+                sb.append("1")
+            } else {
+                sb.append("0")
+            }
+            i = i + 1
+        }
+        sb.toString()
+    }
+}
+
+fn byteCountOf(nbits: int) -> int {
+    (nbits + 7) / 8
+}
