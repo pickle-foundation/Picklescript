@@ -1,0 +1,243 @@
+module std.text.casing
+
+// Identifier-case conversion: split a name into words, then join them back in
+// snake_case, kebab-case, camelCase, PascalCase, CONSTANT_CASE, or Title Case.
+//
+// Word splitting treats any run of ASCII letters and digits as a word and any
+// other ASCII byte (space, `_`, `-`, `.`, punctuation) as a separator. A case
+// boundary inside a run also starts a word: `fooBar` -> `foo|Bar`,
+// `HTTPResponse` -> `HTTP|Response` (the last capital of an acronym run starts
+// the next word when a lowercase letter follows), and `v2Name` -> `v2|Name`.
+// Bytes >= 0x80 (UTF-8 text) stay inside the current word and are copied
+// verbatim, so non-ASCII letters keep their case. Case mapping is ASCII-only
+// (the module does its own byte math rather than relying on string methods,
+// which are not available in the Rust reference).
+//
+// Every conversion first splits into words, lowercases each word in ASCII, and
+// then applies the requested casing. `splitWords("")` is empty, so every
+// conversion of empty or separator-only text is `""`. `equalsIgnoreCase`
+// compares with ASCII case folding.
+
+import { StringBuilder } from std.text.stringbuilder
+
+/// Split `text` into words at separators and case boundaries.
+fn splitWords(text: string) -> List<string> {
+    let out: List<string> = [""]
+    out.remove(0)
+    let bs = bytes(text)
+    let n = len(bs)
+    var start = 0 - 1
+    var i = 0
+    while (i < n) {
+        let b = bs[i] as int
+        if (!isWordByte(b)) {
+            if (start >= 0) {
+                out.push(sliceOf(bs, start, i))
+                start = 0 - 1
+            }
+            i = i + 1
+            continue
+        }
+        if (start < 0) {
+            start = i
+        } else if (isBoundary(bs, i)) {
+            out.push(sliceOf(bs, start, i))
+            start = i
+        }
+        i = i + 1
+    }
+    if (start >= 0) {
+        out.push(sliceOf(bs, start, n))
+    }
+    out
+}
+
+/// `words` joined by `sep`, each word lowercased.
+fn joinLower(words: List<string>, sep: string) -> string {
+    joinAs(words, sep, false)
+}
+
+/// `words` joined by `sep`, each word uppercased.
+fn joinUpper(words: List<string>, sep: string) -> string {
+    joinAs(words, sep, true)
+}
+
+/// `words` joined by `sep`, each word capitalized (`fooBar` -> `FooBar`).
+fn joinCapitalized(words: List<string>, sep: string) -> string {
+    let sb = StringBuilder()
+    var first = true
+    for (w in words) {
+        if (!first) {
+            sb.append(sep)
+        }
+        first = false
+        sb.append(capitalize(w))
+    }
+    sb.toString()
+}
+
+fn joinAs(words: List<string>, sep: string, upper: bool) -> string {
+    let sb = StringBuilder()
+    var first = true
+    for (w in words) {
+        if (!first) {
+            sb.append(sep)
+        }
+        first = false
+        if (upper) {
+            sb.append(upperAscii(w))
+        } else {
+            sb.append(lowerAscii(w))
+        }
+    }
+    sb.toString()
+}
+
+/// `foo_bar_baz`
+fn toSnake(text: string) -> string {
+    joinLower(splitWords(text), "_")
+}
+
+/// `foo-bar-baz`
+fn toKebab(text: string) -> string {
+    joinLower(splitWords(text), "-")
+}
+
+/// `FOO_BAR_BAZ`
+fn toConstant(text: string) -> string {
+    joinUpper(splitWords(text), "_")
+}
+
+/// `fooBarBaz` (the first word keeps its lowercase form)
+fn toCamel(text: string) -> string {
+    let words = splitWords(text)
+    if (len(words) == 0) {
+        return ""
+    }
+    let sb = StringBuilder()
+    sb.append(lowerAscii(words[0]))
+    var i = 1
+    while (i < len(words)) {
+        sb.append(capitalize(words[i]))
+        i = i + 1
+    }
+    sb.toString()
+}
+
+/// `FooBarBaz`
+fn toPascal(text: string) -> string {
+    joinCapitalized(splitWords(text), "")
+}
+
+/// `Foo Bar Baz`
+fn toTitle(text: string) -> string {
+    joinCapitalized(splitWords(text), " ")
+}
+
+/// ASCII case-insensitive equality.
+fn equalsIgnoreCase(a: string, b: string) -> bool {
+    lowerAscii(a) == lowerAscii(b)
+}
+
+/// Lowercase the ASCII letters of `word` and uppercase its first byte when it
+/// is an ASCII letter (a leading digit or non-ASCII byte is left alone, so
+/// `2fa` -> `2fa` and `über` -> `über`).
+fn capitalize(word: string) -> string {
+    let bs = bytes(lowerAscii(word))
+    if (len(bs) == 0) {
+        return ""
+    }
+    let first = bs[0] as int
+    if (first < 0x61 || first > 0x7A) {
+        return lowerAscii(word)
+    }
+    let sb = StringBuilder()
+    sb.appendByte((first - 0x20) as byte)
+    var i = 1
+    while (i < len(bs)) {
+        sb.appendByte(bs[i])
+        i = i + 1
+    }
+    sb.toString()
+}
+
+/// Lowercase ASCII `A`-`Z`; other bytes pass through.
+fn lowerAscii(s: string) -> string {
+    let sb = StringBuilder()
+    for (b in bytes(s)) {
+        let c = b as int
+        if (c >= 0x41 && c <= 0x5A) {
+            sb.appendByte((c + 0x20) as byte)
+        } else {
+            sb.appendByte(b)
+        }
+    }
+    sb.toString()
+}
+
+/// Uppercase ASCII `a`-`z`; other bytes pass through.
+fn upperAscii(s: string) -> string {
+    let sb = StringBuilder()
+    for (b in bytes(s)) {
+        let c = b as int
+        if (c >= 0x61 && c <= 0x7A) {
+            sb.appendByte((c - 0x20) as byte)
+        } else {
+            sb.appendByte(b)
+        }
+    }
+    sb.toString()
+}
+
+fn isWordByte(b: int) -> bool {
+    if (b >= 0x80) {
+        return true
+    }
+    if (b >= 0x41 && b <= 0x5A) {
+        return true
+    }
+    if (b >= 0x61 && b <= 0x7A) {
+        return true
+    }
+    b >= 0x30 && b <= 0x39
+}
+
+fn isUpper(b: int) -> bool {
+    b >= 0x41 && b <= 0x5A
+}
+
+fn isLower(b: int) -> bool {
+    b >= 0x61 && b <= 0x7A
+}
+
+fn isDigit(b: int) -> bool {
+    b >= 0x30 && b <= 0x39
+}
+
+/// Whether a new word starts at byte `i` inside the current run. A non-ASCII
+/// byte counts as a lowercase letter for the boundary rule, so `caféBar`
+/// splits into `café|Bar`.
+fn isBoundary(bs: List<byte>, i: int) -> bool {
+    let prev = bs[i - 1] as int
+    let cur = bs[i] as int
+    if (!isUpper(cur)) {
+        return false
+    }
+    if (isLower(prev) || prev >= 0x80 || isDigit(prev)) {
+        return true
+    }
+    if (isUpper(prev) && i + 1 < len(bs) && isLower(bs[i + 1] as int)) {
+        return true
+    }
+    false
+}
+
+fn sliceOf(bs: List<byte>, lo: int, hi: int) -> string {
+    let out = bytes("")
+    var i = lo
+    while (i < hi) {
+        out.push(bs[i])
+        i = i + 1
+    }
+    str(out)
+}

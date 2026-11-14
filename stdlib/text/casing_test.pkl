@@ -1,0 +1,129 @@
+module std.text.casing_test
+
+import { splitWords, toSnake, toKebab, toConstant, toCamel, toPascal,
+         toTitle, equalsIgnoreCase } from std.text.casing
+
+test fn splits_separators_and_camel_humps() {
+    let plain = splitWords("foo bar")
+    expect(len(plain)).toBe(2)
+    expect(plain[0]).toBe("foo")
+    expect(plain[1]).toBe("bar")
+    let camel = splitWords("fooBarBaz")
+    expect(len(camel)).toBe(3)
+    expect(camel[0]).toBe("foo")
+    expect(camel[1]).toBe("Bar")
+    expect(camel[2]).toBe("Baz")
+    let mixed = splitWords("  HTTP_response-code.v2  ")
+    expect(len(mixed)).toBe(4)
+    expect(mixed[0]).toBe("HTTP")
+    expect(mixed[1]).toBe("response")
+    expect(mixed[2]).toBe("code")
+    expect(mixed[3]).toBe("v2")
+}
+
+test fn acronym_boundary_takes_last_capital() {
+    let w = splitWords("HTTPResponseCode")
+    expect(len(w)).toBe(3)
+    expect(w[0]).toBe("HTTP")
+    expect(w[1]).toBe("Response")
+    expect(w[2]).toBe("Code")
+    let t = splitWords("IOError")
+    expect(len(t)).toBe(2)
+    expect(t[0]).toBe("IO")
+    expect(t[1]).toBe("Error")
+}
+
+test fn digit_boundaries() {
+    let w = splitWords("v2Name")
+    expect(len(w)).toBe(2)
+    expect(w[0]).toBe("v2")
+    expect(w[1]).toBe("Name")
+    let t = splitWords("sha256Sum")
+    expect(len(t)).toBe(2)
+    expect(t[0]).toBe("sha256")
+    expect(t[1]).toBe("Sum")
+    expect(splitWords("x86")[0]).toBe("x86")
+}
+
+test fn empty_and_separator_only_input() {
+    expect(len(splitWords(""))).toBe(0)
+    expect(len(splitWords("___--- .."))).toBe(0)
+    expect(toSnake("")).toBe("")
+    expect(toCamel("")).toBe("")
+    expect(toPascal("")).toBe("")
+    expect(toTitle("")).toBe("")
+    expect(toConstant("---")).toBe("")
+}
+
+test fn snake_case() {
+    expect(toSnake("fooBar")).toBe("foo_bar")
+    expect(toSnake("HTTPResponse")).toBe("http_response")
+    expect(toSnake("already_snake")).toBe("already_snake")
+    expect(toSnake("With Spaces")).toBe("with_spaces")
+    expect(toSnake("kebab-case-name")).toBe("kebab_case_name")
+    expect(toSnake("__leading__trailing__")).toBe("leading_trailing")
+}
+
+test fn kebab_case() {
+    expect(toKebab("fooBar")).toBe("foo-bar")
+    expect(toKebab("HTTPResponse")).toBe("http-response")
+    expect(toKebab("already_snake")).toBe("already-snake")
+    expect(toKebab("A")).toBe("a")
+}
+
+test fn constant_case() {
+    expect(toConstant("fooBar")).toBe("FOO_BAR")
+    expect(toConstant("maxRetryCount")).toBe("MAX_RETRY_COUNT")
+    expect(toConstant("io error")).toBe("IO_ERROR")
+    expect(toConstant("v2Name")).toBe("V2_NAME")
+}
+
+test fn camel_case() {
+    expect(toCamel("foo_bar")).toBe("fooBar")
+    expect(toCamel("HTTP response code")).toBe("httpResponseCode")
+    expect(toCamel("alreadyCamel")).toBe("alreadyCamel")
+    expect(toCamel("ABC")).toBe("abc")
+    expect(toCamel("_x_")).toBe("x")
+}
+
+test fn pascal_case() {
+    expect(toPascal("foo_bar")).toBe("FooBar")
+    expect(toPascal("http response code")).toBe("HttpResponseCode")
+    expect(toPascal("alreadyCamel")).toBe("AlreadyCamel")
+    expect(toPascal("io_error")).toBe("IoError")
+    expect(toPascal("v2_name")).toBe("V2Name")
+}
+
+test fn title_case() {
+    expect(toTitle("foo_bar")).toBe("Foo Bar")
+    expect(toTitle("HTTP response code")).toBe("Http Response Code")
+    expect(toTitle("alreadyCamel")).toBe("Already Camel")
+    expect(toTitle("a")).toBe("A")
+}
+
+test fn case_insensitive_equality() {
+    expect(equalsIgnoreCase("FooBar", "foobar")).toBe(true)
+    expect(equalsIgnoreCase("ABC", "abc")).toBe(true)
+    expect(equalsIgnoreCase("a", "b")).toBe(false)
+    expect(equalsIgnoreCase("", "")).toBe(true)
+    expect(equalsIgnoreCase("a b", "a  b")).toBe(false)
+}
+
+test fn non_ascii_bytes_are_preserved() {
+    expect(toSnake("caféBar")).toBe("café_bar")
+    expect(toKebab("naïve name")).toBe("naïve-name")
+    let w = splitWords("caféBar")
+    expect(len(w)).toBe(2)
+    expect(w[0]).toBe("café")
+    expect(w[1]).toBe("Bar")
+    expect(toTitle("über story")).toBe("über Story")
+}
+
+test fn conversions_round_trip_through_words() {
+    let inputs: List<string> = ["fooBar", "HTTPResponseCode", "alpha_beta-gamma delta", "v2Name", "xyz"]
+    for (s in inputs) {
+        expect(toSnake(toCamel(s))).toBe(toSnake(s))
+        expect(toKebab(toPascal(s))).toBe(toKebab(s))
+        expect(toConstant(toSnake(s))).toBe(toConstant(s))
+    }
+}
