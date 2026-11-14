@@ -1,0 +1,162 @@
+module std.text.template
+
+// Minimal `{name}` string templates.
+//
+// The scanner only knows one form: a placeholder `{ name }` (surrounding spaces
+// and tabs are trimmed, and the body must not contain another `{`). `render`
+// leaves an unknown name and an unclosed placeholder untouched, so a template
+// with a missing variable still produces readable output; `renderStrict` returns
+// `none` instead. Non-ASCII bytes pass through untouched.
+//
+// Single braces are deliberate: PickleScript string literals spell a literal
+// brace as `{{`/`}}`, so a double-brace template syntax would force source
+// templates to be written with four braces each side.
+
+/// Whether `b` is a space or tab (placeholder padding).
+fn isPad(b: int) -> bool {
+    b == 32 || b == 9
+}
+
+/// Trim spaces/tabs from both ends of `s`.
+fn trimPads(s: string) -> string {
+    let bs = bytes(s)
+    var lo = 0
+    var hi = len(bs)
+    while (lo < hi) {
+        if (!isPad(bs[lo] as int)) {
+            break
+        }
+        lo = lo + 1
+    }
+    while (hi > lo) {
+        if (!isPad(bs[hi - 1] as int)) {
+            break
+        }
+        hi = hi - 1
+    }
+    var out = bytes("")
+    var i = lo
+    while (i < hi) {
+        out.push(bs[i])
+        i = i + 1
+    }
+    str(out)
+}
+
+/// The bytes of `bs[lo..hi)` as a string.
+fn sliceStr(bs: List<byte>, lo: int, hi: int) -> string {
+    var out = bytes("")
+    var i = lo
+    while (i < hi) {
+        out.push(bs[i])
+        i = i + 1
+    }
+    str(out)
+}
+
+/// Index of the first `}` at or after `start`, or -1.
+fn findClose(bs: List<byte>, start: int) -> int {
+    var i = start
+    while (i < len(bs)) {
+        if ((bs[i] as int) == 125) {
+            return i
+        }
+        i = i + 1
+    }
+    -1
+}
+
+/// Whether `name` is a usable placeholder body (non-empty, no nested `{`).
+fn isName(name: string) -> bool {
+    if (len(name) == 0) {
+        return false
+    }
+    for (b in bytes(name)) {
+        if ((b as int) == 123) {
+            return false
+        }
+    }
+    true
+}
+
+/// Append the bytes of `s` to `out`.
+fn pushStr(out: List<byte>, s: string) {
+    let vb = bytes(s)
+    var k = 0
+    while (k < len(vb)) {
+        out.push(vb[k])
+        k = k + 1
+    }
+}
+
+/// Render `tpl`, substituting `{key}` from `vars`. Unknown names and an
+/// unclosed brace stay literal; a `{` that does not open a valid placeholder is
+/// ordinary text, so surrounding prose is preserved.
+fn render(tpl: string, vars: Map<string, string>) -> string {
+    let bs = bytes(tpl)
+    let out = bytes("")
+    var i = 0
+    while (i < len(bs)) {
+        let b = bs[i] as int
+        if (b == 123) {
+            let close = findClose(bs, i + 1)
+            if (close < 0) {
+                out.push(bs[i])
+                i = i + 1
+            } else {
+                let name = trimPads(sliceStr(bs, i + 1, close))
+                if (!isName(name)) {
+                    out.push(bs[i])
+                    i = i + 1
+                } else if (let some(v) = vars.get(name)) {
+                    pushStr(out, v)
+                    i = close + 1
+                } else {
+                    var k = i
+                    while (k < close + 1) {
+                        out.push(bs[k])
+                        k = k + 1
+                    }
+                    i = close + 1
+                }
+            }
+        } else {
+            out.push(bs[i])
+            i = i + 1
+        }
+    }
+    str(out)
+}
+
+/// Like `render` but `none` when a placeholder names a key absent from `vars`.
+/// Unclosed and malformed braces stay literal, exactly as in `render`.
+fn renderStrict(tpl: string, vars: Map<string, string>) -> string? {
+    let bs = bytes(tpl)
+    let out = bytes("")
+    var i = 0
+    while (i < len(bs)) {
+        let b = bs[i] as int
+        if (b == 123) {
+            let close = findClose(bs, i + 1)
+            if (close < 0) {
+                out.push(bs[i])
+                i = i + 1
+            } else {
+                let name = trimPads(sliceStr(bs, i + 1, close))
+                if (!isName(name)) {
+                    out.push(bs[i])
+                    i = i + 1
+                } else if (let some(v) = vars.get(name)) {
+                    pushStr(out, v)
+                    i = close + 1
+                } else {
+                    return none
+                }
+            }
+        } else {
+            out.push(bs[i])
+            i = i + 1
+        }
+    }
+    str(out)
+}

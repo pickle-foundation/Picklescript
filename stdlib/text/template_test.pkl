@@ -1,0 +1,110 @@
+module std.text.template_test
+
+import { render, renderStrict } from std.text.template
+
+test fn empty_template_renders_empty() {
+    var m: Map<string, string> = { "": "" }
+    m.remove("")
+    expect(render("", m)).toBe("")
+}
+
+test fn text_without_placeholders_is_unchanged() {
+    var m: Map<string, string> = { "": "" }
+    m.remove("")
+    expect(render("plain text", m)).toBe("plain text")
+    expect(render("a } b", m)).toBe("a } b")
+    expect(render("a {{ b", m)).toBe("a {{ b")
+}
+
+test fn substitutes_a_single_key() {
+    var m: Map<string, string> = { "": "" }
+    m.remove("")
+    m["name"] = "Ada"
+    expect(render("Hi {{name}}!", m)).toBe("Hi Ada!")
+}
+
+test fn substitutes_every_occurrence() {
+    var m: Map<string, string> = { "": "" }
+    m.remove("")
+    m["x"] = "1"
+    m["y"] = "2"
+    expect(render("{{x}}+{{y}}={{x}}{{y}}", m)).toBe("1+2=12")
+}
+
+test fn trims_padding_inside_braces() {
+    var m: Map<string, string> = { "": "" }
+    m.remove("")
+    m["name"] = "Ada"
+    expect(render("{{ name }}", m)).toBe("Ada")
+    expect(render("{{   name   }}", m)).toBe("Ada")
+}
+
+test fn empty_body_is_literal() {
+    var m: Map<string, string> = { "": "" }
+    m.remove("")
+    m[""] = "X"
+    expect(render("[{{}}]", m)).toBe("[{{}}]")
+}
+
+test fn unknown_keys_stay_literal() {
+    var m: Map<string, string> = { "": "" }
+    m.remove("")
+    expect(render("a {{missing}} b", m)).toBe("a {{missing}} b")
+}
+
+test fn prose_braces_do_not_block_later_keys() {
+    var m: Map<string, string> = { "": "" }
+    m.remove("")
+    m["name"] = "Ada"
+    expect(render("f() {{ return {{name}} }", m)).toBe("f() {{ return Ada }")
+    expect(render("{{ {{name}} }", m)).toBe("{{ Ada }")
+}
+
+test fn unclosed_placeholder_stays_literal() {
+    var m: Map<string, string> = { "": "" }
+    m.remove("")
+    m["name"] = "Ada"
+    expect(render("a {{name", m)).toBe("a {{name")
+    expect(render("a {{", m)).toBe("a {{")
+}
+
+test fn non_ascii_passes_through() {
+    var m: Map<string, string> = { "": "" }
+    m.remove("")
+    m["who"] = "café"
+    expect(render("→ {{who}} ←", m)).toBe("→ café ←")
+    expect(render("日本語 {{ who }}", m)).toBe("日本語 café")
+}
+
+test fn strict_returns_the_value_when_all_keys_exist() {
+    var m: Map<string, string> = { "": "" }
+    m.remove("")
+    m["a"] = "1"
+    m["b"] = "2"
+    match (renderStrict("{{a}}-{{b}}", m)) {
+    case some(v) -> expect(v).toBe("1-2")
+    case none -> expect(true).toBe(false)
+    }
+}
+
+test fn strict_returns_none_on_a_missing_key() {
+    var m: Map<string, string> = { "": "" }
+    m.remove("")
+    m["a"] = "1"
+    match (renderStrict("{{a}} {{b}}", m)) {
+    case some(_) -> expect(true).toBe(false)
+    case none -> expect(true).toBe(true)
+    }
+    match (renderStrict("no placeholders", m)) {
+    case some(v) -> expect(v).toBe("no placeholders")
+    case none -> expect(true).toBe(false)
+    }
+    match (renderStrict("a {{unclosed", m)) {
+    case some(v) -> expect(v).toBe("a {{unclosed")
+    case none -> expect(true).toBe(false)
+    }
+    match (renderStrict("x {{}} y", m)) {
+    case some(v) -> expect(v).toBe("x {{}} y")
+    case none -> expect(true).toBe(false)
+    }
+}
