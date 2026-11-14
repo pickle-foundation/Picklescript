@@ -1,0 +1,586 @@
+module std.text.unicode
+
+import { decodeCp, encodeCpStr } from std.text.utf8
+
+// Unicode scalar helpers over UTF-8 strings.
+//
+// The module deliberately does not ship Unicode tables: it covers ASCII,
+// Latin-1, Greek, and Cyrillic for case mapping and a practical approximation
+// of combining marks, wide characters, whitespace, and letters. Everything is
+// deterministic, so the module behaves identically wherever it runs.
+//
+// Invalid UTF-8 is never hidden. `isValid` reports it, and the walkers
+// (`scalars`, `charAt`, `displayWidth`, case mapping, slicing) replace each
+// offending byte with U+FFFD and advance one byte, so callers can still get a
+// stable answer from damaged input.
+//
+// Scalars are `int` code points; `char` in the language is also a Unicode
+// scalar, so a scalar index and a `chars` index agree.
+
+/// Whether `i` is a continuation byte (`10xxxxxx`).
+fn isCont(b: int) -> bool {
+    (b & 0xC0) == 0x80
+}
+
+/// Whether the UTF-8 sequence starting at `i` in `bs` is well formed.
+fn validAt(bs: List<byte>, i: int) -> bool {
+    let n = len(bs)
+    let b0 = bs[i] as int
+    if (b0 < 0x80) {
+        return true
+    }
+    if (b0 < 0xC2 || b0 > 0xF4) {
+        return false
+    }
+    var l = 2
+    if (b0 >= 0xF0) {
+        l = 4
+    } else if (b0 >= 0xE0) {
+        l = 3
+    }
+    if (i + l > n) {
+        return false
+    }
+    var k = 1
+    while (k < l) {
+        if (!isCont(bs[i + k] as int)) {
+            return false
+        }
+        k = k + 1
+    }
+    let b1 = bs[i + 1] as int
+    if (b0 == 0xE0 && b1 < 0xA0) {
+        return false
+    }
+    if (b0 == 0xED && b1 >= 0xA0) {
+        return false
+    }
+    if (b0 == 0xF0 && b1 < 0x90) {
+        return false
+    }
+    if (b0 == 0xF4 && b1 >= 0x90) {
+        return false
+    }
+    true
+}
+
+/// Whether `s` is well-formed UTF-8.
+fn isValid(s: string) -> bool {
+    let bs = bytes(s)
+    var i = 0
+    while (i < len(bs)) {
+        if (!validAt(bs, i)) {
+            return false
+        }
+        var l = 1
+        if ((bs[i] as int) >= 0xF0) {
+            l = 4
+        } else if ((bs[i] as int) >= 0xE0) {
+            l = 3
+        } else if ((bs[i] as int) >= 0xC2) {
+            l = 2
+        }
+        i = i + l
+    }
+    true
+}
+
+/// The scalar at byte offset `i` of `bs`, or U+FFFD for a malformed sequence.
+fn cpAt(bs: List<byte>, i: int) -> int {
+    if (validAt(bs, i)) {
+        match (decodeCp(bs, i)) {
+        case some(cp) -> cp
+        case none -> 0xFFFD
+        }
+    } else {
+        0xFFFD
+    }
+}
+
+/// The byte length of the scalar at `i` (`1` for a malformed sequence).
+fn lenAt(bs: List<byte>, i: int) -> int {
+    if (!validAt(bs, i)) {
+        return 1
+    }
+    let b0 = bs[i] as int
+    if (b0 < 0x80) {
+        return 1
+    }
+    if (b0 < 0xE0) {
+        return 2
+    }
+    if (b0 < 0xF0) {
+        return 3
+    }
+    4
+}
+
+/// The code points of `s` in order; each malformed byte becomes U+FFFD.
+fn scalars(s: string) -> List<int> {
+    let bs = bytes(s)
+    var out: List<int> = [0]
+    out.remove(0)
+    var i = 0
+    while (i < len(bs)) {
+        out.push(cpAt(bs, i))
+        i = i + lenAt(bs, i)
+    }
+    out
+}
+
+/// The string for a list of code points; values outside the scalar range
+/// (including surrogates) encode as U+FFFD.
+fn fromScalars(cps: List<int>) -> string {
+    var out = bytes("")
+    var i = 0
+    while (i < len(cps)) {
+        let enc = bytes(encodeCpStr(cps[i]))
+        var k = 0
+        while (k < len(enc)) {
+            out.push(enc[k])
+            k = k + 1
+        }
+        i = i + 1
+    }
+    str(out)
+}
+
+/// The number of scalars in `s` (malformed bytes count once each).
+fn scalarCount(s: string) -> int {
+    let bs = bytes(s)
+    var n = 0
+    var i = 0
+    while (i < len(bs)) {
+        i = i + lenAt(bs, i)
+        n = n + 1
+    }
+    n
+}
+
+/// The scalar at scalar index `i`; `none` when `i` is out of range.
+fn charAt(s: string, i: int) -> int? {
+    if (i < 0) {
+        return none
+    }
+    let bs = bytes(s)
+    var at = 0
+    var k = 0
+    while (k < i && at < len(bs)) {
+        at = at + lenAt(bs, at)
+        k = k + 1
+    }
+    if (at >= len(bs)) {
+        return none
+    }
+    cpAt(bs, at)
+}
+
+/// The byte slice `[lo, hi)` of `s`, clamped.
+fn sliceBytes(s: string, lo: int, hi: int) -> string {
+    let bs = bytes(s)
+    var a = lo
+    var b = hi
+    if (a < 0) {
+        a = 0
+    }
+    if (b > len(bs)) {
+        b = len(bs)
+    }
+    if (a >= b) {
+        return ""
+    }
+    var out = bytes("")
+    var i = a
+    while (i < b) {
+        out.push(bs[i])
+        i = i + 1
+    }
+    str(out)
+}
+
+/// The substring from scalar index `start` (inclusive) to `end` (exclusive);
+/// `none` when the range is negative, reversed, or past the end.
+fn sliceScalars(s: string, start: int, end: int) -> string? {
+    if (start < 0 || end < start) {
+        return none
+    }
+    let bs = bytes(s)
+    var at = 0
+    var k = 0
+    while (k < start) {
+        if (at >= len(bs)) {
+            return none
+        }
+        at = at + lenAt(bs, at)
+        k = k + 1
+    }
+    let begin = at
+    while (k < end) {
+        if (at >= len(bs)) {
+            return none
+        }
+        at = at + lenAt(bs, at)
+        k = k + 1
+    }
+    sliceBytes(s, begin, at)
+}
+
+/// Whether `cp` is an ASCII digit.
+fn isDigit(cp: int) -> bool {
+    cp >= 48 && cp <= 57
+}
+
+/// Whether `cp` is an ASCII letter.
+fn isAsciiAlpha(cp: int) -> bool {
+    (cp >= 65 && cp <= 90) || (cp >= 97 && cp <= 122)
+}
+
+/// Whether `cp` is ASCII: a letter, digit, or punctuation/space below U+0080.
+fn isAscii(cp: int) -> bool {
+    cp >= 0 && cp < 0x80
+}
+
+/// Whether `cp` is whitespace: the ASCII controls, U+0085, U+00A0, and the
+/// Zs/Zl/Zp separators.
+fn isSpace(cp: int) -> bool {
+    if (cp == 32 || (cp >= 9 && cp <= 13)) {
+        return true
+    }
+    if (cp == 0x85 || cp == 0xA0) {
+        return true
+    }
+    if (cp >= 0x2000 && cp <= 0x200A) {
+        return true
+    }
+    if (cp == 0x1680 || cp == 0x2028 || cp == 0x2029) {
+        return true
+    }
+    if (cp == 0x202F || cp == 0x205F || cp == 0x3000) {
+        return true
+    }
+    false
+}
+
+/// Whether `cp` is a letter in ASCII, Latin-1, Latin Extended, Greek,
+/// Cyrillic, Armenian, Hebrew, Arabic, Devanagari, kana, CJK, or Hangul.
+fn isLetter(cp: int) -> bool {
+    if (isAsciiAlpha(cp)) {
+        return true
+    }
+    if (cp == 0xAA || cp == 0xB5 || cp == 0xBA) {
+        return true
+    }
+    if (cp >= 0xC0 && cp <= 0xD6) {
+        return true
+    }
+    if (cp >= 0xD8 && cp <= 0xF6) {
+        return true
+    }
+    if (cp >= 0xF8 && cp <= 0x2AF) {
+        return true
+    }
+    if (cp >= 0x370 && cp <= 0x4FF) {
+        return true
+    }
+    if (cp >= 0x531 && cp <= 0x58F) {
+        return true
+    }
+    if (cp >= 0x5D0 && cp <= 0x5EA) {
+        return true
+    }
+    if (cp >= 0x620 && cp <= 0x64A) {
+        return true
+    }
+    if (cp >= 0x900 && cp <= 0x97F) {
+        return true
+    }
+    if (cp >= 0x3040 && cp <= 0x30FF) {
+        return true
+    }
+    if (cp >= 0x4E00 && cp <= 0x9FFF) {
+        return true
+    }
+    if (cp >= 0xAC00 && cp <= 0xD7A3) {
+        return true
+    }
+    if (cp >= 0x1E00 && cp <= 0x1FFF) {
+        return true
+    }
+    false
+}
+
+/// Whether `cp` is a letter or an ASCII digit.
+fn isAlnum(cp: int) -> bool {
+    isLetter(cp) || isDigit(cp)
+}
+
+/// The simple uppercase mapping of `cp` (ASCII, Latin-1, Greek, Cyrillic);
+/// `cp` itself when there is none.
+fn upperOf(cp: int) -> int {
+    if (cp >= 97 && cp <= 122) {
+        return cp - 32
+    }
+    if (cp >= 0xE0 && cp <= 0xFE && cp != 0xF7) {
+        return cp - 32
+    }
+    if (cp == 0xFF) {
+        return 0x178
+    }
+    if (cp >= 0x3B1 && cp <= 0x3C1) {
+        return cp - 32
+    }
+    if (cp == 0x3C2 || cp == 0x3C3) {
+        return 0x3A3
+    }
+    if (cp >= 0x3C4 && cp <= 0x3C9) {
+        return cp - 32
+    }
+    if (cp >= 0x430 && cp <= 0x44F) {
+        return cp - 32
+    }
+    if (cp >= 0x450 && cp <= 0x45F) {
+        return cp - 80
+    }
+    cp
+}
+
+/// The simple lowercase mapping of `cp` (ASCII, Latin-1, Greek, Cyrillic);
+/// `cp` itself when there is none.
+fn lowerOf(cp: int) -> int {
+    if (cp >= 65 && cp <= 90) {
+        return cp + 32
+    }
+    if (cp >= 0xC0 && cp <= 0xDE && cp != 0xD7) {
+        return cp + 32
+    }
+    if (cp == 0x178) {
+        return 0xFF
+    }
+    if (cp >= 0x391 && cp <= 0x3A1) {
+        return cp + 32
+    }
+    if (cp >= 0x3A3 && cp <= 0x3A9) {
+        return cp + 32
+    }
+    if (cp >= 0x410 && cp <= 0x42F) {
+        return cp + 32
+    }
+    if (cp >= 0x400 && cp <= 0x40F) {
+        return cp + 80
+    }
+    cp
+}
+
+/// Whether `cp` is an uppercase letter in this module's coverage: it has a
+/// lowercase mapping and no uppercase one.
+fn isUpper(cp: int) -> bool {
+    lowerOf(cp) != cp && upperOf(cp) == cp
+}
+
+/// Whether `cp` is a lowercase letter in this module's coverage: it has an
+/// uppercase mapping and no lowercase one.
+fn isLower(cp: int) -> bool {
+    upperOf(cp) != cp && lowerOf(cp) == cp
+}
+
+/// `s` with every covered scalar uppercased; other bytes pass through.
+fn toUpper(s: string) -> string {
+    var out = bytes("")
+    let bs = bytes(s)
+    var i = 0
+    while (i < len(bs)) {
+        let cp = cpAt(bs, i)
+        let enc = bytes(encodeCpStr(upperOf(cp)))
+        var k = 0
+        while (k < len(enc)) {
+            out.push(enc[k])
+            k = k + 1
+        }
+        i = i + lenAt(bs, i)
+    }
+    str(out)
+}
+
+/// `s` with every covered scalar lowercased; other bytes pass through.
+fn toLower(s: string) -> string {
+    var out = bytes("")
+    let bs = bytes(s)
+    var i = 0
+    while (i < len(bs)) {
+        let cp = cpAt(bs, i)
+        let enc = bytes(encodeCpStr(lowerOf(cp)))
+        var k = 0
+        while (k < len(enc)) {
+            out.push(enc[k])
+            k = k + 1
+        }
+        i = i + lenAt(bs, i)
+    }
+    str(out)
+}
+
+/// Whether `cp` is a combining mark (zero display width).
+fn isCombining(cp: int) -> bool {
+    if (cp >= 0x300 && cp <= 0x36F) {
+        return true
+    }
+    if (cp >= 0x483 && cp <= 0x489) {
+        return true
+    }
+    if (cp >= 0x591 && cp <= 0x5BD) {
+        return true
+    }
+    if (cp >= 0x610 && cp <= 0x61A) {
+        return true
+    }
+    if (cp >= 0x64B && cp <= 0x65F) {
+        return true
+    }
+    if (cp >= 0x6D6 && cp <= 0x6DC) {
+        return true
+    }
+    if (cp == 0xE31 || (cp >= 0xE34 && cp <= 0xE3A) || (cp >= 0xE47 && cp <= 0xE4E)) {
+        return true
+    }
+    if (cp >= 0x1AB0 && cp <= 0x1AFF) {
+        return true
+    }
+    if (cp >= 0x1DC0 && cp <= 0x1DFF) {
+        return true
+    }
+    if (cp == 0x200B || cp == 0x200C || cp == 0x200D) {
+        return true
+    }
+    if (cp >= 0x20D0 && cp <= 0x20F0) {
+        return true
+    }
+    if (cp >= 0xFE00 && cp <= 0xFE0F) {
+        return true
+    }
+    if (cp >= 0xFE20 && cp <= 0xFE2F) {
+        return true
+    }
+    if (cp >= 0xE0100 && cp <= 0xE01EF) {
+        return true
+    }
+    false
+}
+
+/// Whether `cp` is rendered double width (CJK, Hangul, fullwidth forms, and
+/// the emoji blocks).
+fn isWide(cp: int) -> bool {
+    if (cp >= 0x1100 && cp <= 0x115F) {
+        return true
+    }
+    if (cp >= 0x2E80 && cp <= 0x303E) {
+        return true
+    }
+    if (cp >= 0x3041 && cp <= 0x33FF) {
+        return true
+    }
+    if (cp >= 0x3400 && cp <= 0x4DBF) {
+        return true
+    }
+    if (cp >= 0x4E00 && cp <= 0x9FFF) {
+        return true
+    }
+    if (cp >= 0xA000 && cp <= 0xA4CF) {
+        return true
+    }
+    if (cp >= 0xA960 && cp <= 0xA97F) {
+        return true
+    }
+    if (cp >= 0xAC00 && cp <= 0xD7A3) {
+        return true
+    }
+    if (cp >= 0xF900 && cp <= 0xFAFF) {
+        return true
+    }
+    if (cp >= 0xFE10 && cp <= 0xFE19) {
+        return true
+    }
+    if (cp >= 0xFE30 && cp <= 0xFE6F) {
+        return true
+    }
+    if (cp >= 0xFF00 && cp <= 0xFF60) {
+        return true
+    }
+    if (cp >= 0xFFE0 && cp <= 0xFFE6) {
+        return true
+    }
+    if (cp >= 0x1F300 && cp <= 0x1F64F) {
+        return true
+    }
+    if (cp >= 0x1F900 && cp <= 0x1F9FF) {
+        return true
+    }
+    if (cp >= 0x20000 && cp <= 0x2FFFD) {
+        return true
+    }
+    if (cp >= 0x30000 && cp <= 0x3FFFD) {
+        return true
+    }
+    false
+}
+
+/// The terminal cell width of one scalar: 0 for controls and combining marks,
+/// 2 for wide characters, 1 otherwise.
+fn charWidth(cp: int) -> int {
+    if (cp < 0x20 || cp == 0x7F) {
+        return 0
+    }
+    if (isCombining(cp)) {
+        return 0
+    }
+    if (isWide(cp)) {
+        return 2
+    }
+    1
+}
+
+/// The terminal cell width of `s` (malformed bytes count as U+FFFD, width 1).
+fn displayWidth(s: string) -> int {
+    let bs = bytes(s)
+    var w = 0
+    var i = 0
+    while (i < len(bs)) {
+        w = w + charWidth(cpAt(bs, i))
+        i = i + lenAt(bs, i)
+    }
+    w
+}
+
+/// The longest prefix of `s` whose display width is at most `maxWidth`;
+/// never splits a scalar. An empty string when `maxWidth` is not positive.
+fn truncateToWidth(s: string, maxWidth: int) -> string {
+    if (maxWidth <= 0) {
+        return ""
+    }
+    let bs = bytes(s)
+    var w = 0
+    var at = 0
+    while (at < len(bs)) {
+        let cw = charWidth(cpAt(bs, at))
+        if (w + cw > maxWidth) {
+            break
+        }
+        w = w + cw
+        at = at + lenAt(bs, at)
+    }
+    sliceBytes(s, 0, at)
+}
+
+/// The scalar index of the first occurrence of `needle` in `s`, or -1.
+fn indexOfScalar(s: string, needle: int) -> int {
+    let bs = bytes(s)
+    var i = 0
+    var k = 0
+    while (i < len(bs)) {
+        if (cpAt(bs, i) == needle) {
+            return k
+        }
+        i = i + lenAt(bs, i)
+        k = k + 1
+    }
+    -1
+}
