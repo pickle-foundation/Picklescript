@@ -1,0 +1,128 @@
+module std.math.random
+
+// A deterministic, seedable pseudo-random generator (xorshift32) plus helpers.
+//
+// `Rng(seed)` mixes the seed with a 32-bit avalanche step so small or
+// neighbouring seeds start far apart, and maps the all-zero state to a fixed
+// constant because xorshift cannot escape zero. Nothing is shared between
+// instances and nothing reads the clock, so a seed always replays the same
+// sequence - the tests pin exact values for that reason.
+//
+// All state stays in the low 32 bits (`& 0xFFFFFFFF`), so the internal
+// multiply-free xorshift steps cannot overflow a 64-bit `int`.
+//
+// `nextU32` returns `0 .. 2^32 - 1`; `nextInt` returns `0 .. 2^31 - 1`;
+// `nextRange(lo, hi)` returns `lo .. hi - 1` (an empty range returns `lo`);
+// `nextBool` is a fair coin; `nextFloat` returns `[0, 1)` as `2^-32`
+// granularity. `shuffle` is an in-place Fisher-Yates pass, `choice` picks one
+// element (`none` on an empty list), and `seedOf` derives a seed from text.
+
+/// 32-bit mask used after every shift.
+const MASK: int = 4294967295
+
+/// The all-zero xorshift state, replaced on construction.
+const ZERO_STATE: int = 2463534242
+
+/// A deterministic pseudo-random generator with private 32-bit state.
+class Rng {
+    var state: int
+
+    /// Seed the generator; the same seed always replays the same sequence.
+    constructor(seed: int) {
+        var s = mix32(seed)
+        if (s == 0) {
+            s = ZERO_STATE
+        }
+        this.state = s
+    }
+
+    /// The next value in `0 .. 2^32 - 1`.
+    fn nextU32() -> int {
+        var x = this.state
+        x = x ^ ((x << 13) & MASK)
+        x = x ^ (x >> 17)
+        x = x ^ ((x << 5) & MASK)
+        x = x & MASK
+        this.state = x
+        x
+    }
+
+    /// The next value in `0 .. 2^31 - 1`.
+    fn nextInt() -> int {
+        this.nextU32() & 2147483647
+    }
+
+    /// A value in `lo .. hi - 1`; an empty range returns `lo`.
+    fn nextRange(lo: int, hi: int) -> int {
+        if (hi <= lo) {
+            return lo
+        }
+        lo + this.nextU32() % (hi - lo)
+    }
+
+    /// A fair coin (the high bit of the next word).
+    fn nextBool() -> bool {
+        (this.nextU32() >> 31) == 1
+    }
+
+    /// A value in `[0, 1)` with `2^-32` granularity.
+    fn nextFloat() -> float {
+        (this.nextU32() as float) / 4294967296.0
+    }
+
+    /// A fresh copy of the internal state (for save/restore experiments).
+    fn snapshot() -> int {
+        this.state
+    }
+
+    /// Restore a state produced by `snapshot`.
+    fn restore(state: int) {
+        var s = state & MASK
+        if (s == 0) {
+            s = ZERO_STATE
+        }
+        this.state = s
+    }
+}
+
+/// Shuffle `xs` in place with Fisher-Yates; deterministic for a given `rng`.
+fn shuffle<T>(rng: Rng, xs: List<T>) {
+    var i = len(xs) - 1
+    while (i > 0) {
+        let j = rng.nextRange(0, i + 1)
+        let tmp = xs[i]
+        xs[i] = xs[j]
+        xs[j] = tmp
+        i = i - 1
+    }
+}
+
+/// One element of `xs`, or `none` when it is empty.
+fn choice<T>(rng: Rng, xs: List<T>) -> T? {
+    if (len(xs) == 0) {
+        return none
+    }
+    let i = rng.nextRange(0, len(xs))
+    xs[i]
+}
+
+/// A deterministic 32-bit seed derived from the bytes of `text` (FNV-1a).
+fn seedOf(text: string) -> int {
+    var h = 2166136261
+    for (b in bytes(text)) {
+        h = h ^ (b as int)
+        h = (h * 16777619) & MASK
+    }
+    h
+}
+
+/// SplitMix-style avalanche: spreads nearby seeds across the 32-bit space.
+fn mix32(seed: int) -> int {
+    var x = seed & MASK
+    x = x ^ (x >> 16)
+    x = (x * 2146121005) & MASK
+    x = x ^ (x >> 15)
+    x = (x * 1597334677) & MASK
+    x = x ^ (x >> 16)
+    x & MASK
+}

@@ -1,0 +1,198 @@
+module std.math.random_test
+
+import { Rng, shuffle, choice, seedOf } from std.math.random
+
+test fn same_seed_replays_the_same_sequence() {
+    let a = Rng(42)
+    let b = Rng(42)
+    let expected: List<int> = [2035908847, 1640812013, 4132645749, 4102397835, 2851035665]
+    for (want in expected) {
+        expect(a.nextU32()).toBe(want)
+        expect(b.nextU32()).toBe(want)
+    }
+}
+
+test fn different_seeds_diverge() {
+    let a = Rng(1)
+    let b = Rng(2)
+    expect(a.nextU32()).toBe(222323184)
+    expect(b.nextU32() == 222323184).toBe(false)
+    let c = Rng(123456789)
+    expect(c.nextU32()).toBe(2063265830)
+}
+
+test fn zero_seed_is_remapped() {
+    let r = Rng(0)
+    expect(r.snapshot()).toBe(2463534242)
+    expect(r.nextU32()).toBe(723471715)
+    expect(r.nextU32()).toBe(2497366906)
+}
+
+test fn next_int_is_non_negative() {
+    let r = Rng(42)
+    expect(r.nextInt()).toBe(2035908847)
+    let q = Rng(7)
+    var i = 0
+    while (i < 100) {
+        let v = q.nextInt()
+        expect(v >= 0).toBe(true)
+        expect(v <= 2147483647).toBe(true)
+        i = i + 1
+    }
+}
+
+test fn next_range_respects_bounds() {
+    let r = Rng(42)
+    expect(r.nextRange(10, 20)).toBe(17)
+    expect(r.nextRange(5, 5)).toBe(5)
+    expect(r.nextRange(5, 3)).toBe(5)
+    var i = 0
+    while (i < 200) {
+        let v = r.nextRange(3, 8)
+        expect(v >= 3).toBe(true)
+        expect(v < 8).toBe(true)
+        i = i + 1
+    }
+    var k = 0
+    while (k < 50) {
+        let v = r.nextRange(0 - 4, 4)
+        expect(v >= 0 - 4).toBe(true)
+        expect(v < 4).toBe(true)
+        k = k + 1
+    }
+}
+
+test fn next_bool_uses_the_high_bit() {
+    let r = Rng(42)
+    expect(r.nextBool()).toBe(false)
+    expect(r.nextBool()).toBe(false)
+    expect(r.nextBool()).toBe(true)
+    expect(r.nextBool()).toBe(true)
+    expect(r.nextBool()).toBe(true)
+    let q = Rng(99)
+    var t = 0
+    var f = 0
+    var i = 0
+    while (i < 200) {
+        if (q.nextBool()) {
+            t = t + 1
+        } else {
+            f = f + 1
+        }
+        i = i + 1
+    }
+    expect(t > 40).toBe(true)
+    expect(f > 40).toBe(true)
+}
+
+test fn next_float_stays_in_unit_interval() {
+    let r = Rng(42)
+    var i = 0
+    var sawHigh = false
+    while (i < 300) {
+        let v = r.nextFloat()
+        expect(v >= 0.0).toBe(true)
+        expect(v < 1.0).toBe(true)
+        if (v > 0.5) {
+            sawHigh = true
+        }
+        i = i + 1
+    }
+    expect(sawHigh).toBe(true)
+}
+
+test fn ranges_cover_every_bucket() {
+    let r = Rng(2024)
+    let counts: List<int> = [0, 0, 0, 0]
+    var i = 0
+    while (i < 400) {
+        let v = r.nextRange(0, 4)
+        counts[v] = counts[v] + 1
+        i = i + 1
+    }
+    var k = 0
+    while (k < 4) {
+        expect(counts[k] > 40).toBe(true)
+        k = k + 1
+    }
+}
+
+test fn shuffle_permutes_deterministically() {
+    let r = Rng(7)
+    let xs: List<int> = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    shuffle(r, xs)
+    let expected: List<int> = [9, 5, 10, 4, 8, 2, 6, 3, 1, 7]
+    var i = 0
+    while (i < 10) {
+        expect(xs[i]).toBe(expected[i])
+        i = i + 1
+    }
+    let again: List<int> = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    shuffle(Rng(7), again)
+    i = 0
+    while (i < 10) {
+        expect(again[i]).toBe(expected[i])
+        i = i + 1
+    }
+    var n = 0
+    while (n < 10) {
+        var seen = 0
+        var j = 0
+        while (j < 10) {
+            if (xs[j] == n + 1) {
+                seen = seen + 1
+            }
+            j = j + 1
+        }
+        expect(seen).toBe(1)
+        n = n + 1
+    }
+}
+
+test fn shuffle_keeps_empty_and_singleton_lists() {
+    let empty: List<int> = [0]
+    empty.remove(0)
+    shuffle(Rng(3), empty)
+    expect(len(empty)).toBe(0)
+    let one: List<int> = [7]
+    shuffle(Rng(3), one)
+    expect(len(one)).toBe(1)
+    expect(one[0]).toBe(7)
+}
+
+test fn choice_picks_inside_the_list() {
+    let names: List<string> = ["a", "b", "c", "d", "e"]
+    match (choice(Rng(42), names)) {
+        case some(v) -> expect(v).toBe("c")
+        case none -> expect(true).toBe(false)
+    }
+    let empty: List<string> = [""]
+    empty.remove(0)
+    match (choice(Rng(42), empty)) {
+        case some(_) -> expect(true).toBe(false)
+        case none -> expect(true).toBe(true)
+    }
+}
+
+test fn snapshot_and_restore_replay() {
+    let r = Rng(5)
+    r.nextU32()
+    let s = r.snapshot()
+    let a = r.nextU32()
+    let b = r.nextU32()
+    r.restore(s)
+    expect(r.nextU32()).toBe(a)
+    expect(r.nextU32()).toBe(b)
+    r.restore(0)
+    expect(r.snapshot()).toBe(2463534242)
+}
+
+test fn seed_of_text_is_stable() {
+    expect(seedOf("abc")).toBe(440920331)
+    expect(seedOf("abc")).toBe(seedOf("abc"))
+    expect(seedOf("abd") == seedOf("abc")).toBe(false)
+    expect(seedOf("")).toBe(2166136261)
+    let a = Rng(seedOf("hello"))
+    let b = Rng(seedOf("hello"))
+    expect(a.nextU32()).toBe(b.nextU32())
+}
