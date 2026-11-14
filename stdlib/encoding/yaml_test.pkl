@@ -1,0 +1,417 @@
+module std.encoding.yaml_test
+
+import { parse, Yaml, typeOf, asStr, asInt, asFloat, asBool, isNull, field, has, at, size, keysOf, keyAt, valueAt } from std.encoding.yaml
+
+/// Parse `text`, failing the test when it does not parse.
+fn must(text: string) -> Yaml {
+    match (parse(text)) {
+    case some(v) -> v
+    case none -> {
+        expect(false).toBe(true)
+        Yaml.YNull
+    }
+    }
+}
+
+/// Whether `text` parses.
+fn parses(text: string) -> bool {
+    match (parse(text)) {
+    case some(_) -> true
+    case none -> false
+    }
+}
+
+/// A compact type-tagged rendering used for assertions.
+fn show(v: Yaml) -> string {
+    match (v) {
+    case Yaml.YNull -> "null"
+    case Yaml.YBool(b) -> "bool:{b}"
+    case Yaml.YInt(n) -> "int:{n}"
+    case Yaml.YFloat(x) -> "float:{x}"
+    case Yaml.YStr(s) -> "str:{s}"
+    case Yaml.YSeq(items) -> "seq[{len(items)}]"
+    case Yaml.YMap(keys, _) -> "map[{len(keys)}]"
+    }
+}
+
+/// `show` of a mapping field, or `<missing>`.
+fn showField(v: Yaml, key: string) -> string {
+    match (field(v, key)) {
+    case some(x) -> show(x)
+    case none -> "<missing>"
+    }
+}
+
+/// `show` of a sequence element, or `<missing>`.
+fn showAt(v: Yaml, i: int) -> string {
+    match (at(v, i)) {
+    case some(x) -> show(x)
+    case none -> "<missing>"
+    }
+}
+
+/// The field or a null scratch value.
+fn mustField(v: Yaml, key: string) -> Yaml {
+    match (field(v, key)) {
+    case some(x) -> x
+    case none -> {
+        expect(false).toBe(true)
+        Yaml.YNull
+    }
+    }
+}
+
+/// The element or a null scratch value.
+fn mustAt(v: Yaml, i: int) -> Yaml {
+    match (at(v, i)) {
+    case some(x) -> x
+    case none -> {
+        expect(false).toBe(true)
+        Yaml.YNull
+    }
+    }
+}
+
+/// The key at position `i`, or `<none>`.
+fn keyTextAt(v: Yaml, i: int) -> string {
+    match (keyAt(v, i)) {
+    case some(k) -> k
+    case none -> "<none>"
+    }
+}
+
+/// `show` of the mapping value at position `i`, or `<missing>`.
+fn showValueAt(v: Yaml, i: int) -> string {
+    match (valueAt(v, i)) {
+    case some(x) -> show(x)
+    case none -> "<missing>"
+    }
+}
+
+/// Whether `asStr` succeeded.
+fn strSome(v: Yaml) -> bool {
+    match (asStr(v)) {
+    case some(_) -> true
+    case none -> false
+    }
+}
+
+/// Whether `asInt` succeeded.
+fn intSome(v: Yaml) -> bool {
+    match (asInt(v)) {
+    case some(_) -> true
+    case none -> false
+    }
+}
+
+/// Whether `asFloat` succeeded.
+fn floatSome(v: Yaml) -> bool {
+    match (asFloat(v)) {
+    case some(_) -> true
+    case none -> false
+    }
+}
+
+/// Whether `asBool` succeeded.
+fn boolSome(v: Yaml) -> bool {
+    match (asBool(v)) {
+    case some(_) -> true
+    case none -> false
+    }
+}
+
+test fn resolves_scalars() {
+    let v = must("a: 1\nb: -2\nc: 3.5\nd: true\ne: null\nf: hello\ng: ~\nh: 1e3\ni: false\n")
+    expect(typeOf(v)).toBe("mapping")
+    expect(showField(v, "a")).toBe("int:1")
+    expect(showField(v, "b")).toBe("int:-2")
+    expect(showField(v, "c")).toBe("float:3.5")
+    expect(showField(v, "d")).toBe("bool:true")
+    expect(showField(v, "e")).toBe("null")
+    expect(showField(v, "f")).toBe("str:hello")
+    expect(showField(v, "g")).toBe("null")
+    expect(showField(v, "h")).toBe("float:1000")
+    expect(showField(v, "i")).toBe("bool:false")
+    expect(size(v)).toBe(9)
+}
+
+test fn nested_blocks() {
+    let v = must("server:\n  host: localhost\n  port: 8080\n  tags:\n    - a\n    - b\nclient:\n  host: example.com\n")
+    expect(showField(v, "server")).toBe("map[3]")
+    let server = mustField(v, "server")
+    expect(showField(server, "host")).toBe("str:localhost")
+    expect(showField(server, "port")).toBe("int:8080")
+    let tags = mustField(server, "tags")
+    expect(typeOf(tags)).toBe("sequence")
+    expect(size(tags)).toBe(2)
+    expect(showAt(tags, 0)).toBe("str:a")
+    expect(showAt(tags, 1)).toBe("str:b")
+    expect(showField(mustField(v, "client"), "host")).toBe("str:example.com")
+}
+
+test fn block_sequences() {
+    let v = must("- one\n- 2\n- true\n- [x, y]\n-\n- 3.25\n")
+    expect(typeOf(v)).toBe("sequence")
+    expect(size(v)).toBe(6)
+    expect(showAt(v, 0)).toBe("str:one")
+    expect(showAt(v, 1)).toBe("int:2")
+    expect(showAt(v, 2)).toBe("bool:true")
+    expect(showAt(v, 3)).toBe("seq[2]")
+    expect(showAt(v, 4)).toBe("null")
+    expect(showAt(v, 5)).toBe("float:3.25")
+}
+
+test fn sequence_of_mappings() {
+    let v = must("- name: a\n  age: 1\n- name: b\n  age: 2\n")
+    expect(size(v)).toBe(2)
+    let first = mustAt(v, 0)
+    expect(typeOf(first)).toBe("mapping")
+    expect(showField(first, "name")).toBe("str:a")
+    expect(showField(first, "age")).toBe("int:1")
+    let ks = keysOf(first)
+    expect(len(ks)).toBe(2)
+    expect(ks[0]).toBe("name")
+    expect(ks[1]).toBe("age")
+    expect(showField(mustAt(v, 1), "name")).toBe("str:b")
+}
+
+test fn sequence_mapping_with_nested_block() {
+    let v = must("- name:\n    first: A\n    last: B\n  active: true\n")
+    expect(size(v)).toBe(1)
+    let item = mustAt(v, 0)
+    expect(showField(item, "name")).toBe("map[2]")
+    expect(showField(mustField(item, "name"), "last")).toBe("str:B")
+    expect(showField(item, "active")).toBe("bool:true")
+}
+
+test fn flow_collections() {
+    let v = must("nums: [1, 2, 3]\nempty: []\nmap: {{a: 1, b: [2, 3]}}\ntrail: [1, 2, ]\n")
+    let nums = mustField(v, "nums")
+    expect(typeOf(nums)).toBe("sequence")
+    expect(size(nums)).toBe(3)
+    expect(showAt(nums, 2)).toBe("int:3")
+    expect(size(mustField(v, "empty"))).toBe(0)
+    let m = mustField(v, "map")
+    expect(typeOf(m)).toBe("mapping")
+    expect(showField(m, "a")).toBe("int:1")
+    expect(showField(m, "b")).toBe("seq[2]")
+    expect(showAt(mustField(m, "b"), 1)).toBe("int:3")
+    expect(size(mustField(v, "trail"))).toBe(2)
+}
+
+test fn comments_and_blank_lines() {
+    let v = must("# top\n\na: 1 # trailing\n  # indented comment\nb: x#y\nc: \"q # r\"\n\n")
+    expect(size(v)).toBe(3)
+    expect(showField(v, "a")).toBe("int:1")
+    expect(showField(v, "b")).toBe("str:x#y")
+    expect(showField(v, "c")).toBe("str:q # r")
+}
+
+test fn document_markers() {
+    expect(show(must("---\na: 1\n...\n"))).toBe("map[1]")
+    expect(show(must("--- # start\na: 1\n"))).toBe("map[1]")
+    expect(show(must("...\n"))).toBe("null")
+    expect(show(must("---\n...\n"))).toBe("null")
+    expect(parses("a: 1\n---\nb: 2\n")).toBe(false)
+    expect(parses("---\na: 1\n---\nb: 2\n")).toBe(false)
+}
+
+test fn quoted_keys_and_scalars() {
+    let v = must("\"a b\": 1\n'c d': 2\nplain: \"x: y\"\n")
+    expect(showField(v, "a b")).toBe("int:1")
+    expect(showField(v, "c d")).toBe("int:2")
+    expect(showField(v, "plain")).toBe("str:x: y")
+    expect(has(v, "a b")).toBe(true)
+    expect(has(v, "a")).toBe(false)
+    let ks = keysOf(v)
+    expect(ks[0]).toBe("a b")
+    expect(ks[1]).toBe("c d")
+}
+
+test fn double_quoted_escapes() {
+    let v = must("a: \"tab\\there\"\nb: \"line\\nbreak\"\nc: \"\\x41\\u0042\\U00000043\"\nd: \"q\\\"q\"\ne: \"sl\\\\ash\"\n")
+    expect(showField(v, "a")).toBe("str:tab\there")
+    expect(showField(v, "b")).toBe("str:line\nbreak")
+    expect(showField(v, "c")).toBe("str:ABC")
+    expect(showField(v, "d")).toBe("str:q\"q")
+    expect(showField(v, "e")).toBe("str:sl\\ash")
+}
+
+test fn single_quoted_scalars() {
+    let v = must("a: 'it''s'\nb: 'c:\\path'\nc: 'no \"escapes\" here'\n")
+    expect(showField(v, "a")).toBe("str:it's")
+    expect(showField(v, "b")).toBe("str:c:\\path")
+    expect(showField(v, "c")).toBe("str:no \"escapes\" here")
+}
+
+test fn numeric_formats() {
+    let v = must("h: 0x1F\no: 0o17\nb: 0b101\nu: 1_000\np: +7\nn: -0\nf: 1_0.5_0\ne: 2.5e2\nd: .5\nt: 1.\nz: 1e0\n")
+    expect(showField(v, "h")).toBe("int:31")
+    expect(showField(v, "o")).toBe("int:15")
+    expect(showField(v, "b")).toBe("int:5")
+    expect(showField(v, "u")).toBe("int:1000")
+    expect(showField(v, "p")).toBe("int:7")
+    expect(showField(v, "n")).toBe("int:0")
+    expect(showField(v, "f")).toBe("float:10.5")
+    expect(showField(v, "e")).toBe("float:250")
+    expect(showField(v, "d")).toBe("float:0.5")
+    expect(showField(v, "t")).toBe("float:1")
+    expect(showField(v, "z")).toBe("float:1")
+}
+
+test fn rejects_duplicate_keys() {
+    expect(parses("a: 1\na: 2\n")).toBe(false)
+    expect(parses("a:\n  b: 1\n  b: 2\n")).toBe(false)
+    expect(parses("{{a: 1, a: 2}}\n")).toBe(false)
+    expect(parses("- a: 1\n  a: 2\n")).toBe(false)
+}
+
+test fn rejects_tabs_in_indentation() {
+    expect(parses("a:\n\tb: 1\n")).toBe(false)
+    expect(parses("\ta: 1\n")).toBe(false)
+    expect(parses("a: 1\n\t# a comment is fine\n")).toBe(true)
+}
+
+test fn rejects_unsupported_constructs() {
+    let bad: List<string> = [
+        "a: &x 1\n",
+        "a: *x\n",
+        "a: !tag 1\n",
+        "a: |\n  x\n",
+        "a: >\n  x\n",
+        "? a\n: 1\n",
+        "a: 1\n  b\n",
+        "a: @x\n",
+        "a: %x\n",
+        "a: `x`\n",
+        "a: \"\\q\"\n",
+        "a: \"oops\n",
+        "a: 'oops\n",
+        "a: [1, 2\n",
+        "a: {{x: 1\n",
+    ]
+    var i = 0
+    while (i < len(bad)) {
+        expect(bad[i]).toBe(bad[i])
+        expect(parses(bad[i])).toBe(false)
+        i = i + 1
+    }
+}
+
+test fn mapping_order_is_document_order() {
+    let v = must("z: 1\na: 2\nm: 3\n")
+    let ks = keysOf(v)
+    expect(len(ks)).toBe(3)
+    expect(ks[0]).toBe("z")
+    expect(ks[1]).toBe("a")
+    expect(ks[2]).toBe("m")
+    expect(keyTextAt(v, 0)).toBe("z")
+    expect(showValueAt(v, 0)).toBe("int:1")
+    expect(keyTextAt(v, 2)).toBe("m")
+    expect(showValueAt(v, 2)).toBe("int:3")
+    expect(keyTextAt(v, 3)).toBe("<none>")
+    expect(showValueAt(v, 3)).toBe("<missing>")
+    let f = must("{{b: 1, a: 2}}\n")
+    let fk = keysOf(f)
+    expect(fk[0]).toBe("b")
+    expect(fk[1]).toBe("a")
+}
+
+test fn unicode_text() {
+    let v = must("name: café\ncity: 東京\nflag: 🇱🇻\n")
+    expect(showField(v, "name")).toBe("str:café")
+    expect(showField(v, "city")).toBe("str:東京")
+    expect(showField(v, "flag")).toBe("str:🇱🇻")
+    let q = must("e: \"\\u00e9\"\ns: \"\\U0001F600\"\n")
+    expect(showField(q, "e")).toBe("str:é")
+    expect(showField(q, "s")).toBe("str:😀")
+    let single = must("n: 'naïve'\n")
+    expect(showField(single, "n")).toBe("str:naïve")
+}
+
+test fn empty_documents_and_null_values() {
+    expect(show(must(""))).toBe("null")
+    expect(show(must("\n\n# c\n"))).toBe("null")
+    expect(show(must("[]"))).toBe("seq[0]")
+    expect(show(must("{{}}"))).toBe("map[0]")
+    let v = must("a:\nb: 2\n")
+    expect(showField(v, "a")).toBe("null")
+    expect(showField(v, "b")).toBe("int:2")
+    let s = must("- \n- 1\n")
+    expect(size(s)).toBe(2)
+    expect(showAt(s, 0)).toBe("null")
+    expect(showAt(s, 1)).toBe("int:1")
+    expect(isNull(mustField(v, "a"))).toBe(true)
+}
+
+test fn root_scalars() {
+    expect(show(must("hello"))).toBe("str:hello")
+    expect(show(must("42"))).toBe("int:42")
+    expect(show(must("[1, 2]"))).toBe("seq[2]")
+    expect(show(must("{{a: 1}}"))).toBe("map[1]")
+    expect(show(must("\"hi\""))).toBe("str:hi")
+    expect(show(must("true"))).toBe("bool:true")
+}
+
+test fn colons_do_not_split_scalars() {
+    let v = must("url: http://example.com/a\nclock: 12:30\nratio: a:b\n")
+    expect(showField(v, "url")).toBe("str:http://example.com/a")
+    expect(showField(v, "clock")).toBe("str:12:30")
+    expect(showField(v, "ratio")).toBe("str:a:b")
+}
+
+test fn deep_nesting() {
+    let v = must("a:\n  b:\n    c:\n      d: 1\n")
+    let a = mustField(v, "a")
+    let b = mustField(a, "b")
+    let c = mustField(b, "c")
+    expect(showField(c, "d")).toBe("int:1")
+    expect(size(a)).toBe(1)
+    expect(size(b)).toBe(1)
+}
+
+test fn accessor_bounds() {
+    let v = must("s: 1\nq: [1]\n")
+    expect(showAt(v, 0)).toBe("<missing>")
+    expect(showAt(mustField(v, "q"), 1)).toBe("<missing>")
+    expect(showAt(mustField(v, "q"), -1)).toBe("<missing>")
+    expect(showField(mustField(v, "q"), "x")).toBe("<missing>")
+    expect(size(mustField(v, "s"))).toBe(0)
+    expect(len(keysOf(mustField(v, "s")))).toBe(0)
+    expect(keyTextAt(mustField(v, "s"), 0)).toBe("<none>")
+    expect(showValueAt(mustField(v, "s"), 0)).toBe("<missing>")
+    expect(has(mustField(v, "q"), "x")).toBe(false)
+    expect(strSome(mustField(v, "s"))).toBe(false)
+    expect(intSome(mustField(v, "s"))).toBe(true)
+    expect(floatSome(mustField(v, "s"))).toBe(true)
+    expect(boolSome(mustField(v, "s"))).toBe(false)
+    expect(typeOf(mustField(v, "s"))).toBe("int")
+}
+
+test fn rejects_bad_indentation() {
+    expect(parses("a:\n    b: 1\n  c: 2\n")).toBe(false)
+    expect(parses("a: 1\n b: 2\n")).toBe(false)
+    expect(parses("- a\n - b\n")).toBe(false)
+    expect(parses("a:\n  - 1\n - 2\n")).toBe(false)
+    expect(parses("a:\n  b: 1\n   c: 2\n")).toBe(false)
+}
+
+test fn flow_collections_can_nest() {
+    let v = must("a: {{x: [1, {{y: 2}}], z: []}}\n")
+    let a = mustField(v, "a")
+    expect(typeOf(a)).toBe("mapping")
+    let x = mustField(a, "x")
+    expect(size(x)).toBe(2)
+    expect(showAt(x, 0)).toBe("int:1")
+    expect(showField(mustAt(x, 1), "y")).toBe("int:2")
+    expect(size(mustField(a, "z"))).toBe(0)
+    let s = must("[{{a: 1}}, {{b: 2}}]\n")
+    expect(size(s)).toBe(2)
+    expect(showField(mustAt(s, 1), "b")).toBe("int:2")
+}
+
+test fn quoted_scalars_keep_braces_and_hashes() {
+    let v = must("a: \"{{x}}\"\nb: '{{y}}'\n")
+    expect(showField(v, "a")).toBe("str:{{x}}")
+    expect(showField(v, "b")).toBe("str:{{y}}")
+}

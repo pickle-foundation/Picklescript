@@ -1,0 +1,1456 @@
+module std.encoding.yaml
+
+// A dependency-free YAML subset parser.
+//
+// Supported: comments, blank lines, one optional leading `---` and one
+// trailing `...`, block mappings and block sequences (including sequences of
+// mappings such as `- key: value`), nested blocks via indentation, single-line
+// flow sequences/mappings (`[a, b]`, `{a: 1, b: [2, 3]}`), plain scalars, and
+// single- or double-quoted scalars. Double quotes support `\0 \a \b \t \n \v
+// \f \r \e \" \/ \\ \N \_ \L \P`, `\xXX`, `\uXXXX`, and `\UXXXXXXXX`.
+// Scalars resolve to null (`~`, `null`), booleans (`true`/`false` in the three
+// usual casings), integers (decimal, `0x`, `0o`, `0b`, with `_` separators),
+// floats (fraction and/or exponent), and otherwise strings.
+//
+// Not supported, rejected with `none` instead of being silently misread:
+// anchors and aliases, tags, block scalars (`|`, `>`), explicit `?` keys,
+// multi-document streams, multi-line plain scalars, and tabs in the indentation
+// of a content line. Numeric-looking tokens that do not parse completely stay
+// strings, which is the common YAML behavior for e.g. `1abc`.
+//
+// `parse(text)` returns the root value or `none` on any syntax error. The
+// accessors mirror `std.json`/`std.encoding.toml` (`typeOf`, `asStr`, `asInt`,
+// `asFloat`, `asBool`, `field`, `at`, `size`, `keysOf`) and add `has`, `keyAt`,
+// and `valueAt`. Unlike the TOML module, a mapping preserves document key
+// order, so `keysOf`/`keyAt`/`valueAt` iterate in source order.
+//
+// Failure is reported through the `fail` flag rather than through option-typed
+// internal returns, the same shape the TOML parser uses: propagation is a
+// single `if (this.fail)` and the module compiles on the Rust reference.
+
+enum Yaml {
+    YNull
+    YBool(b: bool)
+    YInt(n: int)
+    YFloat(x: float)
+    YStr(s: string)
+    YSeq(items: List<Yaml>)
+    YMap(keys: List<string>, vals: List<Yaml>)
+}
+
+/// A typed empty value list.
+fn emptyYaml() -> List<Yaml> {
+    var out: List<Yaml> = [Yaml.YNull]
+    out.remove(0)
+    out
+}
+
+/// A typed empty string list.
+fn emptyStrings() -> List<string> {
+    var out: List<string> = [""]
+    out.remove(0)
+    out
+}
+
+/// A typed empty row list.
+fn emptyRows() -> List<Row> {
+    var out: List<Row> = [Row(0, "")]
+    out.remove(0)
+    out
+}
+
+/// One significant source line: its indentation (in spaces) and trimmed text.
+class Row {
+    var indent: int
+    var text: string
+
+    constructor(indent: int, text: string) {
+        this.indent = indent
+        this.text = text
+    }
+}
+
+/// One `key: value` split at the first top-level `:` that is followed by a
+/// space, tab, or end of line. `isMap` is false when there is no such colon
+/// (the text is then a scalar or sequence item).
+class KeySplit {
+    var isMap: bool
+    var ok: bool
+    var key: string
+    var value: string
+
+    constructor(isMap: bool, ok: bool, key: string, value: string) {
+        this.isMap = isMap
+        this.ok = ok
+        this.key = key
+        this.value = value
+    }
+}
+
+/// Whether `b` is an ASCII space or tab.
+fn isPad(b: int) -> bool {
+    b == 32 || b == 9
+}
+
+/// Whether `b` is an ASCII digit.
+fn isDigit(b: int) -> bool {
+    b >= 48 && b <= 57
+}
+
+/// The value of `b` as a digit in `base`, or -1 when it is not one.
+fn digitValue(b: int, base: int) -> int {
+    var d = -1
+    if (b >= 48 && b <= 57) {
+        d = b - 48
+    } else if (b >= 97 && b <= 102) {
+        d = b - 87
+    } else if (b >= 65 && b <= 70) {
+        d = b - 55
+    }
+    if (d < 0 || d >= base) {
+        return -1
+    }
+    d
+}
+
+/// The value of a hex digit, or -1.
+fn hexVal(b: int) -> int {
+    digitValue(b, 16)
+}
+
+/// The byte slice `[lo, hi)` of `s`, clamped and safe for any offsets.
+fn sliceBytes(s: string, lo: int, hi: int) -> string {
+    let bs = bytes(s)
+    var a = lo
+    var b = hi
+    if (a < 0) {
+        a = 0
+    }
+    if (b > len(bs)) {
+        b = len(bs)
+    }
+    if (a >= b) {
+        return ""
+    }
+    var out = bytes("")
+    var i = a
+    while (i < b) {
+        out.push(bs[i])
+        i = i + 1
+    }
+    str(out)
+}
+
+/// Trim ASCII spaces and tabs from both ends of `s`.
+fn trimPads(s: string) -> string {
+    let bs = bytes(s)
+    var lo = 0
+    var hi = len(bs)
+    while (lo < hi) {
+        if (!isPad(bs[lo] as int)) {
+            break
+        }
+        lo = lo + 1
+    }
+    while (hi > lo) {
+        if (!isPad(bs[hi - 1] as int)) {
+            break
+        }
+        hi = hi - 1
+    }
+    sliceBytes(s, lo, hi)
+}
+
+/// Trim ASCII spaces and tabs from the start of `s`.
+fn trimLeftPads(s: string) -> string {
+    let bs = bytes(s)
+    var lo = 0
+    while (lo < len(bs)) {
+        if (!isPad(bs[lo] as int)) {
+            break
+        }
+        lo = lo + 1
+    }
+    sliceBytes(s, lo, len(bs))
+}
+
+/// Append the UTF-8 encoding of scalar `cp` to `out`.
+fn pushUtf8(out: List<byte>, cp: int) {
+    if (cp <= 0x7F) {
+        out.push(cp as byte)
+        return
+    }
+    if (cp <= 0x7FF) {
+        out.push((0xC0 + (cp >> 6)) as byte)
+        out.push((0x80 + (cp & 0x3F)) as byte)
+        return
+    }
+    if (cp <= 0xFFFF) {
+        out.push((0xE0 + (cp >> 12)) as byte)
+        out.push((0x80 + ((cp >> 6) & 0x3F)) as byte)
+        out.push((0x80 + (cp & 0x3F)) as byte)
+        return
+    }
+    out.push((0xF0 + (cp >> 18)) as byte)
+    out.push((0x80 + ((cp >> 12) & 0x3F)) as byte)
+    out.push((0x80 + ((cp >> 6) & 0x3F)) as byte)
+    out.push((0x80 + (cp & 0x3F)) as byte)
+}
+
+/// Whether `cp` is a Unicode scalar value (no surrogates, in range).
+fn isScalar(cp: int) -> bool {
+    if (cp < 0 || cp > 0x10FFFF) {
+        return false
+    }
+    if (cp >= 0xD800 && cp <= 0xDFFF) {
+        return false
+    }
+    true
+}
+
+/// Whether `text` is a document marker: `---` or `...` optionally followed by
+/// a comment. Returns 1 for `---`, 2 for `...`, and 0 otherwise.
+fn markerKind(text: string) -> int {
+    let bs = bytes(text)
+    if (len(bs) < 3) {
+        return 0
+    }
+    var kind = 0
+    if ((bs[0] as int) == 45 && (bs[1] as int) == 45 && (bs[2] as int) == 45) {
+        kind = 1
+    } else if ((bs[0] as int) == 46 && (bs[1] as int) == 46 && (bs[2] as int) == 46) {
+        kind = 2
+    } else {
+        return 0
+    }
+    if (len(bs) == 3) {
+        return kind
+    }
+    let rest = trimLeftPads(sliceBytes(text, 3, len(bs)))
+    if (len(rest) == 0) {
+        return kind
+    }
+    if ((bytes(rest)[0] as int) == 35) {
+        return kind
+    }
+    0
+}
+
+/// Whether `text` starts a block sequence entry (`-` alone or `- `).
+fn isDashRow(text: string) -> bool {
+    let bs = bytes(text)
+    if (len(bs) == 0 || (bs[0] as int) != 45) {
+        return false
+    }
+    if (len(bs) == 1) {
+        return true
+    }
+    (bs[1] as int) == 32
+}
+
+/// Whether `text` starts a single-line flow collection (`[` or `{`).
+fn startsFlow(text: string) -> bool {
+    let bs = bytes(text)
+    if (len(bs) == 0) {
+        return false
+    }
+    let c = bs[0] as int
+    c == 91 || c == 123
+}
+
+/// The offset of the first top-level `:` that is followed by a space, tab, or
+/// end of input; -1 when there is none. Quoted sections are skipped.
+fn findColon(text: string) -> int {
+    let bs = bytes(text)
+    var i = 0
+    var quote = 0
+    while (i < len(bs)) {
+        let c = bs[i] as int
+        if (quote == 34) {
+            if (c == 92) {
+                i = i + 2
+                continue
+            }
+            if (c == 34) {
+                quote = 0
+            }
+            i = i + 1
+            continue
+        }
+        if (quote == 39) {
+            if (c == 39) {
+                if (i + 1 < len(bs) && (bs[i + 1] as int) == 39) {
+                    i = i + 2
+                    continue
+                }
+                quote = 0
+            }
+            i = i + 1
+            continue
+        }
+        if (c == 34 || c == 39) {
+            quote = c
+            i = i + 1
+            continue
+        }
+        if (c == 58) {
+            if (i + 1 >= len(bs)) {
+                return i
+            }
+            let n = bs[i + 1] as int
+            if (n == 32 || n == 9) {
+                return i
+            }
+        }
+        i = i + 1
+    }
+    -1
+}
+
+/// Whether plain text may start with byte `c` (a reserved indicator when it is
+/// `&`, `*`, `!`, `|`, `>`, `@`, `` ` ``, `%`, or a structural bracket).
+fn okPlainStart(c: int) -> bool {
+    if (c == 38 || c == 42 || c == 33 || c == 124 || c == 62) {
+        return false
+    }
+    if (c == 64 || c == 96 || c == 37) {
+        return false
+    }
+    if (c == 91 || c == 93 || c == 123 || c == 125 || c == 44) {
+        return false
+    }
+    true
+}
+
+/// A single-line YAML scanner over one value or flow collection.
+class Flow {
+    var bs: List<byte>
+    var i: int
+    var fail: bool
+
+    constructor(text: string) {
+        this.bs = bytes(text)
+        this.i = 0
+        this.fail = false
+    }
+
+    /// The byte at the cursor as `int`, or -1 at end.
+    fn peek() -> int {
+        if (this.i >= len(this.bs)) {
+            return -1
+        }
+        this.bs[this.i] as int
+    }
+
+    /// Skip ASCII spaces and tabs.
+    fn skipWs() {
+        while (this.i < len(this.bs)) {
+            let c = this.bs[this.i] as int
+            if (c == 32 || c == 9) {
+                this.i = this.i + 1
+            } else {
+                return
+            }
+        }
+    }
+
+    /// Parse a complete inline value, allowing a trailing comment.
+    fn parseLine() -> Yaml {
+        let v = this.parseValue(false)
+        this.skipWs()
+        if (this.i < len(this.bs)) {
+            let c = this.bs[this.i] as int
+            if (c == 35) {
+                let atStart = this.i == 0
+                var padded = atStart
+                if (!atStart) {
+                    let p = this.bs[this.i - 1] as int
+                    padded = p == 32 || p == 9
+                }
+                if (!padded) {
+                    this.fail = true
+                    return Yaml.YNull
+                }
+                this.i = len(this.bs)
+            } else {
+                this.fail = true
+                return Yaml.YNull
+            }
+        }
+        v
+    }
+
+    /// One value. `stopCommas` is true inside flow collections, where `,`,
+    /// `]`, and `}` terminate a plain scalar.
+    fn parseValue(stopCommas: bool) -> Yaml {
+        this.skipWs()
+        let c = this.peek()
+        if (c < 0) {
+            return Yaml.YNull
+        }
+        if (c == 91) {
+            return this.parseFlowSeq()
+        }
+        if (c == 123) {
+            return this.parseFlowMap()
+        }
+        if (c == 34) {
+            return Yaml.YStr(this.parseDouble())
+        }
+        if (c == 39) {
+            return Yaml.YStr(this.parseSingle())
+        }
+        resolvePlain(this.parsePlain(stopCommas))
+    }
+
+    /// A plain scalar token, trimmed. In block mode commas and braces are
+    /// ordinary characters; in flow mode they end the token.
+    fn parsePlain(stopCommas: bool) -> string {
+        var out = bytes("")
+        let start = this.i
+        while (this.i < len(this.bs)) {
+            let c = this.bs[this.i] as int
+            if (c == 10 || c == 13) {
+                break
+            }
+            if (stopCommas) {
+                if (c == 44 || c == 93 || c == 125 || c == 58) {
+                    break
+                }
+            } else {
+                if (c == 58) {
+                    if (this.i + 1 >= len(this.bs)) {
+                        break
+                    }
+                    let n = this.bs[this.i + 1] as int
+                    if (n == 32 || n == 9) {
+                        break
+                    }
+                }
+            }
+            if (c == 35) {
+                if (this.i == start) {
+                    break
+                }
+                let p = this.bs[this.i - 1] as int
+                if (p == 32 || p == 9) {
+                    break
+                }
+            }
+            out.push(c as byte)
+            this.i = this.i + 1
+        }
+        let tok = str(out)
+        if (this.i == start && !stopCommas) {
+            // Nothing consumed: the caller decides whether that is a null.
+            return ""
+        }
+        if (len(tok) > 0 && !okPlainStart((bytes(tok)[0] as int))) {
+            this.fail = true
+            return ""
+        }
+        if (len(tok) > 1) {
+            let f = bytes(tok)[0] as int
+            let s = bytes(tok)[1] as int
+            if (f == 45 && s == 32) {
+                this.fail = true
+                return ""
+            }
+            if (f == 63 && s == 32) {
+                this.fail = true
+                return ""
+            }
+        }
+        trimPads(tok)
+    }
+
+    /// A `"..."` scalar with YAML escapes; sets `fail` on malformed input.
+    fn parseDouble() -> string {
+        this.i = this.i + 1
+        var out = bytes("")
+        while (this.i < len(this.bs)) {
+            let c = this.bs[this.i] as int
+            if (c == 34) {
+                this.i = this.i + 1
+                return str(out)
+            }
+            if (c == 10 || c == 13) {
+                this.fail = true
+                return ""
+            }
+            if (c != 92) {
+                out.push(c as byte)
+                this.i = this.i + 1
+                continue
+            }
+            this.i = this.i + 1
+            if (this.i >= len(this.bs)) {
+                this.fail = true
+                return ""
+            }
+            let e = this.bs[this.i] as int
+            this.i = this.i + 1
+            if (e == 48) {
+                out.push(0 as byte)
+            } else if (e == 97) {
+                out.push(7 as byte)
+            } else if (e == 98) {
+                out.push(8 as byte)
+            } else if (e == 116) {
+                out.push(9 as byte)
+            } else if (e == 110) {
+                out.push(10 as byte)
+            } else if (e == 118) {
+                out.push(11 as byte)
+            } else if (e == 102) {
+                out.push(12 as byte)
+            } else if (e == 114) {
+                out.push(13 as byte)
+            } else if (e == 101) {
+                out.push(27 as byte)
+            } else if (e == 34) {
+                out.push(34 as byte)
+            } else if (e == 47) {
+                out.push(47 as byte)
+            } else if (e == 92) {
+                out.push(92 as byte)
+            } else if (e == 32) {
+                out.push(32 as byte)
+            } else if (e == 78) {
+                pushUtf8(out, 0x85)
+            } else if (e == 95) {
+                pushUtf8(out, 0xA0)
+            } else if (e == 76) {
+                pushUtf8(out, 0x2028)
+            } else if (e == 80) {
+                pushUtf8(out, 0x2029)
+            } else if (e == 120) {
+                let cp = this.readHex(2)
+                if (this.fail) {
+                    return ""
+                }
+                out.push(cp as byte)
+            } else if (e == 117) {
+                let cp = this.readHex(4)
+                if (this.fail || !isScalar(cp)) {
+                    this.fail = true
+                    return ""
+                }
+                pushUtf8(out, cp)
+            } else if (e == 85) {
+                let cp = this.readHex(8)
+                if (this.fail || !isScalar(cp)) {
+                    this.fail = true
+                    return ""
+                }
+                pushUtf8(out, cp)
+            } else {
+                this.fail = true
+                return ""
+            }
+        }
+        this.fail = true
+        ""
+    }
+
+    /// Read exactly `n` hex digits as an integer; sets `fail` on a bad digit.
+    fn readHex(n: int) -> int {
+        var v = 0
+        var k = 0
+        while (k < n) {
+            if (this.i >= len(this.bs)) {
+                this.fail = true
+                return 0
+            }
+            let d = hexVal(this.bs[this.i] as int)
+            if (d < 0) {
+                this.fail = true
+                return 0
+            }
+            v = v * 16 + d
+            this.i = this.i + 1
+            k = k + 1
+        }
+        v
+    }
+
+    /// A `'...'` scalar, where `''` is a literal quote.
+    fn parseSingle() -> string {
+        this.i = this.i + 1
+        var out = bytes("")
+        while (this.i < len(this.bs)) {
+            let c = this.bs[this.i] as int
+            if (c == 39) {
+                if (this.i + 1 < len(this.bs) && (this.bs[this.i + 1] as int) == 39) {
+                    out.push(39 as byte)
+                    this.i = this.i + 2
+                    continue
+                }
+                this.i = this.i + 1
+                return str(out)
+            }
+            if (c == 10 || c == 13) {
+                this.fail = true
+                return ""
+            }
+            out.push(c as byte)
+            this.i = this.i + 1
+        }
+        this.fail = true
+        ""
+    }
+
+    /// A `[...]` flow sequence.
+    fn parseFlowSeq() -> Yaml {
+        this.i = this.i + 1
+        var items = emptyYaml()
+        this.skipWs()
+        if (this.peek() == 93) {
+            this.i = this.i + 1
+            return Yaml.YSeq(items)
+        }
+        while (!this.fail) {
+            items.push(this.parseValue(true))
+            if (this.fail) {
+                return Yaml.YNull
+            }
+            this.skipWs()
+            let c = this.peek()
+            if (c == 44) {
+                this.i = this.i + 1
+                this.skipWs()
+                if (this.peek() == 93) {
+                    this.i = this.i + 1
+                    return Yaml.YSeq(items)
+                }
+                continue
+            }
+            if (c == 93) {
+                this.i = this.i + 1
+                return Yaml.YSeq(items)
+            }
+            this.fail = true
+            return Yaml.YNull
+        }
+        Yaml.YNull
+    }
+
+    /// A flow-mapping key: quoted or plain up to `:`.
+    fn parseFlowKey() -> string {
+        this.skipWs()
+        let c = this.peek()
+        if (c == 34) {
+            return this.parseDouble()
+        }
+        if (c == 39) {
+            return this.parseSingle()
+        }
+        var out = bytes("")
+        let start = this.i
+        while (this.i < len(this.bs)) {
+            let b = this.bs[this.i] as int
+            if (b == 58 || b == 44 || b == 125) {
+                break
+            }
+            if (b == 35) {
+                if (this.i == start) {
+                    break
+                }
+                let p = this.bs[this.i - 1] as int
+                if (p == 32 || p == 9) {
+                    break
+                }
+            }
+            out.push(b as byte)
+            this.i = this.i + 1
+        }
+        let key = trimPads(str(out))
+        if (len(key) == 0) {
+            this.fail = true
+            return ""
+        }
+        if (!okPlainStart((bytes(key)[0] as int))) {
+            this.fail = true
+            return ""
+        }
+        key
+    }
+
+    /// A `{...}` flow mapping.
+    fn parseFlowMap() -> Yaml {
+        this.i = this.i + 1
+        var keys = emptyStrings()
+        var vals = emptyYaml()
+        this.skipWs()
+        if (this.peek() == 125) {
+            this.i = this.i + 1
+            return Yaml.YMap(keys, vals)
+        }
+        while (!this.fail) {
+            let key = this.parseFlowKey()
+            if (this.fail) {
+                return Yaml.YNull
+            }
+            this.skipWs()
+            if (this.peek() != 58) {
+                this.fail = true
+                return Yaml.YNull
+            }
+            this.i = this.i + 1
+            let v = this.parseValue(true)
+            if (this.fail) {
+                return Yaml.YNull
+            }
+            if (hasKey(keys, key)) {
+                this.fail = true
+                return Yaml.YNull
+            }
+            keys.push(key)
+            vals.push(v)
+            this.skipWs()
+            let c = this.peek()
+            if (c == 44) {
+                this.i = this.i + 1
+                this.skipWs()
+                if (this.peek() == 125) {
+                    this.i = this.i + 1
+                    return Yaml.YMap(keys, vals)
+                }
+                continue
+            }
+            if (c == 125) {
+                this.i = this.i + 1
+                return Yaml.YMap(keys, vals)
+            }
+            this.fail = true
+            return Yaml.YNull
+        }
+        Yaml.YNull
+    }
+}
+
+/// Resolve a trimmed plain token to a typed scalar.
+fn resolvePlain(tok: string) -> Yaml {
+    let t = trimPads(tok)
+    let bs = bytes(t)
+    if (len(bs) == 0) {
+        return Yaml.YNull
+    }
+    if (t == "~" || t == "null" || t == "Null" || t == "NULL") {
+        return Yaml.YNull
+    }
+    if (t == "true" || t == "True" || t == "TRUE") {
+        return Yaml.YBool(true)
+    }
+    if (t == "false" || t == "False" || t == "FALSE") {
+        return Yaml.YBool(false)
+    }
+    match (parseNumberToken(t)) {
+    case some(v) -> v
+    case none -> Yaml.YStr(t)
+    }
+}
+
+/// Parse a YAML number token; `none` when it is not one.
+fn parseNumberToken(t: string) -> Yaml? {
+    let bs = bytes(t)
+    if (len(bs) == 0) {
+        return none
+    }
+    var i = 0
+    var neg = false
+    let c0 = bs[0] as int
+    if (c0 == 45) {
+        neg = true
+        i = 1
+    } else if (c0 == 43) {
+        i = 1
+    }
+    if (i >= len(bs)) {
+        return none
+    }
+    if ((bs[i] as int) == 48 && i + 1 < len(bs)) {
+        let r = bs[i + 1] as int
+        var base = 0
+        if (r == 120 || r == 88) {
+            base = 16
+        } else if (r == 111 || r == 79) {
+            base = 8
+        } else if (r == 98 || r == 66) {
+            base = 2
+        }
+        if (base > 0) {
+            i = i + 2
+            var radixN = 0
+            var radixDigits = 0
+            var radixPrev = false
+            let limit = 100000000000000000 / base
+            while (i < len(bs)) {
+                let b = bs[i] as int
+                if (b == 95) {
+                    if (!radixPrev || i + 1 >= len(bs)) {
+                        return none
+                    }
+                    if (digitValue(bs[i + 1] as int, base) < 0) {
+                        return none
+                    }
+                    radixPrev = false
+                    i = i + 1
+                    continue
+                }
+                let d = digitValue(b, base)
+                if (d < 0) {
+                    return none
+                }
+                if (radixN > limit) {
+                    return none
+                }
+                radixN = radixN * base + d
+                radixDigits = radixDigits + 1
+                radixPrev = true
+                i = i + 1
+            }
+            if (radixDigits == 0 || i != len(bs)) {
+                return none
+            }
+            if (neg) {
+                radixN = 0 - radixN
+            }
+            return Yaml.YInt(radixN)
+        }
+    }
+    var n = 0
+    var digits = 0
+    var prevDigit = false
+    while (i < len(bs)) {
+        let b = bs[i] as int
+        if (b == 95) {
+            if (!prevDigit || i + 1 >= len(bs) || !isDigit(bs[i + 1] as int)) {
+                return none
+            }
+            prevDigit = false
+            i = i + 1
+            continue
+        }
+        if (!isDigit(b)) {
+            break
+        }
+        if (n > 100000000000000000) {
+            return none
+        }
+        n = n * 10 + (b - 48)
+        digits = digits + 1
+        prevDigit = true
+        i = i + 1
+    }
+    var frac = 0.0
+    var hasFrac = false
+    var fracDigits = 0
+    if (i < len(bs) && (bs[i] as int) == 46) {
+        hasFrac = true
+        i = i + 1
+        var place = 0.1
+        prevDigit = false
+        while (i < len(bs)) {
+            let b = bs[i] as int
+            if (b == 95) {
+                if (!prevDigit || i + 1 >= len(bs) || !isDigit(bs[i + 1] as int)) {
+                    return none
+                }
+                prevDigit = false
+                i = i + 1
+                continue
+            }
+            if (!isDigit(b)) {
+                break
+            }
+            frac = frac + ((b - 48) as float) * place
+            place = place / 10.0
+            fracDigits = fracDigits + 1
+            prevDigit = true
+            i = i + 1
+        }
+        if (digits == 0 && fracDigits == 0) {
+            return none
+        }
+    } else {
+        if (digits == 0) {
+            return none
+        }
+    }
+    var exp = 0
+    var hasExp = false
+    if (i < len(bs) && ((bs[i] as int) == 101 || (bs[i] as int) == 69)) {
+        hasExp = true
+        i = i + 1
+        var esign = 1
+        if (i < len(bs) && (bs[i] as int) == 45) {
+            esign = 0 - 1
+            i = i + 1
+        } else if (i < len(bs) && (bs[i] as int) == 43) {
+            i = i + 1
+        }
+        var expDigits = 0
+        while (i < len(bs) && isDigit(bs[i] as int)) {
+            exp = exp * 10 + ((bs[i] as int) - 48)
+            if (exp > 308) {
+                return none
+            }
+            expDigits = expDigits + 1
+            i = i + 1
+        }
+        if (expDigits == 0) {
+            return none
+        }
+        exp = exp * esign
+    }
+    if (i != len(bs)) {
+        return none
+    }
+    if (!hasFrac && !hasExp) {
+        if (neg) {
+            n = 0 - n
+        }
+        return Yaml.YInt(n)
+    }
+    var v = (n as float) + frac
+    if (neg) {
+        v = 0.0 - v
+    }
+    var k = 0
+    if (exp > 0) {
+        while (k < exp) {
+            v = v * 10.0
+            k = k + 1
+        }
+    } else {
+        while (k < 0 - exp) {
+            v = v / 10.0
+            k = k + 1
+        }
+    }
+    Yaml.YFloat(v)
+}
+
+/// Whether `keys` already contains `key`.
+fn hasKey(keys: List<string>, key: string) -> bool {
+    var i = 0
+    while (i < len(keys)) {
+        if (keys[i] == key) {
+            return true
+        }
+        i = i + 1
+    }
+    false
+}
+
+/// The index of `key` in `keys`, or -1.
+fn keyIndex(keys: List<string>, key: string) -> int {
+    var i = 0
+    while (i < len(keys)) {
+        if (keys[i] == key) {
+            return i
+        }
+        i = i + 1
+    }
+    -1
+}
+
+/// A quoted key parsed as a complete token; `none` when malformed.
+fn parseQuotedKey(s: string) -> string? {
+    let f = Flow(s)
+    var out = ""
+    let c = f.peek()
+    if (c == 34) {
+        out = f.parseDouble()
+    } else if (c == 39) {
+        out = f.parseSingle()
+    } else {
+        return none
+    }
+    if (f.fail) {
+        return none
+    }
+    f.skipWs()
+    if (f.i != len(f.bs)) {
+        return none
+    }
+    out
+}
+
+/// Split a line at its top-level `key:`. `isMap` is false when the line has no
+/// spaced colon; `ok` is false when the key part is malformed.
+fn splitKey(text: string) -> KeySplit {
+    let colon = findColon(text)
+    if (colon < 0) {
+        return KeySplit(false, true, "", "")
+    }
+    let keyText = trimPads(sliceBytes(text, 0, colon))
+    let valText = trimLeftPads(sliceBytes(text, colon + 1, len(text)))
+    if (len(keyText) == 0) {
+        return KeySplit(true, false, "", "")
+    }
+    let bs = bytes(keyText)
+    let first = bs[0] as int
+    if (first == 34 || first == 39) {
+        match (parseQuotedKey(keyText)) {
+        case some(k) -> KeySplit(true, true, k, valText)
+        case none -> KeySplit(true, false, "", "")
+        }
+    } else {
+        if (!okPlainStart(first)) {
+            return KeySplit(true, false, "", "")
+        }
+        if (first == 45 && len(bs) > 1 && (bs[1] as int) == 32) {
+            return KeySplit(true, false, "", "")
+        }
+        if (first == 63 && len(bs) > 1 && (bs[1] as int) == 32) {
+            return KeySplit(true, false, "", "")
+        }
+        KeySplit(true, true, keyText, valText)
+    }
+}
+
+/// The indentation-aware document parser.
+class Parser {
+    var rows: List<Row>
+    var pos: int
+    var fail: bool
+    var depth: int
+
+    constructor(text: string) {
+        this.rows = emptyRows()
+        this.pos = 0
+        this.fail = false
+        this.depth = 0
+        this.scanRows(text)
+    }
+
+    /// Split `text` into significant rows, dropping blank and comment lines.
+    fn scanRows(text: string) {
+        let bs = bytes(text)
+        var start = 0
+        while (start <= len(bs) && !this.fail) {
+            var e = start
+            while (e < len(bs) && (bs[e] as int) != 10) {
+                e = e + 1
+            }
+            var end = e
+            if (end > start && (bs[end - 1] as int) == 13) {
+                end = end - 1
+            }
+            this.scanLine(text, start, end)
+            start = e + 1
+        }
+    }
+
+    /// Scan one line `[start, end)` of `text`.
+    fn scanLine(text: string, start: int, end: int) {
+        let bs = bytes(text)
+        var hi = end
+        while (hi > start && isPad(bs[hi - 1] as int)) {
+            hi = hi - 1
+        }
+        if (hi == start) {
+            return
+        }
+        var j = start
+        while (j < hi && (bs[j] as int) == 32) {
+            j = j + 1
+        }
+        let first = bs[j] as int
+        if (first == 35) {
+            return
+        }
+        if (first == 9) {
+            var k = j
+            while (k < hi && (bs[k] as int) == 9) {
+                k = k + 1
+            }
+            if (k == hi || (bs[k] as int) == 35) {
+                return
+            }
+            this.fail = true
+            return
+        }
+        this.rows.push(Row(j - start, sliceBytes(text, j, hi)))
+    }
+
+    /// Parse the whole document.
+    fn parseDoc() -> Yaml? {
+        if (this.fail) {
+            return none
+        }
+        var start = 0
+        if (this.pos < len(this.rows)) {
+            let r = this.rows[0]
+            if (r.indent == 0 && markerKind(r.text) == 1) {
+                start = 1
+            }
+        }
+        this.pos = start
+        if (this.pos < len(this.rows)) {
+            let r = this.rows[this.pos]
+            if (r.indent == 0 && markerKind(r.text) == 2) {
+                this.pos = this.pos + 1
+                if (this.pos != len(this.rows)) {
+                    return none
+                }
+                return Yaml.YNull
+            }
+        }
+        if (this.pos >= len(this.rows)) {
+            return Yaml.YNull
+        }
+        let v = this.parseNode(this.rows[this.pos].indent)
+        if (this.fail) {
+            return none
+        }
+        if (this.pos < len(this.rows)) {
+            let r = this.rows[this.pos]
+            if (r.indent == 0 && markerKind(r.text) == 2) {
+                this.pos = this.pos + 1
+            }
+        }
+        if (this.pos != len(this.rows)) {
+            return none
+        }
+        v
+    }
+
+    /// Parse the block starting at the cursor at `indent`.
+    fn parseNode(indent: int) -> Yaml {
+        if (this.fail || this.pos >= len(this.rows)) {
+            this.fail = true
+            return Yaml.YNull
+        }
+        if (this.depth > 100) {
+            this.fail = true
+            return Yaml.YNull
+        }
+        this.depth = this.depth + 1
+        let row = this.rows[this.pos]
+        if (row.indent != indent) {
+            this.fail = true
+            this.depth = this.depth - 1
+            return Yaml.YNull
+        }
+        if (markerKind(row.text) != 0) {
+            this.fail = true
+            this.depth = this.depth - 1
+            return Yaml.YNull
+        }
+        var out = Yaml.YNull
+        if (isDashRow(row.text)) {
+            out = this.parseSeq(indent)
+        } else if (startsFlow(row.text)) {
+            this.pos = this.pos + 1
+            let f = Flow(row.text)
+            out = f.parseLine()
+            if (f.fail) {
+                this.fail = true
+            }
+        } else {
+            let split = splitKey(row.text)
+            if (!split.ok) {
+                this.fail = true
+            } else if (split.isMap) {
+                out = this.parseMap(indent)
+            } else {
+                this.pos = this.pos + 1
+                let f = Flow(row.text)
+                out = f.parseLine()
+                if (f.fail) {
+                    this.fail = true
+                }
+            }
+        }
+        this.depth = this.depth - 1
+        out
+    }
+
+    /// A block sequence at `indent`.
+    fn parseSeq(indent: int) -> Yaml {
+        var items = emptyYaml()
+        while (!this.fail && this.pos < len(this.rows)) {
+            let row = this.rows[this.pos]
+            if (row.indent != indent || !isDashRow(row.text)) {
+                break
+            }
+            var rest = sliceBytes(row.text, 1, len(row.text))
+            rest = trimLeftPads(rest)
+            var dashWidth = 2
+            let raw = sliceBytes(row.text, 1, len(row.text))
+            var pads = 0
+            while (pads < len(raw) && isPad((bytes(raw)[pads] as int))) {
+                pads = pads + 1
+            }
+            dashWidth = pads + 1
+            if (dashWidth < 2) {
+                dashWidth = 2
+            }
+            this.pos = this.pos + 1
+            if (len(rest) == 0) {
+                if (this.pos < len(this.rows) && this.rows[this.pos].indent > indent) {
+                    items.push(this.parseNode(this.rows[this.pos].indent))
+                } else {
+                    items.push(Yaml.YNull)
+                }
+                continue
+            }
+            let split = splitKey(rest)
+            if (startsFlow(rest)) {
+                let f = Flow(rest)
+                items.push(f.parseLine())
+                if (f.fail) {
+                    this.fail = true
+                    break
+                }
+            } else if (!split.ok) {
+                this.fail = true
+                break
+            } else if (split.isMap) {
+                items.push(this.parseSeqMap(rest, indent + dashWidth))
+            } else {
+                let f = Flow(rest)
+                items.push(f.parseLine())
+                if (f.fail) {
+                    this.fail = true
+                    break
+                }
+            }
+        }
+        Yaml.YSeq(items)
+    }
+
+    /// A mapping that begins on the same line as a sequence dash. Continuation
+    /// keys sit at `entryIndent`; deeper lines belong to the previous value.
+    fn parseSeqMap(first: string, entryIndent: int) -> Yaml {
+        var keys = emptyStrings()
+        var vals = emptyYaml()
+        var pending = first
+        while (!this.fail) {
+            let split = splitKey(pending)
+            if (!split.ok || !split.isMap) {
+                this.fail = true
+                break
+            }
+            if (hasKey(keys, split.key)) {
+                this.fail = true
+                break
+            }
+            keys.push(split.key)
+            if (len(split.value) != 0) {
+                let f = Flow(split.value)
+                vals.push(f.parseLine())
+                if (f.fail) {
+                    this.fail = true
+                    break
+                }
+            } else if (this.pos < len(this.rows) && this.rows[this.pos].indent > entryIndent) {
+                vals.push(this.parseNode(this.rows[this.pos].indent))
+            } else {
+                vals.push(Yaml.YNull)
+            }
+            if (this.fail) {
+                break
+            }
+            if (this.pos < len(this.rows)) {
+                let row = this.rows[this.pos]
+                if (row.indent == entryIndent && !isDashRow(row.text) && markerKind(row.text) == 0) {
+                    pending = row.text
+                    this.pos = this.pos + 1
+                    continue
+                }
+            }
+            break
+        }
+        Yaml.YMap(keys, vals)
+    }
+
+    /// A block mapping at `indent`.
+    fn parseMap(indent: int) -> Yaml {
+        var keys = emptyStrings()
+        var vals = emptyYaml()
+        while (!this.fail && this.pos < len(this.rows)) {
+            let row = this.rows[this.pos]
+            if (row.indent != indent || isDashRow(row.text) || markerKind(row.text) != 0) {
+                break
+            }
+            let split = splitKey(row.text)
+            if (!split.ok || !split.isMap) {
+                this.fail = true
+                break
+            }
+            if (hasKey(keys, split.key)) {
+                this.fail = true
+                break
+            }
+            this.pos = this.pos + 1
+            keys.push(split.key)
+            if (len(split.value) != 0) {
+                let f = Flow(split.value)
+                vals.push(f.parseLine())
+                if (f.fail) {
+                    this.fail = true
+                    break
+                }
+            } else if (this.pos < len(this.rows) && this.rows[this.pos].indent > indent) {
+                vals.push(this.parseNode(this.rows[this.pos].indent))
+            } else {
+                vals.push(Yaml.YNull)
+            }
+        }
+        Yaml.YMap(keys, vals)
+    }
+}
+
+/// Parse a YAML document; `none` on any syntax error or unsupported construct.
+fn parse(text: string) -> Yaml? {
+    let p = Parser(text)
+    p.parseDoc()
+}
+
+/// The value's type name: `null`, `bool`, `int`, `float`, `string`,
+/// `sequence`, or `mapping`.
+fn typeOf(v: Yaml) -> string {
+    match (v) {
+    case Yaml.YNull -> "null"
+    case Yaml.YBool(_) -> "bool"
+    case Yaml.YInt(_) -> "int"
+    case Yaml.YFloat(_) -> "float"
+    case Yaml.YStr(_) -> "string"
+    case Yaml.YSeq(_) -> "sequence"
+    case Yaml.YMap(_, _) -> "mapping"
+    }
+}
+
+/// The value as `string?`.
+fn asStr(v: Yaml) -> string? {
+    match (v) {
+    case Yaml.YStr(s) -> s
+    case _ -> none
+    }
+}
+
+/// The value as `int?`.
+fn asInt(v: Yaml) -> int? {
+    match (v) {
+    case Yaml.YInt(n) -> n
+    case _ -> none
+    }
+}
+
+/// The value as `float?`; an int is widened.
+fn asFloat(v: Yaml) -> float? {
+    match (v) {
+    case Yaml.YFloat(x) -> x
+    case Yaml.YInt(n) -> n as float
+    case _ -> none
+    }
+}
+
+/// The value as `bool?`.
+fn asBool(v: Yaml) -> bool? {
+    match (v) {
+    case Yaml.YBool(b) -> b
+    case _ -> none
+    }
+}
+
+/// Whether the value is null.
+fn isNull(v: Yaml) -> bool {
+    match (v) {
+    case Yaml.YNull -> true
+    case _ -> false
+    }
+}
+
+/// Look up `key` in a mapping value; `none` when absent or not a mapping.
+fn field(v: Yaml, key: string) -> Yaml? {
+    match (v) {
+    case Yaml.YMap(keys, vals) -> {
+        let idx = keyIndex(keys, key)
+        if (idx >= 0) {
+            return vals[idx]
+        }
+        none
+    }
+    case _ -> none
+    }
+}
+
+/// Whether a mapping value has `key`.
+fn has(v: Yaml, key: string) -> bool {
+    match (v) {
+    case Yaml.YMap(keys, _) -> hasKey(keys, key)
+    case _ -> false
+    }
+}
+
+/// The element at index `i` of a sequence value; `none` when out of range or
+/// not a sequence.
+fn at(v: Yaml, i: int) -> Yaml? {
+    match (v) {
+    case Yaml.YSeq(items) -> {
+        if (i >= 0 && i < len(items)) {
+            return items[i]
+        }
+        none
+    }
+    case _ -> none
+    }
+}
+
+/// The number of elements in a sequence or keys in a mapping; 0 for scalars.
+fn size(v: Yaml) -> int {
+    match (v) {
+    case Yaml.YSeq(items) -> len(items)
+    case Yaml.YMap(keys, _) -> len(keys)
+    case _ -> 0
+    }
+}
+
+/// The keys of a mapping in document order; empty for non-mappings.
+fn keysOf(v: Yaml) -> List<string> {
+    match (v) {
+    case Yaml.YMap(keys, _) -> {
+        var out = emptyStrings()
+        var i = 0
+        while (i < len(keys)) {
+            out.push(keys[i])
+            i = i + 1
+        }
+        out
+    }
+    case _ -> emptyStrings()
+    }
+}
+
+/// The key at position `i` of a mapping in document order; `none` when out of
+/// range or not a mapping.
+fn keyAt(v: Yaml, i: int) -> string? {
+    match (v) {
+    case Yaml.YMap(keys, _) -> {
+        if (i >= 0 && i < len(keys)) {
+            return keys[i]
+        }
+        none
+    }
+    case _ -> none
+    }
+}
+
+/// The value at position `i` of a mapping in document order; `none` when out
+/// of range or not a mapping.
+fn valueAt(v: Yaml, i: int) -> Yaml? {
+    match (v) {
+    case Yaml.YMap(_, vals) -> {
+        if (i >= 0 && i < len(vals)) {
+            return vals[i]
+        }
+        none
+    }
+    case _ -> none
+    }
+}
