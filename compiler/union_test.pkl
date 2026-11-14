@@ -56,6 +56,10 @@ fn cbrace() -> string {
     "{(125 as char)}"
 }
 
+fn quote() -> string {
+    "{(34 as char)}"
+}
+
 // ==== runtime fixtures ====
 
 class Animal {
@@ -361,6 +365,59 @@ test fn union_map_keys_box_scalar_members() {
     expect(m["two"]).toBe("2")
 }
 
+// ==== runtime: literals adopt an annotated container type ====
+
+class UnionHolder {
+    var values: List<int | string> = [5, "five"]
+}
+
+fn sumUnion(xs: List<int | string>) -> int {
+    len(xs)
+}
+
+fn makeUnion() -> List<int | string> {
+    return [2, "y"]
+}
+
+test fn a_list_literal_adopts_a_union_annotation() {
+    let xs: List<int | string> = [1, "x"]
+    expect(len(xs)).toBe(2)
+    expect(xs[0] is int).toBe(true)
+    expect(xs[0] as int).toBe(1)
+    expect(xs[1] is string).toBe(true)
+    expect(xs[1] as string).toBe("x")
+}
+
+test fn a_map_literal_adopts_a_union_annotation() {
+    let m: Map<string, int | string> = {"a": 1, "b": "z"}
+    expect(len(m)).toBe(2)
+    expect(m["a"] is int).toBe(true)
+    expect(m["a"] as int).toBe(1)
+    expect(m["b"] as string).toBe("z")
+}
+
+test fn a_map_literal_adopts_union_keys() {
+    let m: Map<int | string, string> = {1: "one", "two": "2"}
+    expect(m[1]).toBe("one")
+    expect(m["two"]).toBe("2")
+}
+
+test fn an_annotated_literal_argument_adopts_the_parameter_type() {
+    expect(sumUnion([1, "x"])).toBe(2)
+}
+
+test fn an_annotated_return_literal_adopts_the_return_type() {
+    let xs = makeUnion()
+    expect(xs[0] as int).toBe(2)
+    expect(xs[1] as string).toBe("y")
+}
+
+test fn a_field_initializer_adopts_the_field_type() {
+    let h = UnionHolder()
+    expect(h.values[0] as int).toBe(5)
+    expect(h.values[1] as string).toBe("five")
+}
+
 // ==== diagnostics ====
 
 test fn a_union_binding_accepts_every_member() {
@@ -470,4 +527,30 @@ test fn a_union_cast_target_keeps_bit_or_without_parens() {
     // `a as int | 2` is `(a as int) | 2`, not a union cast target.
     let msgs = checkSource("fn main() " + ob + "\n let a: int | string = 1 \n let b = (a as int) | 2 \n " + cb)
     expect(len(msgs)).toBe(0)
+}
+
+// ==== adoption diagnostics ====
+
+test fn an_annotated_literal_still_rejects_a_non_member() {
+    let ob = obrace()
+    let cb = cbrace()
+    let q = quote()
+    let msgs = checkSource("fn main() " + ob + "\n let xs: List<int> = [1, " + q + "x" + q + "] \n " + cb)
+    expect(hasContaining(msgs, "type mismatch in array element")).toBe(true)
+}
+
+test fn an_annotated_map_literal_still_rejects_a_non_member() {
+    let ob = obrace()
+    let cb = cbrace()
+    let q = quote()
+    let msgs = checkSource("fn main() " + ob + "\n let m: Map<string, int> = " + ob + q + "a" + q + ": 1, " + q + "b" + q + ": 2.5" + cb + " \n " + cb)
+    expect(hasContaining(msgs, "type mismatch in map value")).toBe(true)
+}
+
+test fn an_unannotated_literal_keeps_monomorphic_inference() {
+    let ob = obrace()
+    let cb = cbrace()
+    let q = quote()
+    let msgs = checkSource("fn main() " + ob + "\n let xs = [1, " + q + "x" + q + "] \n " + cb)
+    expect(hasContaining(msgs, "type mismatch in array element")).toBe(true)
 }

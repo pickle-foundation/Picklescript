@@ -251,7 +251,7 @@ fn check(ck: Checker) {
                         }
                         i = i + 1
                     }
-                    var got = checkExpr(ck, c.value)
+                    var got = checkExprExpecting(ck, c.value, ty)
                     guardRefUse(ck, ty, c.span, "a `const` binding")
                     got = adoptEmptyList(ck, c.value, ty, got)
                     checkAssignable(ck, ty, got, c.span, "const initializer")
@@ -270,7 +270,7 @@ fn check(ck: Checker) {
                         }
                         i = i + 1
                     }
-                    var got = checkExpr(ck, g.value)
+                    var got = checkExprExpecting(ck, g.value, ty)
                     guardRefUse(ck, ty, g.span, "a `var` binding")
                     got = adoptEmptyList(ck, g.value, ty, got)
                     checkAssignable(ck, ty, got, g.span, "global initializer")
@@ -460,7 +460,7 @@ fn checkFnSignatureBodies(ck: Checker, f: FnDecl, attrs: List<Attribute>) {
 fn checkFnBody(ck: Checker, body: FnBody) {
         match (body) {
             case FnBody.Block(b) -> {
-                var exprTy = checkBlock(ck, b)
+                var exprTy = checkBlockExpecting(ck, b, ck.retTy)
                 if (let some(e) = b.expr) {
                     exprTy = adoptEmptyList(ck, e, ck.retTy, exprTy)
                 }
@@ -481,13 +481,19 @@ fn checkFnBody(ck: Checker, body: FnBody) {
 
 
 fn checkBlock(ck: Checker, b: Block) -> Ty {
+        checkBlockExpecting(ck, b, Ty.Unknown)
+}
+
+/// `checkBlock`, but the block's tail expression is checked with `want` as its
+/// expected type (see `checkExprExpecting`).
+fn checkBlockExpecting(ck: Checker, b: Block, want: Ty) -> Ty {
         pushScope(ck)
         var last = Ty.Empty
         for (s in b.stmts) {
             last = checkStmt(ck, s)
         }
         if (let some(e) = b.expr) {
-            last = checkExpr(ck, e)
+            last = checkExprExpecting(ck, e, want)
         }
         popScope(ck)
         last
@@ -546,7 +552,7 @@ fn checkStmtInner(ck: Checker, s: Stmt) -> Ty {
                 var inferredTy = Ty.Unknown
                 if (let some(e) = init) {
                     hasInferred = true
-                    inferredTy = adoptEmptyList(ck, e, annotatedTy, checkExpr(ck, e))
+                    inferredTy = adoptEmptyList(ck, e, annotatedTy, checkExprExpecting(ck, e, annotatedTy))
                 }
                 var finalTy = Ty.Unknown
                 if (hasAnnotated && hasInferred) {
@@ -594,20 +600,26 @@ fn checkStmtInner(ck: Checker, s: Stmt) -> Ty {
                 finalTy
             }
             case Stmt.Const(name, ty, value, span) -> {
-                var vt = checkExpr(ck, value)
+                var declaredTy = Ty.Unknown
+                var hasDeclaredTy = false
                 if (let some(t) = ty) {
                     let tt = resolvedFnTy(ck, t, ck.fnGenerics)
                     guardRefUse(ck, tt, span, "a `const` binding")
-                    vt = adoptEmptyList(ck, value, tt, vt)
-                    checkAssignable(ck, tt, vt, span, "const initializer")
-                    declare(ck, name, tt, false)
+                    declaredTy = tt
+                    hasDeclaredTy = true
+                }
+                var vt = checkExprExpecting(ck, value, declaredTy)
+                if (hasDeclaredTy) {
+                    vt = adoptEmptyList(ck, value, declaredTy, vt)
+                    checkAssignable(ck, declaredTy, vt, span, "const initializer")
+                    declare(ck, name, declaredTy, false)
                 } else {
                     declare(ck, name, vt, false)
                 }
                 vt
             }
             case Stmt.Return(value, span) -> {
-                var vt = if (let some(e) = value) { checkExpr(ck, e) } else { Ty.Empty }
+                var vt = if (let some(e) = value) { checkExprExpecting(ck, e, ck.retTy) } else { Ty.Empty }
                 if (let some(e) = value) {
                     vt = adoptEmptyList(ck, e, ck.retTy, vt)
                 }
@@ -787,7 +799,6 @@ fn checkForHeader(ck: Checker, header: ForHeader) {
 fn checkFieldDecl(ck: Checker, typeName: string, fname: string, fty: TypeExpr?, init: Expr?, isStatic: bool, isConst: bool, attrs: List<Attribute>, span: Span, generics: List<string>) {
         match (init) {
             case some(e) -> {
-                var ft = checkExpr(ck, e)
                 var w = Ty.Unknown
                 if (let some(te) = fty) {
                     w = resolvedFnTy(ck, te, generics)
@@ -816,6 +827,7 @@ fn checkFieldDecl(ck: Checker, typeName: string, fname: string, fty: TypeExpr?, 
                         }
                     }
                 }
+                var ft = checkExprExpecting(ck, e, w)
                 if (w == Ty.Unknown) {
                     w = ft
                 }
@@ -864,11 +876,16 @@ fn checkClassBodies(ck: Checker, c: ClassDecl) {
                         checkFieldDecl(ck, c.name, name, fty, init, isStatic, isConst, attrs, span, table.generics)
                     }
                     case ClassMember.Const(_cname, _visibility, cty, value, cspan) -> {
-                        var vt = checkExpr(ck, value)
+                        var declaredTy = Ty.Unknown
+                        var hasDeclaredTy = false
                         if (let some(t) = cty) {
-                            let tt = resolvedFnTy(ck, t, table.generics)
-                            vt = adoptEmptyList(ck, value, tt, vt)
-                            checkAssignable(ck, tt, vt, cspan, "const initializer")
+                            declaredTy = resolvedFnTy(ck, t, table.generics)
+                            hasDeclaredTy = true
+                        }
+                        var vt = checkExprExpecting(ck, value, declaredTy)
+                        if (hasDeclaredTy) {
+                            vt = adoptEmptyList(ck, value, declaredTy, vt)
+                            checkAssignable(ck, declaredTy, vt, cspan, "const initializer")
                         }
                     }
                     case ClassMember.Method(md) -> checkMethodBody(ck, md, table)
@@ -1096,6 +1113,29 @@ fn checkExpr(ck: Checker, e: Expr) -> Ty {
         t
 }
 
+/// Check `e` with `want` as its expected type. A list or map literal that is
+/// the whole expression adopts a union element/key/value type from `want`
+/// instead of inferring a monomorphic container from its first entry, so
+/// `let xs: List<int | string> = [1, "x"]` typechecks. Other expected types
+/// keep the existing inference (and its diagnostics), and every non-literal
+/// expression ignores the hint; it is not pushed into subexpressions.
+fn checkExprExpecting(ck: Checker, e: Expr, want: Ty) -> Ty {
+        if (want == Ty.Unknown) {
+            return checkExpr(ck, e)
+        }
+        ck.literalHint = want
+        checkExpr(ck, e)
+}
+
+/// Is `t` a union, i.e. a literal element type whose members differ in
+/// representation and therefore needs the annotated container type up front?
+fn wantsUnionElem(t: Ty) -> bool {
+        match (t) {
+            case Ty.Union(_) -> true
+            case _ -> false
+        }
+}
+
 /// The element type a list-literal entry contributes: a plain entry is its own
 /// type; a `...xs` spread contributes `xs`'s element type. Mirrors the element
 /// half of the `ExprKind::Array` arm in check.rs.
@@ -1116,6 +1156,11 @@ fn checkArrayElemTy(ck: Checker, e: Expr) -> Ty {
 }
 
 fn checkExprImpl(ck: Checker, e: Expr) -> Ty {
+        // An expected type supplied by `checkExprExpecting` belongs to this
+        // expression only; clear it here so nested expressions (list entries,
+        // call arguments, subexpressions) never inherit it.
+        let hint = ck.literalHint
+        ck.literalHint = Ty.Unknown
         match (e.kind) {
             case ExprKind.Lit(Lit.String(parts)) -> stringTy(ck, parts)
             case ExprKind.Lit(l) -> litTy(ck, l)
@@ -1138,8 +1183,25 @@ fn checkExprImpl(ck: Checker, e: Expr) -> Ty {
                 Ty.Tuple(ts)
             }
             case ExprKind.Array(parts) -> {
+                var elemHint = Ty.Unknown
+                match (hint) {
+                    case Ty.List(ht) -> elemHint = ht
+                    case _ -> {}
+                }
                 if (len(parts) == 0) {
-                    Ty.List(Ty.Unknown)
+                    Ty.List(elemHint)
+                } else if (wantsUnionElem(elemHint)) {
+                    // An annotated union literal adopts the expected element
+                    // type instead of inferring a monomorphic container from
+                    // its first entry:
+                    // `let xs: List<int | string> = [1, "x"]`.
+                    var i = 0
+                    while (i < len(parts)) {
+                        let t = checkArrayElemTy(ck, parts[i])
+                        checkAssignable(ck, elemHint, t, parts[i].span, "array element")
+                        i = i + 1
+                    }
+                    Ty.List(elemHint)
                 } else {
                     let elem = checkArrayElemTy(ck, parts[0])
                     var i = 1
@@ -1157,8 +1219,32 @@ fn checkExprImpl(ck: Checker, e: Expr) -> Ty {
                 Ty.Unknown
             }
             case ExprKind.Map(pairs) -> {
+                var kHint = Ty.Unknown
+                var vHint = Ty.Unknown
+                match (hint) {
+                    case Ty.Map(hk, hv) -> {
+                        kHint = hk
+                        vHint = hv
+                    }
+                    case _ -> {}
+                }
                 if (len(pairs) == 0) {
-                    Ty.Map(Ty.Unknown, Ty.Unknown)
+                    Ty.Map(kHint, vHint)
+                } else if (wantsUnionElem(kHint) || wantsUnionElem(vHint)) {
+                    // Same adoption for an annotated map literal:
+                    // `let m: Map<string, int | string> = {"a": 1, "b": "z"}`.
+                    if (!mapKeyTyAllowed(kHint)) {
+                        err(ck, pairs[0].key.span, "map keys must be `string`, `int`, `float`, `bool`, `char`, `byte`, a list, a map, a class/struct, an enum, an option, a tuple, or a union, found `{bareName(kHint)}`")
+                    }
+                    var mi = 0
+                    while (mi < len(pairs)) {
+                        let tk = checkExpr(ck, pairs[mi].key)
+                        checkAssignable(ck, kHint, tk, pairs[mi].key.span, "map key")
+                        let tv = checkExpr(ck, pairs[mi].value)
+                        checkAssignable(ck, vHint, tv, pairs[mi].value.span, "map value")
+                        mi = mi + 1
+                    }
+                    Ty.Map(kHint, vHint)
                 } else {
                     let k = checkExpr(ck, pairs[0].key)
                     if (k != Ty.Unknown) {
@@ -2157,7 +2243,7 @@ fn checkArgs(ck: Checker, e: Expr, params: List<Ty>, args: List<CallArg>) {
             }
             if (position < fixed) {
                 let want = params[position]
-                let got = checkExpr(ck, a.value)
+                let got = checkExprExpecting(ck, a.value, want)
                 checkAssignable(ck, want, adoptEmptyList(ck, a.value, want, got), a.span, "argument")
             } else {
                 let _ = checkExpr(ck, a.value)
@@ -2280,7 +2366,7 @@ fn checkArgsInfo(ck: Checker, e: Expr, params: List<ParamInfo>, args: List<CallA
             }
             if (position < fixed) {
                 let want = params[position].ty
-                let got = checkExpr(ck, a.value)
+                let got = checkExprExpecting(ck, a.value, want)
                 checkAssignable(ck, want, adoptEmptyList(ck, a.value, want, got), a.span, "argument")
             } else if (let some(rt) = restTy) {
                 let got = checkExpr(ck, a.value)
