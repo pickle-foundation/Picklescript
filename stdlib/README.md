@@ -14,14 +14,14 @@ Seeds (see `docs/08-stdlib.md`, office `port/` tracker):
   flat `pickle/compiler/{lexer,parser,resolve,check,emit}.pkl` slices took
   over lexing/parsing/checking, and this tree is where `std.*`/`runtime.*`
   seeds live (`text/{utf8,stringbuilder,format,lexer,ccm,casing,diff,wrap,template}`, `collections/*`,
-  `encoding/{base64,csv,hex,url}`, `math/{basic,random}`, `fs`, `os`, `json`, `io`,
+  `encoding/{base64,csv,hex,url,toml}`, `math/{basic,random}`, `fs`, `os`, `json`, `io`,
   `process`, `test`, `time`, `thread`).
 - `collections/` — `List`/`Map` wrappers plus `Set`, `Multiset`, `Deque`,
   `Vec`, `BitSet`, `LruCache`
 - `fs/`, `os/`, `time/`, `test/` — shipped flat (`fs.pkl`, `os.pkl`, ...);
   `math/` has `basic.pkl` and `random.pkl` (see the plan doc)
 
-Status (2026-09-26): the whole `stdlib/**/*_test.pkl` tree (30 files) is gated
+Status (2026-09-26): the whole `stdlib/**/*_test.pkl` tree (31 files) is gated
 by **GATE11** in `tools/battery_full.ps1` — the ported test driver must run
 each file byte-identical (stdout + exit) to Rust `pickle test`.
 The compiler registers builtins (`print`, `println`, `len`, `abs`, ...)
