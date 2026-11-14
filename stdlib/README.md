@@ -8,12 +8,12 @@ Seeds (see `docs/08-stdlib.md`, office `port/` tracker):
 
 - `text/` — string/byte builder, UTF-8 helpers, format, identifier-case
   conversion (`casing.pkl`), line diffing (`diff.pkl`), word wrapping
-  (`wrap.pkl`), `{name}` templates (`template.pkl`); first seed
+  (`wrap.pkl`), `{name}` templates (`template.pkl`), regular expressions (`regex.pkl`); first seed
   `text/lexer.pkl` (the compiler lexer's scanner; validated at the time on the
   battery — see `tools/diff/port/`). The lexer seed is now legacy: the port's
   flat `pickle/compiler/{lexer,parser,resolve,check,emit}.pkl` slices took
   over lexing/parsing/checking, and this tree is where `std.*`/`runtime.*`
-  seeds live (`text/{utf8,stringbuilder,format,lexer,ccm,casing,diff,wrap,template}`, `collections/*`,
+  seeds live (`text/{utf8,stringbuilder,format,lexer,ccm,casing,diff,wrap,template,regex}`, `collections/*`,
   `encoding/{base64,csv,hex,url,toml}`, `math/{basic,random,statistics}`, `fs`, `os`, `json`, `io`,
   `logging`, `process`, `test`, `time`, `thread`).
 - `collections/` — `List`/`Map` wrappers plus `Set`, `Multiset`, `Deque`,
@@ -22,7 +22,7 @@ Seeds (see `docs/08-stdlib.md`, office `port/` tracker):
   `math/` has `basic.pkl`, `random.pkl`, and `statistics.pkl`; `logging.pkl`
   ships flat (see the plan doc)
 
-Status (2026-09-26): the whole `stdlib/**/*_test.pkl` tree (33 files) is gated
+Status (2026-09-26): the whole `stdlib/**/*_test.pkl` tree (34 files) is gated
 by **GATE11** in `tools/battery_full.ps1` — the ported test driver must run
 each file byte-identical (stdout + exit) to Rust `pickle test`.
 The compiler registers builtins (`print`, `println`, `len`, `abs`, ...)
