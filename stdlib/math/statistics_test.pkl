@@ -1,0 +1,195 @@
+module std.math.statistics_test
+
+import { sum, mean, minOf, maxOf, span, median, mode, variance, sampleVariance, stddev, sampleStddev, percentile, normalize, cumulativeSums, sqrt } from std.math.statistics
+
+fn empties() -> List<float> {
+    var xs: List<float> = [0.0]
+    xs.remove(0)
+    xs
+}
+
+fn expectFloat(x: float?, want: float) {
+    match (x) {
+    case some(v) -> expect(v).toBe(want)
+    case none -> expect(true).toBe(false)
+    }
+}
+
+fn expectClose(x: float?, want: float, eps: float) {
+    match (x) {
+    case some(v) -> expect(abs(v - want) <= eps).toBe(true)
+    case none -> expect(true).toBe(false)
+    }
+}
+
+fn expectNone(x: float?) {
+    match (x) {
+    case some(_) -> expect(true).toBe(false)
+    case none -> expect(true).toBe(true)
+    }
+}
+
+test fn sum_and_mean_basics() {
+    let xs: List<float> = [1.0, 2.0, 3.0, 4.0]
+    expect(sum(xs)).toBe(10.0)
+    expect(sum(empties())).toBe(0.0)
+    expectFloat(mean(xs), 2.5)
+    let twos: List<float> = [2.0, 2.0]
+    expectFloat(mean(twos), 2.0)
+    expectNone(mean(empties()))
+}
+
+test fn min_max_and_span() {
+    let xs: List<float> = [3.0, 1.0, 2.0]
+    expectFloat(minOf(xs), 1.0)
+    expectFloat(maxOf(xs), 3.0)
+    expectFloat(span(xs), 2.0)
+    let one: List<float> = [7.0]
+    expectFloat(span(one), 0.0)
+    expectNone(minOf(empties()))
+    expectNone(maxOf(empties()))
+    expectNone(span(empties()))
+}
+
+test fn median_of_odd_and_even_counts() {
+    let odd: List<float> = [3.0, 1.0, 2.0]
+    expectFloat(median(odd), 2.0)
+    let even: List<float> = [4.0, 1.0, 3.0, 2.0]
+    expectFloat(median(even), 2.5)
+    expectNone(median(empties()))
+    // The input list is not reordered by the sort.
+    expect(odd[0]).toBe(3.0)
+    expect(odd[1]).toBe(1.0)
+}
+
+test fn mode_resolves_ties_to_the_smallest() {
+    let xs: List<float> = [1.0, 2.0, 2.0, 3.0]
+    expectFloat(mode(xs), 2.0)
+    let tie: List<float> = [2.0, 2.0, 1.0, 1.0]
+    expectFloat(mode(tie), 1.0)
+    let distinct: List<float> = [3.0, 1.0, 2.0]
+    expectFloat(mode(distinct), 1.0)
+    expectNone(mode(empties()))
+}
+
+test fn variance_and_stddev_are_population_forms() {
+    let xs: List<float> = [2.0, 4.0, 6.0, 8.0]
+    expectFloat(variance(xs), 5.0)
+    expectClose(stddev(xs), 2.23606797749979, 0.000000000000001)
+    let one: List<float> = [5.0]
+    expectFloat(variance(one), 0.0)
+    expectFloat(stddev(one), 0.0)
+    expectNone(variance(empties()))
+    expectNone(stddev(empties()))
+}
+
+test fn sample_forms_need_two_values() {
+    let xs: List<float> = [1.0, 3.0]
+    expectFloat(sampleVariance(xs), 2.0)
+    expectClose(sampleStddev(xs), 1.4142135623730951, 0.000000000000001)
+    let one: List<float> = [5.0]
+    expectNone(sampleVariance(one))
+    expectNone(sampleStddev(one))
+    expectNone(sampleVariance(empties()))
+    expectNone(sampleStddev(empties()))
+}
+
+test fn percentile_interpolates_between_ranks() {
+    let xs: List<float> = [1.0, 2.0, 3.0, 4.0]
+    expectFloat(percentile(xs, 0.0), 1.0)
+    expectFloat(percentile(xs, 25.0), 1.75)
+    expectFloat(percentile(xs, 50.0), 2.5)
+    expectFloat(percentile(xs, 75.0), 3.25)
+    expectFloat(percentile(xs, 100.0), 4.0)
+    expectFloat(percentile(xs, 120.0), 4.0)
+    expectFloat(percentile(xs, 0.0 - 5.0), 1.0)
+    let one: List<float> = [9.0]
+    expectFloat(percentile(one, 42.0), 9.0)
+    expectNone(percentile(empties(), 50.0))
+}
+
+test fn normalize_scales_to_the_unit_range() {
+    let xs: List<float> = [2.0, 4.0, 6.0]
+    let n = normalize(xs)
+    expect(len(n)).toBe(3)
+    expect(n[0]).toBe(0.0)
+    expect(n[1]).toBe(0.5)
+    expect(n[2]).toBe(1.0)
+    let flat: List<float> = [5.0, 5.0, 5.0]
+    let f = normalize(flat)
+    expect(len(f)).toBe(3)
+    expect(f[0]).toBe(0.0)
+    expect(f[2]).toBe(0.0)
+    expect(len(normalize(empties()))).toBe(0)
+}
+
+test fn cumulative_sums_track_running_totals() {
+    let xs: List<float> = [1.0, 2.0, 3.0]
+    let c = cumulativeSums(xs)
+    expect(len(c)).toBe(3)
+    expect(c[0]).toBe(1.0)
+    expect(c[1]).toBe(3.0)
+    expect(c[2]).toBe(6.0)
+    let mixed: List<float> = [0.0 - 1.0, 1.0]
+    let m = cumulativeSums(mixed)
+    expect(m[0]).toBe(-1.0)
+    expect(m[1]).toBe(0.0)
+    expect(len(cumulativeSums(empties()))).toBe(0)
+}
+
+test fn sqrt_handles_exact_squares_and_zero() {
+    expectFloat(sqrt(4.0), 2.0)
+    expectFloat(sqrt(9.0), 3.0)
+    expectFloat(sqrt(0.25), 0.5)
+    expectFloat(sqrt(0.0), 0.0)
+    expectFloat(sqrt(1.0), 1.0)
+    expectNone(sqrt(0.0 - 1.0))
+}
+
+test fn sqrt_converges_across_magnitudes() {
+    expectClose(sqrt(2.0), 1.4142135623730951, 0.000000000000001)
+    expectClose(sqrt(1000000000000.0), 1000000.0, 0.000001)
+    expectClose(sqrt(1.0e300), 1.0e150, 1.0e135)
+    expectClose(sqrt(1.0e-12), 1.0e-6, 1.0e-21)
+    expectClose(sqrt(0.3), 0.5477225575051661, 0.000000000000001)
+}
+
+test fn single_value_samples_collapse() {
+    let one: List<float> = [4.0]
+    expectFloat(mean(one), 4.0)
+    expectFloat(minOf(one), 4.0)
+    expectFloat(maxOf(one), 4.0)
+    expectFloat(median(one), 4.0)
+    expectFloat(mode(one), 4.0)
+    expectFloat(variance(one), 0.0)
+    expectFloat(percentile(one, 100.0), 4.0)
+}
+
+test fn empty_samples_return_none() {
+    let e = empties()
+    expectNone(mean(e))
+    expectNone(minOf(e))
+    expectNone(maxOf(e))
+    expectNone(span(e))
+    expectNone(median(e))
+    expectNone(mode(e))
+    expectNone(variance(e))
+    expectNone(sampleVariance(e))
+    expectNone(stddev(e))
+    expectNone(sampleStddev(e))
+    expectNone(percentile(e, 50.0))
+    expect(sum(e)).toBe(0.0)
+    expect(len(normalize(e))).toBe(0)
+    expect(len(cumulativeSums(e))).toBe(0)
+}
+
+test fn negative_values_work_like_positive_ones() {
+    let xs: List<float> = [0.0 - 2.0, 0.0 - 4.0, 0.0 - 6.0, 0.0 - 8.0]
+    expect(sum(xs)).toBe(-20.0)
+    expectFloat(minOf(xs), -8.0)
+    expectFloat(maxOf(xs), -2.0)
+    expectFloat(span(xs), 6.0)
+    expectFloat(mean(xs), -5.0)
+    expectFloat(variance(xs), 5.0)
+    expectFloat(median(xs), -5.0)
+}

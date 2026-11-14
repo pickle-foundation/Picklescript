@@ -1,0 +1,323 @@
+module std.math.statistics
+
+// Descriptive statistics over `List<float>`.
+//
+// Every summary returns a `float?` so an empty sample is unambiguous: the
+// result is `none` rather than a sentinel. `sum` is the exception - the empty
+// sum is `0.0`, matching the usual convention. Samples are treated as data
+// values, not as a stream: every function takes the list by value and never
+// mutates it.
+//
+// Ordering functions (`median`, `mode`, `percentile`) sort a private copy with
+// a stable insertion sort, so the input list keeps its order. `percentile`
+// uses linear interpolation between the two closest ranks (the same definition
+// as the default `numpy` method): `p = 0` is the minimum, `p = 100` the
+// maximum, and `p` outside `[0, 100]` is clamped.
+//
+// `variance`/`stddev` are the population forms; `sampleVariance`/
+// `sampleStddev` use Bessel's correction and need at least two values.
+// `stddev` needs a float square root, which the language does not provide, so
+// this module ships `sqrt` (Newton's method on a power-of-four scaled mantissa
+// interval, accurate to within a few ulps).
+//
+// Inputs are expected to be finite. A NaN flows through the arithmetic the way
+// IEEE says it should (the summary is NaN); it is not detected or rejected.
+
+/// A typed empty `List<float>` (the empty-list staging workaround).
+fn emptyFloats() -> List<float> {
+    var out: List<float> = [0.0]
+    out.remove(0)
+    out
+}
+
+/// A stable ascending copy of `xs` (insertion sort, so equal values keep their
+/// relative order and the input is untouched).
+fn sortedCopy(xs: List<float>) -> List<float> {
+    var out = emptyFloats()
+    var i = 0
+    while (i < len(xs)) {
+        let v = xs[i]
+        out.push(v)
+        var j = len(out) - 1
+        while (j > 0) {
+            if (out[j - 1] > v) {
+                out[j] = out[j - 1]
+                out[j - 1] = v
+                j = j - 1
+            } else {
+                break
+            }
+        }
+        i = i + 1
+    }
+    out
+}
+
+/// The arithmetic sum; `0.0` for an empty list.
+fn sum(xs: List<float>) -> float {
+    var total = 0.0
+    for (x in xs) {
+        total = total + x
+    }
+    total
+}
+
+/// The arithmetic mean; `none` for an empty list.
+fn mean(xs: List<float>) -> float? {
+    let n = len(xs)
+    if (n == 0) {
+        return none
+    }
+    sum(xs) / (n as float)
+}
+
+/// The smallest value; `none` for an empty list.
+fn minOf(xs: List<float>) -> float? {
+    let n = len(xs)
+    if (n == 0) {
+        return none
+    }
+    var best = xs[0]
+    var i = 1
+    while (i < n) {
+        if (xs[i] < best) {
+            best = xs[i]
+        }
+        i = i + 1
+    }
+    best
+}
+
+/// The largest value; `none` for an empty list.
+fn maxOf(xs: List<float>) -> float? {
+    let n = len(xs)
+    if (n == 0) {
+        return none
+    }
+    var best = xs[0]
+    var i = 1
+    while (i < n) {
+        if (xs[i] > best) {
+            best = xs[i]
+        }
+        i = i + 1
+    }
+    best
+}
+
+/// `max - min`; `none` for an empty list (a single value spans 0).
+fn span(xs: List<float>) -> float? {
+    let lo = minOf(xs)
+    let hi = maxOf(xs)
+    match (lo) {
+    case some(a) -> match (hi) {
+        case some(b) -> b - a
+        case none -> none
+    }
+    case none -> none
+    }
+}
+
+/// The middle value of the sorted sample; the mean of the two middle values
+/// when the count is even. `none` for an empty list.
+fn median(xs: List<float>) -> float? {
+    let n = len(xs)
+    if (n == 0) {
+        return none
+    }
+    let s = sortedCopy(xs)
+    let mid = n / 2
+    if (n % 2 == 1) {
+        return s[mid]
+    }
+    (s[mid - 1] + s[mid]) / 2.0
+}
+
+/// The most frequent value; ties resolve to the smallest value. `none` for an
+/// empty list.
+fn mode(xs: List<float>) -> float? {
+    let n = len(xs)
+    if (n == 0) {
+        return none
+    }
+    let s = sortedCopy(xs)
+    var best = s[0]
+    var bestCount = 1
+    var cur = s[0]
+    var curCount = 1
+    var i = 1
+    while (i < n) {
+        if (s[i] == cur) {
+            curCount = curCount + 1
+        } else {
+            cur = s[i]
+            curCount = 1
+        }
+        if (curCount > bestCount) {
+            best = cur
+            bestCount = curCount
+        }
+        i = i + 1
+    }
+    best
+}
+
+/// The population variance (divide by `n`); `none` for an empty list.
+fn variance(xs: List<float>) -> float? {
+    let n = len(xs)
+    if (n == 0) {
+        return none
+    }
+    let m = sum(xs) / (n as float)
+    var acc = 0.0
+    for (x in xs) {
+        let d = x - m
+        acc = acc + d * d
+    }
+    acc / (n as float)
+}
+
+/// The unbiased sample variance (Bessel's correction, divide by `n - 1`);
+/// `none` when there are fewer than two values.
+fn sampleVariance(xs: List<float>) -> float? {
+    let n = len(xs)
+    if (n < 2) {
+        return none
+    }
+    let m = sum(xs) / (n as float)
+    var acc = 0.0
+    for (x in xs) {
+        let d = x - m
+        acc = acc + d * d
+    }
+    acc / ((n - 1) as float)
+}
+
+/// The population standard deviation; `none` for an empty list.
+fn stddev(xs: List<float>) -> float? {
+    match (variance(xs)) {
+    case some(v) -> sqrt(v)
+    case none -> none
+    }
+}
+
+/// The sample standard deviation; `none` when there are fewer than two values.
+fn sampleStddev(xs: List<float>) -> float? {
+    match (sampleVariance(xs)) {
+    case some(v) -> sqrt(v)
+    case none -> none
+    }
+}
+
+/// The `p`-th percentile with linear interpolation between ranks; `p` is
+/// clamped to `[0, 100]`. `none` for an empty list.
+fn percentile(xs: List<float>, p: float) -> float? {
+    let n = len(xs)
+    if (n == 0) {
+        return none
+    }
+    var q = p
+    if (q < 0.0) {
+        q = 0.0
+    }
+    if (q > 100.0) {
+        q = 100.0
+    }
+    let s = sortedCopy(xs)
+    let rank = (q / 100.0) * ((n - 1) as float)
+    let lo = rank as int
+    let hi = lo + 1
+    if (hi >= n) {
+        return s[n - 1]
+    }
+    let frac = rank - (lo as float)
+    s[lo] + (s[hi] - s[lo]) * frac
+}
+
+/// Min-max scaling to `[0, 1]`: the smallest value maps to `0.0` and the
+/// largest to `1.0`. Empty stays empty, and an all-equal sample maps to zeros
+/// (there is no range to stretch).
+fn normalize(xs: List<float>) -> List<float> {
+    var out = emptyFloats()
+    let n = len(xs)
+    if (n == 0) {
+        return out
+    }
+    let lo = minOf(xs)
+    let hi = maxOf(xs)
+    var a = 0.0
+    var b = 0.0
+    match (lo) {
+    case some(v) -> a = v
+    case none -> {}
+    }
+    match (hi) {
+    case some(v) -> b = v
+    case none -> {}
+    }
+    let spread = b - a
+    var i = 0
+    while (i < n) {
+        if (spread == 0.0) {
+            out.push(0.0)
+        } else {
+            out.push((xs[i] - a) / spread)
+        }
+        i = i + 1
+    }
+    out
+}
+
+/// Running totals: element `i` is the sum of `xs[0..=i]`; empty stays empty.
+fn cumulativeSums(xs: List<float>) -> List<float> {
+    var out = emptyFloats()
+    var total = 0.0
+    for (x in xs) {
+        total = total + x
+        out.push(total)
+    }
+    out
+}
+
+/// The float square root; `none` for a negative argument, `0.0` for `0.0`, and
+/// NaN for NaN. The argument is scaled by powers of four into `[0.25, 4]`
+/// (exact in binary floating point), solved with Newton's method there, and
+/// scaled back, so both very large and very small magnitudes converge in a
+/// handful of steps. The result is accurate to within a few ulps.
+fn sqrt(x: float) -> float? {
+    if (x < 0.0) {
+        return none
+    }
+    if (x == 0.0) {
+        return 0.0
+    }
+    var scaled = x
+    var doublings = 0
+    while (scaled > 4.0) {
+        scaled = scaled / 4.0
+        doublings = doublings + 1
+    }
+    while (scaled < 0.25) {
+        scaled = scaled * 4.0
+        doublings = doublings - 1
+    }
+    var g = scaled
+    var i = 0
+    while (i < 60) {
+        let next = 0.5 * (g + scaled / g)
+        if (next == g) {
+            break
+        }
+        g = next
+        i = i + 1
+    }
+    while (doublings > 0) {
+        g = g * 2.0
+        doublings = doublings - 1
+    }
+    while (doublings < 0) {
+        g = g / 2.0
+        doublings = doublings + 1
+    }
+    g
+}
