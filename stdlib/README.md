@@ -19,11 +19,12 @@ Seeds (see `docs/08-stdlib.md`, office `port/` tracker):
 - `collections/` — `List`/`Map` wrappers plus `Set`, `Multiset`, `Deque`,
   `Vec`, `BitSet`, `LruCache`
 - `fs/`, `os/`, `time/`, `test/` — shipped flat (`fs.pkl`, `os.pkl`, ...);
-  `math/` has `basic.pkl`, `random.pkl`, and `statistics.pkl`; `logging.pkl`
+  `math/` has `basic.pkl`, `random.pkl`, `statistics.pkl`, and
+  `interpolation.pkl`; `logging.pkl`
   ships flat (see the plan doc); `encoding/` has `base64`, `csv`, `hex`,
   `url`, `toml`, and `yaml`
 
-Status (2026-09-26): the whole `stdlib/**/*_test.pkl` tree (35 files) is gated
+Status (2026-09-26): the whole `stdlib/**/*_test.pkl` tree (36 files) is gated
 by **GATE11** in `tools/battery_full.ps1` — the ported test driver must run
 each file byte-identical (stdout + exit) to Rust `pickle test`.
 The compiler registers builtins (`print`, `println`, `len`, `abs`, ...)
