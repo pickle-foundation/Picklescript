@@ -1,0 +1,175 @@
+module std.collections.multiset
+
+// A multiset (bag) seed: membership by `==` over a `List<T>`, with a parallel
+// occurrence count per distinct value. Distinct values keep insertion order.
+//
+// Like `std.collections.set`, the constructor takes a *typed proto* value
+// (`Multiset<int>(0)`) so the two backing lists can be staged empty and
+// correctly typed without a `List<T>()` constructor.
+//
+// `add(v)` adds one occurrence, `addN(v, n)` adds `n` (a non-positive `n` is
+// ignored); `remove(v)` drops one occurrence and returns whether `v` was
+// present; `removeAll(v)` drops every occurrence and returns how many it
+// removed. `size` counts occurrences, `uniqueSize` counts distinct values,
+// `toList` expands back to one element per occurrence, and `keys` yields the
+// distinct values.
+
+class Multiset<T> {
+    var items: List<T>
+    var counts: List<int>
+    var proto: T
+
+    constructor(proto: T) {
+        this.proto = proto
+        this.items = [proto]
+        this.items.remove(0)
+        this.counts = [0]
+        this.counts.remove(0)
+    }
+
+    /// The index of `v` in `items`, or -1.
+    fn indexOf(v: T) -> int {
+        var i = 0
+        while (i < len(this.items)) {
+            if (this.items[i] == v) {
+                return i
+            }
+            i = i + 1
+        }
+        0 - 1
+    }
+
+    /// Add one occurrence of `v`.
+    fn add(v: T) {
+        this.addN(v, 1)
+    }
+
+    /// Add `n` occurrences of `v`; a non-positive `n` is ignored.
+    fn addN(v: T, n: int) {
+        if (n <= 0) {
+            return
+        }
+        let i = this.indexOf(v)
+        if (i < 0) {
+            this.items.push(v)
+            this.counts.push(n)
+            return
+        }
+        this.counts[i] = this.counts[i] + n
+    }
+
+    /// Remove one occurrence of `v`; `false` when `v` is absent.
+    fn remove(v: T) -> bool {
+        let i = this.indexOf(v)
+        if (i < 0) {
+            return false
+        }
+        let left = this.counts[i] - 1
+        if (left == 0) {
+            this.items.remove(i)
+            this.counts.remove(i)
+            return true
+        }
+        this.counts[i] = left
+        true
+    }
+
+    /// Remove every occurrence of `v`, returning how many were removed.
+    fn removeAll(v: T) -> int {
+        let i = this.indexOf(v)
+        if (i < 0) {
+            return 0
+        }
+        let n = this.counts[i]
+        this.items.remove(i)
+        this.counts.remove(i)
+        n
+    }
+
+    /// The number of occurrences of `v` (`0` when absent).
+    fn countOf(v: T) -> int {
+        let i = this.indexOf(v)
+        if (i < 0) {
+            return 0
+        }
+        this.counts[i]
+    }
+
+    /// Whether `v` occurs at least once.
+    fn contains(v: T) -> bool {
+        this.indexOf(v) >= 0
+    }
+
+    /// The total number of occurrences.
+    fn size() -> int {
+        var n = 0
+        for (c in this.counts) {
+            n = n + c
+        }
+        n
+    }
+
+    /// The number of distinct values.
+    fn uniqueSize() -> int {
+        len(this.items)
+    }
+
+    /// The distinct values, in insertion order.
+    fn keys() -> List<T> {
+        var out: List<T> = [this.proto]
+        out.remove(0)
+        for (v in this.items) {
+            out.push(v)
+        }
+        out
+    }
+
+    /// Every occurrence, in insertion order (distinct values in the order they
+    /// first appeared, each repeated by its count).
+    fn toList() -> List<T> {
+        var out: List<T> = [this.proto]
+        out.remove(0)
+        var i = 0
+        while (i < len(this.items)) {
+            var k = 0
+            while (k < this.counts[i]) {
+                out.push(this.items[i])
+                k = k + 1
+            }
+            i = i + 1
+        }
+        out
+    }
+
+    /// Remove every value.
+    fn clear() {
+        this.items = [this.proto]
+        this.items.remove(0)
+        this.counts = [0]
+        this.counts.remove(0)
+    }
+}
+
+/// A new multiset with the occurrences of both `a` and `b`.
+fn unionOf<K>(a: Multiset<K>, b: Multiset<K>) -> Multiset<K> {
+    let ka = a.keys()
+    let kb = b.keys()
+    if (len(ka) == 0) {
+        if (len(kb) == 0) {
+            return a
+        }
+        let other = Multiset<K>(kb[0])
+        for (v in kb) {
+            other.addN(v, b.countOf(v))
+        }
+        return other
+    }
+    let out = Multiset<K>(ka[0])
+    for (v in ka) {
+        out.addN(v, a.countOf(v))
+    }
+    for (v in kb) {
+        out.addN(v, b.countOf(v))
+    }
+    out
+}
