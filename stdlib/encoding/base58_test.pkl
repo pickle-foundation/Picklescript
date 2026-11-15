@@ -1,0 +1,225 @@
+module std.encoding.base58_test
+
+import { encode, decode, isValid, encodeString, decodeString } from std.encoding.base58
+
+/// The bytes of `text`.
+fn data(text: string) -> List<byte> {
+    bytes(text)
+}
+
+/// A byte list from integer values.
+fn fromInts(values: List<int>) -> List<byte> {
+    var out = bytes("")
+    var i = 0
+    while (i < len(values)) {
+        out.push(values[i] as byte)
+        i = i + 1
+    }
+    out
+}
+
+/// A decoded byte list rendered as a string (`<none>` for `none`).
+fn showBytes(x: List<byte>?) -> string {
+    match (x) {
+    case some(b) -> str(b)
+    case none -> "<none>"
+    }
+}
+
+/// A rendered optional string (`<none>` for `none`).
+fn showS(x: string?) -> string {
+    match (x) {
+    case some(v) -> v
+    case none -> "<none>"
+    }
+}
+
+/// Whether `text` decodes to exactly these byte values.
+fn eqDecoded(text: string, values: List<int>) -> bool {
+    match (decode(text)) {
+    case some(b) -> sameBytes(b, fromInts(values))
+    case none -> false
+    }
+}
+
+/// Whether two byte lists have the same length and bytes.
+fn sameBytes(a: List<byte>, b: List<byte>) -> bool {
+    if (len(a) != len(b)) {
+        return false
+    }
+    var i = 0
+    while (i < len(a)) {
+        if (a[i] != b[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+/// A 256-byte list holding every byte value once, in order.
+fn allBytes() -> List<byte> {
+    var out = bytes("")
+    var i = 0
+    while (i < 256) {
+        out.push(i as byte)
+        i = i + 1
+    }
+    out
+}
+
+/// A deterministic 600-byte pattern.
+fn patternBytes() -> List<byte> {
+    var out = bytes("")
+    var i = 0
+    while (i < 600) {
+        out.push(((i * 53 + 7) % 256) as byte)
+        i = i + 1
+    }
+    out
+}
+
+test fn empty_input_encodes_to_empty_text() {
+    expect(encode(data(""))).toBe("")
+    expect(showBytes(decode(""))).toBe("")
+    expect(isValid("")).toBe(true)
+}
+
+test fn published_vectors() {
+    expect(encode(data("Hello World!"))).toBe("2NEpo7TZRRrLZSi2U")
+    expect(encode(data("The quick brown fox jumps over the lazy dog."))).toBe("USm3fpXnKG5EUBx2ndxBDMPVciP5hGey2Jh4NDv6gmeo1LkMeiKrLJUUBk6Z")
+    expect(showBytes(decode("2NEpo7TZRRrLZSi2U"))).toBe("Hello World!")
+    expect(showBytes(decode("USm3fpXnKG5EUBx2ndxBDMPVciP5hGey2Jh4NDv6gmeo1LkMeiKrLJUUBk6Z"))).toBe("The quick brown fox jumps over the lazy dog.")
+}
+
+test fn single_byte_values() {
+    expect(encode(fromInts([1]))).toBe("2")
+    expect(encode(fromInts([57]))).toBe("z")
+    expect(encode(fromInts([58]))).toBe("21")
+    expect(encode(fromInts([255]))).toBe("5Q")
+    expect(eqDecoded("2", [1])).toBe(true)
+    expect(eqDecoded("21", [58])).toBe(true)
+}
+
+test fn leading_zero_bytes_become_ones() {
+    expect(encode(fromInts([0]))).toBe("1")
+    expect(encode(fromInts([0, 0, 0]))).toBe("111")
+    expect(encode(fromInts([0, 1]))).toBe("12")
+    expect(encode(fromInts([0, 255]))).toBe("15Q")
+    expect(eqDecoded("1", [0])).toBe(true)
+    expect(eqDecoded("111", [0, 0, 0])).toBe(true)
+    expect(eqDecoded("12", [0, 1])).toBe(true)
+    expect(eqDecoded("15Q", [0, 255])).toBe(true)
+}
+
+test fn decoding_rejects_out_of_alphabet_characters() {
+    expect(showBytes(decode("0"))).toBe("<none>")
+    expect(showBytes(decode("O"))).toBe("<none>")
+    expect(showBytes(decode("I"))).toBe("<none>")
+    expect(showBytes(decode("l"))).toBe("<none>")
+    expect(showBytes(decode("Hello World!"))).toBe("<none>")
+    expect(showBytes(decode("2NEpo7TZRRrLZSi2U!"))).toBe("<none>")
+    expect(showBytes(decode(" 2"))).toBe("<none>")
+    expect(isValid("2NEpo7TZRRrLZSi2U")).toBe(true)
+    expect(isValid("2NEpo7TZRRrLZSi2U!")).toBe(false)
+    expect(isValid("0OIl")).toBe(false)
+}
+
+test fn round_trip_over_every_byte_value() {
+    let all = allBytes()
+    let text = encode(all)
+    match (decode(text)) {
+    case some(back) -> expect(sameBytes(all, back)).toBe(true)
+    case none -> expect(true).toBe(false)
+    }
+}
+
+test fn round_trip_over_a_long_pattern() {
+    let src = patternBytes()
+    let text = encode(src)
+    match (decode(text)) {
+    case some(back) -> expect(sameBytes(src, back)).toBe(true)
+    case none -> expect(true).toBe(false)
+    }
+    match (decode(text)) {
+    case some(back) -> expect(len(back)).toBe(600)
+    case none -> expect(true).toBe(false)
+    }
+}
+
+test fn encoding_uses_only_alphabet_characters() {
+    let text = encode(allBytes())
+    let allowed = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    var bad = 0
+    var i = 0
+    while (i < len(text)) {
+        var found = false
+        var j = 0
+        while (j < len(allowed)) {
+            if ((allowed[j] as int) == (text[i] as int)) {
+                found = true
+            }
+            j = j + 1
+        }
+        if (!found) {
+            bad = bad + 1
+        }
+        i = i + 1
+    }
+    expect(bad).toBe(0)
+}
+
+test fn leading_zeros_are_preserved_by_round_trips() {
+    let src = fromInts([0, 0, 7, 0, 255])
+    let text = encode(src)
+    expect(len(text)).toBe(6)
+    expect(text[0] as int).toBe(49)
+    expect(text[1] as int).toBe(49)
+    match (decode(text)) {
+    case some(back) -> expect(sameBytes(src, back)).toBe(true)
+    case none -> expect(true).toBe(false)
+    }
+}
+
+test fn string_helpers() {
+    expect(encodeString("Hello World!")).toBe("2NEpo7TZRRrLZSi2U")
+    expect(showS(decodeString("2NEpo7TZRRrLZSi2U"))).toBe("Hello World!")
+    expect(showS(decodeString(encodeString("héllo café")))).toBe("héllo café")
+    expect(showS(decodeString("0OIl"))).toBe("<none>")
+}
+
+test fn encode_is_deterministic() {
+    let a = encodeString("The quick brown fox jumps over the lazy dog")
+    let b = encodeString("The quick brown fox jumps over the lazy dog")
+    expect(a).toBe(b)
+    expect(encodeString("A")).toBe(encodeString("A"))
+}
+
+test fn increasing_values_grow_monotonically() {
+    var previous = ""
+    var previousLen = 0
+    var bad = 0
+    var n = 1
+    while (n <= 200) {
+        let text = encode(fromInts([n]))
+        if (len(text) < previousLen) {
+            bad = bad + 1
+        }
+        previousLen = len(text)
+        previous = text
+        n = n + 1
+    }
+    expect(bad).toBe(0)
+    expect(previous).toBe(encode(fromInts([200])))
+}
+
+test fn decoding_is_not_self_delimiting() {
+    // Base58 text is a whole number, so concatenation is a different value.
+    let a = encode(fromInts([1]))
+    let b = encode(fromInts([2]))
+    let joined = a + b
+    match (decode(joined)) {
+    case some(back) -> expect(sameBytes(back, fromInts([1, 2]))).toBe(false)
+    case none -> expect(true).toBe(false)
+    }
+}

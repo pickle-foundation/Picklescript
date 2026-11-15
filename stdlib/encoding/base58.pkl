@@ -1,0 +1,148 @@
+module std.encoding.base58
+
+// Base58 (the Bitcoin alphabet) encoding and decoding.
+//
+// The alphabet is the 58-character string
+// `123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz`: it omits `0`,
+// `O`, `I`, and `l`, which are easy to confuse when a value is transcribed by
+// hand.
+//
+// Base58 is a whole-number encoding, so it is not a bit-packing scheme like
+// base64: the data is read as one big-endian integer and repeatedly divided by
+// 58. Leading zero bytes are not part of that number, so they are represented
+// explicitly by leading `1` characters, one per zero byte; decoding restores
+// them. An empty input encodes to the empty string.
+//
+// The arithmetic is exact integer arithmetic on byte lists, so results are
+// identical across implementations regardless of `int` width.
+//
+// The API is byte-oriented. `encodeString`/`decodeString` are the string
+// conveniences; `decodeString` renders the decoded bytes as UTF-8 via `str`,
+// so invalid UTF-8 is replaced rather than rejected.
+
+import { StringBuilder } from std.text.stringbuilder
+
+const ALPHABET: string = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+/// Encode `data` with the standard alphabet.
+fn encode(data: List<byte>) -> string {
+    encodeAlphabet(data, ALPHABET)
+}
+
+fn encodeAlphabet(data: List<byte>, alphabet: string) -> string {
+    var zeros = 0
+    while (zeros < len(data) && (data[zeros] as int) == 0) {
+        zeros = zeros + 1
+    }
+    var digits: List<int> = [0]
+    digits.remove(0)
+    var i = zeros
+    while (i < len(data)) {
+        var carry = data[i] as int
+        var j = 0
+        while (j < len(digits)) {
+            carry = carry + digits[j] * 256
+            digits[j] = carry % 58
+            carry = carry / 58
+            j = j + 1
+        }
+        while (carry > 0) {
+            digits.push(carry % 58)
+            carry = carry / 58
+        }
+        i = i + 1
+    }
+    let sb = StringBuilder()
+    var k = 0
+    while (k < zeros) {
+        sb.appendByte(alphabet[0])
+        k = k + 1
+    }
+    var d = len(digits) - 1
+    while (d >= 0) {
+        sb.appendByte(alphabet[digits[d]])
+        d = d - 1
+    }
+    sb.toString()
+}
+
+/// Decode standard-alphabet base58; `none` when a character is outside the
+/// alphabet.
+fn decode(text: string) -> List<byte>? {
+    decodeAlphabet(text, ALPHABET)
+}
+
+fn decodeAlphabet(text: string, alphabet: string) -> List<byte>? {
+    let bs = bytes(text)
+    var zeros = 0
+    while (zeros < len(bs) && (bs[zeros] as int) == 49) {
+        zeros = zeros + 1
+    }
+    var acc: List<int> = [0]
+    acc.remove(0)
+    var i = zeros
+    while (i < len(bs)) {
+        let v = valueOf(bs[i] as int, alphabet)
+        if (v < 0) {
+            return none
+        }
+        var carry = v
+        var j = 0
+        while (j < len(acc)) {
+            carry = carry + acc[j] * 58
+            acc[j] = carry % 256
+            carry = carry / 256
+            j = j + 1
+        }
+        while (carry > 0) {
+            acc.push(carry % 256)
+            carry = carry / 256
+        }
+        i = i + 1
+    }
+    let out = bytes("")
+    var z = 0
+    while (z < zeros) {
+        out.push(0 as byte)
+        z = z + 1
+    }
+    var k = len(acc) - 1
+    while (k >= 0) {
+        out.push(acc[k] as byte)
+        k = k - 1
+    }
+    out
+}
+
+/// The index of character `cp` in `alphabet`, or `-1`.
+fn valueOf(cp: int, alphabet: string) -> int {
+    var i = 0
+    while (i < len(alphabet)) {
+        if ((alphabet[i] as int) == cp) {
+            return i
+        }
+        i = i + 1
+    }
+    0 - 1
+}
+
+/// `true` when `decode` accepts `text`.
+fn isValid(text: string) -> bool {
+    match (decode(text)) {
+    case some(_) -> true
+    case none -> false
+    }
+}
+
+/// Base58 of the UTF-8 bytes of `text`.
+fn encodeString(text: string) -> string {
+    encode(bytes(text))
+}
+
+/// Decode base58 and render the bytes as a UTF-8 string.
+fn decodeString(text: string) -> string? {
+    match (decode(text)) {
+    case some(b) -> str(b)
+    case none -> none
+    }
+}
