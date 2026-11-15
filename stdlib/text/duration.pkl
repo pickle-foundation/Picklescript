@@ -1,0 +1,130 @@
+module std.text.duration
+
+// Compact durations: parsing `1h30m`-style text and rendering seconds back.
+//
+// A duration is an integer number of seconds. `parse` accepts a sequence of
+// integer counts, each optionally followed by a unit letter:
+//
+//   w = week, d = day, h = hour, m = minute, s = second
+//
+// A count with no unit means seconds, components may be separated by spaces,
+// and components are added in any order (`30m1h` equals `1h30m`). A leading
+// minus sign negates the whole text. Anything else - a missing count, an
+// unknown unit, a bare unit letter, a decimal point - makes `parse` return
+// `none`, as does empty text.
+//
+// `describe` renders seconds in the canonical form: the largest units first,
+// zero units skipped, units written as a count immediately followed by its
+// letter, and no separators. So `5400` is `1h30m` and `90061` is
+// `1d1h1m1s`. Zero is `0s` and negative values keep a leading `-`. Parsing the
+// canonical form always returns the original value.
+
+/// Seconds in each supported unit, largest first.
+fn unitSeconds() -> List<int> {
+    [604800, 86400, 3600, 60, 1]
+}
+
+/// Unit letters matching `unitSeconds`.
+fn unitLetters() -> List<string> {
+    ["w", "d", "h", "m", "s"]
+}
+
+/// The seconds value of unit byte `b`, or `0` when it is not a unit.
+fn secondsOf(b: byte) -> int {
+    if (b == 119) {
+        return 604800
+    }
+    if (b == 100) {
+        return 86400
+    }
+    if (b == 104) {
+        return 3600
+    }
+    if (b == 109) {
+        return 60
+    }
+    if (b == 115) {
+        return 1
+    }
+    0
+}
+
+/// The number of seconds described by `text`, or `none` when it is malformed.
+fn parse(text: string) -> int? {
+    let bs = bytes(text)
+    if (len(bs) == 0) {
+        return none
+    }
+    var i = 0
+    var sign = 1
+    if (bs[0] == 45) {
+        sign = -1
+        i = 1
+        if (len(bs) == 1) {
+            return none
+        }
+    }
+    var total = 0
+    var seen = false
+    while (i < len(bs)) {
+        if (bs[i] == 32) {
+            i = i + 1
+        } else if (bs[i] >= 48 && bs[i] <= 57) {
+            var num = 0
+            while (i < len(bs) && bs[i] >= 48 && bs[i] <= 57) {
+                num = num * 10 + ((bs[i] as int) - 48)
+                i = i + 1
+            }
+            var unit = 1
+            if (i < len(bs) && bs[i] != 32) {
+                unit = secondsOf(bs[i])
+                if (unit == 0) {
+                    return none
+                }
+                i = i + 1
+            }
+            total = total + num * unit
+            seen = true
+        } else {
+            return none
+        }
+    }
+    if (!seen) {
+        return none
+    }
+    sign * total
+}
+
+/// The canonical compact spelling of `seconds` (for example `1h30m`).
+fn describe(seconds: int) -> string {
+    if (seconds == 0) {
+        return "0s"
+    }
+    var sign = ""
+    var rest = seconds
+    if (rest < 0) {
+        sign = "-"
+        rest = 0 - rest
+    }
+    let units = unitSeconds()
+    let letters = unitLetters()
+    var out = ""
+    var i = 0
+    while (i < len(units)) {
+        if (rest >= units[i]) {
+            let count = rest / units[i]
+            rest = rest % units[i]
+            out = out + "{count}" + letters[i]
+        }
+        i = i + 1
+    }
+    sign + out
+}
+
+/// Whether `text` parses as a duration.
+fn isValid(text: string) -> bool {
+    match (parse(text)) {
+    case some(_) -> true
+    case none -> false
+    }
+}

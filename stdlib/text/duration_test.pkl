@@ -1,0 +1,150 @@
+module std.text.duration_test
+
+import { parse, describe, isValid } from std.text.duration
+
+/// A parsed duration (`<none>` when malformed).
+fn showI(x: int?) -> string {
+    match (x) {
+    case some(v) -> "{v}"
+    case none -> "<none>"
+    }
+}
+
+/// `text` parsed and rendered again (`<none>` when malformed).
+fn reDescribe(text: string) -> string {
+    if (let some(v) = parse(text)) {
+        return describe(v)
+    }
+    "<none>"
+}
+
+/// `text` plus `extra` seconds, rendered canonically.
+fn plusSeconds(text: string, extra: int) -> string {
+    if (let some(v) = parse(text)) {
+        return describe(v + extra)
+    }
+    "<none>"
+}
+
+test fn parsing_single_components() {
+    expect(showI(parse("1s"))).toBe("1")
+    expect(showI(parse("90s"))).toBe("90")
+    expect(showI(parse("5m"))).toBe("300")
+    expect(showI(parse("2h"))).toBe("7200")
+    expect(showI(parse("2d"))).toBe("172800")
+    expect(showI(parse("3w"))).toBe("1814400")
+}
+
+test fn parsing_combined_components() {
+    expect(showI(parse("1h30m"))).toBe("5400")
+    expect(showI(parse("1h30m15s"))).toBe("5415")
+    expect(showI(parse("1d2h3m4s"))).toBe("93784")
+    expect(showI(parse("1w1d1h1m1s"))).toBe("694861")
+    expect(showI(parse("2w3d"))).toBe("1468800")
+}
+
+test fn components_may_be_separated_or_reordered() {
+    expect(showI(parse("1h 30m"))).toBe("5400")
+    expect(showI(parse("1h  30m"))).toBe("5400")
+    expect(showI(parse("30m1h"))).toBe("5400")
+    expect(showI(parse("15s 1m 1h"))).toBe("3675")
+    expect(showI(parse("1h30m "))).toBe("5400")
+}
+
+test fn bare_counts_are_seconds() {
+    expect(showI(parse("0"))).toBe("0")
+    expect(showI(parse("45"))).toBe("45")
+    expect(showI(parse("1000000"))).toBe("1000000")
+    expect(showI(parse("1 30"))).toBe("31")
+}
+
+test fn negative_durations() {
+    expect(showI(parse("-5s"))).toBe("-5")
+    expect(showI(parse("-1h30m"))).toBe("-5400")
+    expect(showI(parse("-0"))).toBe("0")
+    expect(showI(parse("-"))).toBe("<none>")
+}
+
+test fn malformed_text_is_rejected() {
+    expect(showI(parse(""))).toBe("<none>")
+    expect(showI(parse("   "))).toBe("<none>")
+    expect(showI(parse("h"))).toBe("<none>")
+    expect(showI(parse("s"))).toBe("<none>")
+    expect(showI(parse("30x"))).toBe("<none>")
+    expect(showI(parse("1.5h"))).toBe("<none>")
+    expect(showI(parse("1h-30m"))).toBe("<none>")
+    expect(showI(parse("1 h"))).toBe("<none>")
+    expect(showI(parse("1H"))).toBe("<none>")
+    expect(showI(parse("1hs"))).toBe("<none>")
+    expect(showI(parse("1h30s!"))).toBe("<none>")
+}
+
+test fn describing_small_values() {
+    expect(describe(0)).toBe("0s")
+    expect(describe(1)).toBe("1s")
+    expect(describe(59)).toBe("59s")
+    expect(describe(60)).toBe("1m")
+    expect(describe(61)).toBe("1m1s")
+    expect(describe(3600)).toBe("1h")
+    expect(describe(3599)).toBe("59m59s")
+}
+
+test fn describing_larger_values() {
+    expect(describe(5400)).toBe("1h30m")
+    expect(describe(86399)).toBe("23h59m59s")
+    expect(describe(86400)).toBe("1d")
+    expect(describe(90061)).toBe("1d1h1m1s")
+    expect(describe(604800)).toBe("1w")
+    expect(describe(694861)).toBe("1w1d1h1m1s")
+    expect(describe(172800)).toBe("2d")
+}
+
+test fn describing_negative_values() {
+    expect(describe(-1)).toBe("-1s")
+    expect(describe(-5400)).toBe("-1h30m")
+    expect(describe(-694861)).toBe("-1w1d1h1m1s")
+}
+
+test fn describe_and_parse_round_trip() {
+    var v = 0
+    while (v <= 2000) {
+        if (showI(parse(describe(v))) != "{v}") {
+            expect(showI(parse(describe(v)))).toBe("{v}")
+        }
+        v = v + 7
+    }
+    var samples = [86399, 86400, 90061, 604800, 694861, 1000000, 123456789]
+    var i = 0
+    while (i < len(samples)) {
+        expect(showI(parse(describe(samples[i])))).toBe("{samples[i]}")
+        expect(showI(parse(describe(-samples[i])))).toBe("-{samples[i]}")
+        i = i + 1
+    }
+}
+
+test fn canonical_forms_are_stable() {
+    let texts = ["0s", "59s", "1m", "1m1s", "1h30m", "23h59m59s", "1d1h1m1s", "1w1d1h1m1s"]
+    var i = 0
+    while (i < len(texts)) {
+        expect(reDescribe(texts[i])).toBe(texts[i])
+        i = i + 1
+    }
+}
+
+test fn validity_predicate() {
+    expect(isValid("1h30m")).toBe(true)
+    expect(isValid("45")).toBe(true)
+    expect(isValid("-2d")).toBe(true)
+    expect(isValid("0s")).toBe(true)
+    expect(isValid("")).toBe(false)
+    expect(isValid("1h30x")).toBe(false)
+    expect(isValid("1.5h")).toBe(false)
+}
+
+test fn a_rounded_report() {
+    let elapsed = parse("1h59m60s")
+    expect(showI(elapsed)).toBe("7200")
+    expect(describe(7200)).toBe("2h")
+    expect(plusSeconds("45m", 15)).toBe("45m15s")
+    expect(plusSeconds("23h59m59s", 1)).toBe("1d")
+}
