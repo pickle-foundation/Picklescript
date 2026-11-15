@@ -1,0 +1,174 @@
+module std.text.search_test
+
+import { indexOf, lastIndexOf, contains, countOf, findAll, replaceFirst, replaceAll, removeAll, hasPrefix, hasSuffix, splitOn } from std.text.search
+
+/// A rendered optional offset (`<none>` for `none`).
+fn showI(x: int?) -> string {
+    match (x) {
+    case some(v) -> "{v}"
+    case none -> "<none>"
+    }
+}
+
+/// An ascending offset list rendered as `[0, 2, 4]`.
+fn showOffsets(xs: List<int>) -> string {
+    var out = "["
+    var i = 0
+    while (i < len(xs)) {
+        if (i > 0) {
+            out = out + ", "
+        }
+        out = out + "{xs[i]}"
+        i = i + 1
+    }
+    out + "]"
+}
+
+/// A string list rendered as `[a|b|c]` (empty fields show as nothing).
+fn showParts(xs: List<string>) -> string {
+    var out = "["
+    var i = 0
+    while (i < len(xs)) {
+        if (i > 0) {
+            out = out + "|"
+        }
+        out = out + xs[i]
+        i = i + 1
+    }
+    out + "]"
+}
+
+test fn index_of_basics() {
+    expect(showI(indexOf("hello world", "world"))).toBe("6")
+    expect(showI(indexOf("hello world", "hello"))).toBe("0")
+    expect(showI(indexOf("hello world", "o"))).toBe("4")
+    expect(showI(indexOf("hello world", "z"))).toBe("<none>")
+    expect(showI(indexOf("", "a"))).toBe("<none>")
+    expect(showI(indexOf("abc", "abcd"))).toBe("<none>")
+    expect(showI(indexOf("abc", "abc"))).toBe("0")
+}
+
+test fn index_of_edge_cases() {
+    expect(showI(indexOf("abc", ""))).toBe("0")
+    expect(showI(indexOf("", ""))).toBe("0")
+    expect(showI(indexOf("héllo", "llo"))).toBe("3")
+    expect(showI(indexOf("héllo", "é"))).toBe("1")
+    expect(showI(indexOf("abc", "c"))).toBe("2")
+}
+
+test fn last_index_of() {
+    expect(showI(lastIndexOf("abcabc", "abc"))).toBe("3")
+    expect(showI(lastIndexOf("abcabc", "c"))).toBe("5")
+    expect(showI(lastIndexOf("abcabc", "z"))).toBe("<none>")
+    expect(showI(lastIndexOf("abc", "abc"))).toBe("0")
+    expect(showI(lastIndexOf("abc", ""))).toBe("3")
+    expect(showI(lastIndexOf("héllo", "l"))).toBe("4")
+}
+
+test fn contains_predicate() {
+    expect(contains("hello world", "lo w")).toBe(true)
+    expect(contains("hello world", "hello")).toBe(true)
+    expect(contains("hello world", "world!")).toBe(false)
+    expect(contains("", "")).toBe(true)
+    expect(contains("abc", "")).toBe(true)
+}
+
+test fn counts_are_non_overlapping() {
+    expect(countOf("aaaa", "aa")).toBe(2)
+    expect(countOf("aaa", "aa")).toBe(1)
+    expect(countOf("abcabcabc", "abc")).toBe(3)
+    expect(countOf("abc", "z")).toBe(0)
+    expect(countOf("abc", "")).toBe(0)
+    expect(countOf("", "")).toBe(0)
+    expect(countOf("", "a")).toBe(0)
+}
+
+test fn find_all_offsets() {
+    expect(showOffsets(findAll("abcabcabc", "abc"))).toBe("[0, 3, 6]")
+    expect(showOffsets(findAll("aaaa", "aa"))).toBe("[0, 2]")
+    expect(showOffsets(findAll("abc", "z"))).toBe("[]")
+    expect(showOffsets(findAll("abc", ""))).toBe("[]")
+    expect(showOffsets(findAll("héllo héllo", "hé"))).toBe("[0, 7]")
+}
+
+test fn replacing_the_first_match() {
+    expect(replaceFirst("abcabc", "abc", "X")).toBe("Xabc")
+    expect(replaceFirst("abcabc", "bc", "X")).toBe("aXabc")
+    expect(replaceFirst("abcabc", "z", "X")).toBe("abcabc")
+    expect(replaceFirst("abc", "abc", "")).toBe("")
+    expect(replaceFirst("abc", "", "X")).toBe("abc")
+    expect(replaceFirst("héllo", "l", "L")).toBe("héLlo")
+}
+
+test fn replacing_every_match() {
+    expect(replaceAll("abcabc", "abc", "X")).toBe("XX")
+    expect(replaceAll("aaaa", "aa", "b")).toBe("bb")
+    expect(replaceAll("abc", "z", "X")).toBe("abc")
+    expect(replaceAll("abc", "abc", "")).toBe("")
+    expect(replaceAll("abc", "", "X")).toBe("abc")
+    expect(replaceAll("héllo café", "é", "e")).toBe("hello cafe")
+}
+
+test fn removing_all_matches() {
+    expect(removeAll("a-b-c", "-")).toBe("abc")
+    expect(removeAll("aaaa", "aa")).toBe("")
+    expect(removeAll("abc", "z")).toBe("abc")
+    expect(removeAll("abc", "")).toBe("abc")
+}
+
+test fn prefix_and_suffix() {
+    expect(hasPrefix("hello", "he")).toBe(true)
+    expect(hasPrefix("hello", "hello")).toBe(true)
+    expect(hasPrefix("hello", "hellos")).toBe(false)
+    expect(hasPrefix("hello", "")).toBe(true)
+    expect(hasSuffix("hello", "lo")).toBe(true)
+    expect(hasSuffix("hello", "hello")).toBe(true)
+    expect(hasSuffix("hello", "xhello")).toBe(false)
+    expect(hasSuffix("hello", "")).toBe(true)
+    expect(hasSuffix("", "")).toBe(true)
+    expect(hasSuffix("", "a")).toBe(false)
+}
+
+test fn splitting_keeps_empty_fields() {
+    expect(showParts(splitOn("a,b,c", ","))).toBe("[a|b|c]")
+    expect(showParts(splitOn("a,,c", ","))).toBe("[a||c]")
+    expect(showParts(splitOn(",a,", ","))).toBe("[|a|]")
+    expect(showParts(splitOn("abc", ","))).toBe("[abc]")
+    expect(showParts(splitOn("", ","))).toBe("[]")
+    expect(showParts(splitOn("aaa", "aa"))).toBe("[|a]")
+    expect(showParts(splitOn("a--b--c", "--"))).toBe("[a|b|c]")
+}
+
+test fn splitting_with_an_empty_separator() {
+    expect(showParts(splitOn("abc", ""))).toBe("[abc]")
+    expect(showParts(splitOn("", ""))).toBe("[]")
+}
+
+test fn byte_semantics_for_unicode() {
+    let text = "héllo café"
+    expect(showI(indexOf(text, "café"))).toBe("7")
+    expect(countOf(text, "é")).toBe(2)
+    expect(replaceAll(text, "é", "e")).toBe("hello cafe")
+    expect(showParts(splitOn(text, " "))).toBe("[héllo|café]")
+}
+
+test fn replacements_are_not_rescanned() {
+    expect(replaceAll("aaa", "a", "aa")).toBe("aaaaaa")
+    expect(replaceAll("ab", "b", "ba")).toBe("aba")
+    expect(replaceFirst("aaa", "a", "aa")).toBe("aaaa")
+    expect(removeAll("aaa", "a")).toBe("")
+}
+
+test fn a_small_pipeline() {
+    let log = "warn: a; error: b; error: c"
+    expect(countOf(log, "error:")).toBe(2)
+    expect(countOf(log, "warn:")).toBe(1)
+    let no_warn = removeAll(log, "warn: ")
+    expect(no_warn).toBe("a; error: b; error: c")
+    let parts = splitOn(log, "; ")
+    expect(len(parts)).toBe(3)
+    expect(parts[0]).toBe("warn: a")
+    expect(parts[2]).toBe("error: c")
+    expect(hasPrefix(parts[1], "error")).toBe(true)
+    expect(replaceAll(log, "; ", "\n")).toBe("warn: a\nerror: b\nerror: c")
+}

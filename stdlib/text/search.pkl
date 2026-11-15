@@ -1,0 +1,215 @@
+module std.text.search
+
+// Plain substring search and rewriting over UTF-8 strings.
+//
+// Everything here works on bytes, so a match is a byte-for-byte match: a
+// needle that starts or ends inside a multi-byte sequence simply does not
+// match at that position. Searching a non-ASCII needle that is itself valid
+// UTF-8 therefore behaves as expected, while malformed needles are treated as
+// opaque bytes.
+//
+// `indexOf` returns the first byte offset (or `none`); an empty needle matches
+// at offset `0`. `lastIndexOf` returns the last offset (or `none`) and treats
+// an empty needle as matching at the end of the text. `countOf` and `findAll`
+// scan non-overlapping matches, so `"aaaa"` contains two `"aa"` matches.
+// `replaceAll` also replaces non-overlapping matches and never rescans the
+// replacement text; `replaceFirst` rewrites only the first match.
+// `removeAll` is `replaceAll` with an empty replacement.
+//
+// An empty needle is not a searchable pattern for `countOf`/`findAll`/
+// `replaceAll` (there are too many valid answers); those return `0`, an empty
+// list, or the original text. `splitOn` keeps empty fields and, for an empty
+// separator, returns a one-element list holding the whole text.
+
+import { StringBuilder } from std.text.stringbuilder
+
+/// The bytes `bs[lo..hi)` as a string.
+fn sliceOf(bs: List<byte>, lo: int, hi: int) -> string {
+    let out = bytes("")
+    var i = lo
+    while (i < hi) {
+        out.push(bs[i])
+        i = i + 1
+    }
+    str(out)
+}
+
+/// Whether `needle` matches `text` at byte offset `at`.
+fn matchAt(bs: List<byte>, needle: List<byte>, at: int) -> bool {
+    if (at < 0 || at + len(needle) > len(bs)) {
+        return false
+    }
+    var i = 0
+    while (i < len(needle)) {
+        if (bs[at + i] != needle[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+/// The first byte offset of `needle`, or `none`; an empty needle matches at 0.
+fn indexOf(text: string, needle: string) -> int? {
+    let bs = bytes(text)
+    let nd = bytes(needle)
+    if (len(nd) == 0) {
+        return 0
+    }
+    var i = 0
+    while (i + len(nd) <= len(bs)) {
+        if (matchAt(bs, nd, i)) {
+            return i
+        }
+        i = i + 1
+    }
+    none
+}
+
+/// The last byte offset of `needle`, or `none`; an empty needle matches at the
+/// end of the text.
+fn lastIndexOf(text: string, needle: string) -> int? {
+    let bs = bytes(text)
+    let nd = bytes(needle)
+    if (len(nd) == 0) {
+        return len(bs)
+    }
+    var i = len(bs) - len(nd)
+    while (i >= 0) {
+        if (matchAt(bs, nd, i)) {
+            return i
+        }
+        i = i - 1
+    }
+    none
+}
+
+/// Whether `needle` occurs in `text`.
+fn contains(text: string, needle: string) -> bool {
+    match (indexOf(text, needle)) {
+    case some(_) -> true
+    case none -> false
+    }
+}
+
+/// The number of non-overlapping matches of `needle` (`0` for an empty needle).
+fn countOf(text: string, needle: string) -> int {
+    let bs = bytes(text)
+    let nd = bytes(needle)
+    if (len(nd) == 0) {
+        return 0
+    }
+    var count = 0
+    var i = 0
+    while (i + len(nd) <= len(bs)) {
+        if (matchAt(bs, nd, i)) {
+            count = count + 1
+            i = i + len(nd)
+        } else {
+            i = i + 1
+        }
+    }
+    count
+}
+
+/// The start offsets of every non-overlapping match, ascending.
+fn findAll(text: string, needle: string) -> List<int> {
+    var out: List<int> = [0]
+    out.remove(0)
+    let bs = bytes(text)
+    let nd = bytes(needle)
+    if (len(nd) == 0) {
+        return out
+    }
+    var i = 0
+    while (i + len(nd) <= len(bs)) {
+        if (matchAt(bs, nd, i)) {
+            out.push(i)
+            i = i + len(nd)
+        } else {
+            i = i + 1
+        }
+    }
+    out
+}
+
+/// `text` with the first occurrence of `needle` replaced by `replacement`
+/// (an empty needle leaves the text unchanged).
+fn replaceFirst(text: string, needle: string, replacement: string) -> string {
+    if (len(bytes(needle)) == 0) {
+        return text
+    }
+    if (let some(at) = indexOf(text, needle)) {
+        let bs = bytes(text)
+        return sliceOf(bs, 0, at) + replacement + sliceOf(bs, at + len(bytes(needle)), len(bs))
+    }
+    text
+}
+
+/// `text` with every non-overlapping occurrence of `needle` replaced (an empty
+/// needle leaves the text unchanged).
+fn replaceAll(text: string, needle: string, replacement: string) -> string {
+    let bs = bytes(text)
+    let nd = bytes(needle)
+    if (len(nd) == 0) {
+        return text
+    }
+    let sb = StringBuilder()
+    var i = 0
+    while (i < len(bs)) {
+        if (matchAt(bs, nd, i)) {
+            sb.append(replacement)
+            i = i + len(nd)
+        } else {
+            sb.appendByte(bs[i])
+            i = i + 1
+        }
+    }
+    sb.toString()
+}
+
+/// `text` with every non-overlapping occurrence of `needle` removed.
+fn removeAll(text: string, needle: string) -> string {
+    replaceAll(text, needle, "")
+}
+
+/// Whether `text` starts with `prefix` (an empty prefix always matches).
+fn hasPrefix(text: string, prefix: string) -> bool {
+    matchAt(bytes(text), bytes(prefix), 0)
+}
+
+/// Whether `text` ends with `suffix` (an empty suffix always matches).
+fn hasSuffix(text: string, suffix: string) -> bool {
+    let bs = bytes(text)
+    let sf = bytes(suffix)
+    if (len(sf) > len(bs)) {
+        return false
+    }
+    matchAt(bs, sf, len(bs) - len(sf))
+}
+
+/// `text` split at every non-overlapping occurrence of `separator`, keeping
+/// empty fields; an empty separator returns a one-element list.
+fn splitOn(text: string, separator: string) -> List<string> {
+    var out: List<string> = [""]
+    out.remove(0)
+    let bs = bytes(text)
+    let sep = bytes(separator)
+    if (len(sep) == 0) {
+        out.push(text)
+        return out
+    }
+    var start = 0
+    var i = 0
+    while (i + len(sep) <= len(bs)) {
+        if (matchAt(bs, sep, i)) {
+            out.push(sliceOf(bs, start, i))
+            i = i + len(sep)
+            start = i
+        } else {
+            i = i + 1
+        }
+    }
+    out.push(sliceOf(bs, start, len(bs)))
+    out
+}
