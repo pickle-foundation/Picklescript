@@ -1,0 +1,251 @@
+module std.math.radix
+
+// Positional numeral systems for `int`: conversion to and from any base from 2
+// to 36, prefixed literal parsing, and digit counting.
+//
+// Digits above 9 are letters, upper or lower case on input and lower case on
+// output (`toBaseUpper` renders them in upper case). Negative numbers carry a
+// leading `-`; everything else is unsigned text.
+//
+// Conversion is exact integer arithmetic, so results are identical across
+// implementations. The only limitation is the width of `int`: parsing a value
+// that does not fit, or expanding one whose digits overflow, is not detected.
+// `fromBase` rejects an empty string, a lone `-`, and any character outside the
+// base, and `digitCount`/`bitLength` work on the magnitude of the input.
+
+import { StringBuilder } from std.text.stringbuilder
+
+const DIGITS: string = "0123456789abcdefghijklmnopqrstuvwxyz"
+const DIGITS_UPPER: string = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+/// Whether `base` is a supported radix (2 through 36).
+fn validBase(base: int) -> bool {
+    base >= 2 && base <= 36
+}
+
+/// The value of a digit character, upper or lower case; `-1` when it is not a
+/// digit.
+fn digitValue(cp: int) -> int {
+    if (cp >= 48 && cp <= 57) {
+        return cp - 48
+    }
+    if (cp >= 97 && cp <= 122) {
+        return cp - 97 + 10
+    }
+    if (cp >= 65 && cp <= 90) {
+        return cp - 65 + 10
+    }
+    0 - 1
+}
+
+/// The magnitude of `n` as digits in `base`, least significant first.
+fn magnitudeDigits(n: int, base: int) -> List<int> {
+    var x = n
+    if (x < 0) {
+        x = 0 - x
+    }
+    var out: List<int> = [0]
+    out.remove(0)
+    if (x == 0) {
+        out.push(0)
+        return out
+    }
+    while (x > 0) {
+        out.push(x % base)
+        x = x / base
+    }
+    out
+}
+
+/// `magnitudeDigits` rendered with `alphabet`, padded with `0` to `width`.
+fn renderDigits(digits: List<int>, alphabet: string, negative: bool, width: int) -> string {
+    let sb = StringBuilder()
+    if (negative) {
+        sb.append("-")
+    }
+    var pad = width - len(digits)
+    while (pad > 0) {
+        sb.appendByte(alphabet[0])
+        pad = pad - 1
+    }
+    var i = len(digits) - 1
+    while (i >= 0) {
+        sb.appendByte(alphabet[digits[i]])
+        i = i - 1
+    }
+    sb.toString()
+}
+
+/// `n` in `base` with lower-case digits; `none` when `base` is outside 2..36.
+fn toBase(n: int, base: int) -> string? {
+    if (!validBase(base)) {
+        return none
+    }
+    renderDigits(magnitudeDigits(n, base), DIGITS, n < 0, 0)
+}
+
+/// `n` in `base` with upper-case digits; `none` when `base` is outside 2..36.
+fn toBaseUpper(n: int, base: int) -> string? {
+    if (!validBase(base)) {
+        return none
+    }
+    renderDigits(magnitudeDigits(n, base), DIGITS_UPPER, n < 0, 0)
+}
+
+/// `n` in `base` padded with leading `0` digits to `width` characters
+/// (excluding the sign); `none` when `base` is outside 2..36.
+fn toBasePadded(n: int, base: int, width: int) -> string? {
+    if (!validBase(base)) {
+        return none
+    }
+    renderDigits(magnitudeDigits(n, base), DIGITS, n < 0, width)
+}
+
+/// The value of `text` read in `base`; `none` when `base` is outside 2..36, the
+/// text is empty or a lone `-`, or a character is not a digit of `base`.
+fn fromBase(text: string, base: int) -> int? {
+    if (!validBase(base)) {
+        return none
+    }
+    let bs = bytes(text)
+    let n = len(bs)
+    if (n == 0) {
+        return none
+    }
+    var i = 0
+    var negative = false
+    if ((bs[0] as int) == 45) {
+        negative = true
+        i = 1
+        if (n == 1) {
+            return none
+        }
+    }
+    var value = 0
+    while (i < n) {
+        let d = digitValue(bs[i] as int)
+        if (d < 0 || d >= base) {
+            return none
+        }
+        value = value * base + d
+        i = i + 1
+    }
+    if (negative) {
+        return 0 - value
+    }
+    value
+}
+
+/// `n` in binary with no prefix and a leading `-` for negative values.
+fn binary(n: int) -> string {
+    match (toBase(n, 2)) {
+    case some(s) -> s
+    case none -> ""
+    }
+}
+
+/// `n` in octal with no prefix and a leading `-` for negative values.
+fn octal(n: int) -> string {
+    match (toBase(n, 8)) {
+    case some(s) -> s
+    case none -> ""
+    }
+}
+
+/// `n` in lower-case hexadecimal with no prefix and a leading `-` for negative
+/// values.
+fn hexOf(n: int) -> string {
+    match (toBase(n, 16)) {
+    case some(s) -> s
+    case none -> ""
+    }
+}
+
+/// The value of a binary literal with no prefix.
+fn fromBinary(text: string) -> int? {
+    fromBase(text, 2)
+}
+
+/// The value of an octal literal with no prefix.
+fn fromOctal(text: string) -> int? {
+    fromBase(text, 8)
+}
+
+/// The value of a hexadecimal literal with no prefix.
+fn fromHex(text: string) -> int? {
+    fromBase(text, 16)
+}
+
+/// Parse a literal with an optional `0b`, `0o`, or `0x` prefix (in either
+/// case), defaulting to base 10; `none` when the digits do not fit the base.
+fn parsePrefixed(text: string) -> int? {
+    let bs = bytes(text)
+    let n = len(bs)
+    if (n == 0) {
+        return none
+    }
+    var negative = false
+    var i = 0
+    if ((bs[0] as int) == 45) {
+        negative = true
+        i = 1
+    }
+    if (n - i < 2 || (bs[i] as int) != 48) {
+        return fromBase(text, 10)
+    }
+    let marker = bs[i + 1] as int
+    var base = 10
+    if (marker == 98 || marker == 66) {
+        base = 2
+    } else if (marker == 111 || marker == 79) {
+        base = 8
+    } else if (marker == 120 || marker == 88) {
+        base = 16
+    } else {
+        return fromBase(text, 10)
+    }
+    let body = fromBase(sliceFrom(bs, i + 2), base)
+    if (let some(v) = body) {
+        if (negative) {
+            return 0 - v
+        }
+        v
+    } else {
+        none
+    }
+}
+
+/// The bytes `bs[lo..]` as a string.
+fn sliceFrom(bs: List<byte>, lo: int) -> string {
+    let out = bytes("")
+    var i = lo
+    while (i < len(bs)) {
+        out.push(bs[i])
+        i = i + 1
+    }
+    str(out)
+}
+
+/// The number of digits `n` needs in `base`, ignoring the sign (`0` needs one
+/// digit); `none` when `base` is outside 2..36.
+fn digitCount(n: int, base: int) -> int? {
+    if (!validBase(base)) {
+        return none
+    }
+    len(magnitudeDigits(n, base))
+}
+
+/// The number of binary digits in the magnitude of `n` (0 for 0, so
+/// `bitLength(0) == 0`).
+fn bitLength(n: int) -> int {
+    var x = n
+    if (x < 0) {
+        x = 0 - x
+    }
+    var bits = 0
+    while (x > 0) {
+        bits = bits + 1
+        x = x / 2
+    }
+    bits
+}
