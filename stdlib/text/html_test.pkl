@@ -1,0 +1,144 @@
+module std.text.html_test
+
+import { escape, unescape, isEscaped, stripTags } from std.text.html
+
+/// A byte list rendered as `65,66,` (empty for no bytes).
+fn showBytes(xs: List<byte>) -> string {
+    var out = ""
+    var i = 0
+    while (i < len(xs)) {
+        out = out + "{(xs[i] as int)},"
+        i = i + 1
+    }
+    out
+}
+
+/// A decoded string in brackets, or `<none>`.
+fn showS(x: string?) -> string {
+    match (x) {
+    case some(v) -> "[" + v + "]"
+    case none -> "<none>"
+    }
+}
+
+/// The UTF-8 bytes of a decoded string, or `<none>`.
+fn showBytesOf(x: string?) -> string {
+    match (x) {
+    case some(v) -> showBytes(bytes(v))
+    case none -> "<none>"
+    }
+}
+
+test fn escaping_special_characters() {
+    expect(escape("a<b&c>d\"e'f")).toBe("a&lt;b&amp;c&gt;d&quot;e&#39;f")
+    expect(escape("<")).toBe("&lt;")
+    expect(escape(">")).toBe("&gt;")
+    expect(escape("&")).toBe("&amp;")
+    expect(escape("\"")).toBe("&quot;")
+    expect(escape("'")).toBe("&#39;")
+}
+
+test fn escaping_leaves_ordinary_text_alone() {
+    expect(escape("")).toBe("")
+    expect(escape("plain text")).toBe("plain text")
+    expect(escape("héllo café")).toBe("héllo café")
+    expect(escape("tab\there\nline")).toBe("tab\there\nline")
+}
+
+test fn escaping_is_not_idempotent() {
+    expect(escape("&amp;")).toBe("&amp;amp;")
+    expect(escape(escape("<b>"))).toBe("&amp;lt;b&amp;gt;")
+}
+
+test fn decoding_named_entities() {
+    expect(showS(unescape("&amp;"))).toBe("[&]")
+    expect(showS(unescape("&lt;"))).toBe("[<]")
+    expect(showS(unescape("&gt;"))).toBe("[>]")
+    expect(showS(unescape("&quot;"))).toBe("[\"]")
+    expect(showS(unescape("&apos;"))).toBe("[']")
+    expect(showS(unescape("a&amp;b&lt;c"))).toBe("[a&b<c]")
+    expect(showBytesOf(unescape("&nbsp;"))).toBe("194,160,")
+}
+
+test fn decoding_numeric_entities() {
+    expect(showS(unescape("&#65;"))).toBe("[A]")
+    expect(showS(unescape("&#x42;"))).toBe("[B]")
+    expect(showS(unescape("&#X43;"))).toBe("[C]")
+    expect(showS(unescape("&#65;&#x42;&#67;"))).toBe("[ABC]")
+    expect(showBytesOf(unescape("&#233;"))).toBe("195,169,")
+    expect(showBytesOf(unescape("&#128512;"))).toBe("240,159,152,128,")
+    expect(showBytesOf(unescape("&#160;"))).toBe("194,160,")
+}
+
+test fn unicode_survives_both_directions() {
+    let text = "héllo — café ☕"
+    expect(showS(unescape(escape(text)))).toBe("[héllo — café ☕]")
+    expect(showBytesOf(unescape("&#x2603;"))).toBe("226,152,131,")
+}
+
+test fn escaping_round_trips() {
+    let samples = ["", "plain", "a<b", "a&b", "quotes: \"double\" and 'single'", "mixed <a href=\"x\"> & 'stuff'", "héllo & <café>"]
+    var i = 0
+    while (i < len(samples)) {
+        expect(showS(unescape(escape(samples[i])))).toBe("[" + samples[i] + "]")
+        i = i + 1
+    }
+}
+
+test fn malformed_entities_are_rejected() {
+    expect(showS(unescape("&"))).toBe("<none>")
+    expect(showS(unescape("&;"))).toBe("<none>")
+    expect(showS(unescape("&amp"))).toBe("<none>")
+    expect(showS(unescape("&unknown;"))).toBe("<none>")
+    expect(showS(unescape("&ampx;"))).toBe("<none>")
+    expect(showS(unescape("&#"))).toBe("<none>")
+    expect(showS(unescape("&#;"))).toBe("<none>")
+    expect(showS(unescape("&#x;"))).toBe("<none>")
+    expect(showS(unescape("&#xZZ;"))).toBe("<none>")
+    expect(showS(unescape("&#12x;"))).toBe("<none>")
+    expect(showS(unescape("a & b"))).toBe("<none>")
+    expect(showS(unescape("&averylongentitynamethatneverends"))).toBe("<none>")
+}
+
+test fn out_of_range_code_points_are_rejected() {
+    expect(showS(unescape("&#x110000;"))).toBe("<none>")
+    expect(showS(unescape("&#1114112;"))).toBe("<none>")
+    expect(showS(unescape("&#55296;"))).toBe("<none>")
+    expect(showS(unescape("&#xDFFF;"))).toBe("<none>")
+    expect(showS(unescape("&#999999999999999999999;"))).toBe("<none>")
+}
+
+test fn entity_predicate() {
+    expect(isEscaped("&amp;")).toBe(true)
+    expect(isEscaped("plain")).toBe(true)
+    expect(isEscaped("&#65;")).toBe(true)
+    expect(isEscaped("&nope;")).toBe(false)
+    expect(isEscaped("&amp")).toBe(false)
+}
+
+test fn stripping_tags() {
+    expect(stripTags("<p>Hello <b>world</b></p>")).toBe("Hello world")
+    expect(stripTags("<p></p>")).toBe("")
+    expect(stripTags("<<>>")).toBe(">")
+    expect(stripTags("no tags")).toBe("no tags")
+    expect(stripTags("<a>text")).toBe("text")
+    expect(stripTags("text<a>")).toBe("text")
+    expect(stripTags("<b>bold</b> tail")).toBe("bold tail")
+    expect(stripTags("a < b")).toBe("a < b")
+    expect(stripTags("a <b")).toBe("a <b")
+    expect(stripTags("héllo <i>café</i>")).toBe("héllo café")
+}
+
+test fn tag_stripping_is_textual_not_a_parser() {
+    expect(stripTags("<a href=\"x>y\">z")).toBe("y\">z")
+    expect(stripTags("<!-- comment -->kept")).toBe("kept")
+}
+
+test fn a_small_markup_pipeline() {
+    let snippet = "<p>Fish &amp; chips</p>"
+    expect(stripTags(snippet)).toBe("Fish &amp; chips")
+    expect(showS(unescape(stripTags(snippet)))).toBe("[Fish & chips]")
+    let raw = "5 < 6 & 7 > 6"
+    expect(escape(raw)).toBe("5 &lt; 6 &amp; 7 &gt; 6")
+    expect(showS(unescape(escape(raw)))).toBe("[5 < 6 & 7 > 6]")
+}

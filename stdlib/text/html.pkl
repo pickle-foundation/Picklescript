@@ -1,0 +1,192 @@
+module std.text.html
+
+// HTML text escaping, entity decoding, and tag stripping.
+//
+// `escape` replaces the five characters that matter in HTML text and attribute
+// values: `&`, `<`, `>`, `"`, and `'`. The ampersand is replaced first, so
+// escaping is not idempotent - `&amp;` becomes `&amp;amp;`. Every other byte is
+// copied through unchanged, so UTF-8 text survives untouched.
+//
+// `unescape` is the inverse for the named entities `amp`, `lt`, `gt`, `quot`,
+// `apos`, and `nbsp`, plus numeric `&#NN;` (decimal) and `&#xHH;` (hex)
+// references. Numeric references are validated as Unicode scalars (no
+// surrogates, at most `U+10FFFF`) and encoded to UTF-8. An entity that is
+// unknown, empty, unterminated, or malformed makes the whole call return
+// `none` rather than leaving a half-decoded string.
+//
+// `stripTags` removes every `<...>` span, leaving the text between tags. A `<`
+// with no later `>` is kept literally, so HTML with an unterminated tag is not
+// silently truncated. This is a textual filter, not a parser: it does not
+// understand comments, quoted attributes, or CDATA, and it does not collapse
+// whitespace.
+
+import { StringBuilder } from std.text.stringbuilder
+import { encodeCpStr, isScalar } from std.text.utf8
+
+/// `text` with `&`, `<`, `>`, `"`, and `'` replaced by HTML entities.
+fn escape(text: string) -> string {
+    let bs = bytes(text)
+    let sb = StringBuilder()
+    var i = 0
+    while (i < len(bs)) {
+        let b = bs[i]
+        if (b == 38) {
+            sb.append("&amp;")
+        } else if (b == 60) {
+            sb.append("&lt;")
+        } else if (b == 62) {
+            sb.append("&gt;")
+        } else if (b == 34) {
+            sb.append("&quot;")
+        } else if (b == 39) {
+            sb.append("&#39;")
+        } else {
+            sb.appendByte(b)
+        }
+        i = i + 1
+    }
+    sb.toString()
+}
+
+/// The bytes `bs[lo..hi)` as a string.
+fn sliceOf(bs: List<byte>, lo: int, hi: int) -> string {
+    let out = bytes("")
+    var i = lo
+    while (i < hi) {
+        out.push(bs[i])
+        i = i + 1
+    }
+    str(out)
+}
+
+/// The decimal or hex number in `bs[lo..hi)`, or `-1` when it is invalid or
+/// beyond `0x10FFFF`.
+fn parseNumber(bs: List<byte>, lo: int, hi: int, radix: int) -> int {
+    if (lo >= hi) {
+        return -1
+    }
+    var value = 0
+    var i = lo
+    while (i < hi) {
+        let b = bs[i]
+        var digit = -1
+        if (b >= 48 && b <= 57) {
+            digit = (b as int) - 48
+        } else if (radix == 16 && b >= 97 && b <= 102) {
+            digit = (b as int) - 97 + 10
+        } else if (radix == 16 && b >= 65 && b <= 70) {
+            digit = (b as int) - 65 + 10
+        }
+        if (digit < 0 || digit >= radix) {
+            return -1
+        }
+        value = value * radix + digit
+        if (value > 0x10FFFF) {
+            return -1
+        }
+        i = i + 1
+    }
+    value
+}
+
+/// The text for entity body `body` (without `&` and `;`), or `none`.
+fn decodeBody(bs: List<byte>, lo: int, hi: int) -> string? {
+    if (lo >= hi) {
+        return none
+    }
+    if (bs[lo] == 35) {
+        if (hi - lo >= 2 && (bs[lo + 1] == 120 || bs[lo + 1] == 88)) {
+            let cp = parseNumber(bs, lo + 2, hi, 16)
+            if (cp < 0 || !isScalar(cp)) {
+                return none
+            }
+            return encodeCpStr(cp)
+        }
+        let cp = parseNumber(bs, lo + 1, hi, 10)
+        if (cp < 0 || !isScalar(cp)) {
+            return none
+        }
+        return encodeCpStr(cp)
+    }
+    let body = sliceOf(bs, lo, hi)
+    if (body == "amp") {
+        return "&"
+    }
+    if (body == "lt") {
+        return "<"
+    }
+    if (body == "gt") {
+        return ">"
+    }
+    if (body == "quot") {
+        return "\""
+    }
+    if (body == "apos") {
+        return "'"
+    }
+    if (body == "nbsp") {
+        return encodeCpStr(160)
+    }
+    none
+}
+
+/// `text` with HTML entities decoded, or `none` when any entity is malformed.
+fn unescape(text: string) -> string? {
+    let bs = bytes(text)
+    let sb = StringBuilder()
+    var i = 0
+    while (i < len(bs)) {
+        if (bs[i] != 38) {
+            sb.appendByte(bs[i])
+            i = i + 1
+        } else {
+            var j = i + 1
+            while (j < len(bs) && bs[j] != 59 && j - i <= 32) {
+                j = j + 1
+            }
+            if (j >= len(bs) || bs[j] != 59) {
+                return none
+            }
+            if (let some(decoded) = decodeBody(bs, i + 1, j)) {
+                sb.append(decoded)
+            } else {
+                return none
+            }
+            i = j + 1
+        }
+    }
+    sb.toString()
+}
+
+/// Whether `text` decodes cleanly with `unescape`.
+fn isEscaped(text: string) -> bool {
+    match (unescape(text)) {
+    case some(_) -> true
+    case none -> false
+    }
+}
+
+/// `text` with every `<...>` span removed; an unterminated `<` is kept.
+fn stripTags(text: string) -> string {
+    let bs = bytes(text)
+    let sb = StringBuilder()
+    var i = 0
+    while (i < len(bs)) {
+        if (bs[i] == 60) {
+            var j = i + 1
+            while (j < len(bs) && bs[j] != 62) {
+                j = j + 1
+            }
+            if (j < len(bs)) {
+                i = j + 1
+            } else {
+                sb.appendByte(60 as byte)
+                i = i + 1
+            }
+        } else {
+            sb.appendByte(bs[i])
+            i = i + 1
+        }
+    }
+    sb.toString()
+}
