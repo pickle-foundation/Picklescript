@@ -1,0 +1,284 @@
+module std.math.polynomial
+
+// Polynomials with `int` coefficients.
+//
+// A polynomial is a `List<int>` in ascending degree order: index `i` holds the
+// coefficient of `x^i`. The canonical form trims trailing zero coefficients, so
+// the zero polynomial is the empty list, `degree(zero) == -1`, and two
+// polynomials are equal exactly when their lists are equal. Every operation
+// returns a new list and never mutates its inputs.
+//
+// Arithmetic is exact integer arithmetic, so results are identical across
+// implementations. `int` overflow is documented, not detected. Rendering uses
+// descending order (`3x^2 - 2x + 1`), omits a coefficient of `1` on a
+// non-constant term, and prints `x` rather than `x^1`.
+
+import { StringBuilder } from std.text.stringbuilder
+
+/// The zero polynomial.
+fn zero() -> List<int> {
+    var out: List<int> = [0]
+    out.remove(0)
+    out
+}
+
+/// The constant polynomial `1`.
+fn one() -> List<int> {
+    var out: List<int> = [0]
+    out.remove(0)
+    out.push(1)
+    out
+}
+
+/// The constant polynomial `c` (the zero list when `c == 0`).
+fn constant(c: int) -> List<int> {
+    var out: List<int> = [0]
+    out.remove(0)
+    if (c != 0) {
+        out.push(c)
+    }
+    out
+}
+
+/// Drop trailing zero coefficients from `p`.
+fn trim(p: List<int>) -> List<int> {
+    var n = len(p)
+    while (n > 0) {
+        if (p[n - 1] != 0) {
+            break
+        }
+        n = n - 1
+    }
+    if (n == len(p)) {
+        return p
+    }
+    var out: List<int> = [0]
+    out.remove(0)
+    var i = 0
+    while (i < n) {
+        out.push(p[i])
+        i = i + 1
+    }
+    out
+}
+
+/// A polynomial from ascending-degree coefficients, canonicalized.
+fn of(values: List<int>) -> List<int> {
+    var out: List<int> = [0]
+    out.remove(0)
+    var i = 0
+    while (i < len(values)) {
+        out.push(values[i])
+        i = i + 1
+    }
+    trim(out)
+}
+
+/// `c * x^degree`.
+fn monomial(c: int, degree: int) -> List<int> {
+    var out: List<int> = [0]
+    out.remove(0)
+    if (c == 0 || degree < 0) {
+        return out
+    }
+    var i = 0
+    while (i < degree) {
+        out.push(0)
+        i = i + 1
+    }
+    out.push(c)
+    out
+}
+
+/// The highest exponent with a non-zero coefficient (`-1` for zero).
+fn degree(p: List<int>) -> int {
+    len(p) - 1
+}
+
+/// The coefficient of `x^i` (`0` outside the list).
+fn coeffAt(p: List<int>, i: int) -> int {
+    if (i < 0 || i >= len(p)) {
+        return 0
+    }
+    p[i]
+}
+
+/// The coefficient of the highest term (`0` for zero).
+fn leading(p: List<int>) -> int {
+    coeffAt(p, len(p) - 1)
+}
+
+/// Whether `p` is the zero polynomial.
+fn isZero(p: List<int>) -> bool {
+    len(p) == 0
+}
+
+/// `a + b`.
+fn add(a: List<int>, b: List<int>) -> List<int> {
+    let n = max(len(a), len(b))
+    var out: List<int> = [0]
+    out.remove(0)
+    var i = 0
+    while (i < n) {
+        out.push(coeffAt(a, i) + coeffAt(b, i))
+        i = i + 1
+    }
+    trim(out)
+}
+
+/// `a - b`.
+fn sub(a: List<int>, b: List<int>) -> List<int> {
+    let n = max(len(a), len(b))
+    var out: List<int> = [0]
+    out.remove(0)
+    var i = 0
+    while (i < n) {
+        out.push(coeffAt(a, i) - coeffAt(b, i))
+        i = i + 1
+    }
+    trim(out)
+}
+
+/// `-a`.
+fn neg(a: List<int>) -> List<int> {
+    scale(a, 0 - 1)
+}
+
+/// `a * k`.
+fn scale(a: List<int>, k: int) -> List<int> {
+    if (k == 0) {
+        return zero()
+    }
+    var out: List<int> = [0]
+    out.remove(0)
+    var i = 0
+    while (i < len(a)) {
+        out.push(a[i] * k)
+        i = i + 1
+    }
+    trim(out)
+}
+
+/// `a * b`.
+fn mul(a: List<int>, b: List<int>) -> List<int> {
+    if (len(a) == 0 || len(b) == 0) {
+        return zero()
+    }
+    let n = len(a) + len(b) - 1
+    var out: List<int> = [0]
+    out.remove(0)
+    var k = 0
+    while (k < n) {
+        out.push(0)
+        k = k + 1
+    }
+    var i = 0
+    while (i < len(a)) {
+        var j = 0
+        while (j < len(b)) {
+            out[i + j] = out[i + j] + a[i] * b[j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    trim(out)
+}
+
+/// `p(x)` by Horner's rule.
+fn evaluate(p: List<int>, x: int) -> int {
+    var acc = 0
+    var i = len(p) - 1
+    while (i >= 0) {
+        acc = acc * x + p[i]
+        i = i - 1
+    }
+    acc
+}
+
+/// The formal derivative.
+fn derivative(p: List<int>) -> List<int> {
+    var out: List<int> = [0]
+    out.remove(0)
+    var i = 1
+    while (i < len(p)) {
+        out.push(p[i] * i)
+        i = i + 1
+    }
+    trim(out)
+}
+
+/// `(x - r0) * (x - r1) * ...` (the monic polynomial with these roots).
+fn fromRoots(roots: List<int>) -> List<int> {
+    var acc = one()
+    var i = 0
+    while (i < len(roots)) {
+        var factor: List<int> = [0]
+        factor.remove(0)
+        factor.push(0 - roots[i])
+        factor.push(1)
+        acc = mul(acc, factor)
+        i = i + 1
+    }
+    acc
+}
+
+/// Whether `a` and `b` have the same canonical coefficients.
+fn equals(a: List<int>, b: List<int>) -> bool {
+    if (len(a) != len(b)) {
+        return false
+    }
+    var i = 0
+    while (i < len(a)) {
+        if (a[i] != b[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+/// The absolute value of `c`.
+fn absOf(c: int) -> int {
+    if (c < 0) {
+        return 0 - c
+    }
+    c
+}
+
+/// `p` in descending order (`"0"` for the zero polynomial).
+fn render(p: List<int>) -> string {
+    if (len(p) == 0) {
+        return "0"
+    }
+    let sb = StringBuilder()
+    var first = true
+    var i = len(p) - 1
+    while (i >= 0) {
+        let c = p[i]
+        if (c != 0) {
+            let negative = c < 0
+            let mag = absOf(c)
+            if (!first) {
+                if (negative) {
+                    sb.append(" - ")
+                } else {
+                    sb.append(" + ")
+                }
+            } else if (negative) {
+                sb.append("-")
+            }
+            if (mag != 1 || i == 0) {
+                sb.appendInt(mag)
+            }
+            if (i == 1) {
+                sb.append("x")
+            } else if (i > 1) {
+                sb.append("x^")
+                sb.appendInt(i)
+            }
+            first = false
+        }
+        i = i - 1
+    }
+    sb.toString()
+}
