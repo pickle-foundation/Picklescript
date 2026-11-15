@@ -1,0 +1,380 @@
+module std.encoding.xml
+
+// XML text helpers: escaping, entity decoding, name checks, attribute
+// scanning, and element markup.
+//
+// `escapeText` escapes the three markup characters (`&`, `<`, `>`) and
+// `escapeAttr` also escapes both quote characters, so a value can sit inside
+// double or single quotes. `unescape` recognizes the five predefined entities
+// (`amp`, `lt`, `gt`, `quot`, `apos`) plus decimal (`&#65;`) and hexadecimal
+// (`&#x41;`) character references. It is lenient: an unknown entity name, a
+// malformed or out-of-range character reference, or a `&` with no terminating
+// `;` is copied through literally, so round-tripping arbitrary text never
+// loses data.
+//
+// Names are checked with an ASCII rule: the first byte must be a letter, `_`,
+// `:`, or a byte >= 0x80; the rest may also contain digits, `-`, and `.`.
+// Those bytes are the ones this module treats as name characters; full XML
+// name validation follows the Unicode tables, which this module does not
+// ship.
+//
+// `parseAttributes` scans the inside of a start tag (the part after the
+// element name) into name/value pairs with entity decoding applied to values,
+// returning `none` for a missing `=`, an unquoted value, an unterminated
+// quote, an invalid name, or a duplicate name. `renderAttributes` produces
+// the canonical double-quoted form. `element` and `selfClosingElement` build
+// markup from a name, attributes, and inner text; they assume the name and
+// attribute names are already valid.
+
+import { StringBuilder } from std.text.stringbuilder
+import { encodeCpStr } from std.text.utf8
+
+/// An attribute name/value pair.
+class Attribute {
+    var name: string
+    var value: string
+
+    constructor(name: string, value: string) {
+        this.name = name
+        this.value = value
+    }
+}
+
+/// A typed empty attribute list.
+fn emptyAttributes() -> List<Attribute> {
+    var out: List<Attribute> = [Attribute("", "")]
+    out.remove(0)
+    out
+}
+
+/// Escape `&`, `<`, and `>` in text content.
+fn escapeText(text: string) -> string {
+    let sb = StringBuilder()
+    let bs = bytes(text)
+    var i = 0
+    while (i < len(bs)) {
+        let b = bs[i] as int
+        if (b == 38) {
+            sb.append("&amp;")
+        } else if (b == 60) {
+            sb.append("&lt;")
+        } else if (b == 62) {
+            sb.append("&gt;")
+        } else {
+            sb.appendByte(bs[i])
+        }
+        i = i + 1
+    }
+    sb.toString()
+}
+
+/// Escape `&`, `<`, `>`, `"`, and `'` in an attribute value.
+fn escapeAttr(text: string) -> string {
+    let sb = StringBuilder()
+    let bs = bytes(text)
+    var i = 0
+    while (i < len(bs)) {
+        let b = bs[i] as int
+        if (b == 38) {
+            sb.append("&amp;")
+        } else if (b == 60) {
+            sb.append("&lt;")
+        } else if (b == 62) {
+            sb.append("&gt;")
+        } else if (b == 34) {
+            sb.append("&quot;")
+        } else if (b == 39) {
+            sb.append("&apos;")
+        } else {
+            sb.appendByte(bs[i])
+        }
+        i = i + 1
+    }
+    sb.toString()
+}
+
+/// The bytes `bs[lo..hi)` as a string.
+fn sliceOf(bs: List<byte>, lo: int, hi: int) -> string {
+    let out = bytes("")
+    var i = lo
+    while (i < hi) {
+        out.push(bs[i])
+        i = i + 1
+    }
+    str(out)
+}
+
+/// The numeric value of one hexadecimal digit, or `-1`.
+fn hexDigitValue(cp: int) -> int {
+    if (cp >= 48 && cp <= 57) {
+        return cp - 48
+    }
+    if (cp >= 97 && cp <= 102) {
+        return cp - 97 + 10
+    }
+    if (cp >= 65 && cp <= 70) {
+        return cp - 65 + 10
+    }
+    0 - 1
+}
+
+/// Whether `cp` is a Unicode scalar value that can be encoded as UTF-8.
+fn isScalar(cp: int) -> bool {
+    if (cp <= 0) {
+        return false
+    }
+    if (cp > 1114111) {
+        return false
+    }
+    !(cp >= 55296 && cp <= 57343)
+}
+
+/// The replacement for a numeric character reference body (no `#`), or `none`.
+fn numericReference(body: string) -> string? {
+    let bs = bytes(body)
+    if (len(bs) == 0) {
+        return none
+    }
+    var hex = false
+    var start = 0
+    let first = bs[0] as int
+    if (first == 120 || first == 88) {
+        hex = true
+        start = 1
+        if (len(bs) == 1) {
+            return none
+        }
+    }
+    var value = 0
+    var i = start
+    while (i < len(bs)) {
+        let d = hexDigitValue(bs[i] as int)
+        if (d < 0) {
+            return none
+        }
+        if (hex) {
+            value = value * 16 + d
+        } else {
+            value = value * 10 + d
+        }
+        i = i + 1
+    }
+    if (!isScalar(value)) {
+        return none
+    }
+    encodeCpStr(value)
+}
+
+/// The replacement for an entity body (the text between `&` and `;`), or
+/// `none` for an unknown or malformed reference.
+fn entityValue(body: string) -> string? {
+    if (body == "amp") {
+        return "&"
+    }
+    if (body == "lt") {
+        return "<"
+    }
+    if (body == "gt") {
+        return ">"
+    }
+    if (body == "quot") {
+        return "\""
+    }
+    if (body == "apos") {
+        return "'"
+    }
+    let bs = bytes(body)
+    if (len(bs) > 0 && (bs[0] as int) == 35) {
+        return numericReference(sliceOf(bs, 1, len(bs)))
+    }
+    none
+}
+
+/// Decode the entities and character references in `text`; unknown or
+/// malformed references are kept literally.
+fn unescape(text: string) -> string {
+    let sb = StringBuilder()
+    let bs = bytes(text)
+    let n = len(bs)
+    var i = 0
+    while (i < n) {
+        if ((bs[i] as int) != 38) {
+            sb.appendByte(bs[i])
+            i = i + 1
+            continue
+        }
+        var j = i + 1
+        while (j < n && (bs[j] as int) != 59 && j - i <= 32) {
+            j = j + 1
+        }
+        if (j >= n || (bs[j] as int) != 59) {
+            sb.appendByte(bs[i])
+            i = i + 1
+            continue
+        }
+        let body = sliceOf(bs, i + 1, j)
+        if (let some(rep) = entityValue(body)) {
+            sb.append(rep)
+            i = j + 1
+        } else {
+            sb.appendByte(bs[i])
+            i = i + 1
+        }
+    }
+    sb.toString()
+}
+
+/// Whether byte `b` can start an XML name.
+fn isNameStart(b: int) -> bool {
+    if (b >= 128) {
+        return true
+    }
+    if (b >= 65 && b <= 90) {
+        return true
+    }
+    if (b >= 97 && b <= 122) {
+        return true
+    }
+    b == 95 || b == 58
+}
+
+/// Whether byte `b` can continue an XML name.
+fn isNameChar(b: int) -> bool {
+    if (isNameStart(b)) {
+        return true
+    }
+    if (b >= 48 && b <= 57) {
+        return true
+    }
+    b == 45 || b == 46
+}
+
+/// Whether `name` is a non-empty XML name by the ASCII rule above.
+fn isValidName(name: string) -> bool {
+    let bs = bytes(name)
+    if (len(bs) == 0) {
+        return false
+    }
+    if (!isNameStart(bs[0] as int)) {
+        return false
+    }
+    var i = 1
+    while (i < len(bs)) {
+        if (!isNameChar(bs[i] as int)) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+/// Whether byte `b` is XML whitespace (space, tab, CR, LF).
+fn isSpace(b: int) -> bool {
+    b == 32 || b == 9 || b == 13 || b == 10
+}
+
+/// Parse the attribute part of a start tag into name/value pairs (values
+/// entity-decoded); `none` when the text is malformed.
+fn parseAttributes(body: string) -> List<Attribute>? {
+    let bs = bytes(body)
+    let n = len(bs)
+    var out = emptyAttributes()
+    var i = 0
+    while (i < n) {
+        while (i < n && isSpace(bs[i] as int)) {
+            i = i + 1
+        }
+        if (i >= n) {
+            break
+        }
+        let nameStart = i
+        if (!isNameStart(bs[i] as int)) {
+            return none
+        }
+        i = i + 1
+        while (i < n && isNameChar(bs[i] as int)) {
+            i = i + 1
+        }
+        let name = sliceOf(bs, nameStart, i)
+        while (i < n && isSpace(bs[i] as int)) {
+            i = i + 1
+        }
+        if (i >= n || (bs[i] as int) != 61) {
+            return none
+        }
+        i = i + 1
+        while (i < n && isSpace(bs[i] as int)) {
+            i = i + 1
+        }
+        if (i >= n) {
+            return none
+        }
+        let quote = bs[i] as int
+        if (quote != 34 && quote != 39) {
+            return none
+        }
+        i = i + 1
+        let valueStart = i
+        while (i < n && (bs[i] as int) != quote) {
+            i = i + 1
+        }
+        if (i >= n) {
+            return none
+        }
+        let value = sliceOf(bs, valueStart, i)
+        i = i + 1
+        if (hasAttribute(out, name)) {
+            return none
+        }
+        out.push(Attribute(name, unescape(value)))
+    }
+    out
+}
+
+/// Whether `attrs` already contains `name`.
+fn hasAttribute(attrs: List<Attribute>, name: string) -> bool {
+    var i = 0
+    while (i < len(attrs)) {
+        if (attrs[i].name == name) {
+            return true
+        }
+        i = i + 1
+    }
+    false
+}
+
+/// `name="value"` with the value escaped.
+fn renderAttribute(a: Attribute) -> string {
+    let quoted = "\"" + escapeAttr(a.value) + "\""
+    a.name + "=" + quoted
+}
+
+/// The attributes rendered with single spaces and a leading space (empty for
+/// an empty list).
+fn renderAttributes(attrs: List<Attribute>) -> string {
+    if (len(attrs) == 0) {
+        return ""
+    }
+    var out = " "
+    var i = 0
+    while (i < len(attrs)) {
+        if (i > 0) {
+            out = out + " "
+        }
+        out = out + renderAttribute(attrs[i])
+        i = i + 1
+    }
+    out
+}
+
+/// `<name attrs>inner</name>`; the caller supplies valid names.
+fn element(name: string, attrs: List<Attribute>, inner: string) -> string {
+    let open = "<" + name + renderAttributes(attrs) + ">"
+    let close = "</" + name + ">"
+    open + inner + close
+}
+
+/// `<name attrs/>`; the caller supplies valid names.
+fn selfClosingElement(name: string, attrs: List<Attribute>) -> string {
+    "<" + name + renderAttributes(attrs) + "/>"
+}

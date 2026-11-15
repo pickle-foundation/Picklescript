@@ -1,0 +1,196 @@
+module std.encoding.xml_test
+
+import { Attribute, emptyAttributes, escapeText, escapeAttr, unescape, isNameStart, isNameChar, isValidName, parseAttributes, renderAttribute, renderAttributes, element, selfClosingElement } from std.encoding.xml
+
+/// A rendered optional attribute list (`<none>` for `none`).
+fn showAttrs(xs: List<Attribute>?) -> string {
+    match (xs) {
+    case some(list) -> {
+        var out = "["
+        var i = 0
+        while (i < len(list)) {
+            if (i > 0) {
+                out = out + ", "
+            }
+            out = out + renderAttribute(list[i])
+            i = i + 1
+        }
+        out + "]"
+    }
+    case none -> "<none>"
+    }
+}
+
+/// A single attribute list holding one pair.
+fn one(name: string, value: string) -> List<Attribute> {
+    var out = emptyAttributes()
+    out.push(Attribute(name, value))
+    out
+}
+
+test fn escaping_text_content() {
+    expect(escapeText("")).toBe("")
+    expect(escapeText("plain text")).toBe("plain text")
+    expect(escapeText("a < b & c > d")).toBe("a &lt; b &amp; c &gt; d")
+    expect(escapeText("<script>")).toBe("&lt;script&gt;")
+    expect(escapeText("quotes \" and ' stay")).toBe("quotes \" and ' stay")
+}
+
+test fn escaping_attribute_values() {
+    expect(escapeAttr("")).toBe("")
+    expect(escapeAttr("a\"b'c<d>e&f")).toBe("a&quot;b&apos;c&lt;d&gt;e&amp;f")
+    expect(escapeAttr("plain")).toBe("plain")
+}
+
+test fn escaping_is_textual_not_idempotent() {
+    expect(escapeText("&amp;")).toBe("&amp;amp;")
+    expect(escapeAttr("&quot;")).toBe("&amp;quot;")
+}
+
+test fn unescaping_the_predefined_entities() {
+    expect(unescape("&amp;&lt;&gt;&quot;&apos;")).toBe("&<>\"'")
+    expect(unescape("no entities here")).toBe("no entities here")
+    expect(unescape("")).toBe("")
+}
+
+test fn unescaping_character_references() {
+    expect(unescape("&#65;&#x41;")).toBe("AA")
+    expect(unescape("&#233;")).toBe("é")
+    expect(unescape("&#x1F600;")).toBe("😀")
+    expect(unescape("caf&#233;")).toBe("café")
+}
+
+test fn unescaping_keeps_unknown_references_literal() {
+    expect(unescape("&bogus;")).toBe("&bogus;")
+    expect(unescape("&#;")).toBe("&#;")
+    expect(unescape("&#x;")).toBe("&#x;")
+    expect(unescape("&#xZZ;")).toBe("&#xZZ;")
+    expect(unescape("&#0;")).toBe("&#0;")
+    expect(unescape("a & b")).toBe("a & b")
+    expect(unescape("&amp")).toBe("&amp")
+    expect(unescape("&")).toBe("&")
+}
+
+test fn escape_and_unescape_round_trip() {
+    let text = "5 < 6 & \"7\" > '3' café 😀"
+    expect(unescape(escapeText(text))).toBe(text)
+    expect(unescape(escapeAttr(text))).toBe(text)
+}
+
+test fn name_character_classes() {
+    expect(isNameStart(97)).toBe(true)
+    expect(isNameStart(90)).toBe(true)
+    expect(isNameStart(95)).toBe(true)
+    expect(isNameStart(58)).toBe(true)
+    expect(isNameStart(200)).toBe(true)
+    expect(isNameStart(49)).toBe(false)
+    expect(isNameStart(45)).toBe(false)
+    expect(isNameChar(49)).toBe(true)
+    expect(isNameChar(45)).toBe(true)
+    expect(isNameChar(46)).toBe(true)
+    expect(isNameChar(32)).toBe(false)
+    expect(isNameChar(33)).toBe(false)
+}
+
+test fn name_validation() {
+    expect(isValidName("a")).toBe(true)
+    expect(isValidName("a-b.c_d:e")).toBe(true)
+    expect(isValidName("_x")).toBe(true)
+    expect(isValidName(":x")).toBe(true)
+    expect(isValidName("café")).toBe(true)
+    expect(isValidName("x2")).toBe(true)
+    expect(isValidName("")).toBe(false)
+    expect(isValidName("1abc")).toBe(false)
+    expect(isValidName("a b")).toBe(false)
+    expect(isValidName("a!b")).toBe(false)
+    expect(isValidName("a/b")).toBe(false)
+}
+
+test fn attribute_parsing() {
+    expect(showAttrs(parseAttributes("id=\"a\" class='b'"))).toBe("[id=\"a\", class=\"b\"]")
+    expect(showAttrs(parseAttributes("  id = \"a\"   class = 'b'  "))).toBe("[id=\"a\", class=\"b\"]")
+    expect(showAttrs(parseAttributes("count=\"42\""))).toBe("[count=\"42\"]")
+    expect(showAttrs(parseAttributes(""))).toBe("[]")
+    expect(showAttrs(parseAttributes("   \t\n "))).toBe("[]")
+}
+
+test fn attribute_values_decode_entities() {
+    expect(showAttrs(parseAttributes("title=\"a &amp; b\""))).toBe("[title=\"a &amp; b\"]")
+    if (let some(list) = parseAttributes("title=\"a &amp; b\"")) {
+        expect(list[0].value).toBe("a & b")
+    } else {
+        expect(true).toBe(false)
+    }
+    if (let some(list) = parseAttributes("n='&#65;'")) {
+        expect(list[0].value).toBe("A")
+    } else {
+        expect(true).toBe(false)
+    }
+}
+
+test fn attribute_values_preserve_whitespace() {
+    if (let some(list) = parseAttributes("a=\"x  y\"")) {
+        expect(list[0].value).toBe("x  y")
+    } else {
+        expect(true).toBe(false)
+    }
+    if (let some(list) = parseAttributes("a=' spaced '")) {
+        expect(list[0].value).toBe(" spaced ")
+    } else {
+        expect(true).toBe(false)
+    }
+}
+
+test fn attribute_parsing_rejects_malformed_input() {
+    expect(showAttrs(parseAttributes("a"))).toBe("<none>")
+    expect(showAttrs(parseAttributes("a="))).toBe("<none>")
+    expect(showAttrs(parseAttributes("a=b"))).toBe("<none>")
+    expect(showAttrs(parseAttributes("a=\"1"))).toBe("<none>")
+    expect(showAttrs(parseAttributes("=1"))).toBe("<none>")
+    expect(showAttrs(parseAttributes("1a=\"1\""))).toBe("<none>")
+    expect(showAttrs(parseAttributes("a=\"1\" a=\"2\""))).toBe("<none>")
+    expect(showAttrs(parseAttributes("a=\"1\"!"))).toBe("<none>")
+    expect(showAttrs(parseAttributes("a=\"1\" b"))).toBe("<none>")
+}
+
+test fn attributes_render_canonically() {
+    expect(renderAttribute(Attribute("a", "1"))).toBe("a=\"1\"")
+    expect(renderAttribute(Attribute("q", "a\"b"))).toBe("q=\"a&quot;b\"")
+    expect(renderAttributes(emptyAttributes())).toBe("")
+    expect(renderAttributes(one("a", "1"))).toBe(" a=\"1\"")
+    if (let some(list) = parseAttributes("id=\"x\" n='2'")) {
+        expect(renderAttributes(list)).toBe(" id=\"x\" n=\"2\"")
+    } else {
+        expect(true).toBe(false)
+    }
+}
+
+test fn element_markup() {
+    expect(element("p", emptyAttributes(), "hello")).toBe("<p>hello</p>")
+    expect(element("p", one("id", "x"), "hello")).toBe("<p id=\"x\">hello</p>")
+    expect(element("p", emptyAttributes(), escapeText("a < b"))).toBe("<p>a &lt; b</p>")
+    expect(element("empty", emptyAttributes(), "")).toBe("<empty></empty>")
+    expect(element("café", emptyAttributes(), "oui")).toBe("<café>oui</café>")
+}
+
+test fn self_closing_markup() {
+    expect(selfClosingElement("br", emptyAttributes())).toBe("<br/>")
+    expect(selfClosingElement("img", one("src", "a.png"))).toBe("<img src=\"a.png\"/>")
+    expect(selfClosingElement("img", one("alt", "a\"b"))).toBe("<img alt=\"a&quot;b\"/>")
+}
+
+test fn parse_then_render_is_stable() {
+    let src = " id=\"x\" title=\"a &amp; b\" data-n=\"1\""
+    match (parseAttributes(src)) {
+    case some(list) -> expect(renderAttributes(list)).toBe(src)
+    case none -> expect(true).toBe(false)
+    }
+}
+
+test fn attribute_values_are_escaped_on_render() {
+    let text = "a < b & \"c\""
+    let markup = element("t", one("v", text), "")
+    expect(markup).toBe("<t v=\"a &lt; b &amp; &quot;c&quot;\"></t>")
+    let listed = one("v", text)
+    expect(renderAttribute(listed[0])).toBe("v=\"a &lt; b &amp; &quot;c&quot;\"")
+}
