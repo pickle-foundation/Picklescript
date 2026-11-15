@@ -8,12 +8,12 @@ Seeds (see `docs/08-stdlib.md`, office `port/` tracker):
 
 - `text/` — string/byte builder, UTF-8 helpers, format, identifier-case
   conversion (`casing.pkl`), line diffing (`diff.pkl`), word wrapping
-  (`wrap.pkl`), `{name}` templates (`template.pkl`), regular expressions (`regex.pkl`), Unicode scalars, widths, and case mapping (`unicode.pkl`); first seed
+  (`wrap.pkl`), `{name}` templates (`template.pkl`), regular expressions (`regex.pkl`), Unicode scalars, widths, and case mapping (`unicode.pkl`), cell-accurate text tables (`table.pkl`); first seed
   `text/lexer.pkl` (the compiler lexer's scanner; validated at the time on the
   battery — see `tools/diff/port/`). The lexer seed is now legacy: the port's
   flat `pickle/compiler/{lexer,parser,resolve,check,emit}.pkl` slices took
   over lexing/parsing/checking, and this tree is where `std.*`/`runtime.*`
-  seeds live (`text/{utf8,stringbuilder,format,lexer,ccm,casing,diff,wrap,template,regex,unicode}`, `collections/*`,
+  seeds live (`text/{utf8,stringbuilder,format,lexer,ccm,casing,diff,wrap,template,regex,unicode,table}`, `collections/*`,
   `encoding/{base64,csv,hex,url,toml,yaml}`, `math/{basic,random,statistics,interpolation}`, `fs`, `os`, `json`, `io`,
   `logging`, `process`, `test`, `time`, `thread`).
 - `collections/` — `List`/`Map` wrappers plus `Set`, `Multiset`, `Deque`,
