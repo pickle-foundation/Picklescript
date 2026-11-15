@@ -1,0 +1,266 @@
+module std.text.table
+
+import { displayWidth } from std.text.unicode
+
+// Aligned text tables.
+//
+// Column widths are measured in terminal cells, so wide CJK characters and
+// combining marks line up (`std.text.unicode` supplies the width rules). Cells
+// are padded with spaces only; alignment is left, right, or center. Cells must
+// not contain newlines - the renderers treat a cell as one line of text.
+//
+// The widest row decides the column count: a data row with more cells than the
+// header still renders, and short rows are padded with empty cells. Every
+// rendered line has its trailing spaces trimmed, so a table never carries
+// invisible padding at the end of a line. Each renderer ends with a newline
+// unless the table is empty, in which case it returns the empty string.
+
+/// How a cell is padded inside its column.
+enum Align {
+    AlignLeft
+    AlignRight
+    AlignCenter
+}
+
+/// A typed empty column-width list.
+fn emptyInts() -> List<int> {
+    var out: List<int> = [0]
+    out.remove(0)
+    out
+}
+
+/// A typed empty alignment list.
+fn emptyAligns() -> List<Align> {
+    var out: List<Align> = [Align.AlignLeft]
+    out.remove(0)
+    out
+}
+
+/// `n` spaces.
+fn spaces(n: int) -> string {
+    var out = bytes("")
+    var i = 0
+    while (i < n) {
+        out.push(32 as byte)
+        i = i + 1
+    }
+    str(out)
+}
+
+/// Cell `i` of `row`, or the empty string when the row is short.
+fn cellAt(row: List<string>, i: int) -> string {
+    if (i < len(row)) {
+        return row[i]
+    }
+    ""
+}
+
+/// The number of columns: the longest of the header and the rows.
+fn columnCount(headers: List<string>, rows: List<List<string>>) -> int {
+    var n = len(headers)
+    var r = 0
+    while (r < len(rows)) {
+        if (len(rows[r]) > n) {
+            n = len(rows[r])
+        }
+        r = r + 1
+    }
+    n
+}
+
+/// The display width of every column.
+fn widthsOf(headers: List<string>, rows: List<List<string>>) -> List<int> {
+    let n = columnCount(headers, rows)
+    var widths = emptyInts()
+    var c = 0
+    while (c < n) {
+        var w = displayWidth(cellAt(headers, c))
+        var r = 0
+        while (r < len(rows)) {
+            let cw = displayWidth(cellAt(rows[r], c))
+            if (cw > w) {
+                w = cw
+            }
+            r = r + 1
+        }
+        widths.push(w)
+        c = c + 1
+    }
+    widths
+}
+
+/// The alignment for column `i`: `aligns[i]` when present, else left.
+fn alignAt(aligns: List<Align>, i: int) -> Align {
+    if (i < len(aligns)) {
+        return aligns[i]
+    }
+    Align.AlignLeft
+}
+
+/// Pad `s` to `width` cells according to `a`; never truncates.
+fn padTo(s: string, width: int, a: Align) -> string {
+    let pad = width - displayWidth(s)
+    if (pad <= 0) {
+        return s
+    }
+    var out = s
+    if (a == Align.AlignRight) {
+        out = spaces(pad) + s
+    } else if (a == Align.AlignCenter) {
+        let left = pad / 2
+        out = spaces(left) + s + spaces(pad - left)
+    } else {
+        out = s + spaces(pad)
+    }
+    out
+}
+
+/// Remove trailing spaces from `s`.
+fn rtrimSpaces(s: string) -> string {
+    let bs = bytes(s)
+    var hi = len(bs)
+    while (hi > 0 && (bs[hi - 1] as int) == 32) {
+        hi = hi - 1
+    }
+    if (hi == len(bs)) {
+        return s
+    }
+    var out = bytes("")
+    var i = 0
+    while (i < hi) {
+        out.push(bs[i])
+        i = i + 1
+    }
+    str(out)
+}
+
+/// One row rendered with `gap` between columns and no outer borders.
+fn lineOf(row: List<string>, widths: List<int>, aligns: List<Align>, gap: string) -> string {
+    var out = ""
+    var c = 0
+    while (c < len(widths)) {
+        if (c > 0) {
+            out = out + gap
+        }
+        out = out + padTo(cellAt(row, c), widths[c], alignAt(aligns, c))
+        c = c + 1
+    }
+    rtrimSpaces(out)
+}
+
+/// A left-aligned header row plus the data rows, two spaces between columns.
+fn render(headers: List<string>, rows: List<List<string>>) -> string {
+    renderAligned(headers, rows, emptyAligns())
+}
+
+/// Like `render`, but with per-column alignment.
+fn renderAligned(headers: List<string>, rows: List<List<string>>, aligns: List<Align>) -> string {
+    let widths = widthsOf(headers, rows)
+    if (len(widths) == 0) {
+        return ""
+    }
+    var out = ""
+    if (len(headers) > 0) {
+        out = lineOf(headers, widths, aligns, "  ") + "\n"
+    }
+    var r = 0
+    while (r < len(rows)) {
+        out = out + lineOf(rows[r], widths, aligns, "  ") + "\n"
+        r = r + 1
+    }
+    out
+}
+
+/// A dashed rule under the header. Each column contributes `-` per cell.
+fn ruleLine(widths: List<int>) -> string {
+    var out = ""
+    var c = 0
+    while (c < len(widths)) {
+        if (c > 0) {
+            out = out + "  "
+        }
+        var k = 0
+        while (k < widths[c]) {
+            out = out + "-"
+            k = k + 1
+        }
+        c = c + 1
+    }
+    rtrimSpaces(out)
+}
+
+/// `render` with a dashed rule between the header and the data rows.
+fn renderSeparator(headers: List<string>, rows: List<List<string>>) -> string {
+    renderSeparatorAligned(headers, rows, emptyAligns())
+}
+
+/// `renderSeparator` with per-column alignment.
+fn renderSeparatorAligned(headers: List<string>, rows: List<List<string>>, aligns: List<Align>) -> string {
+    let widths = widthsOf(headers, rows)
+    if (len(widths) == 0) {
+        return ""
+    }
+    var out = ""
+    if (len(headers) > 0) {
+        out = lineOf(headers, widths, aligns, "  ") + "\n"
+        out = out + ruleLine(widths) + "\n"
+    }
+    var r = 0
+    while (r < len(rows)) {
+        out = out + lineOf(rows[r], widths, aligns, "  ") + "\n"
+        r = r + 1
+    }
+    out
+}
+
+/// A `+---+---+` junction line for the bordered renderer.
+fn borderLine(widths: List<int>) -> string {
+    var out = "+"
+    var c = 0
+    while (c < len(widths)) {
+        var k = 0
+        while (k < widths[c] + 2) {
+            out = out + "-"
+            k = k + 1
+        }
+        out = out + "+"
+        c = c + 1
+    }
+    out
+}
+
+/// One row of the bordered renderer, using left alignment.
+fn borderedRow(row: List<string>, widths: List<int>) -> string {
+    var out = "|"
+    var c = 0
+    while (c < len(widths)) {
+        out = out + " " + padTo(cellAt(row, c), widths[c], Align.AlignLeft) + " |"
+        c = c + 1
+    }
+    rtrimSpaces(out)
+}
+
+/// A fully bordered table: top rule, header, rule, rows, bottom rule.
+fn renderBordered(headers: List<string>, rows: List<List<string>>) -> string {
+    let widths = widthsOf(headers, rows)
+    if (len(widths) == 0) {
+        return ""
+    }
+    let border = borderLine(widths) + "\n"
+    var out = border
+    if (len(headers) > 0) {
+        out = out + borderedRow(headers, widths) + "\n"
+    }
+    if (len(headers) > 0) {
+        out = out + border
+    }
+    var r = 0
+    while (r < len(rows)) {
+        out = out + borderedRow(rows[r], widths) + "\n"
+        r = r + 1
+    }
+    if (len(rows) > 0) {
+        out = out + border
+    }
+    out
+}
