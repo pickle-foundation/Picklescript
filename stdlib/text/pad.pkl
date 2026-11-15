@@ -1,0 +1,175 @@
+module std.text.pad
+
+// Padding, alignment, and truncation for fixed-width text.
+//
+// Widths are measured in bytes, not display cells or scalars. That makes these
+// helpers exact and cheap for ASCII text, which is what terminals and simple
+// column layouts use; a string with multi-byte UTF-8 sequences counts each
+// byte. Padding a non-ASCII string is safe (nothing is cut), but truncating one
+// can cut a sequence, so prefer ASCII for truncation or callers that already
+// know the boundary is safe.
+//
+// `padLeft`, `padRight`, and `padCenter` return `text` unchanged when it is
+// already at least `width` bytes wide. `padCenter` puts an odd extra byte on
+// the right. The fill is the first byte of the `fill` string; an empty fill
+// means a space.
+//
+// `truncateRight` keeps the start of the text and appends the ellipsis,
+// `truncateLeft` keeps the end and prepends it, and `truncateMiddle` keeps both
+// ends with the ellipsis between them (the head gets the extra byte). When the
+// text fits, it is returned unchanged. When `width` is not wider than the
+// ellipsis, the result is the ellipsis cut to `width` bytes; a non-positive
+// width yields the empty string.
+
+import { StringBuilder } from std.text.stringbuilder
+
+/// The first byte of `fill`, or a space when `fill` is empty.
+fn fillByte(fill: string) -> byte {
+    let fb = bytes(fill)
+    if (len(fb) == 0) {
+        return 32 as byte
+    }
+    fb[0]
+}
+
+/// `text` widened on the left with `fill` to `width` bytes.
+fn padLeft(text: string, width: int, fill: string) -> string {
+    let n = len(bytes(text))
+    if (n >= width) {
+        return text
+    }
+    let sb = StringBuilder()
+    var i = n
+    while (i < width) {
+        sb.appendByte(fillByte(fill))
+        i = i + 1
+    }
+    sb.append(text)
+    sb.toString()
+}
+
+/// `text` widened on the right with `fill` to `width` bytes.
+fn padRight(text: string, width: int, fill: string) -> string {
+    let n = len(bytes(text))
+    if (n >= width) {
+        return text
+    }
+    let sb = StringBuilder()
+    sb.append(text)
+    var i = n
+    while (i < width) {
+        sb.appendByte(fillByte(fill))
+        i = i + 1
+    }
+    sb.toString()
+}
+
+/// `text` centered in `width` bytes (an odd extra fill byte goes on the right).
+fn padCenter(text: string, width: int, fill: string) -> string {
+    let n = len(bytes(text))
+    if (n >= width) {
+        return text
+    }
+    let total = width - n
+    let left = total / 2
+    let sb = StringBuilder()
+    var i = 0
+    while (i < left) {
+        sb.appendByte(fillByte(fill))
+        i = i + 1
+    }
+    sb.append(text)
+    var j = left
+    while (j < total) {
+        sb.appendByte(fillByte(fill))
+        j = j + 1
+    }
+    sb.toString()
+}
+
+/// The bytes `bs[lo..hi)` as a string.
+fn sliceOf(bs: List<byte>, lo: int, hi: int) -> string {
+    let out = bytes("")
+    var i = lo
+    while (i < hi) {
+        out.push(bs[i])
+        i = i + 1
+    }
+    str(out)
+}
+
+/// The first `count` bytes of `ellipsis` (at most the whole ellipsis).
+fn ellipsisPrefix(ellipsis: string, count: int) -> string {
+    let eb = bytes(ellipsis)
+    if (count >= len(eb)) {
+        return ellipsis
+    }
+    if (count <= 0) {
+        return ""
+    }
+    sliceOf(eb, 0, count)
+}
+
+/// `text` cut to `width` bytes, keeping the start and appending `ellipsis`.
+fn truncateRight(text: string, width: int, ellipsis: string) -> string {
+    let bs = bytes(text)
+    if (len(bs) <= width) {
+        return text
+    }
+    if (width <= 0) {
+        return ""
+    }
+    let el = len(bytes(ellipsis))
+    if (width <= el) {
+        return ellipsisPrefix(ellipsis, width)
+    }
+    sliceOf(bs, 0, width - el) + ellipsis
+}
+
+/// `text` cut to `width` bytes, keeping the end and prepending `ellipsis`.
+fn truncateLeft(text: string, width: int, ellipsis: string) -> string {
+    let bs = bytes(text)
+    if (len(bs) <= width) {
+        return text
+    }
+    if (width <= 0) {
+        return ""
+    }
+    let el = len(bytes(ellipsis))
+    if (width <= el) {
+        return ellipsisPrefix(ellipsis, width)
+    }
+    ellipsis + sliceOf(bs, len(bs) - (width - el), len(bs))
+}
+
+/// `text` cut to `width` bytes, keeping both ends with `ellipsis` between them
+/// (the head gets the odd extra byte).
+fn truncateMiddle(text: string, width: int, ellipsis: string) -> string {
+    let bs = bytes(text)
+    if (len(bs) <= width) {
+        return text
+    }
+    if (width <= 0) {
+        return ""
+    }
+    let el = len(bytes(ellipsis))
+    if (width <= el) {
+        return ellipsisPrefix(ellipsis, width)
+    }
+    let keep = width - el
+    let head = (keep + 1) / 2
+    let tail = keep - head
+    sliceOf(bs, 0, head) + ellipsis + sliceOf(bs, len(bs) - tail, len(bs))
+}
+
+/// `text` padded on the right or truncated from the right to exactly `width`
+/// bytes (so `len(bytes(fitRight(...))) == width` for a positive width).
+fn fitRight(text: string, width: int, fill: string, ellipsis: string) -> string {
+    padRight(truncateRight(text, width, ellipsis), width, fill)
+}
+
+/// `text` padded on the left or truncated from the left to exactly `width`
+/// bytes.
+fn fitLeft(text: string, width: int, fill: string, ellipsis: string) -> string {
+    padLeft(truncateLeft(text, width, ellipsis), width, fill)
+}
