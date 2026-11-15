@@ -1,0 +1,146 @@
+module std.math.complex_test
+
+import { Complex, zero, one, imaginaryUnit, add, sub, mul, div, neg, conj, scale, normSquared, magnitude, equals, approxEq, render } from std.math.complex
+
+/// A rendered optional complex number (`<none>` for `none`).
+fn showC(c: Complex?) -> string {
+    match (c) {
+    case some(v) -> render(v)
+    case none -> "<none>"
+    }
+}
+
+test fn constants() {
+    expect(render(zero())).toBe("0")
+    expect(render(one())).toBe("1")
+    expect(render(imaginaryUnit())).toBe("(0, 1)")
+    expect(render(Complex(3.0, 0.0))).toBe("3")
+    expect(render(Complex(3.0, 4.0))).toBe("(3, 4)")
+    expect(render(Complex(-1.5, 2.25))).toBe("(-1.5, 2.25)")
+}
+
+test fn fields_are_reachable() {
+    let z = Complex(2.5, -3.5)
+    expect(z.re).toBe(2.5)
+    expect(z.im).toBe(-3.5)
+}
+
+test fn addition_and_subtraction() {
+    expect(render(add(Complex(1.0, 2.0), Complex(3.0, 4.0)))).toBe("(4, 6)")
+    expect(render(add(Complex(1.0, 2.0), Complex(-1.0, -2.0)))).toBe("0")
+    expect(render(sub(Complex(1.0, 2.0), Complex(3.0, 4.0)))).toBe("(-2, -2)")
+    expect(render(sub(Complex(3.0, 4.0), Complex(3.0, 4.0)))).toBe("0")
+    expect(render(add(zero(), imaginaryUnit()))).toBe("(0, 1)")
+}
+
+test fn multiplication() {
+    expect(render(mul(imaginaryUnit(), imaginaryUnit()))).toBe("-1")
+    expect(render(mul(Complex(1.0, 2.0), Complex(3.0, 4.0)))).toBe("(-5, 10)")
+    expect(render(mul(Complex(2.0, 0.0), Complex(0.0, 3.0)))).toBe("(0, 6)")
+    expect(render(mul(Complex(-1.0, 0.0), Complex(5.0, 5.0)))).toBe("(-5, -5)")
+    expect(render(mul(one(), Complex(7.0, -2.0)))).toBe("(7, -2)")
+    expect(render(mul(Complex(0.5, 0.5), Complex(2.0, 2.0)))).toBe("(0, 2)")
+}
+
+test fn division() {
+    expect(showC(div(Complex(1.0, 2.0), Complex(3.0, 4.0)))).toBe("(0.44, 0.08)")
+    expect(showC(div(one(), imaginaryUnit()))).toBe("(0, -1)")
+    expect(showC(div(Complex(10.0, 0.0), Complex(2.0, 0.0)))).toBe("5")
+    expect(showC(div(Complex(1.0, 1.0), Complex(0.0, 0.0)))).toBe("<none>")
+    expect(showC(div(zero(), Complex(3.0, 4.0)))).toBe("0")
+}
+
+test fn division_inverts_multiplication() {
+    let a = Complex(1.5, -2.5)
+    let b = Complex(0.75, 3.25)
+    if (let some(q) = div(a, b)) {
+        let back = mul(q, b)
+        expect(approxEq(back, a, 0.000000001)).toBe(true)
+    } else {
+        expect(true).toBe(false)
+    }
+}
+
+test fn negation_and_conjugation() {
+    expect(render(neg(Complex(1.0, -2.0)))).toBe("(-1, 2)")
+    expect(render(neg(zero()))).toBe("0")
+    expect(render(conj(Complex(1.0, 2.0)))).toBe("(1, -2)")
+    expect(render(conj(Complex(1.0, 0.0)))).toBe("1")
+    expect(render(conj(conj(Complex(3.0, 4.0))))).toBe("(3, 4)")
+}
+
+test fn scalar_multiplication() {
+    expect(render(scale(Complex(1.0, 2.0), 2.5))).toBe("(2.5, 5)")
+    expect(render(scale(Complex(1.0, 2.0), -1.0))).toBe("(-1, -2)")
+    expect(render(scale(Complex(1.0, 2.0), 0.0))).toBe("0")
+}
+
+test fn magnitudes() {
+    expect(normSquared(Complex(3.0, 4.0))).toBe(25.0)
+    expect(normSquared(Complex(-3.0, -4.0))).toBe(25.0)
+    expect(normSquared(zero())).toBe(0.0)
+    expect(magnitude(Complex(3.0, 4.0))).toBe(5.0)
+    expect(magnitude(Complex(-3.0, 4.0))).toBe(5.0)
+    expect(magnitude(Complex(1.0, 0.0))).toBe(1.0)
+    expect(magnitude(imaginaryUnit())).toBe(1.0)
+    expect(magnitude(zero())).toBe(0.0)
+}
+
+test fn magnitude_matches_the_pythagorean_identity() {
+    if (let some(q) = div(Complex(1.0, 2.0), Complex(3.0, -4.0))) {
+        let m = magnitude(q)
+        let direct = magnitude(Complex(1.0, 2.0)) / magnitude(Complex(3.0, -4.0))
+        expect(approxEq(Complex(m, 0.0), Complex(direct, 0.0), 0.000000000001)).toBe(true)
+    } else {
+        expect(true).toBe(false)
+    }
+}
+
+test fn norm_of_a_product() {
+    let a = Complex(1.0, 2.0)
+    let b = Complex(3.0, -1.0)
+    let product = mul(a, b)
+    let left = normSquared(product)
+    let right = normSquared(a) * normSquared(b)
+    expect(approxEq(Complex(left, 0.0), Complex(right, 0.0), 0.000000000001)).toBe(true)
+}
+
+test fn equality() {
+    expect(equals(Complex(1.0, 2.0), Complex(1.0, 2.0))).toBe(true)
+    expect(equals(Complex(1.0, 2.0), Complex(1.0, 2.5))).toBe(false)
+    expect(equals(Complex(1.0, 2.0), Complex(0.0, 2.0))).toBe(false)
+    expect(approxEq(Complex(1.0, 2.0), Complex(1.0001, 2.0), 0.001)).toBe(true)
+    expect(approxEq(Complex(1.0, 2.0), Complex(1.01, 2.0), 0.001)).toBe(false)
+}
+
+test fn conjugate_product_is_real() {
+    let a = Complex(2.0, -3.0)
+    let p = mul(a, conj(a))
+    expect(equals(Complex(p.re, 0.0), p)).toBe(true)
+    expect(p.re).toBe(13.0)
+}
+
+test fn addition_is_commutative_over_a_grid() {
+    var bad = 0
+    var i = 0
+    while (i < 5) {
+        var j = 0
+        while (j < 5) {
+            let a = Complex((i as float) - 2.0, (j as float) - 2.0)
+            let b = Complex((j as float) * 0.5, (i as float) * -1.5)
+            if (!equals(add(a, b), add(b, a))) {
+                bad = bad + 1
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    expect(bad).toBe(0)
+}
+
+test fn zero_is_the_additive_identity() {
+    let a = Complex(4.5, -1.25)
+    expect(equals(add(a, zero()), a)).toBe(true)
+    expect(equals(sub(a, a), zero())).toBe(true)
+    expect(equals(mul(a, one()), a)).toBe(true)
+}
