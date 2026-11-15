@@ -1,0 +1,586 @@
+module std.math.geometry
+
+// Planar geometry over `float`: points, vectors between points, segments,
+// triangles, simple polygons, and axis-aligned bounds.
+//
+// A point is a `Point` with `x` and `y` fields. Points behave as values: every
+// operation returns a new `Point` and never mutates its inputs.
+//
+// All arithmetic is plain IEEE addition, subtraction, multiplication, and
+// division in a fixed order, and lengths use the same fixed-iteration Newton
+// square root as `std.math.vector`, so results are bit-identical across
+// implementations. Compare computed lengths and coordinates with a tolerance;
+// exact equality is only reliable where the inputs were exact.
+//
+// Polygons are given as a list of vertices in order, either clockwise or
+// counter-clockwise; the closing edge from the last vertex back to the first is
+// implicit. A polygon with fewer than three vertices has zero area and no
+// interior. `convexHull` returns a counter-clockwise hull with the
+// lexicographically smallest vertex first (and no repeated closing vertex).
+
+/// A point (or vector) in the plane.
+class Point {
+    var x: float
+    var y: float
+
+    constructor(x: float, y: float) {
+        this.x = x
+        this.y = y
+    }
+}
+
+/// An axis-aligned rectangle.
+class Bounds {
+    var minX: float
+    var minY: float
+    var maxX: float
+    var maxY: float
+
+    constructor(minX: float, minY: float, maxX: float, maxY: float) {
+        this.minX = minX
+        this.minY = minY
+        this.maxX = maxX
+        this.maxY = maxY
+    }
+
+    /// The horizontal extent.
+    fn width() -> float {
+        this.maxX - this.minX
+    }
+
+    /// The vertical extent.
+    fn height() -> float {
+        this.maxY - this.minY
+    }
+
+    /// The centre of the rectangle.
+    fn center() -> Point {
+        Point((this.minX + this.maxX) / 2.0, (this.minY + this.maxY) / 2.0)
+    }
+
+    /// Whether `p` lies inside or on the rectangle.
+    fn contains(p: Point) -> bool {
+        p.x >= this.minX && p.x <= this.maxX && p.y >= this.minY && p.y <= this.maxY
+    }
+}
+
+/// A typed empty list of points.
+fn emptyPoints() -> List<Point> {
+    var out: List<Point> = [Point(0.0, 0.0)]
+    out.remove(0)
+    out
+}
+
+/// The absolute value of `x`.
+fn fabs(x: float) -> float {
+    if (x < 0.0) {
+        return 0.0 - x
+    }
+    x
+}
+
+/// The smaller of `a` and `b`.
+fn fmin(a: float, b: float) -> float {
+    if (a < b) {
+        return a
+    }
+    b
+}
+
+/// The larger of `a` and `b`.
+fn fmax(a: float, b: float) -> float {
+    if (a > b) {
+        return a
+    }
+    b
+}
+
+/// The square root of `x` by Newton's method (fixed 64 halvings); returns 0
+/// for `x <= 0`.
+fn sqrt(x: float) -> float {
+    if (x <= 0.0) {
+        return 0.0
+    }
+    var guess = x
+    if (guess < 1.0) {
+        guess = 1.0
+    }
+    var i = 0
+    while (i < 64) {
+        guess = 0.5 * (guess + x / guess)
+        i = i + 1
+    }
+    guess
+}
+
+/// The point `(x, y)`.
+fn point(x: float, y: float) -> Point {
+    Point(x, y)
+}
+
+/// The origin `(0, 0)`.
+fn origin() -> Point {
+    Point(0.0, 0.0)
+}
+
+/// `a + b`.
+fn add(a: Point, b: Point) -> Point {
+    Point(a.x + b.x, a.y + b.y)
+}
+
+/// `a - b`.
+fn sub(a: Point, b: Point) -> Point {
+    Point(a.x - b.x, a.y - b.y)
+}
+
+/// `p` scaled by `k`.
+fn scale(p: Point, k: float) -> Point {
+    Point(p.x * k, p.y * k)
+}
+
+/// `(-x, -y)`.
+fn neg(p: Point) -> Point {
+    Point(0.0 - p.x, 0.0 - p.y)
+}
+
+/// The dot product.
+fn dot(a: Point, b: Point) -> float {
+    a.x * b.x + a.y * b.y
+}
+
+/// The z component of the 3D cross product (`a.x * b.y - a.y * b.x`); positive
+/// when `b` is counter-clockwise from `a`.
+fn cross(a: Point, b: Point) -> float {
+    a.x * b.y - a.y * b.x
+}
+
+/// The squared length of `p`.
+fn normSquared(p: Point) -> float {
+    p.x * p.x + p.y * p.y
+}
+
+/// The length of `p`.
+fn norm(p: Point) -> float {
+    sqrt(normSquared(p))
+}
+
+/// The squared distance between `a` and `b`.
+fn distanceSquared(a: Point, b: Point) -> float {
+    normSquared(sub(a, b))
+}
+
+/// The distance between `a` and `b`.
+fn distance(a: Point, b: Point) -> float {
+    norm(sub(a, b))
+}
+
+/// A unit vector in the direction of `p`; `none` for the zero vector.
+fn normalize(p: Point) -> Point? {
+    let n = norm(p)
+    if (n <= 0.0) {
+        return none
+    }
+    Point(p.x / n, p.y / n)
+}
+
+/// The midpoint of `a` and `b`.
+fn midpoint(a: Point, b: Point) -> Point {
+    Point((a.x + b.x) / 2.0, (a.y + b.y) / 2.0)
+}
+
+/// The point a fraction `t` of the way from `a` to `b` (extrapolating outside
+/// `[0, 1]`).
+fn lerp(a: Point, b: Point, t: float) -> Point {
+    Point(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)
+}
+
+/// `p` rotated 90 degrees counter-clockwise.
+fn perp(p: Point) -> Point {
+    Point(0.0 - p.y, p.x)
+}
+
+/// `p` rotated by the angle whose cosine and sine are given.
+fn rotate(p: Point, cosT: float, sinT: float) -> Point {
+    Point(p.x * cosT - p.y * sinT, p.x * sinT + p.y * cosT)
+}
+
+/// Whether `a` and `b` have exactly the same coordinates.
+fn equals(a: Point, b: Point) -> bool {
+    a.x == b.x && a.y == b.y
+}
+
+/// Whether every coordinate differs by at most `eps`.
+fn approxEq(a: Point, b: Point, eps: float) -> bool {
+    fabs(a.x - b.x) <= eps && fabs(a.y - b.y) <= eps
+}
+
+/// `(x, y)`.
+fn render(p: Point) -> string {
+    "({p.x}, {p.y})"
+}
+
+/// `[(x, y), ...]`.
+fn renderAll(pts: List<Point>) -> string {
+    var out = "["
+    var i = 0
+    while (i < len(pts)) {
+        if (i > 0) {
+            out = out + ", "
+        }
+        out = out + render(pts[i])
+        i = i + 1
+    }
+    out + "]"
+}
+
+/// `[minX, minY, maxX, maxY]`.
+fn renderBounds(b: Bounds) -> string {
+    "[{b.minX}, {b.minY}, {b.maxX}, {b.maxY}]"
+}
+
+/// The turn direction of `a -> b -> c`: 1 counter-clockwise, -1 clockwise, and
+/// 0 when the three points are collinear.
+fn orient(a: Point, b: Point, c: Point) -> int {
+    let v = cross(sub(b, a), sub(c, a))
+    if (v > 0.0) {
+        return 1
+    }
+    if (v < 0.0) {
+        return 0 - 1
+    }
+    0
+}
+
+/// Whether `a`, `b`, and `c` lie on one line.
+fn isCollinear(a: Point, b: Point, c: Point) -> bool {
+    orient(a, b, c) == 0
+}
+
+/// Whether `p` lies on the segment `a`-`b` (including the endpoints).
+fn onSegment(a: Point, b: Point, p: Point) -> bool {
+    if (orient(a, b, p) != 0) {
+        return false
+    }
+    p.x >= fmin(a.x, b.x) && p.x <= fmax(a.x, b.x) && p.y >= fmin(a.y, b.y) && p.y <= fmax(a.y, b.y)
+}
+
+/// Whether the segments `a`-`b` and `c`-`d` share at least one point.
+fn segmentsIntersect(a: Point, b: Point, c: Point, d: Point) -> bool {
+    let o1 = orient(a, b, c)
+    let o2 = orient(a, b, d)
+    let o3 = orient(c, d, a)
+    let o4 = orient(c, d, b)
+    if (o1 * o2 < 0 && o3 * o4 < 0) {
+        return true
+    }
+    if (o1 == 0 && onSegment(a, b, c)) {
+        return true
+    }
+    if (o2 == 0 && onSegment(a, b, d)) {
+        return true
+    }
+    if (o3 == 0 && onSegment(c, d, a)) {
+        return true
+    }
+    if (o4 == 0 && onSegment(c, d, b)) {
+        return true
+    }
+    false
+}
+
+/// The intersection of the infinite lines through `a`-`b` and `c`-`d`; `none`
+/// when the lines are parallel (or coincident).
+fn lineIntersection(a: Point, b: Point, c: Point, d: Point) -> Point? {
+    let r = sub(b, a)
+    let s = sub(d, c)
+    let denom = cross(r, s)
+    if (denom == 0.0) {
+        return none
+    }
+    let t = cross(sub(c, a), s) / denom
+    Point(a.x + t * r.x, a.y + t * r.y)
+}
+
+/// The single point where the segments `a`-`b` and `c`-`d` cross; `none` when
+/// they do not cross at a unique point (disjoint, parallel, or overlapping
+/// collinearly).
+fn segmentIntersection(a: Point, b: Point, c: Point, d: Point) -> Point? {
+    let r = sub(b, a)
+    let s = sub(d, c)
+    let denom = cross(r, s)
+    if (denom == 0.0) {
+        return none
+    }
+    let t = cross(sub(c, a), s) / denom
+    let u = cross(sub(c, a), r) / denom
+    if (t < 0.0 || t > 1.0 || u < 0.0 || u > 1.0) {
+        return none
+    }
+    Point(a.x + t * r.x, a.y + t * r.y)
+}
+
+/// The distance from `p` to the infinite line through `a`-`b`; `none` when
+/// `a` and `b` coincide.
+fn distanceToLine(p: Point, a: Point, b: Point) -> float? {
+    let ab = sub(b, a)
+    let lenSq = normSquared(ab)
+    if (lenSq == 0.0) {
+        return none
+    }
+    fabs(cross(ab, sub(p, a))) / sqrt(lenSq)
+}
+
+/// The point of the segment `a`-`b` closest to `p`; `a` when the segment is
+/// degenerate.
+fn closestPointOnSegment(p: Point, a: Point, b: Point) -> Point {
+    let ab = sub(b, a)
+    let lenSq = normSquared(ab)
+    if (lenSq == 0.0) {
+        return a
+    }
+    var t = dot(sub(p, a), ab) / lenSq
+    if (t < 0.0) {
+        t = 0.0
+    }
+    if (t > 1.0) {
+        t = 1.0
+    }
+    Point(a.x + ab.x * t, a.y + ab.y * t)
+}
+
+/// The distance from `p` to the segment `a`-`b`.
+fn distanceToSegment(p: Point, a: Point, b: Point) -> float {
+    distance(p, closestPointOnSegment(p, a, b))
+}
+
+/// Twice the signed area of the triangle `a`, `b`, `c`: positive when the
+/// points turn counter-clockwise.
+fn signedArea2(a: Point, b: Point, c: Point) -> float {
+    cross(sub(b, a), sub(c, a))
+}
+
+/// The area of the triangle `a`, `b`, `c`.
+fn triangleArea(a: Point, b: Point, c: Point) -> float {
+    fabs(signedArea2(a, b, c)) / 2.0
+}
+
+/// The centroid of the triangle `a`, `b`, `c`.
+fn triangleCentroid(a: Point, b: Point, c: Point) -> Point {
+    Point((a.x + b.x + c.x) / 3.0, (a.y + b.y + c.y) / 3.0)
+}
+
+/// The signed area of a polygon (positive for counter-clockwise vertices); 0
+/// below three vertices.
+fn polygonSignedArea(pts: List<Point>) -> float {
+    if (len(pts) < 3) {
+        return 0.0
+    }
+    var total = 0.0
+    var i = 0
+    while (i < len(pts)) {
+        let j = (i + 1) % len(pts)
+        total = total + pts[i].x * pts[j].y - pts[j].x * pts[i].y
+        i = i + 1
+    }
+    total / 2.0
+}
+
+/// The area of a polygon; 0 below three vertices.
+fn polygonArea(pts: List<Point>) -> float {
+    fabs(polygonSignedArea(pts))
+}
+
+/// The length of the polygon's boundary; 0 below two vertices.
+fn polygonPerimeter(pts: List<Point>) -> float {
+    if (len(pts) < 2) {
+        return 0.0
+    }
+    var total = 0.0
+    var i = 0
+    while (i < len(pts)) {
+        let j = (i + 1) % len(pts)
+        total = total + distance(pts[i], pts[j])
+        i = i + 1
+    }
+    total
+}
+
+/// The centroid (area centre) of a polygon; `none` below three vertices or
+/// when the polygon has zero area.
+fn polygonCentroid(pts: List<Point>) -> Point? {
+    if (len(pts) < 3) {
+        return none
+    }
+    var twice = 0.0
+    var cx = 0.0
+    var cy = 0.0
+    var i = 0
+    while (i < len(pts)) {
+        let j = (i + 1) % len(pts)
+        let c = pts[i].x * pts[j].y - pts[j].x * pts[i].y
+        twice = twice + c
+        cx = cx + (pts[i].x + pts[j].x) * c
+        cy = cy + (pts[i].y + pts[j].y) * c
+        i = i + 1
+    }
+    if (twice == 0.0) {
+        return none
+    }
+    Point(cx / (3.0 * twice), cy / (3.0 * twice))
+}
+
+/// Whether the polygon is strictly convex (no collinear corner and every turn
+/// in the same direction); false below three vertices.
+fn isConvex(pts: List<Point>) -> bool {
+    let n = len(pts)
+    if (n < 3) {
+        return false
+    }
+    var turn = 0
+    var i = 0
+    while (i < n) {
+        let o = orient(pts[i], pts[(i + 1) % n], pts[(i + 2) % n])
+        if (o == 0) {
+            return false
+        }
+        if (turn == 0) {
+            turn = o
+        } else if (o != turn) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+/// Whether `p` lies on one of the polygon's edges.
+fn isOnBoundary(pts: List<Point>, p: Point) -> bool {
+    if (len(pts) < 2) {
+        return false
+    }
+    var i = 0
+    while (i < len(pts)) {
+        if (onSegment(pts[i], pts[(i + 1) % len(pts)], p)) {
+            return true
+        }
+        i = i + 1
+    }
+    false
+}
+
+/// Whether `p` lies inside or on the polygon (ray casting with an explicit
+/// boundary test); false below three vertices.
+fn containsPoint(pts: List<Point>, p: Point) -> bool {
+    let n = len(pts)
+    if (n < 3) {
+        return false
+    }
+    if (isOnBoundary(pts, p)) {
+        return true
+    }
+    var inside = false
+    var i = 0
+    while (i < n) {
+        let j = (i + 1) % n
+        let yi = pts[i].y
+        let yj = pts[j].y
+        if ((yi > p.y) != (yj > p.y)) {
+            let xCross = pts[i].x + (p.y - yi) * (pts[j].x - pts[i].x) / (yj - yi)
+            if (p.x < xCross) {
+                inside = !inside
+            }
+        }
+        i = i + 1
+    }
+    inside
+}
+
+/// The axis-aligned bounds of a non-empty point list; `none` when empty.
+fn boundsOf(pts: List<Point>) -> Bounds? {
+    if (len(pts) == 0) {
+        return none
+    }
+    var mnx = pts[0].x
+    var mny = pts[0].y
+    var mxx = pts[0].x
+    var mxy = pts[0].y
+    var i = 1
+    while (i < len(pts)) {
+        mnx = fmin(mnx, pts[i].x)
+        mny = fmin(mny, pts[i].y)
+        mxx = fmax(mxx, pts[i].x)
+        mxy = fmax(mxy, pts[i].y)
+        i = i + 1
+    }
+    Bounds(mnx, mny, mxx, mxy)
+}
+
+/// Whether `p` and `q` have the same coordinates.
+fn samePoint(p: Point, q: Point) -> bool {
+    p.x == q.x && p.y == q.y
+}
+
+/// `pts` sorted by `x`, then by `y`, in place (insertion sort).
+fn sortPoints(pts: List<Point>) {
+    var i = 1
+    while (i < len(pts)) {
+        let v = pts[i]
+        var j = i
+        while (j > 0) {
+            let prev = pts[j - 1]
+            if (prev.x > v.x || (prev.x == v.x && prev.y > v.y)) {
+                pts[j] = prev
+                j = j - 1
+            } else {
+                break
+            }
+        }
+        pts[j] = v
+        i = i + 1
+    }
+}
+
+/// The counter-clockwise convex hull of `pts` (monotone chain), without a
+/// repeated closing vertex. Collinear points are dropped from the edges; a
+/// fully collinear set reduces to its two extreme points, and fewer than three
+/// distinct points are returned as they are.
+fn convexHull(pts: List<Point>) -> List<Point> {
+    var sorted = emptyPoints()
+    var i = 0
+    while (i < len(pts)) {
+        sorted.push(pts[i])
+        i = i + 1
+    }
+    sortPoints(sorted)
+    var uniq = emptyPoints()
+    i = 0
+    while (i < len(sorted)) {
+        if (i == 0 || !samePoint(sorted[i], sorted[i - 1])) {
+            uniq.push(sorted[i])
+        }
+        i = i + 1
+    }
+    if (len(uniq) < 3) {
+        return uniq
+    }
+    var hull = emptyPoints()
+    i = 0
+    while (i < len(uniq)) {
+        while (len(hull) >= 2 && orient(hull[len(hull) - 2], hull[len(hull) - 1], uniq[i]) <= 0) {
+            hull.remove(len(hull) - 1)
+        }
+        hull.push(uniq[i])
+        i = i + 1
+    }
+    let lowerCount = len(hull)
+    var k = len(uniq) - 2
+    while (k >= 0) {
+        while (len(hull) >= lowerCount + 1 && orient(hull[len(hull) - 2], hull[len(hull) - 1], uniq[k]) <= 0) {
+            hull.remove(len(hull) - 1)
+        }
+        hull.push(uniq[k])
+        k = k - 1
+    }
+    hull.remove(len(hull) - 1)
+    hull
+}

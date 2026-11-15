@@ -1,0 +1,245 @@
+module std.math.geometry_test
+
+import { Point, Bounds, emptyPoints, point, origin, add, sub, scale, neg, dot, cross, normSquared, norm, distanceSquared, distance, normalize, midpoint, lerp, perp, rotate, equals, approxEq, render, renderAll, renderBounds, orient, isCollinear, onSegment, segmentsIntersect, lineIntersection, segmentIntersection, distanceToLine, closestPointOnSegment, distanceToSegment, signedArea2, triangleArea, triangleCentroid, polygonSignedArea, polygonArea, polygonPerimeter, polygonCentroid, isConvex, isOnBoundary, containsPoint, boundsOf, convexHull } from std.math.geometry
+
+/// A rendered optional point (`<none>` for `none`).
+fn showP(p: Point?) -> string {
+    match (p) {
+    case some(v) -> render(v)
+    case none -> "<none>"
+    }
+}
+
+/// A rendered optional float (`<none>` for `none`).
+fn showF(x: float?) -> string {
+    match (x) {
+    case some(v) -> "{v}"
+    case none -> "<none>"
+    }
+}
+
+/// A rendered optional bounds (`<none>` for `none`).
+fn showB(b: Bounds?) -> string {
+    match (b) {
+    case some(v) -> renderBounds(v)
+    case none -> "<none>"
+    }
+}
+
+test fn points_render_as_coordinates() {
+    expect(render(point(1.0, 2.0))).toBe("(1, 2)")
+    expect(render(origin())).toBe("(0, 0)")
+    expect(render(point(-1.5, 2.25))).toBe("(-1.5, 2.25)")
+    let p = point(3.5, -4.0)
+    expect(p.x).toBe(3.5)
+    expect(p.y).toBe(-4.0)
+}
+
+test fn point_arithmetic() {
+    expect(render(add(point(1.0, 2.0), point(3.0, 4.0)))).toBe("(4, 6)")
+    expect(render(sub(point(1.0, 2.0), point(3.0, 4.0)))).toBe("(-2, -2)")
+    expect(render(scale(point(1.0, 2.0), 2.5))).toBe("(2.5, 5)")
+    expect(render(neg(point(1.0, -2.0)))).toBe("(-1, 2)")
+}
+
+test fn dot_and_cross_products() {
+    expect(dot(point(1.0, 2.0), point(3.0, 4.0))).toBe(11.0)
+    expect(dot(point(1.0, 0.0), point(0.0, 1.0))).toBe(0.0)
+    expect(cross(point(1.0, 2.0), point(3.0, 4.0))).toBe(-2.0)
+    expect(cross(point(1.0, 0.0), point(0.0, 1.0))).toBe(1.0)
+    expect(cross(point(0.0, 1.0), point(1.0, 0.0))).toBe(-1.0)
+}
+
+test fn lengths_and_distances() {
+    expect(normSquared(point(3.0, 4.0))).toBe(25.0)
+    expect(norm(point(3.0, 4.0))).toBe(5.0)
+    expect(norm(point(0.0, 0.0))).toBe(0.0)
+    expect(norm(point(-3.0, 4.0))).toBe(5.0)
+    expect(distanceSquared(point(0.0, 0.0), point(3.0, 4.0))).toBe(25.0)
+    expect(distance(point(0.0, 0.0), point(3.0, 4.0))).toBe(5.0)
+    expect(distance(point(1.0, 1.0), point(4.0, 5.0))).toBe(5.0)
+    expect(distance(point(5.0, 5.0), point(5.0, 5.0))).toBe(0.0)
+}
+
+test fn normalization() {
+    expect(showP(normalize(point(3.0, 4.0)))).toBe("(0.6, 0.8)")
+    expect(showP(normalize(point(-3.0, 4.0)))).toBe("(-0.6, 0.8)")
+    expect(showP(normalize(point(0.0, 0.0)))).toBe("<none>")
+    if (let some(u) = normalize(point(1.0, 2.0))) {
+        expect(approxEq(u, point(0.4472135954999579, 0.8944271909999159), 0.000000000001)).toBe(true)
+    } else {
+        expect(true).toBe(false)
+    }
+}
+
+test fn midpoints_and_lerps() {
+    expect(render(midpoint(point(0.0, 0.0), point(4.0, 2.0)))).toBe("(2, 1)")
+    expect(render(midpoint(point(-1.0, -3.0), point(3.0, 5.0)))).toBe("(1, 1)")
+    expect(render(lerp(point(0.0, 0.0), point(10.0, 20.0), 0.25))).toBe("(2.5, 5)")
+    expect(render(lerp(point(0.0, 0.0), point(10.0, 20.0), 2.0))).toBe("(20, 40)")
+    expect(render(lerp(point(3.0, 3.0), point(9.0, 9.0), 0.0))).toBe("(3, 3)")
+}
+
+test fn perpendicular_and_rotation() {
+    expect(render(perp(point(1.0, 0.0)))).toBe("(0, 1)")
+    expect(render(perp(point(2.0, 3.0)))).toBe("(-3, 2)")
+    expect(render(perp(perp(point(2.0, 3.0))))).toBe("(-2, -3)")
+    expect(render(rotate(point(1.0, 0.0), 0.0, 1.0))).toBe("(0, 1)")
+    expect(render(rotate(point(1.0, 2.0), 0.0, 1.0))).toBe("(-2, 1)")
+    expect(render(rotate(point(1.0, 2.0), 1.0, 0.0))).toBe("(1, 2)")
+    expect(render(rotate(point(0.0, 0.0), 0.6, 0.8))).toBe("(0, 0)")
+}
+
+test fn point_equality() {
+    expect(equals(point(1.0, 2.0), point(1.0, 2.0))).toBe(true)
+    expect(equals(point(1.0, 2.0), point(1.0, 2.0001))).toBe(false)
+    expect(approxEq(point(1.0, 2.0), point(1.0001, 2.0), 0.001)).toBe(true)
+    expect(approxEq(point(1.0, 2.0), point(1.01, 2.0), 0.001)).toBe(false)
+}
+
+test fn orientation_signs() {
+    expect(orient(point(0.0, 0.0), point(1.0, 0.0), point(0.0, 1.0))).toBe(1)
+    expect(orient(point(0.0, 0.0), point(1.0, 0.0), point(0.0, -1.0))).toBe(-1)
+    expect(orient(point(0.0, 0.0), point(1.0, 1.0), point(2.0, 2.0))).toBe(0)
+    expect(isCollinear(point(0.0, 0.0), point(1.0, 1.0), point(5.0, 5.0))).toBe(true)
+    expect(isCollinear(point(0.0, 0.0), point(1.0, 1.0), point(5.0, 6.0))).toBe(false)
+}
+
+test fn endpoints_of_segments() {
+    let a = point(0.0, 0.0)
+    let b = point(4.0, 0.0)
+    expect(onSegment(a, b, point(2.0, 0.0))).toBe(true)
+    expect(onSegment(a, b, a)).toBe(true)
+    expect(onSegment(a, b, b)).toBe(true)
+    expect(onSegment(a, b, point(5.0, 0.0))).toBe(false)
+    expect(onSegment(a, b, point(2.0, 1.0))).toBe(false)
+    expect(onSegment(a, b, point(-1.0, 0.0))).toBe(false)
+}
+
+test fn segment_intersections() {
+    let a = point(0.0, 0.0)
+    let b = point(2.0, 2.0)
+    let c = point(0.0, 2.0)
+    let d = point(2.0, 0.0)
+    expect(showP(segmentIntersection(a, b, c, d))).toBe("(1, 1)")
+    expect(showP(segmentIntersection(point(0.0, 0.0), point(1.0, 1.0), point(1.0, 1.0), point(2.0, 0.0)))).toBe("(1, 1)")
+    expect(showP(segmentIntersection(point(0.0, 0.0), point(1.0, 0.0), point(2.0, 0.0), point(3.0, 0.0)))).toBe("<none>")
+    expect(showP(segmentIntersection(point(0.0, 0.0), point(1.0, 0.0), point(0.0, 1.0), point(1.0, 1.0)))).toBe("<none>")
+    expect(showP(lineIntersection(point(0.0, 0.0), point(1.0, 0.0), point(2.0, 5.0), point(2.0, -5.0)))).toBe("(2, 0)")
+    expect(showP(lineIntersection(point(0.0, 0.0), point(1.0, 0.0), point(0.0, 1.0), point(1.0, 1.0)))).toBe("<none>")
+}
+
+test fn intersection_predicate() {
+    expect(segmentsIntersect(point(0.0, 0.0), point(2.0, 2.0), point(0.0, 2.0), point(2.0, 0.0))).toBe(true)
+    expect(segmentsIntersect(point(0.0, 0.0), point(1.0, 0.0), point(2.0, 0.0), point(3.0, 0.0))).toBe(false)
+    expect(segmentsIntersect(point(0.0, 0.0), point(4.0, 0.0), point(1.0, 0.0), point(2.0, 0.0))).toBe(true)
+    expect(segmentsIntersect(point(0.0, 0.0), point(1.0, 0.0), point(1.0, 0.0), point(1.0, 2.0))).toBe(true)
+    expect(segmentsIntersect(point(0.0, 0.0), point(1.0, 0.0), point(0.0, 1.0), point(1.0, 1.0))).toBe(false)
+    expect(segmentsIntersect(point(0.0, 0.0), point(1.0, 1.0), point(0.0, 2.0), point(2.0, 0.0))).toBe(true)
+}
+
+test fn distances_to_lines_and_segments() {
+    expect(showF(distanceToLine(point(0.0, 2.0), point(0.0, 0.0), point(4.0, 0.0)))).toBe("2")
+    expect(showF(distanceToLine(point(2.0, 2.0), point(0.0, 0.0), point(4.0, 4.0)))).toBe("0")
+    expect(showF(distanceToLine(point(0.0, 1.0), point(3.0, 3.0), point(3.0, 3.0)))).toBe("<none>")
+    expect(render(closestPointOnSegment(point(2.0, 3.0), point(0.0, 0.0), point(4.0, 0.0)))).toBe("(2, 0)")
+    expect(render(closestPointOnSegment(point(-1.0, 0.0), point(0.0, 0.0), point(4.0, 0.0)))).toBe("(0, 0)")
+    expect(render(closestPointOnSegment(point(9.0, 1.0), point(0.0, 0.0), point(4.0, 0.0)))).toBe("(4, 0)")
+    expect(render(closestPointOnSegment(point(1.0, 1.0), point(3.0, 3.0), point(3.0, 3.0)))).toBe("(3, 3)")
+    expect(distanceToSegment(point(2.0, 3.0), point(0.0, 0.0), point(4.0, 0.0))).toBe(3.0)
+    expect(distanceToSegment(point(9.0, 0.0), point(0.0, 0.0), point(4.0, 0.0))).toBe(5.0)
+}
+
+test fn triangle_areas_and_centroids() {
+    expect(signedArea2(point(0.0, 0.0), point(1.0, 0.0), point(0.0, 1.0))).toBe(1.0)
+    expect(signedArea2(point(0.0, 0.0), point(0.0, 1.0), point(1.0, 0.0))).toBe(-1.0)
+    expect(signedArea2(point(0.0, 0.0), point(1.0, 1.0), point(2.0, 2.0))).toBe(0.0)
+    expect(triangleArea(point(0.0, 0.0), point(1.0, 0.0), point(0.0, 1.0))).toBe(0.5)
+    expect(triangleArea(point(0.0, 0.0), point(4.0, 0.0), point(0.0, 4.0))).toBe(8.0)
+    expect(render(triangleCentroid(point(0.0, 0.0), point(3.0, 0.0), point(0.0, 3.0)))).toBe("(1, 1)")
+    expect(render(triangleCentroid(point(0.0, 0.0), point(6.0, 0.0), point(0.0, 3.0)))).toBe("(2, 1)")
+}
+
+test fn polygon_areas_and_perimeters() {
+    let square = [point(0.0, 0.0), point(2.0, 0.0), point(2.0, 2.0), point(0.0, 2.0)]
+    expect(polygonSignedArea(square)).toBe(4.0)
+    expect(polygonArea(square)).toBe(4.0)
+    expect(polygonPerimeter(square)).toBe(8.0)
+    let reversed = [point(0.0, 0.0), point(0.0, 2.0), point(2.0, 2.0), point(2.0, 0.0)]
+    expect(polygonSignedArea(reversed)).toBe(-4.0)
+    expect(polygonArea(reversed)).toBe(4.0)
+    expect(polygonArea([point(0.0, 0.0), point(1.0, 0.0), point(0.0, 1.0)])).toBe(0.5)
+    expect(polygonArea([point(0.0, 0.0), point(1.0, 0.0)])).toBe(0.0)
+    expect(polygonArea(emptyPoints())).toBe(0.0)
+    expect(polygonPerimeter([point(0.0, 0.0)])).toBe(0.0)
+    expect(polygonPerimeter([point(0.0, 0.0), point(3.0, 4.0)])).toBe(10.0)
+}
+
+test fn polygon_centroids() {
+    let square = [point(0.0, 0.0), point(2.0, 0.0), point(2.0, 2.0), point(0.0, 2.0)]
+    expect(showP(polygonCentroid(square))).toBe("(1, 1)")
+    let triangle = [point(0.0, 0.0), point(6.0, 0.0), point(0.0, 3.0)]
+    expect(showP(polygonCentroid(triangle))).toBe("(2, 1)")
+    expect(showP(polygonCentroid([point(0.0, 0.0), point(1.0, 0.0)]))).toBe("<none>")
+    expect(showP(polygonCentroid([point(0.0, 0.0), point(1.0, 1.0), point(2.0, 2.0)]))).toBe("<none>")
+}
+
+test fn convexity() {
+    expect(isConvex([point(0.0, 0.0), point(2.0, 0.0), point(2.0, 2.0), point(0.0, 2.0)])).toBe(true)
+    expect(isConvex([point(0.0, 0.0), point(0.0, 2.0), point(2.0, 2.0), point(2.0, 0.0)])).toBe(true)
+    expect(isConvex([point(0.0, 0.0), point(4.0, 0.0), point(0.0, 4.0)])).toBe(true)
+    expect(isConvex([point(0.0, 0.0), point(2.0, 0.0), point(1.0, 1.0), point(2.0, 2.0), point(0.0, 2.0)])).toBe(false)
+    expect(isConvex([point(0.0, 0.0), point(1.0, 0.0), point(2.0, 0.0), point(2.0, 2.0), point(0.0, 2.0)])).toBe(false)
+    expect(isConvex([point(0.0, 0.0), point(1.0, 0.0)])).toBe(false)
+    expect(isConvex(emptyPoints())).toBe(false)
+}
+
+test fn point_in_polygon() {
+    let square = [point(0.0, 0.0), point(4.0, 0.0), point(4.0, 4.0), point(0.0, 4.0)]
+    expect(containsPoint(square, point(2.0, 2.0))).toBe(true)
+    expect(containsPoint(square, point(0.5, 3.5))).toBe(true)
+    expect(containsPoint(square, point(5.0, 2.0))).toBe(false)
+    expect(containsPoint(square, point(-0.5, 2.0))).toBe(false)
+    expect(containsPoint(square, point(2.0, 4.0001))).toBe(false)
+    expect(containsPoint(square, point(2.0, 0.0))).toBe(true)
+    expect(containsPoint(square, point(0.0, 0.0))).toBe(true)
+    expect(containsPoint(square, point(4.0, 4.0))).toBe(true)
+    expect(containsPoint(square, point(4.1, 4.0))).toBe(false)
+    expect(isOnBoundary(square, point(2.0, 0.0))).toBe(true)
+    expect(isOnBoundary(square, point(2.0, 2.0))).toBe(false)
+    expect(containsPoint([point(0.0, 0.0), point(1.0, 0.0)], point(0.0, 0.0))).toBe(false)
+}
+
+test fn bounds_cover_points() {
+    let pts = [point(1.0, 2.0), point(0.0, 3.0), point(4.0, 2.0)]
+    expect(showB(boundsOf(pts))).toBe("[0, 2, 4, 3]")
+    expect(showB(boundsOf(emptyPoints()))).toBe("<none>")
+    if (let some(b) = boundsOf(pts)) {
+        expect(b.width()).toBe(4.0)
+        expect(b.height()).toBe(1.0)
+        expect(render(b.center())).toBe("(2, 2.5)")
+        expect(b.contains(point(2.0, 2.5))).toBe(true)
+        expect(b.contains(point(0.0, 2.0))).toBe(true)
+        expect(b.contains(point(4.0, 3.0))).toBe(true)
+        expect(b.contains(point(5.0, 2.0))).toBe(false)
+    } else {
+        expect(true).toBe(false)
+    }
+}
+
+test fn convex_hull_of_a_square_with_an_interior_point() {
+    let src = [point(2.0, 0.0), point(0.0, 0.0), point(1.0, 1.0), point(0.0, 2.0), point(2.0, 2.0)]
+    expect(renderAll(convexHull(src))).toBe("[(0, 0), (2, 0), (2, 2), (0, 2)]")
+    expect(renderAll(src)).toBe("[(2, 0), (0, 0), (1, 1), (0, 2), (2, 2)]")
+}
+
+test fn convex_hull_drops_collinear_and_duplicate_points() {
+    let line = [point(0.0, 0.0), point(1.0, 1.0), point(2.0, 2.0)]
+    expect(renderAll(convexHull(line))).toBe("[(0, 0), (2, 2)]")
+    let dupes = [point(1.0, 1.0), point(1.0, 1.0), point(0.0, 0.0), point(0.0, 0.0)]
+    expect(renderAll(convexHull(dupes))).toBe("[(0, 0), (1, 1)]")
+    let triangle = [point(0.0, 0.0), point(2.0, 0.0), point(0.0, 2.0), point(1.0, 0.5)]
+    expect(renderAll(convexHull(triangle))).toBe("[(0, 0), (2, 0), (0, 2)]")
+    expect(renderAll(convexHull([point(7.0, 8.0)]))).toBe("[(7, 8)]")
+    expect(renderAll(convexHull(emptyPoints()))).toBe("[]")
+}
