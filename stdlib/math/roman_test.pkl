@@ -1,0 +1,155 @@
+module std.math.roman_test
+
+import { toRoman, fromRoman, isRoman } from std.math.roman
+
+/// A rendered roman string (`<none>` when out of range).
+fn showS(x: string?) -> string {
+    match (x) {
+    case some(v) -> v
+    case none -> "<none>"
+    }
+}
+
+/// A rendered parsed value (`<none>` when the text is not canonical).
+fn showI(x: int?) -> string {
+    match (x) {
+    case some(v) -> "{v}"
+    case none -> "<none>"
+    }
+}
+
+test fn small_values() {
+    expect(showS(toRoman(1))).toBe("I")
+    expect(showS(toRoman(2))).toBe("II")
+    expect(showS(toRoman(3))).toBe("III")
+    expect(showS(toRoman(4))).toBe("IV")
+    expect(showS(toRoman(5))).toBe("V")
+    expect(showS(toRoman(6))).toBe("VI")
+    expect(showS(toRoman(7))).toBe("VII")
+    expect(showS(toRoman(8))).toBe("VIII")
+    expect(showS(toRoman(9))).toBe("IX")
+    expect(showS(toRoman(10))).toBe("X")
+}
+
+test fn tens_and_hundreds() {
+    expect(showS(toRoman(14))).toBe("XIV")
+    expect(showS(toRoman(19))).toBe("XIX")
+    expect(showS(toRoman(40))).toBe("XL")
+    expect(showS(toRoman(49))).toBe("XLIX")
+    expect(showS(toRoman(90))).toBe("XC")
+    expect(showS(toRoman(99))).toBe("XCIX")
+    expect(showS(toRoman(400))).toBe("CD")
+    expect(showS(toRoman(444))).toBe("CDXLIV")
+    expect(showS(toRoman(900))).toBe("CM")
+    expect(showS(toRoman(999))).toBe("CMXCIX")
+}
+
+test fn large_values() {
+    expect(showS(toRoman(1000))).toBe("M")
+    expect(showS(toRoman(1666))).toBe("MDCLXVI")
+    expect(showS(toRoman(1994))).toBe("MCMXCIV")
+    expect(showS(toRoman(2024))).toBe("MMXXIV")
+    expect(showS(toRoman(3999))).toBe("MMMCMXCIX")
+}
+
+test fn out_of_range_values_have_no_spelling() {
+    expect(showS(toRoman(0))).toBe("<none>")
+    expect(showS(toRoman(-1))).toBe("<none>")
+    expect(showS(toRoman(-3999))).toBe("<none>")
+    expect(showS(toRoman(4000))).toBe("<none>")
+    expect(showS(toRoman(1000000))).toBe("<none>")
+}
+
+test fn parsing_canonical_text() {
+    expect(showI(fromRoman("I"))).toBe("1")
+    expect(showI(fromRoman("IV"))).toBe("4")
+    expect(showI(fromRoman("IX"))).toBe("9")
+    expect(showI(fromRoman("XL"))).toBe("40")
+    expect(showI(fromRoman("MCMXCIV"))).toBe("1994")
+    expect(showI(fromRoman("MMXXIV"))).toBe("2024")
+    expect(showI(fromRoman("MMMCMXCIX"))).toBe("3999")
+    expect(showI(fromRoman("MDCLXVI"))).toBe("1666")
+}
+
+test fn parsing_rejects_non_canonical_spellings() {
+    expect(showI(fromRoman("IIII"))).toBe("<none>")
+    expect(showI(fromRoman("VV"))).toBe("<none>")
+    expect(showI(fromRoman("IIV"))).toBe("<none>")
+    expect(showI(fromRoman("IC"))).toBe("<none>")
+    expect(showI(fromRoman("XM"))).toBe("<none>")
+    expect(showI(fromRoman("VX"))).toBe("<none>")
+    expect(showI(fromRoman("MMMM"))).toBe("<none>")
+    expect(showI(fromRoman("MCMC"))).toBe("<none>")
+    expect(showI(fromRoman("CMCM"))).toBe("<none>")
+}
+
+test fn parsing_rejects_junk_and_empty_text() {
+    expect(showI(fromRoman(""))).toBe("<none>")
+    expect(showI(fromRoman("IV "))).toBe("<none>")
+    expect(showI(fromRoman(" IV"))).toBe("<none>")
+    expect(showI(fromRoman("iv"))).toBe("<none>")
+    expect(showI(fromRoman("IXI"))).toBe("<none>")
+    expect(showI(fromRoman("ABC"))).toBe("<none>")
+    expect(showI(fromRoman("M1"))).toBe("<none>")
+    expect(showI(fromRoman(" "))).toBe("<none>")
+}
+
+test fn validity_predicate() {
+    expect(isRoman("MCMXCIV")).toBe(true)
+    expect(isRoman("I")).toBe(true)
+    expect(isRoman("MMMCMXCIX")).toBe(true)
+    expect(isRoman("")).toBe(false)
+    expect(isRoman("IIII")).toBe(false)
+    expect(isRoman("MMMM")).toBe(false)
+    expect(isRoman("mcmxciv")).toBe(false)
+}
+
+test fn every_supported_value_round_trips() {
+    var n = 1
+    while (n <= 3999) {
+        let text = showS(toRoman(n))
+        if (showI(fromRoman(text)) != "{n}") {
+            expect(showI(fromRoman(text))).toBe("{n}")
+        }
+        n = n + 1
+    }
+    expect(showI(fromRoman(showS(toRoman(3999))))).toBe("3999")
+}
+
+test fn spellings_only_use_roman_letters() {
+    var n = 1
+    var ok = true
+    while (n <= 3999) {
+        let text = bytes(showS(toRoman(n)))
+        var i = 0
+        while (i < len(text)) {
+            let c = text[i]
+            if (c != 73 && c != 86 && c != 88 && c != 76 && c != 67 && c != 68 && c != 77) {
+                ok = false
+            }
+            i = i + 1
+        }
+        n = n + 1
+    }
+    expect(ok).toBe(true)
+}
+
+test fn length_grows_with_magnitude() {
+    expect(len(bytes(showS(toRoman(1))))).toBe(1)
+    expect(len(bytes(showS(toRoman(8))))).toBe(4)
+    expect(len(bytes(showS(toRoman(88))))).toBe(8)
+    expect(len(bytes(showS(toRoman(888))))).toBe(12)
+    expect(len(bytes(showS(toRoman(3888))))).toBe(15)
+}
+
+test fn a_small_pipeline() {
+    let years = [1066, 1215, 1492, 1776, 1969, 2024]
+    var out = ""
+    var i = 0
+    while (i < len(years)) {
+        out = out + "{years[i]}=" + showS(toRoman(years[i])) + ";"
+        i = i + 1
+    }
+    expect(out).toBe("1066=MLXVI;1215=MCCXV;1492=MCDXCII;1776=MDCCLXXVI;1969=MCMLXIX;2024=MMXXIV;")
+    expect(showI(fromRoman("MLXVI"))).toBe("1066")
+}
