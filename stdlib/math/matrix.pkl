@@ -1,0 +1,461 @@
+module std.math.matrix
+
+// Dense row-major matrices over `float`.
+//
+// A matrix is `List<List<float>>` - row lists of equal length. Construction is
+// checked: `fromRows` returns `none` for a ragged matrix, and every operation
+// that needs matching shapes returns `none` instead of reading out of range.
+// The empty matrix has zero rows and zero columns.
+//
+// Determinants and inverses use Gaussian elimination with partial pivoting (the
+// largest absolute value in the column wins), so the arithmetic is
+// deterministic and bit-identical across implementations. A zero pivot means a
+// singular matrix: `determinant` returns 0 and `inverse` returns `none`.
+// Floating point results are only as exact as the input values; use a
+// tolerance when comparing computed inverses.
+
+/// A typed empty row list.
+fn emptyRows() -> List<List<float>> {
+    var out: List<List<float>> = [[0.0]]
+    out.remove(0)
+    out
+}
+
+/// A typed empty cell list.
+fn emptyCells() -> List<float> {
+    var out: List<float> = [0.0]
+    out.remove(0)
+    out
+}
+
+/// The absolute value of `x`.
+fn fabs(x: float) -> float {
+    if (x < 0.0) {
+        return 0.0 - x
+    }
+    x
+}
+
+/// The number of rows.
+fn rowCount(m: List<List<float>>) -> int {
+    len(m)
+}
+
+/// The number of columns (0 for the empty matrix).
+fn colCount(m: List<List<float>>) -> int {
+    if (len(m) == 0) {
+        return 0
+    }
+    len(m[0])
+}
+
+/// Whether every row has the same length.
+fn isRectangular(rows: List<List<float>>) -> bool {
+    if (len(rows) == 0) {
+        return true
+    }
+    let n = len(rows[0])
+    var r = 1
+    while (r < len(rows)) {
+        if (len(rows[r]) != n) {
+            return false
+        }
+        r = r + 1
+    }
+    true
+}
+
+/// A matrix from row lists; `none` when the rows are ragged.
+fn fromRows(rows: List<List<float>>) -> List<List<float>>? {
+    if (!isRectangular(rows)) {
+        return none
+    }
+    copyOf(rows)
+}
+
+/// A deep copy of `m`.
+fn copyOf(m: List<List<float>>) -> List<List<float>> {
+    var out = emptyRows()
+    var r = 0
+    while (r < len(m)) {
+        var row = emptyCells()
+        var c = 0
+        while (c < len(m[r])) {
+            row.push(m[r][c])
+            c = c + 1
+        }
+        out.push(row)
+        r = r + 1
+    }
+    out
+}
+
+/// A `rows` x `cols` matrix of zeros; `none` when either dimension is negative.
+fn zeros(rows: int, cols: int) -> List<List<float>>? {
+    if (rows < 0 || cols < 0) {
+        return none
+    }
+    var out = emptyRows()
+    var r = 0
+    while (r < rows) {
+        var row = emptyCells()
+        var c = 0
+        while (c < cols) {
+            row.push(0.0)
+            c = c + 1
+        }
+        out.push(row)
+        r = r + 1
+    }
+    out
+}
+
+/// The `n` x `n` identity matrix; `none` when `n` is negative.
+fn identity(n: int) -> List<List<float>>? {
+    if (n < 0) {
+        return none
+    }
+    var out = emptyRows()
+    var r = 0
+    while (r < n) {
+        var row = emptyCells()
+        var c = 0
+        while (c < n) {
+            if (c == r) {
+                row.push(1.0)
+            } else {
+                row.push(0.0)
+            }
+            c = c + 1
+        }
+        out.push(row)
+        r = r + 1
+    }
+    out
+}
+
+/// Whether `m` is square.
+fn isSquare(m: List<List<float>>) -> bool {
+    if (!isRectangular(m)) {
+        return false
+    }
+    len(m) == colCount(m)
+}
+
+/// Element `(r, c)`; `none` when out of range.
+fn get(m: List<List<float>>, r: int, c: int) -> float? {
+    if (r < 0 || r >= len(m) || c < 0 || c >= len(m[r])) {
+        return none
+    }
+    m[r][c]
+}
+
+/// The transpose; `none` when `m` is ragged.
+fn transpose(m: List<List<float>>) -> List<List<float>>? {
+    if (!isRectangular(m)) {
+        return none
+    }
+    let rows = len(m)
+    let cols = colCount(m)
+    var out = emptyRows()
+    var c = 0
+    while (c < cols) {
+        var row = emptyCells()
+        var r = 0
+        while (r < rows) {
+            row.push(m[r][c])
+            r = r + 1
+        }
+        out.push(row)
+        c = c + 1
+    }
+    out
+}
+
+/// The element-wise sum; `none` when the shapes differ.
+fn add(a: List<List<float>>, b: List<List<float>>) -> List<List<float>>? {
+    if (rowCount(a) != rowCount(b) || colCount(a) != colCount(b)) {
+        return none
+    }
+    var out = emptyRows()
+    var r = 0
+    while (r < len(a)) {
+        var row = emptyCells()
+        var c = 0
+        while (c < len(a[r])) {
+            row.push(a[r][c] + b[r][c])
+            c = c + 1
+        }
+        out.push(row)
+        r = r + 1
+    }
+    out
+}
+
+/// The element-wise difference; `none` when the shapes differ.
+fn sub(a: List<List<float>>, b: List<List<float>>) -> List<List<float>>? {
+    if (rowCount(a) != rowCount(b) || colCount(a) != colCount(b)) {
+        return none
+    }
+    var out = emptyRows()
+    var r = 0
+    while (r < len(a)) {
+        var row = emptyCells()
+        var c = 0
+        while (c < len(a[r])) {
+            row.push(a[r][c] - b[r][c])
+            c = c + 1
+        }
+        out.push(row)
+        r = r + 1
+    }
+    out
+}
+
+/// Every element multiplied by `k`.
+fn scale(m: List<List<float>>, k: float) -> List<List<float>> {
+    var out = emptyRows()
+    var r = 0
+    while (r < len(m)) {
+        var row = emptyCells()
+        var c = 0
+        while (c < len(m[r])) {
+            row.push(m[r][c] * k)
+            c = c + 1
+        }
+        out.push(row)
+        r = r + 1
+    }
+    out
+}
+
+/// The matrix product `a * b`; `none` when the inner dimensions differ.
+fn mul(a: List<List<float>>, b: List<List<float>>) -> List<List<float>>? {
+    let n = rowCount(a)
+    let k = colCount(a)
+    if (k != rowCount(b)) {
+        return none
+    }
+    if (!isRectangular(a) || !isRectangular(b)) {
+        return none
+    }
+    let m = colCount(b)
+    var out = emptyRows()
+    var r = 0
+    while (r < n) {
+        var row = emptyCells()
+        var c = 0
+        while (c < m) {
+            var sum = 0.0
+            var t = 0
+            while (t < k) {
+                sum = sum + a[r][t] * b[t][c]
+                t = t + 1
+            }
+            row.push(sum)
+            c = c + 1
+        }
+        out.push(row)
+        r = r + 1
+    }
+    out
+}
+
+/// The sum of the main diagonal; 0 for the empty matrix.
+fn trace(m: List<List<float>>) -> float {
+    var sum = 0.0
+    var i = 0
+    while (i < len(m) && i < colCount(m)) {
+        sum = sum + m[i][i]
+        i = i + 1
+    }
+    sum
+}
+
+/// The determinant via Gaussian elimination with partial pivoting; `none` when
+/// `m` is not square. The determinant of the empty matrix is 1.
+fn determinant(m: List<List<float>>) -> float? {
+    if (!isRectangular(m)) {
+        return none
+    }
+    let n = len(m)
+    if (n != colCount(m)) {
+        return none
+    }
+    if (n == 0) {
+        return 1.0
+    }
+    var a = copyOf(m)
+    var det = 1.0
+    var i = 0
+    while (i < n) {
+        var pivot = i
+        var best = fabs(a[i][i])
+        var r = i + 1
+        while (r < n) {
+            let v = fabs(a[r][i])
+            if (v > best) {
+                best = v
+                pivot = r
+            }
+            r = r + 1
+        }
+        if (best <= 0.0) {
+            return 0.0
+        }
+        if (pivot != i) {
+            let tmp = a[i]
+            a[i] = a[pivot]
+            a[pivot] = tmp
+            det = 0.0 - det
+        }
+        let p = a[i][i]
+        det = det * p
+        var rr = i + 1
+        while (rr < n) {
+            let factor = a[rr][i] / p
+            if (factor != 0.0) {
+                var c = i
+                while (c < n) {
+                    a[rr][c] = a[rr][c] - factor * a[i][c]
+                    c = c + 1
+                }
+            }
+            rr = rr + 1
+        }
+        i = i + 1
+    }
+    det
+}
+
+/// The inverse via Gauss-Jordan elimination with partial pivoting; `none` when
+/// `m` is not square or is singular.
+fn inverse(m: List<List<float>>) -> List<List<float>>? {
+    if (!isRectangular(m)) {
+        return none
+    }
+    let n = len(m)
+    if (n != colCount(m)) {
+        return none
+    }
+    var a = emptyRows()
+    var r = 0
+    while (r < n) {
+        var row = emptyCells()
+        var c = 0
+        while (c < n) {
+            row.push(m[r][c])
+            c = c + 1
+        }
+        c = 0
+        while (c < n) {
+            if (c == r) {
+                row.push(1.0)
+            } else {
+                row.push(0.0)
+            }
+            c = c + 1
+        }
+        a.push(row)
+        r = r + 1
+    }
+    var i = 0
+    while (i < n) {
+        var pivot = i
+        var best = fabs(a[i][i])
+        var rr = i + 1
+        while (rr < n) {
+            let v = fabs(a[rr][i])
+            if (v > best) {
+                best = v
+                pivot = rr
+            }
+            rr = rr + 1
+        }
+        if (best <= 0.0) {
+            return none
+        }
+        if (pivot != i) {
+            let tmp = a[i]
+            a[i] = a[pivot]
+            a[pivot] = tmp
+        }
+        let p = a[i][i]
+        var c = 0
+        while (c < 2 * n) {
+            a[i][c] = a[i][c] / p
+            c = c + 1
+        }
+        var other = 0
+        while (other < n) {
+            if (other != i) {
+                let factor = a[other][i]
+                if (factor != 0.0) {
+                    c = 0
+                    while (c < 2 * n) {
+                        a[other][c] = a[other][c] - factor * a[i][c]
+                        c = c + 1
+                    }
+                }
+            }
+            other = other + 1
+        }
+        i = i + 1
+    }
+    var out = emptyRows()
+    r = 0
+    while (r < n) {
+        var row = emptyCells()
+        var c2 = n
+        while (c2 < 2 * n) {
+            row.push(a[r][c2])
+            c2 = c2 + 1
+        }
+        out.push(row)
+        r = r + 1
+    }
+    out
+}
+
+/// Whether `a` and `b` have the same shape and element-wise difference within
+/// `eps` (absolute).
+fn approxEq(a: List<List<float>>, b: List<List<float>>, eps: float) -> bool {
+    if (rowCount(a) != rowCount(b) || colCount(a) != colCount(b)) {
+        return false
+    }
+    var r = 0
+    while (r < len(a)) {
+        var c = 0
+        while (c < len(a[r])) {
+            if (fabs(a[r][c] - b[r][c]) > eps) {
+                return false
+            }
+            c = c + 1
+        }
+        r = r + 1
+    }
+    true
+}
+
+/// A compact rendering: `[[1, 0], [0, 1]]`.
+fn render(m: List<List<float>>) -> string {
+    var out = "["
+    var r = 0
+    while (r < len(m)) {
+        if (r > 0) {
+            out = out + ", "
+        }
+        out = out + "["
+        var c = 0
+        while (c < len(m[r])) {
+            if (c > 0) {
+                out = out + ", "
+            }
+            out = out + "{m[r][c]}"
+            c = c + 1
+        }
+        out = out + "]"
+        r = r + 1
+    }
+    out + "]"
+}

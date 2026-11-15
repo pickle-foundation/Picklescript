@@ -1,0 +1,333 @@
+module std.math.matrix_test
+
+import { rowCount, colCount, isRectangular, fromRows, copyOf, zeros, identity, isSquare, get, transpose, add, sub, scale, mul, trace, determinant, inverse, approxEq, render } from std.math.matrix
+
+/// A typed empty row list.
+fn noRows() -> List<List<float>> {
+    var out: List<List<float>> = [[0.0]]
+    out.remove(0)
+    out
+}
+
+/// Unwrap an optional matrix, falling back to `fallback`.
+fn mustMat(m: List<List<float>>?, fallback: List<List<float>>) -> List<List<float>> {
+    match (m) {
+    case some(v) -> v
+    case none -> fallback
+    }
+}
+
+/// A rendered optional matrix (`<none>` for `none`).
+fn showMat(m: List<List<float>>?) -> string {
+    match (m) {
+    case some(v) -> render(v)
+    case none -> "<none>"
+    }
+}
+
+/// A rendered optional float (`<none>` for `none`).
+fn showFloat(x: float?) -> string {
+    match (x) {
+    case some(v) -> "{v}"
+    case none -> "<none>"
+    }
+}
+
+/// A rendered optional element (`<none>` for `none`).
+fn showGet(m: List<List<float>>, r: int, c: int) -> string {
+    match (get(m, r, c)) {
+    case some(v) -> "{v}"
+    case none -> "<none>"
+    }
+}
+
+/// The transpose of `m`, or the empty matrix when it is ragged.
+fn transposeOrEmpty(m: List<List<float>>) -> List<List<float>> {
+    mustMat(transpose(m), noRows())
+}
+
+/// A 2x2 matrix used by several tests: [[2, 1], [0, 4]].
+fn upper2() -> List<List<float>> {
+    let r0: List<float> = [2.0, 1.0]
+    let r1: List<float> = [0.0, 4.0]
+    var rows: List<List<float>> = [r0]
+    rows.push(r1)
+    rows
+}
+
+/// A 3x3 matrix used by several tests: [[2, 0, 0], [0, 4, 0], [0, 0, 8]].
+fn diag3() -> List<List<float>> {
+    let r0: List<float> = [2.0, 0.0, 0.0]
+    let r1: List<float> = [0.0, 4.0, 0.0]
+    let r2: List<float> = [0.0, 0.0, 8.0]
+    var rows: List<List<float>> = [r0]
+    rows.push(r1)
+    rows.push(r2)
+    rows
+}
+
+test fn shape_reporting() {
+    let m = upper2()
+    expect(rowCount(m)).toBe(2)
+    expect(colCount(m)).toBe(2)
+    expect(isRectangular(m)).toBe(true)
+    expect(isSquare(m)).toBe(true)
+    let empty = noRows()
+    expect(rowCount(empty)).toBe(0)
+    expect(colCount(empty)).toBe(0)
+    expect(isRectangular(empty)).toBe(true)
+    expect(isSquare(empty)).toBe(true)
+    let r0: List<float> = [1.0, 2.0, 3.0]
+    var wide: List<List<float>> = [r0]
+    expect(rowCount(wide)).toBe(1)
+    expect(colCount(wide)).toBe(3)
+    expect(isSquare(wide)).toBe(false)
+}
+
+test fn ragged_matrices_are_rejected() {
+    let r0: List<float> = [1.0, 2.0]
+    let r1: List<float> = [3.0]
+    var ragged: List<List<float>> = [r0]
+    ragged.push(r1)
+    expect(isRectangular(ragged)).toBe(false)
+    expect(isSquare(ragged)).toBe(false)
+    expect(showMat(fromRows(ragged))).toBe("<none>")
+    expect(showMat(transpose(ragged))).toBe("<none>")
+    expect(showFloat(determinant(ragged))).toBe("<none>")
+    expect(showMat(inverse(ragged))).toBe("<none>")
+}
+
+test fn from_rows_copies_and_shapes() {
+    let m = upper2()
+    expect(showMat(fromRows(m))).toBe("[[2, 1], [0, 4]]")
+    expect(render(copyOf(m))).toBe("[[2, 1], [0, 4]]")
+    expect(showMat(fromRows(noRows()))).toBe("[]")
+}
+
+test fn zeros_and_identity() {
+    expect(showMat(zeros(2, 3))).toBe("[[0, 0, 0], [0, 0, 0]]")
+    expect(showMat(zeros(0, 0))).toBe("[]")
+    expect(showMat(zeros(1, 1))).toBe("[[0]]")
+    expect(showMat(zeros(-1, 2))).toBe("<none>")
+    expect(showMat(zeros(2, -1))).toBe("<none>")
+    expect(showMat(identity(3))).toBe("[[1, 0, 0], [0, 1, 0], [0, 0, 1]]")
+    expect(showMat(identity(0))).toBe("[]")
+    expect(showMat(identity(-1))).toBe("<none>")
+    expect(showMat(identity(1))).toBe("[[1]]")
+}
+
+test fn element_access() {
+    let m = upper2()
+    expect(showGet(m, 0, 0)).toBe("2")
+    expect(showGet(m, 0, 1)).toBe("1")
+    expect(showGet(m, 1, 0)).toBe("0")
+    expect(showGet(m, 1, 1)).toBe("4")
+    expect(showGet(m, 2, 0)).toBe("<none>")
+    expect(showGet(m, 0, 2)).toBe("<none>")
+    expect(showGet(m, -1, 0)).toBe("<none>")
+    expect(showGet(m, 0, -1)).toBe("<none>")
+    expect(showGet(noRows(), 0, 0)).toBe("<none>")
+}
+
+test fn transpose_swaps_axes() {
+    let r0: List<float> = [1.0, 2.0, 3.0]
+    let r1: List<float> = [4.0, 5.0, 6.0]
+    var m: List<List<float>> = [r0]
+    m.push(r1)
+    expect(showMat(transpose(m))).toBe("[[1, 4], [2, 5], [3, 6]]")
+    expect(showMat(transpose(transposeOrEmpty(m)))).toBe("[[1, 2, 3], [4, 5, 6]]")
+    let v0: List<float> = [1.0]
+    let v1: List<float> = [2.0]
+    var col: List<List<float>> = [v0]
+    col.push(v1)
+    expect(showMat(transpose(col))).toBe("[[1, 2]]")
+    expect(showMat(transpose(noRows()))).toBe("[]")
+}
+
+test fn addition_and_subtraction() {
+    let a = upper2()
+    let b = mustMat(identity(2), noRows())
+    expect(showMat(add(a, b))).toBe("[[3, 1], [0, 5]]")
+    expect(showMat(sub(a, b))).toBe("[[1, 1], [0, 3]]")
+    let r0: List<float> = [1.0]
+    var small: List<List<float>> = [r0]
+    expect(showMat(add(a, small))).toBe("<none>")
+    expect(showMat(sub(a, small))).toBe("<none>")
+    expect(showMat(add(noRows(), noRows()))).toBe("[]")
+}
+
+test fn scaling() {
+    let m = upper2()
+    expect(render(scale(m, 2.0))).toBe("[[4, 2], [0, 8]]")
+    expect(render(scale(m, 0.5))).toBe("[[1, 0.5], [0, 2]]")
+    expect(render(scale(m, 0.0))).toBe("[[0, 0], [0, 0]]")
+    expect(render(scale(noRows(), 3.0))).toBe("[]")
+}
+
+test fn multiplication() {
+    let a = upper2()
+    let i2 = mustMat(identity(2), noRows())
+    expect(showMat(mul(a, i2))).toBe("[[2, 1], [0, 4]]")
+    expect(showMat(mul(i2, a))).toBe("[[2, 1], [0, 4]]")
+    let r0: List<float> = [1.0, 1.0]
+    let r1: List<float> = [0.0, 1.0]
+    var b: List<List<float>> = [r0]
+    b.push(r1)
+    expect(showMat(mul(a, b))).toBe("[[2, 3], [0, 4]]")
+    let c0: List<float> = [1.0, 2.0, 3.0]
+    let c1: List<float> = [4.0, 5.0, 6.0]
+    var c: List<List<float>> = [c0]
+    c.push(c1)
+    let d0: List<float> = [1.0]
+    let d1: List<float> = [0.0]
+    let d2: List<float> = [2.0]
+    var d: List<List<float>> = [d0]
+    d.push(d1)
+    d.push(d2)
+    expect(showMat(mul(c, d))).toBe("[[7], [16]]")
+    let r3: List<float> = [1.0, 2.0, 3.0, 4.0]
+    var wide: List<List<float>> = [r3]
+    expect(showMat(mul(a, wide))).toBe("<none>")
+}
+
+test fn trace_sums_the_diagonal() {
+    expect(trace(upper2())).toBe(6.0)
+    expect(trace(diag3())).toBe(14.0)
+    expect(trace(mustMat(identity(4), noRows()))).toBe(4.0)
+    expect(trace(noRows())).toBe(0.0)
+    let r0: List<float> = [1.0, 2.0]
+    let r1: List<float> = [3.0, 4.0]
+    let r2: List<float> = [5.0, 6.0]
+    var tall: List<List<float>> = [r0]
+    tall.push(r1)
+    tall.push(r2)
+    expect(trace(tall)).toBe(5.0)
+}
+
+test fn determinant_of_small_matrices() {
+    let r0: List<float> = [7.0]
+    var one: List<List<float>> = [r0]
+    expect(showFloat(determinant(one))).toBe("7")
+    expect(showFloat(determinant(upper2()))).toBe("8")
+    let m0: List<float> = [0.0, 2.0]
+    let m1: List<float> = [3.0, 0.0]
+    var swap: List<List<float>> = [m0]
+    swap.push(m1)
+    expect(showFloat(determinant(swap))).toBe("-6")
+    let a0: List<float> = [0.0, 1.0]
+    let a1: List<float> = [1.0, 0.0]
+    var anti: List<List<float>> = [a0]
+    anti.push(a1)
+    expect(showFloat(determinant(anti))).toBe("-1")
+    expect(showFloat(determinant(diag3()))).toBe("64")
+    expect(showFloat(determinant(noRows()))).toBe("1")
+}
+
+test fn determinant_of_triangular_matrix() {
+    let r0: List<float> = [2.0, 1.0, 0.0]
+    let r1: List<float> = [0.0, 3.0, 1.0]
+    let r2: List<float> = [0.0, 0.0, 4.0]
+    var m: List<List<float>> = [r0]
+    m.push(r1)
+    m.push(r2)
+    expect(showFloat(determinant(m))).toBe("24")
+    let s0: List<float> = [1.0, 2.0]
+    let s1: List<float> = [2.0, 4.0]
+    var singular: List<List<float>> = [s0]
+    singular.push(s1)
+    expect(showFloat(determinant(singular))).toBe("0")
+    let z0: List<float> = [0.0, 0.0]
+    let z1: List<float> = [0.0, 0.0]
+    var zero: List<List<float>> = [z0]
+    zero.push(z1)
+    expect(showFloat(determinant(zero))).toBe("0")
+}
+
+test fn determinant_requires_a_square_matrix() {
+    let r0: List<float> = [1.0, 2.0, 3.0]
+    let r1: List<float> = [4.0, 5.0, 6.0]
+    var m: List<List<float>> = [r0]
+    m.push(r1)
+    expect(showFloat(determinant(m))).toBe("<none>")
+    let v0: List<float> = [1.0, 2.0]
+    var row: List<List<float>> = [v0]
+    expect(showFloat(determinant(row))).toBe("<none>")
+}
+
+test fn inverse_of_two_by_two() {
+    expect(showMat(inverse(upper2()))).toBe("[[0.5, -0.125], [0, 0.25]]")
+    expect(showMat(inverse(mustMat(identity(2), noRows())))).toBe("[[1, 0], [0, 1]]")
+    expect(showMat(inverse(diag3()))).toBe("[[0.5, 0, 0], [0, 0.25, 0], [0, 0, 0.125]]")
+    let a0: List<float> = [0.0, 1.0]
+    let a1: List<float> = [1.0, 0.0]
+    var anti: List<List<float>> = [a0]
+    anti.push(a1)
+    expect(showMat(inverse(anti))).toBe("[[0, 1], [1, 0]]")
+}
+
+test fn inverse_round_trips() {
+    let a = upper2()
+    match (inverse(a)) {
+    case some(v) -> {
+        match (mul(a, v)) {
+        case some(p) -> expect(approxEq(p, mustMat(identity(2), noRows()), 0.000001)).toBe(true)
+        case none -> expect(false).toBe(true)
+        }
+    }
+    case none -> expect(false).toBe(true)
+    }
+    let d = diag3()
+    match (inverse(d)) {
+    case some(v) -> {
+        match (mul(d, v)) {
+        case some(p) -> expect(approxEq(p, mustMat(identity(3), noRows()), 0.000001)).toBe(true)
+        case none -> expect(false).toBe(true)
+        }
+    }
+    case none -> expect(false).toBe(true)
+    }
+}
+
+test fn inverse_of_singular_matrix_is_none() {
+    let s0: List<float> = [1.0, 2.0]
+    let s1: List<float> = [2.0, 4.0]
+    var singular: List<List<float>> = [s0]
+    singular.push(s1)
+    expect(showMat(inverse(singular))).toBe("<none>")
+    let z0: List<float> = [0.0, 0.0]
+    let z1: List<float> = [0.0, 0.0]
+    var zero: List<List<float>> = [z0]
+    zero.push(z1)
+    expect(showMat(inverse(zero))).toBe("<none>")
+    let r0: List<float> = [1.0, 2.0, 3.0]
+    let r1: List<float> = [4.0, 5.0, 6.0]
+    var wide: List<List<float>> = [r0]
+    wide.push(r1)
+    expect(showMat(inverse(wide))).toBe("<none>")
+    expect(showMat(inverse(noRows()))).toBe("[]")
+}
+
+test fn approx_eq_compares_with_tolerance() {
+    let a = upper2()
+    let b = copyOf(a)
+    expect(approxEq(a, b, 0.0)).toBe(true)
+    let c0: List<float> = [2.0, 1.0]
+    let c1: List<float> = [0.0, 4.5]
+    var c: List<List<float>> = [c0]
+    c.push(c1)
+    expect(approxEq(a, c, 0.25)).toBe(false)
+    expect(approxEq(a, c, 0.5)).toBe(true)
+    let r0: List<float> = [2.0]
+    var small: List<List<float>> = [r0]
+    expect(approxEq(a, small, 100.0)).toBe(false)
+    expect(approxEq(noRows(), noRows(), 0.0)).toBe(true)
+}
+
+test fn render_renders_compact_rows() {
+    expect(render(noRows())).toBe("[]")
+    expect(render(upper2())).toBe("[[2, 1], [0, 4]]")
+    expect(render(mustMat(identity(3), noRows()))).toBe("[[1, 0, 0], [0, 1, 0], [0, 0, 1]]")
+    let r0: List<float> = [0.5, -0.25]
+    var frac: List<List<float>> = [r0]
+    expect(render(frac)).toBe("[[0.5, -0.25]]")
+}
