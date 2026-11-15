@@ -1,0 +1,152 @@
+module std.text.words_test
+
+import { WordCount, tokens, splitWhitespace, normalizeSpace, wordCount, lowerWords, sortedCopy, uniqueSorted, countsOf, topWords, ngrams, containsWord, overlapCount, jaccard, dice, renderCount, renderCounts } from std.text.words
+
+/// Words joined by `|` (`[]` when empty).
+fn showWords(words: List<string>) -> string {
+    if (len(words) == 0) {
+        return "[]"
+    }
+    var out = ""
+    var i = 0
+    while (i < len(words)) {
+        if (i > 0) {
+            out = out + "|"
+        }
+        out = out + words[i]
+        i = i + 1
+    }
+    out
+}
+
+/// A rendered float.
+fn showF(x: float) -> string {
+    "{x}"
+}
+
+test fn tokens_split_on_punctuation_and_space() {
+    expect(showWords(tokens("Hello, world! It's 42."))).toBe("Hello|world|It|s|42")
+    expect(showWords(tokens("  spaced   out  "))).toBe("spaced|out")
+    expect(showWords(tokens("a-b_c.d/e"))).toBe("a|b_c|d|e")
+    expect(showWords(tokens(""))).toBe("[]")
+    expect(showWords(tokens("!!! --- ..."))).toBe("[]")
+}
+
+test fn tokens_keep_unicode_and_case() {
+    expect(showWords(tokens("fooBar café_bar 42x"))).toBe("fooBar|café_bar|42x")
+    expect(showWords(tokens("naïve café"))).toBe("naïve|café")
+    expect(len(tokens("naïve café"))).toBe(2)
+    expect(showWords(tokens("_private __dunder__"))).toBe("_private|__dunder__")
+}
+
+test fn whitespace_splitting_keeps_punctuation() {
+    expect(showWords(splitWhitespace("a, b\tc\n\nd"))).toBe("a,|b|c|d")
+    expect(showWords(splitWhitespace("  lead and trail  "))).toBe("lead|and|trail")
+    expect(showWords(splitWhitespace(""))).toBe("[]")
+    expect(showWords(splitWhitespace("one\rtwo\tthree\nfour"))).toBe("one|two|three|four")
+}
+
+test fn whitespace_normalization() {
+    expect(normalizeSpace("  a \t b\n c  ")).toBe("a b c")
+    expect(normalizeSpace("")).toBe("")
+    expect(normalizeSpace("   ")).toBe("")
+    expect(normalizeSpace("already normal")).toBe("already normal")
+    expect(normalizeSpace("café  au lait")).toBe("café au lait")
+}
+
+test fn word_counts() {
+    expect(wordCount("")).toBe(0)
+    expect(wordCount("one")).toBe(1)
+    expect(wordCount("one two,three")).toBe(3)
+    expect(wordCount("... --- ...")).toBe(0)
+    expect(wordCount("a b c d e")).toBe(5)
+}
+
+test fn lowercasing_words() {
+    expect(showWords(lowerWords(["Hello", "WORLD", "café"]))).toBe("hello|world|café")
+    expect(showWords(lowerWords(tokens("")))).toBe("[]")
+}
+
+test fn sorted_and_unique_vocabularies() {
+    expect(showWords(sortedCopy(["b", "a", "c", "a"]))).toBe("a|a|b|c")
+    expect(showWords(uniqueSorted(["b", "a", "c", "a"]))).toBe("a|b|c")
+    expect(showWords(uniqueSorted(tokens("")))).toBe("[]")
+    expect(showWords(uniqueSorted(["x"]))).toBe("x")
+    expect(showWords(uniqueSorted(["b", "B", "b"]))).toBe("B|b")
+}
+
+test fn frequency_tables() {
+    let ws = tokens("the cat the dog the bird cat")
+    expect(renderCounts(countsOf(ws))).toBe("[(the, 3), (cat, 2), (bird, 1), (dog, 1)]")
+    expect(renderCounts(countsOf(tokens("")))).toBe("[]")
+    expect(renderCounts(countsOf(tokens("solo")))).toBe("[(solo, 1)]")
+}
+
+test fn top_words_are_limited_and_ordered() {
+    let ws = tokens("the cat the dog the bird cat")
+    expect(renderCounts(topWords(ws, 2))).toBe("[(the, 3), (cat, 2)]")
+    expect(renderCounts(topWords(ws, 0))).toBe("[]")
+    expect(renderCounts(topWords(ws, -3))).toBe("[]")
+    expect(renderCounts(topWords(ws, 99))).toBe("[(the, 3), (cat, 2), (bird, 1), (dog, 1)]")
+}
+
+test fn ngrams_overlap_their_neighbours() {
+    let ws = tokens("a b c d")
+    expect(showWords(ngrams(ws, 1))).toBe("a|b|c|d")
+    expect(showWords(ngrams(ws, 2))).toBe("a b|b c|c d")
+    expect(showWords(ngrams(ws, 3))).toBe("a b c|b c d")
+    expect(showWords(ngrams(ws, 4))).toBe("a b c d")
+    expect(showWords(ngrams(ws, 5))).toBe("[]")
+    expect(showWords(ngrams(ws, 0))).toBe("[]")
+    expect(showWords(ngrams(tokens(""), 1))).toBe("[]")
+}
+
+test fn word_membership() {
+    let ws = tokens("alpha beta gamma")
+    expect(containsWord(ws, "beta")).toBe(true)
+    expect(containsWord(ws, "Beta")).toBe(false)
+    expect(containsWord(ws, "delta")).toBe(false)
+    expect(containsWord(tokens(""), "delta")).toBe(false)
+}
+
+test fn overlaps_use_set_semantics() {
+    expect(overlapCount(tokens("a a b"), tokens("a c"))).toBe(1)
+    expect(overlapCount(tokens("a b c"), tokens("a b c"))).toBe(3)
+    expect(overlapCount(tokens("a b"), tokens("c d"))).toBe(0)
+    expect(overlapCount(tokens(""), tokens(""))).toBe(0)
+}
+
+test fn jaccard_similarity() {
+    expect(showF(jaccard(tokens("a b c"), tokens("a b c")))).toBe("1")
+    expect(showF(jaccard(tokens("a b"), tokens("c d")))).toBe("0")
+    expect(showF(jaccard(tokens("a b"), tokens("a c d")))).toBe("0.25")
+    expect(showF(jaccard(tokens(""), tokens("")))).toBe("1")
+    expect(showF(jaccard(tokens("a"), tokens("")))).toBe("0")
+}
+
+test fn dice_similarity() {
+    expect(showF(dice(tokens("a b c d"), tokens("a b x y")))).toBe("0.5")
+    expect(showF(dice(tokens("a b c"), tokens("a b c")))).toBe("1")
+    expect(showF(dice(tokens("a b"), tokens("c d")))).toBe("0")
+    expect(showF(dice(tokens(""), tokens("")))).toBe("1")
+    expect(showF(dice(tokens("a"), tokens("")))).toBe("0")
+}
+
+test fn single_count_rendering() {
+    let cs = countsOf(tokens("solo"))
+    expect(len(cs)).toBe(1)
+    expect(cs[0].word).toBe("solo")
+    expect(cs[0].count).toBe(1)
+    expect(renderCount(cs[0])).toBe("(solo, 1)")
+}
+
+test fn a_realistic_pipeline() {
+    let text = "the quick brown fox jumps over the lazy dog the end"
+    let ws = tokens(text)
+    expect(wordCount(text)).toBe(11)
+    expect(len(uniqueSorted(ws))).toBe(9)
+    let top = topWords(ws, 1)
+    expect(renderCount(top[0])).toBe("(the, 3)")
+    expect(overlapCount(ws, tokens("the quick fox"))).toBe(3)
+    expect(showF(dice(ws, tokens("the quick fox")))).toBe("0.5")
+}
