@@ -1,0 +1,228 @@
+module std.math.combinatorics
+
+// Counting functions over exact `int` arithmetic: factorials, binomial and
+// multinomial coefficients, permutations, Catalan and Bell numbers,
+// derangements, Stirling numbers, and integer partitions.
+//
+// Everything is exact integer arithmetic, so results are identical across
+// implementations. The only limitation is the width of `int`: factorials
+// overflow above `20!`, binomial coefficients above roughly `C(66, 33)`, and
+// several of the sequences overflow sooner. This module never detects
+// overflow - callers must keep the arguments in range.
+//
+// Conventions: `0! = 1`, `C(n, 0) = C(n, n) = 1`, `P(n, 0) = 1`,
+// `Catalan(0) = 1`, `Bell(0) = 1`, `D(0) = 1`, `S(0, 0) = c(0, 0) = 1`, and
+// `p(0) = 1`. Functions that take indices return `none` when an index is
+// negative or out of range (`k > n` for binomials and permutations), and
+// `multinomial` returns `none` for any negative part.
+
+/// `n` factorial; `none` for a negative `n`.
+fn factorial(n: int) -> int? {
+    if (n < 0) {
+        return none
+    }
+    var total = 1
+    var i = 2
+    while (i <= n) {
+        total = total * i
+        i = i + 1
+    }
+    total
+}
+
+/// The binomial coefficient `C(n, k)` (`n` choose `k`); `none` when `n < 0`,
+/// `k < 0`, or `k > n`.
+fn binomial(n: int, k: int) -> int? {
+    if (n < 0 || k < 0 || k > n) {
+        return none
+    }
+    var kk = k
+    if (kk > n - kk) {
+        kk = n - kk
+    }
+    var result = 1
+    var i = 1
+    while (i <= kk) {
+        result = result * (n - kk + i) / i
+        i = i + 1
+    }
+    result
+}
+
+/// The number of ordered arrangements `P(n, k) = n! / (n - k)!`; `none` when
+/// `n < 0`, `k < 0`, or `k > n`.
+fn permutations(n: int, k: int) -> int? {
+    if (n < 0 || k < 0 || k > n) {
+        return none
+    }
+    var result = 1
+    var i = n - k + 1
+    while (i <= n) {
+        result = result * i
+        i = i + 1
+    }
+    result
+}
+
+/// The multinomial coefficient `(sum parts)! / product(part!)`; `none` when
+/// any part is negative.
+fn multinomial(parts: List<int>) -> int? {
+    var total = 0
+    var i = 0
+    while (i < len(parts)) {
+        if (parts[i] < 0) {
+            return none
+        }
+        total = total + parts[i]
+        i = i + 1
+    }
+    var result = 1
+    var remaining = total
+    i = 0
+    while (i < len(parts)) {
+        if (let some(c) = binomial(remaining, parts[i])) {
+            result = result * c
+        } else {
+            return none
+        }
+        remaining = remaining - parts[i]
+        i = i + 1
+    }
+    result
+}
+
+/// The `n`-th Catalan number `C(2n, n) / (n + 1)`; `none` for a negative `n`.
+fn catalan(n: int) -> int? {
+    if (n < 0) {
+        return none
+    }
+    if (let some(c) = binomial(2 * n, n)) {
+        c / (n + 1)
+    } else {
+        none
+    }
+}
+
+/// The number of derangements of `n` items (permutations with no fixed point);
+/// `none` for a negative `n`.
+fn derangements(n: int) -> int? {
+    if (n < 0) {
+        return none
+    }
+    var prev2 = 1
+    var prev1 = 0
+    var i = 2
+    while (i <= n) {
+        let d = (i - 1) * (prev1 + prev2)
+        prev2 = prev1
+        prev1 = d
+        i = i + 1
+    }
+    if (n == 0) {
+        return 1
+    }
+    prev1
+}
+
+/// The Stirling number of the second kind `S(n, k)`, the number of ways to
+/// partition `n` items into `k` non-empty blocks; `none` when `n < 0`,
+/// `k < 0`, or `k > n`.
+fn stirlingSecond(n: int, k: int) -> int? {
+    if (n < 0 || k < 0 || k > n) {
+        return none
+    }
+    var row: List<int> = [0]
+    row.remove(0)
+    var j = 0
+    while (j <= k) {
+        row.push(0)
+        j = j + 1
+    }
+    row[0] = 1
+    var i = 1
+    while (i <= n) {
+        j = k
+        while (j >= 1) {
+            row[j] = row[j - 1] + j * row[j]
+            j = j - 1
+        }
+        row[0] = 0
+        i = i + 1
+    }
+    row[k]
+}
+
+/// The unsigned Stirling number of the first kind `c(n, k)`, the number of
+/// permutations of `n` items with exactly `k` cycles; `none` when `n < 0`,
+/// `k < 0`, or `k > n`.
+fn stirlingFirst(n: int, k: int) -> int? {
+    if (n < 0 || k < 0 || k > n) {
+        return none
+    }
+    var row: List<int> = [0]
+    row.remove(0)
+    var j = 0
+    while (j <= k) {
+        row.push(0)
+        j = j + 1
+    }
+    row[0] = 1
+    var i = 1
+    while (i <= n) {
+        j = k
+        while (j >= 1) {
+            row[j] = row[j - 1] + (i - 1) * row[j]
+            j = j - 1
+        }
+        row[0] = 0
+        i = i + 1
+    }
+    row[k]
+}
+
+/// The `n`-th Bell number, the number of partitions of an `n`-element set
+/// (`sum of S(n, k)`); `none` for a negative `n`.
+fn bell(n: int) -> int? {
+    if (n < 0) {
+        return none
+    }
+    var prev: List<int> = [1]
+    var i = 1
+    while (i <= n) {
+        var cur: List<int> = [prev[len(prev) - 1]]
+        var j = 1
+        while (j <= i) {
+            cur.push(cur[j - 1] + prev[j - 1])
+            j = j + 1
+        }
+        prev = cur
+        i = i + 1
+    }
+    prev[0]
+}
+
+/// The number of integer partitions of `n` (`p(n)`), counting unordered sums of
+/// positive integers; `none` for a negative `n`.
+fn partitionCount(n: int) -> int? {
+    if (n < 0) {
+        return none
+    }
+    var p: List<int> = [0]
+    p.remove(0)
+    var i = 0
+    while (i <= n) {
+        p.push(0)
+        i = i + 1
+    }
+    p[0] = 1
+    var part = 1
+    while (part <= n) {
+        var total = part
+        while (total <= n) {
+            p[total] = p[total] + p[total - part]
+            total = total + 1
+        }
+        part = part + 1
+    }
+    p[n]
+}
