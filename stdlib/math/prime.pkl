@@ -1,0 +1,461 @@
+module std.math.prime
+
+// Integer number theory: primality, sieving, factorization, and the arithmetic
+// functions that are defined through factorization.
+//
+// Everything here is exact integer arithmetic, so results are identical across
+// implementations. Primality is trial division: `isPrime` walks `6k +- 1` up to
+// the square root, and the factorization loops divide out every divisor in
+// order. That is exact for every `int`, but it is not fast for very large
+// inputs (a 19-digit prime costs on the order of a billion divisions), so the
+// module is meant for numbers of moderate size.
+//
+// Ranges: `isPrime` accepts any `int` and is `false` below 2. The functions
+// that need a positive argument (`factorize`, `primeFactors`, `divisors`,
+// `properDivisors`, `divisorCount`, `divisorSum`, `aliquotSum`, `eulerPhi`,
+// `mobius`, `radical`, `smallestPrimeFactor`, `largestPrimeFactor`) return
+// `none` for `n < 1`. `factorize(1)` and `primeFactors(1)` return an empty
+// list, `divisors(1)` is `[1]`, and `eulerPhi(1)` is 1.
+//
+// List results are ascending. `render` prints an `int` list as `[2, 3, 5]`.
+
+/// A typed empty list of integers.
+fn emptyInts() -> List<int> {
+    var out: List<int> = [0]
+    out.remove(0)
+    out
+}
+
+/// The greatest common divisor of `|a|` and `|b|`; `0` when both are zero.
+fn gcdInt(a: int, b: int) -> int {
+    var x = a
+    var y = b
+    if (x < 0) {
+        x = 0 - x
+    }
+    if (y < 0) {
+        y = 0 - y
+    }
+    while (y != 0) {
+        let r = x % y
+        x = y
+        y = r
+    }
+    x
+}
+
+/// The floor of the square root of `n`, or `0` when `n` is negative.
+fn isqrtInt(n: int) -> int {
+    if (n <= 0) {
+        return 0
+    }
+    if (n < 4) {
+        return 1
+    }
+    var x = n / 2 + 1
+    var y = (x + n / x) / 2
+    while (y < x) {
+        x = y
+        y = (x + n / x) / 2
+    }
+    x
+}
+
+/// `xs` sorted ascending in place (insertion sort).
+fn sortInts(xs: List<int>) {
+    var i = 1
+    while (i < len(xs)) {
+        let v = xs[i]
+        var j = i
+        while (j > 0 && xs[j - 1] > v) {
+            xs[j] = xs[j - 1]
+            j = j - 1
+        }
+        xs[j] = v
+        i = i + 1
+    }
+}
+
+/// Whether `n` is prime. `false` for every `n < 2`.
+fn isPrime(n: int) -> bool {
+    if (n < 2) {
+        return false
+    }
+    if (n < 4) {
+        return true
+    }
+    if (n % 2 == 0) {
+        return false
+    }
+    if (n < 9) {
+        return true
+    }
+    if (n % 3 == 0) {
+        return false
+    }
+    let limit = isqrtInt(n)
+    var d = 5
+    while (d <= limit) {
+        if (n % d == 0 || n % (d + 2) == 0) {
+            return false
+        }
+        d = d + 6
+    }
+    true
+}
+
+/// Every prime at most `limit`, ascending; empty when `limit < 2`.
+fn primesUpTo(limit: int) -> List<int> {
+    var out = emptyInts()
+    if (limit < 2) {
+        return out
+    }
+    // `flags[k]` is true while `k` has not been crossed off.
+    var flags: List<bool> = [false]
+    flags.remove(0)
+    var i = 0
+    while (i <= limit) {
+        flags.push(true)
+        i = i + 1
+    }
+    flags[0] = false
+    flags[1] = false
+    var p = 2
+    while (p * p <= limit) {
+        if (flags[p]) {
+            var m = p * p
+            while (m <= limit) {
+                flags[m] = false
+                m = m + p
+            }
+        }
+        p = p + 1
+    }
+    var k = 2
+    while (k <= limit) {
+        if (flags[k]) {
+            out.push(k)
+        }
+        k = k + 1
+    }
+    out
+}
+
+/// The number of primes at most `limit` (`pi(limit)`).
+fn primeCount(limit: int) -> int {
+    len(primesUpTo(limit))
+}
+
+/// The prime at zero-based `index` (`nthPrime(0)` is 2); `none` when `index`
+/// is negative.
+fn nthPrime(index: int) -> int? {
+    if (index < 0) {
+        return none
+    }
+    var limit = 16
+    while (true) {
+        let ps = primesUpTo(limit)
+        if (len(ps) > index) {
+            return ps[index]
+        }
+        let next = limit * 2
+        if (next <= limit) {
+            return none
+        }
+        limit = next
+    }
+    none
+}
+
+/// The smallest prime greater than `n` (`2` below that).
+fn nextPrime(n: int) -> int {
+    if (n < 2) {
+        return 2
+    }
+    var k = n + 1
+    while (!isPrime(k)) {
+        k = k + 1
+    }
+    k
+}
+
+/// The largest prime less than `n`; `none` when `n <= 2`.
+fn prevPrime(n: int) -> int? {
+    if (n <= 2) {
+        return none
+    }
+    var k = n - 1
+    while (!isPrime(k)) {
+        k = k - 1
+    }
+    k
+}
+
+/// The prime factorization of `n` in ascending order, with multiplicity;
+/// empty for 1 and `none` when `n < 1`.
+fn factorize(n: int) -> List<int>? {
+    if (n < 1) {
+        return none
+    }
+    var out = emptyInts()
+    var rest = n
+    var d = 2
+    while (d * d <= rest) {
+        while (rest % d == 0) {
+            out.push(d)
+            rest = rest / d
+        }
+        d = d + 1
+    }
+    if (rest > 1) {
+        out.push(rest)
+    }
+    out
+}
+
+/// The distinct prime factors of `n` in ascending order; empty for 1 and
+/// `none` when `n < 1`.
+fn primeFactors(n: int) -> List<int>? {
+    match (factorize(n)) {
+    case some(fs) -> {
+        var out = emptyInts()
+        var i = 0
+        while (i < len(fs)) {
+            if (i == 0 || fs[i] != fs[i - 1]) {
+                out.push(fs[i])
+            }
+            i = i + 1
+        }
+        out
+    }
+    case none -> none
+    }
+}
+
+/// The smallest prime dividing `n`; `none` when `n < 2`.
+fn smallestPrimeFactor(n: int) -> int? {
+    if (n < 2) {
+        return none
+    }
+    if (n % 2 == 0) {
+        return 2
+    }
+    let limit = isqrtInt(n)
+    var d = 3
+    while (d <= limit) {
+        if (n % d == 0) {
+            return d
+        }
+        d = d + 2
+    }
+    n
+}
+
+/// The largest prime dividing `n`; `none` when `n < 2`.
+fn largestPrimeFactor(n: int) -> int? {
+    match (factorize(n)) {
+    case some(fs) -> {
+        if (len(fs) == 0) {
+            none
+        } else {
+            fs[len(fs) - 1]
+        }
+    }
+    case none -> none
+    }
+}
+
+/// Every positive divisor of `n`, ascending; `none` when `n < 1`.
+fn divisors(n: int) -> List<int>? {
+    if (n < 1) {
+        return none
+    }
+    var out = emptyInts()
+    var d = 1
+    while (d * d <= n) {
+        if (n % d == 0) {
+            out.push(d)
+            let q = n / d
+            if (q != d) {
+                out.push(q)
+            }
+        }
+        d = d + 1
+    }
+    sortInts(out)
+    out
+}
+
+/// Every positive divisor of `n` except `n` itself, ascending; `none` when
+/// `n < 1`.
+fn properDivisors(n: int) -> List<int>? {
+    match (divisors(n)) {
+    case some(ds) -> {
+        var out = emptyInts()
+        var i = 0
+        while (i < len(ds) - 1) {
+            out.push(ds[i])
+            i = i + 1
+        }
+        out
+    }
+    case none -> none
+    }
+}
+
+/// The number of positive divisors of `n`; `none` when `n < 1`.
+fn divisorCount(n: int) -> int? {
+    match (divisors(n)) {
+    case some(ds) -> len(ds)
+    case none -> none
+    }
+}
+
+/// The sum of the positive divisors of `n` (`sigma_1`); `none` when `n < 1`.
+fn divisorSum(n: int) -> int? {
+    if (n < 1) {
+        return none
+    }
+    match (divisors(n)) {
+    case some(ds) -> {
+        var total = 0
+        var i = 0
+        while (i < len(ds)) {
+            total = total + ds[i]
+            i = i + 1
+        }
+        total
+    }
+    case none -> none
+    }
+}
+
+/// The sum of the proper divisors of `n` (the aliquot sum); `none` when
+/// `n < 1`.
+fn aliquotSum(n: int) -> int? {
+    match (divisorSum(n)) {
+    case some(s) -> s - n
+    case none -> none
+    }
+}
+
+/// Euler's totient `phi(n)`, the count of values in `1..n` coprime to `n`;
+/// `none` when `n < 1`.
+fn eulerPhi(n: int) -> int? {
+    if (n < 1) {
+        return none
+    }
+    var result = n
+    var rest = n
+    var d = 2
+    while (d * d <= rest) {
+        if (rest % d == 0) {
+            result = result / d * (d - 1)
+            while (rest % d == 0) {
+                rest = rest / d
+            }
+        }
+        d = d + 1
+    }
+    if (rest > 1) {
+        result = result / rest * (rest - 1)
+    }
+    result
+}
+
+/// The Moebius function: `0` when `n` has a squared prime factor, otherwise
+/// `-1` or `1` according to the parity of the distinct prime count; `none`
+/// when `n < 1`.
+fn mobius(n: int) -> int? {
+    match (factorize(n)) {
+    case some(fs) -> {
+        var sign = 1
+        var i = 0
+        while (i < len(fs)) {
+            if (i > 0 && fs[i] == fs[i - 1]) {
+                return 0
+            }
+            sign = 0 - sign
+            i = i + 1
+        }
+        sign
+    }
+    case none -> none
+    }
+}
+
+/// The product of the distinct prime factors of `n` (its radical); `none`
+/// when `n < 1`.
+fn radical(n: int) -> int? {
+    match (primeFactors(n)) {
+    case some(ps) -> {
+        var total = 1
+        var i = 0
+        while (i < len(ps)) {
+            total = total * ps[i]
+            i = i + 1
+        }
+        total
+    }
+    case none -> none
+    }
+}
+
+/// Whether no prime divides `n` twice; `false` when `n < 1`.
+fn isSquareFree(n: int) -> bool {
+    if (n < 1) {
+        return false
+    }
+    match (mobius(n)) {
+    case some(m) -> m != 0
+    case none -> false
+    }
+}
+
+/// Whether `a` and `b` share no positive divisor above 1.
+fn isCoprime(a: int, b: int) -> bool {
+    gcdInt(a, b) == 1
+}
+
+/// Whether `n` equals the sum of its proper divisors; `false` when `n < 2`.
+fn isPerfect(n: int) -> bool {
+    match (aliquotSum(n)) {
+    case some(s) -> s == n
+    case none -> false
+    }
+}
+
+/// Whether the proper divisors of `n` sum to more than `n`; `false` when
+/// `n < 2`.
+fn isAbundant(n: int) -> bool {
+    match (aliquotSum(n)) {
+    case some(s) -> s > n
+    case none -> false
+    }
+}
+
+/// Whether the proper divisors of `n` sum to less than `n`; `false` when
+/// `n < 2`.
+fn isDeficient(n: int) -> bool {
+    if (n < 2) {
+        return false
+    }
+    match (aliquotSum(n)) {
+    case some(s) -> s < n
+    case none -> false
+    }
+}
+
+/// A compact rendering of an `int` list: `[2, 3, 5]`.
+fn render(xs: List<int>) -> string {
+    var out = "["
+    var i = 0
+    while (i < len(xs)) {
+        if (i > 0) {
+            out = out + ", "
+        }
+        out = out + "{xs[i]}"
+        i = i + 1
+    }
+    out + "]"
+}
