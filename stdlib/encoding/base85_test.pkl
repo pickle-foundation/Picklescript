@@ -1,0 +1,211 @@
+module std.encoding.base85_test
+
+import { encode, decode, encodeString, decodeString, isValid } from std.encoding.base85
+
+/// A byte list rendered as `65,66,` (empty for no bytes).
+fn showBytes(xs: List<byte>) -> string {
+    var out = ""
+    var i = 0
+    while (i < len(xs)) {
+        out = out + "{(xs[i] as int)},"
+        i = i + 1
+    }
+    out
+}
+
+/// A decoded list rendered as bytes, or `<none>`.
+fn showOpt(xs: List<byte>?) -> string {
+    match (xs) {
+    case some(v) -> showBytes(v)
+    case none -> "<none>"
+    }
+}
+
+/// A decoded string rendered in brackets, or `<none>`.
+fn showStr(x: string?) -> string {
+    match (x) {
+    case some(v) -> "[" + v + "]"
+    case none -> "<none>"
+    }
+}
+
+/// The bytes of `text`.
+fn bs(text: string) -> List<byte> {
+    bytes(text)
+}
+
+/// A list of `count` zero bytes.
+fn zeros(count: int) -> List<byte> {
+    var out: List<byte> = [0 as byte]
+    out.remove(0)
+    var i = 0
+    while (i < count) {
+        out.push(0 as byte)
+        i = i + 1
+    }
+    out
+}
+
+test fn published_vectors() {
+    expect(encode(bs("Man "))).toBe("9jqo^")
+    expect(encode(bs("sure."))).toBe("F*2M7/c")
+    expect(encode(bs("hello world"))).toBe("BOu!rD]j7BEbo7")
+    expect(encode(bs("Hello World!"))).toBe("87cURD]i,\"Ebo80")
+    expect(encode(bs("abcd"))).toBe("@:E_W")
+    expect(encode(bs("A"))).toBe("5l")
+    expect(encode(bs("AB"))).toBe("5sb")
+    expect(encode(bs("ABC"))).toBe("5sdp")
+}
+
+test fn empty_input() {
+    expect(encode(bs(""))).toBe("")
+    expect(len(bytes(encode(bs(""))))).toBe(0)
+    expect(showOpt(decode(""))).toBe("")
+}
+
+test fn zero_groups_use_the_short_form() {
+    expect(encode(zeros(1))).toBe("!!")
+    expect(encode(zeros(2))).toBe("!!!")
+    expect(encode(zeros(3))).toBe("!!!!")
+    expect(encode(zeros(4))).toBe("z")
+    expect(encode(zeros(8))).toBe("zz")
+    expect(showOpt(decode("z"))).toBe("0,0,0,0,")
+    expect(showOpt(decode("zz"))).toBe("0,0,0,0,0,0,0,0,")
+}
+
+test fn extreme_groups() {
+    var top: List<byte> = [0 as byte]
+    top.remove(0)
+    var i = 0
+    while (i < 4) {
+        top.push(255 as byte)
+        i = i + 1
+    }
+    expect(encode(top)).toBe("s8W-!")
+    expect(showOpt(decode("s8W-!"))).toBe("255,255,255,255,")
+    expect(showOpt(decode("uuuuu"))).toBe("<none>")
+}
+
+test fn round_trip_over_every_byte_value() {
+    var data: List<byte> = [0 as byte]
+    data.remove(0)
+    var b = 0
+    while (b < 256) {
+        data.push(b as byte)
+        b = b + 1
+    }
+    let encoded = encode(data)
+    expect(showOpt(decode(encoded))).toBe(showBytes(data))
+}
+
+test fn round_trip_over_a_long_pattern() {
+    var data: List<byte> = [0 as byte]
+    data.remove(0)
+    var i = 0
+    while (i < 300) {
+        data.push(((i * 37) % 256) as byte)
+        i = i + 1
+    }
+    let encoded = encode(data)
+    expect(showOpt(decode(encoded))).toBe(showBytes(data))
+}
+
+test fn encoding_uses_only_alphabet_characters() {
+    var data: List<byte> = [0 as byte]
+    data.remove(0)
+    var b = 0
+    while (b < 256) {
+        data.push(b as byte)
+        b = b + 1
+    }
+    let encoded = bytes(encode(data))
+    var i = 0
+    var ok = true
+    while (i < len(encoded)) {
+        let c = encoded[i] as int
+        if (c != 122 && (c < 33 || c > 117)) {
+            ok = false
+        }
+        i = i + 1
+    }
+    expect(ok).toBe(true)
+}
+
+test fn decoding_rejects_invalid_characters() {
+    expect(showOpt(decode("v"))).toBe("<none>")
+    expect(showOpt(decode("~"))).toBe("<none>")
+    expect(showOpt(decode(" "))).toBe("<none>")
+    expect(showOpt(decode("a\tb"))).toBe("<none>")
+    expect(showOpt(decode("!"))).toBe("<none>")
+    expect(showOpt(decode("z!"))).toBe("<none>")
+    expect(showOpt(decode("\"Ebo80"))).toBe("<none>")
+}
+
+test fn decoding_is_strict_about_z_placement() {
+    expect(showOpt(decode("!z"))).toBe("<none>")
+    expect(showOpt(decode("!!z"))).toBe("<none>")
+    expect(showOpt(decode("z!z"))).toBe("<none>")
+    expect(showOpt(decode("z!!"))).toBe("0,0,0,0,0,")
+    expect(showOpt(decode("z!!!"))).toBe("0,0,0,0,0,0,")
+}
+
+test fn partial_groups_are_lenient_about_padding() {
+    expect(showOpt(decode("!!!"))).toBe("0,0,")
+    expect(showOpt(decode("5l"))).toBe("65,")
+    expect(showOpt(decode("5s"))).toBe("65,")
+    expect(showOpt(decode("uuuu"))).toBe("<none>")
+}
+
+test fn encoded_length_rule() {
+    var n = 1
+    while (n <= 12) {
+        var data: List<byte> = [0 as byte]
+        data.remove(0)
+        var i = 0
+        while (i < n) {
+            data.push((i + 1) as byte)
+            i = i + 1
+        }
+        let full = n / 4
+        let rest = n % 4
+        var want = full * 5
+        if (rest > 0) {
+            want = want + rest + 1
+        }
+        expect(len(bytes(encode(data)))).toBe(want)
+        n = n + 1
+    }
+}
+
+test fn string_helpers() {
+    expect(encodeString("Man ")).toBe("9jqo^")
+    expect(showStr(decodeString("9jqo^"))).toBe("[Man ]")
+    expect(encodeString("héllo")).toBe(encode(bs("héllo")))
+    expect(showStr(decodeString(encodeString("héllo")))).toBe("[héllo]")
+    expect(showStr(decodeString("!"))).toBe("<none>")
+    expect(showStr(decodeString("v"))).toBe("<none>")
+}
+
+test fn validity_predicate() {
+    expect(isValid("9jqo^")).toBe(true)
+    expect(isValid("z")).toBe(true)
+    expect(isValid("")).toBe(true)
+    expect(isValid("!!")).toBe(true)
+    expect(isValid("v")).toBe(false)
+    expect(isValid("!")).toBe(false)
+    expect(isValid("!z")).toBe(false)
+    expect(isValid("uuuuu")).toBe(false)
+}
+
+test fn encoding_is_deterministic() {
+    let data = bs("the quick brown fox jumps over the lazy dog")
+    expect(encode(data)).toBe(encode(data))
+    expect(encode(data)).toBe("FD,5.EHPu*CER),Dg-(AAoDo:C3=B4F!,CEATAo8BOr<&@=!2AA8c)")
+}
+
+test fn a_small_pipeline() {
+    let text = "one\ntwo\nthree"
+    let packed = encodeString(text)
+    expect(showStr(decodeString(packed))).toBe("[one\ntwo\nthree]")
+    expect(len(bytes(packed))).toBe(17)
+}

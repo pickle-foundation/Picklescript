@@ -1,0 +1,161 @@
+module std.encoding.base85
+
+// ASCII85 (a "base85" alphabet of `!` through `u`).
+//
+// Four input bytes become five output characters: the group is read as one
+// big-endian 32-bit number and written as five base-85 digits, most
+// significant first. A partial final group of `n` bytes is zero-padded to four
+// and written as `n + 1` characters, so the decoder can tell how many bytes are
+// left by the last group's length. A full group of four zero bytes is written
+// as the single character `z` (the usual ASCII85 space saving); a partial group
+// of zeros is not.
+//
+// `decode` is strict: only characters in `!`..`u` and `z` are accepted, `z` is
+// only legal at a group boundary, and a trailing group of one character is
+// invalid because it cannot name any byte. A short final group is completed
+// with `u` digits (the largest ones) before the high bytes are read, which is
+// the standard way to recover the bytes the encoder zero-padded; the completed
+// value must still fit in 32 bits, matching the overflow rule for full groups.
+// That completion is also lenient about the encoder's choice of trailing
+// digits, in the same spirit as the base64 and base32 decoders.
+//
+// `encodeString`/`decodeString` are the UTF-8 conveniences. Like the other
+// encoders, `decodeString` renders through `str`, which replaces invalid UTF-8.
+
+import { StringBuilder } from std.text.stringbuilder
+
+/// 85 to the power `n`.
+fn pow85(n: int) -> int {
+    var v = 1
+    var i = 0
+    while (i < n) {
+        v = v * 85
+        i = i + 1
+    }
+    v
+}
+
+/// The `place`-th base-85 digit of `v` as an alphabet byte, appended to `sb`.
+fn appendDigit(sb: StringBuilder, v: int, place: int) {
+    let divisor = pow85(place)
+    let digit = (v / divisor) % 85
+    sb.appendByte((digit + 33) as byte)
+}
+
+/// The ASCII85 text for `data`.
+fn encode(data: List<byte>) -> string {
+    let sb = StringBuilder()
+    var i = 0
+    while (i < len(data)) {
+        let remain = len(data) - i
+        var v = 0
+        var j = 0
+        while (j < 4) {
+            v = v * 256
+            if (j < remain) {
+                v = v + (data[i + j] as int)
+            }
+            j = j + 1
+        }
+        if (remain >= 4 && v == 0) {
+            sb.append("z")
+        } else {
+            var places = remain + 1
+            if (remain >= 4) {
+                places = 5
+            }
+            var place = 4
+            while (place >= 5 - places) {
+                appendDigit(sb, v, place)
+                place = place - 1
+            }
+        }
+        i = i + 4
+    }
+    sb.toString()
+}
+
+/// The bytes named by ASCII85 `text`, or `none` when the text is malformed.
+fn decode(text: string) -> List<byte>? {
+    let bs = bytes(text)
+    var out: List<byte> = [0 as byte]
+    out.remove(0)
+    var group = 0
+    var count = 0
+    var i = 0
+    while (i < len(bs)) {
+        let b = bs[i]
+        if (b == 122) {
+            if (count != 0) {
+                return none
+            }
+            out.push(0 as byte)
+            out.push(0 as byte)
+            out.push(0 as byte)
+            out.push(0 as byte)
+        } else if (b < 33 || b > 117) {
+            return none
+        } else {
+            group = group * 85 + ((b as int) - 33)
+            count = count + 1
+            if (count == 5) {
+                if (group > 4294967295) {
+                    return none
+                }
+                var div = 16777216
+                var k = 0
+                while (k < 4) {
+                    out.push(((group / div) % 256) as byte)
+                    div = div / 256
+                    k = k + 1
+                }
+                group = 0
+                count = 0
+            }
+        }
+        i = i + 1
+    }
+    if (count == 1) {
+        return none
+    }
+    if (count > 1) {
+        var k = count
+        while (k < 5) {
+            group = group * 85 + 84
+            k = k + 1
+        }
+        if (group > 4294967295) {
+            return none
+        }
+        let produced = count - 1
+        var div = 16777216
+        var oi = 0
+        while (oi < produced) {
+            out.push(((group / div) % 256) as byte)
+            div = div / 256
+            oi = oi + 1
+        }
+    }
+    out
+}
+
+/// The ASCII85 text for the UTF-8 bytes of `text`.
+fn encodeString(text: string) -> string {
+    encode(bytes(text))
+}
+
+/// The UTF-8 string for ASCII85 `text`, or `none` when it is malformed.
+fn decodeString(text: string) -> string? {
+    if (let some(bs) = decode(text)) {
+        return str(bs)
+    }
+    none
+}
+
+/// Whether `text` is well-formed ASCII85.
+fn isValid(text: string) -> bool {
+    match (decode(text)) {
+    case some(_) -> true
+    case none -> false
+    }
+}
