@@ -1,0 +1,239 @@
+module std.encoding.base32_test
+
+import { encode, encodeNoPad, encodeHex, decode, decodeHex, isValid, isValidHex, encodeString, encodeStringHex, decodeString, decodeStringHex } from std.encoding.base32
+
+/// The raw bytes of `text`.
+fn data(text: string) -> List<byte> {
+    bytes(text)
+}
+
+/// A decoded byte list rendered as a string (`<none>` for `none`).
+fn showBytes(x: List<byte>?) -> string {
+    match (x) {
+    case some(b) -> str(b)
+    case none -> "<none>"
+    }
+}
+
+/// A rendered optional string (`<none>` for `none`).
+fn showS(x: string?) -> string {
+    match (x) {
+    case some(v) -> v
+    case none -> "<none>"
+    }
+}
+
+/// Whether two byte lists have the same length and bytes.
+fn sameBytes(a: List<byte>, b: List<byte>) -> bool {
+    if (len(a) != len(b)) {
+        return false
+    }
+    var i = 0
+    while (i < len(a)) {
+        if (a[i] != b[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+/// A 256-byte list holding every byte value once, in order.
+fn allBytes() -> List<byte> {
+    var out = bytes("")
+    var i = 0
+    while (i < 256) {
+        out.push(i as byte)
+        i = i + 1
+    }
+    out
+}
+
+/// A deterministic 1000-byte pattern.
+fn patternBytes() -> List<byte> {
+    var out = bytes("")
+    var i = 0
+    while (i < 1000) {
+        out.push(((i * 37 + 11) % 256) as byte)
+        i = i + 1
+    }
+    out
+}
+
+test fn rfc4648_standard_vectors() {
+    expect(encode(data(""))).toBe("")
+    expect(encode(data("f"))).toBe("MY======")
+    expect(encode(data("fo"))).toBe("MZXQ====")
+    expect(encode(data("foo"))).toBe("MZXW6===")
+    expect(encode(data("foob"))).toBe("MZXW6YQ=")
+    expect(encode(data("fooba"))).toBe("MZXW6YTB")
+    expect(encode(data("foobar"))).toBe("MZXW6YTBOI======")
+}
+
+test fn unpadded_encoding() {
+    expect(encodeNoPad(data(""))).toBe("")
+    expect(encodeNoPad(data("f"))).toBe("MY")
+    expect(encodeNoPad(data("fo"))).toBe("MZXQ")
+    expect(encodeNoPad(data("foo"))).toBe("MZXW6")
+    expect(encodeNoPad(data("foob"))).toBe("MZXW6YQ")
+    expect(encodeNoPad(data("fooba"))).toBe("MZXW6YTB")
+    expect(encodeNoPad(data("foobar"))).toBe("MZXW6YTBOI")
+}
+
+test fn rfc4648_extended_hex_vectors() {
+    expect(encodeHex(data(""))).toBe("")
+    expect(encodeHex(data("f"))).toBe("CO======")
+    expect(encodeHex(data("fo"))).toBe("CPNG====")
+    expect(encodeHex(data("foo"))).toBe("CPNMU===")
+    expect(encodeHex(data("foob"))).toBe("CPNMUOG=")
+    expect(encodeHex(data("fooba"))).toBe("CPNMUOJ1")
+    expect(encodeHex(data("foobar"))).toBe("CPNMUOJ1E8======")
+}
+
+test fn decoding_rfc4648_vectors() {
+    expect(showBytes(decode("MY======"))).toBe("f")
+    expect(showBytes(decode("MZXQ===="))).toBe("fo")
+    expect(showBytes(decode("MZXW6==="))).toBe("foo")
+    expect(showBytes(decode("MZXW6YQ="))).toBe("foob")
+    expect(showBytes(decode("MZXW6YTB"))).toBe("fooba")
+    expect(showBytes(decode("MZXW6YTBOI======"))).toBe("foobar")
+}
+
+test fn decoding_accepts_unpadded_input() {
+    expect(showBytes(decode("MY"))).toBe("f")
+    expect(showBytes(decode("MZXQ"))).toBe("fo")
+    expect(showBytes(decode("MZXW6"))).toBe("foo")
+    expect(showBytes(decode("MZXW6YQ"))).toBe("foob")
+    expect(showBytes(decode("MZXW6YTBOI"))).toBe("foobar")
+}
+
+test fn decoding_accepts_lowercase() {
+    expect(showBytes(decode("my======"))).toBe("f")
+    expect(showBytes(decode("mzxw6ytboi======"))).toBe("foobar")
+    expect(showBytes(decode("MzXw6YtBoI"))).toBe("foobar")
+}
+
+test fn decoding_is_lenient_about_unused_bits() {
+    // `Z` is 25, so the low four bits of the final value are not zero.
+    expect(showBytes(decode("MZ======"))).toBe("f")
+}
+
+test fn decoding_rejects_impossible_lengths() {
+    expect(showBytes(decode("M"))).toBe("<none>")
+    expect(showBytes(decode("MZX"))).toBe("<none>")
+    expect(showBytes(decode("MZXW6Y"))).toBe("<none>")
+    expect(showBytes(decode("MZXW6YTBO"))).toBe("<none>")
+}
+
+test fn decoding_rejects_out_of_alphabet_characters() {
+    expect(showBytes(decode("MZXW6YT!"))).toBe("<none>")
+    expect(showBytes(decode("MZXW6YT1"))).toBe("<none>")
+    expect(showBytes(decode("MZ0XW6YT"))).toBe("<none>")
+    expect(showBytes(decode("MZ8XW6YT"))).toBe("<none>")
+    expect(showBytes(decode("MZ9XW6YT"))).toBe("<none>")
+    expect(showBytes(decode("M=ZXW6YT"))).toBe("<none>")
+    expect(showBytes(decode("=MY====="))).toBe("<none>")
+}
+
+test fn decoding_rejects_wrong_padding() {
+    expect(showBytes(decode("MY====="))).toBe("<none>")
+    expect(showBytes(decode("MY="))).toBe("<none>")
+    expect(showBytes(decode("MY======="))).toBe("<none>")
+    expect(showBytes(decode("MZXW6YTB="))).toBe("<none>")
+    expect(showBytes(decode("MZXW6YTB===="))).toBe("<none>")
+    expect(showBytes(decode("========"))).toBe("<none>")
+}
+
+test fn empty_input_round_trips() {
+    expect(encode(data(""))).toBe("")
+    expect(showBytes(decode(""))).toBe("")
+    expect(isValid("")).toBe(true)
+    expect(isValidHex("")).toBe(true)
+}
+
+test fn string_helpers() {
+    expect(encodeString("hi")).toBe("NBUQ====")
+    expect(showS(decodeString("NBUQ===="))).toBe("hi")
+    expect(showS(decodeString("NBUQ"))).toBe("hi")
+    expect(encodeStringHex("hi")).toBe("D1KG====")
+    expect(showS(decodeStringHex("D1KG===="))).toBe("hi")
+    expect(showS(decodeString(encodeString("héllo café")))).toBe("héllo café")
+    expect(showS(decodeString("MZXW6YT!"))).toBe("<none>")
+}
+
+test fn extended_hex_decoding() {
+    expect(showBytes(decodeHex("CO======"))).toBe("f")
+    expect(showBytes(decodeHex("CPNMUOJ1E8======"))).toBe("foobar")
+    expect(showBytes(decodeHex("cpnmuoj1e8"))).toBe("foobar")
+    expect(showBytes(decodeHex("CPNMUOG="))).toBe("foob")
+    expect(showBytes(decodeHex("CPNMU==="))).toBe("foo")
+}
+
+test fn extended_hex_rejects_other_alphabets() {
+    expect(showBytes(decodeHex("MZXW6YTB"))).toBe("<none>")
+    expect(showBytes(decodeHex("MY======"))).toBe("<none>")
+    expect(showBytes(decode("CPNMUOJ1E8======"))).toBe("<none>")
+}
+
+test fn validity_predicates() {
+    expect(isValid("MZXW6YTBOI======")).toBe(true)
+    expect(isValid("MZXW6YTBOI")).toBe(true)
+    expect(isValid("MZXW6YT1")).toBe(false)
+    expect(isValid("MZXW6Y")).toBe(false)
+    expect(isValid("MZXW6YTB=")).toBe(false)
+    expect(isValidHex("CPNMUOJ1E8======")).toBe(true)
+    expect(isValidHex("CPNMUOJ1E8")).toBe(true)
+    expect(isValidHex("MZXW6YTB")).toBe(false)
+    expect(isValidHex("CPNMUO")).toBe(false)
+}
+
+test fn round_trip_covers_every_byte_value() {
+    let all = allBytes()
+    match (decode(encode(all))) {
+    case some(back) -> expect(sameBytes(all, back)).toBe(true)
+    case none -> expect(true).toBe(false)
+    }
+    match (decode(encodeNoPad(all))) {
+    case some(back) -> expect(sameBytes(all, back)).toBe(true)
+    case none -> expect(true).toBe(false)
+    }
+    match (decodeHex(encodeHex(all))) {
+    case some(back) -> expect(sameBytes(all, back)).toBe(true)
+    case none -> expect(true).toBe(false)
+    }
+}
+
+test fn round_trip_is_stable_for_a_long_pattern() {
+    let src = patternBytes()
+    let text = encode(src)
+    expect(len(text)).toBe(1600)
+    expect(len(encodeNoPad(src))).toBe(1600)
+    expect(len(encodeHex(src))).toBe(1600)
+    match (decode(text)) {
+    case some(back) -> expect(sameBytes(src, back)).toBe(true)
+    case none -> expect(true).toBe(false)
+    }
+    match (decode(text)) {
+    case some(back) -> expect(len(back)).toBe(1000)
+    case none -> expect(true).toBe(false)
+    }
+    match (decodeHex(encodeHex(src))) {
+    case some(back) -> expect(sameBytes(src, back)).toBe(true)
+    case none -> expect(true).toBe(false)
+    }
+}
+
+test fn encoded_text_is_ascii() {
+    let text = encode(allBytes())
+    let bs = bytes(text)
+    var high = 0
+    var i = 0
+    while (i < len(bs)) {
+        if ((bs[i] as int) >= 128) {
+            high = high + 1
+        }
+        i = i + 1
+    }
+    expect(high).toBe(0)
+    expect(len(text)).toBe(416)
+}

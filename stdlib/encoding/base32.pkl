@@ -1,0 +1,279 @@
+module std.encoding.base32
+
+// Base32 (RFC 4648) encoding and decoding.
+//
+// `encode` emits the standard alphabet (`A`-`Z`, `2`-`7`) with `=` padding;
+// `encodeNoPad` omits the padding; `encodeHex` uses the extended-hex alphabet
+// (`0`-`9`, `A`-`V`) with padding. Decoding accepts padded and unpadded input,
+// either case (the standard alphabet is defined in upper case, but a lower-case
+// spelling decodes to the same values), and returns `none` for malformed input:
+// an out-of-alphabet character, a stray `=` that is not trailing, a padding
+// count that does not match the data length, or a length that no byte count
+// produces.
+//
+// Like the base64 module, the decoder is lenient about the unused low bits of
+// the final group: they do not have to be zero.
+//
+// The API is byte-oriented. `encodeString`/`decodeString` are the string
+// conveniences; `decodeString` renders the decoded bytes as UTF-8 via `str`,
+// so invalid UTF-8 is replaced rather than rejected.
+
+import { StringBuilder } from std.text.stringbuilder
+
+const STD_ALPHABET: string = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+const HEX_ALPHABET: string = "0123456789ABCDEFGHIJKLMNOPQRSTUV"
+
+/// Encode `data` with the standard alphabet and `=` padding.
+fn encode(data: List<byte>) -> string {
+    encodeAlphabet(data, STD_ALPHABET, true)
+}
+
+/// Encode `data` with the standard alphabet and no padding.
+fn encodeNoPad(data: List<byte>) -> string {
+    encodeAlphabet(data, STD_ALPHABET, false)
+}
+
+/// Encode `data` with the extended-hex alphabet (`0`-`9`, `A`-`V`) and `=`
+/// padding.
+fn encodeHex(data: List<byte>) -> string {
+    encodeAlphabet(data, HEX_ALPHABET, true)
+}
+
+fn encodeAlphabet(data: List<byte>, alphabet: string, pad: bool) -> string {
+    let sb = StringBuilder()
+    let n = len(data)
+    var i = 0
+    while (i + 5 <= n) {
+        let b0 = data[i] as int
+        let b1 = data[i + 1] as int
+        let b2 = data[i + 2] as int
+        let b3 = data[i + 3] as int
+        let b4 = data[i + 4] as int
+        sb.appendByte(alphabet[b0 / 8])
+        sb.appendByte(alphabet[(b0 % 8) * 4 + b1 / 64])
+        sb.appendByte(alphabet[(b1 / 2) % 32])
+        sb.appendByte(alphabet[(b1 % 2) * 16 + b2 / 16])
+        sb.appendByte(alphabet[(b2 % 16) * 2 + b3 / 128])
+        sb.appendByte(alphabet[(b3 / 4) % 32])
+        sb.appendByte(alphabet[(b3 % 4) * 8 + b4 / 32])
+        sb.appendByte(alphabet[b4 % 32])
+        i = i + 5
+    }
+    let rem = n - i
+    if (rem == 1) {
+        let b0 = data[i] as int
+        sb.appendByte(alphabet[b0 / 8])
+        sb.appendByte(alphabet[(b0 % 8) * 4])
+        if (pad) {
+            appendPads(sb, 6)
+        }
+    } else if (rem == 2) {
+        let b0 = data[i] as int
+        let b1 = data[i + 1] as int
+        sb.appendByte(alphabet[b0 / 8])
+        sb.appendByte(alphabet[(b0 % 8) * 4 + b1 / 64])
+        sb.appendByte(alphabet[(b1 / 2) % 32])
+        sb.appendByte(alphabet[(b1 % 2) * 16])
+        if (pad) {
+            appendPads(sb, 4)
+        }
+    } else if (rem == 3) {
+        let b0 = data[i] as int
+        let b1 = data[i + 1] as int
+        let b2 = data[i + 2] as int
+        sb.appendByte(alphabet[b0 / 8])
+        sb.appendByte(alphabet[(b0 % 8) * 4 + b1 / 64])
+        sb.appendByte(alphabet[(b1 / 2) % 32])
+        sb.appendByte(alphabet[(b1 % 2) * 16 + b2 / 16])
+        sb.appendByte(alphabet[(b2 % 16) * 2])
+        if (pad) {
+            appendPads(sb, 3)
+        }
+    } else if (rem == 4) {
+        let b0 = data[i] as int
+        let b1 = data[i + 1] as int
+        let b2 = data[i + 2] as int
+        let b3 = data[i + 3] as int
+        sb.appendByte(alphabet[b0 / 8])
+        sb.appendByte(alphabet[(b0 % 8) * 4 + b1 / 64])
+        sb.appendByte(alphabet[(b1 / 2) % 32])
+        sb.appendByte(alphabet[(b1 % 2) * 16 + b2 / 16])
+        sb.appendByte(alphabet[(b2 % 16) * 2 + b3 / 128])
+        sb.appendByte(alphabet[(b3 / 4) % 32])
+        sb.appendByte(alphabet[(b3 % 4) * 8])
+        if (pad) {
+            appendPads(sb, 1)
+        }
+    }
+    sb.toString()
+}
+
+fn appendPads(sb: StringBuilder, count: int) {
+    var i = 0
+    while (i < count) {
+        sb.appendByte(61 as byte)
+        i = i + 1
+    }
+}
+
+/// Decode standard-alphabet base32 (either case, padded or unpadded); `none`
+/// when the input is malformed.
+fn decode(text: string) -> List<byte>? {
+    decodeAlphabet(text, false)
+}
+
+/// Decode extended-hex base32 (either case, padded or unpadded); `none` when
+/// the input is malformed.
+fn decodeHex(text: string) -> List<byte>? {
+    decodeAlphabet(text, true)
+}
+
+fn decodeAlphabet(text: string, hex: bool) -> List<byte>? {
+    let n = len(text)
+    var end = n
+    while (end > 0 && ((text[end - 1] as int) == 61)) {
+        end = end - 1
+    }
+    let padCount = n - end
+    let rem = end % 8
+    if (rem == 1 || rem == 3 || rem == 6) {
+        return none
+    }
+    if (padCount > 0) {
+        let need = (8 - rem) % 8
+        if (padCount != need) {
+            return none
+        }
+    }
+    let out = bytes("")
+    var i = 0
+    while (i + 8 <= end) {
+        let d = b32Digits(text, i, hex)
+        if (len(d) < 8) {
+            return none
+        }
+        let b0 = d[0]
+        let b1 = d[1]
+        let b2 = d[2]
+        let b3 = d[3]
+        let b4 = d[4]
+        let b5 = d[5]
+        let b6 = d[6]
+        let b7 = d[7]
+        out.push((b0 * 8 + b1 / 4) as byte)
+        out.push(((b1 % 4) * 64 + b2 * 2 + b3 / 16) as byte)
+        out.push(((b3 % 16) * 16 + b4 / 2) as byte)
+        out.push(((b4 % 2) * 128 + b5 * 4 + b6 / 8) as byte)
+        out.push(((b6 % 8) * 32 + b7) as byte)
+        i = i + 8
+    }
+    let tail = end - i
+    if (tail == 0) {
+        return out
+    }
+    let d = b32Digits(text, i, hex)
+    if (len(d) != tail) {
+        return none
+    }
+    if (tail == 2) {
+        out.push((d[0] * 8 + d[1] / 4) as byte)
+    } else if (tail == 4) {
+        out.push((d[0] * 8 + d[1] / 4) as byte)
+        out.push(((d[1] % 4) * 64 + d[2] * 2 + d[3] / 16) as byte)
+    } else if (tail == 5) {
+        out.push((d[0] * 8 + d[1] / 4) as byte)
+        out.push(((d[1] % 4) * 64 + d[2] * 2 + d[3] / 16) as byte)
+        out.push(((d[3] % 16) * 16 + d[4] / 2) as byte)
+    } else if (tail == 7) {
+        out.push((d[0] * 8 + d[1] / 4) as byte)
+        out.push(((d[1] % 4) * 64 + d[2] * 2 + d[3] / 16) as byte)
+        out.push(((d[3] % 16) * 16 + d[4] / 2) as byte)
+        out.push(((d[4] % 2) * 128 + d[5] * 4 + d[6] / 8) as byte)
+    }
+    out
+}
+
+/// The value of the character at `i`, or `-1` when it is not in the alphabet.
+fn b32Value(cp: int, hex: bool) -> int {
+    if (hex) {
+        if (cp >= 48 && cp <= 57) {
+            return cp - 48
+        }
+        if (cp >= 65 && cp <= 86) {
+            return cp - 65 + 10
+        }
+        if (cp >= 97 && cp <= 118) {
+            return cp - 97 + 10
+        }
+        return 0 - 1
+    }
+    if (cp >= 65 && cp <= 90) {
+        return cp - 65
+    }
+    if (cp >= 97 && cp <= 122) {
+        return cp - 97
+    }
+    if (cp >= 50 && cp <= 55) {
+        return cp - 50 + 26
+    }
+    0 - 1
+}
+
+/// The values of the `count` characters starting at `i`, or an empty list when
+/// any character is invalid.
+fn b32Digits(text: string, i: int, hex: bool) -> List<int> {
+    var out: List<int> = [0]
+    out.remove(0)
+    var j = i
+    while (j < len(text)) {
+        let v = b32Value(text[j] as int, hex)
+        if (v < 0) {
+            return out
+        }
+        out.push(v)
+        j = j + 1
+    }
+    out
+}
+
+/// `true` when `decode` accepts `text`.
+fn isValid(text: string) -> bool {
+    match (decode(text)) {
+    case some(_) -> true
+    case none -> false
+    }
+}
+
+/// `true` when `decodeHex` accepts `text`.
+fn isValidHex(text: string) -> bool {
+    match (decodeHex(text)) {
+    case some(_) -> true
+    case none -> false
+    }
+}
+
+/// Base32 of the UTF-8 bytes of `text`.
+fn encodeString(text: string) -> string {
+    encode(bytes(text))
+}
+
+/// Extended-hex base32 of the UTF-8 bytes of `text`.
+fn encodeStringHex(text: string) -> string {
+    encodeHex(bytes(text))
+}
+
+/// Decode standard base32 and render the bytes as a UTF-8 string.
+fn decodeString(text: string) -> string? {
+    match (decode(text)) {
+    case some(b) -> str(b)
+    case none -> none
+    }
+}
+
+/// Decode extended-hex base32 and render the bytes as a UTF-8 string.
+fn decodeStringHex(text: string) -> string? {
+    match (decodeHex(text)) {
+    case some(b) -> str(b)
+    case none -> none
+    }
+}
