@@ -1,0 +1,233 @@
+module std.text.indent
+
+// Line indentation helpers: adding, removing, and normalising leading
+// whitespace.
+//
+// Lines are separated by `\n`. Only spaces and tabs count as indentation, and
+// only at the very start of a line, so a trailing `\r` (from CRLF input) is
+// ordinary content and survives every operation. Blank lines are lines that
+// hold nothing but spaces, tabs, or a trailing `\r`.
+//
+// `indent` prefixes each non-blank line and leaves blank lines alone.
+// `indentSpaces` is the common case with a space count. `dedent` removes the
+// longest leading whitespace prefix shared by every non-blank line, so a
+// uniformly indented block loses its margin; lines that are nothing but
+// whitespace are normalised to empty. `stripIndent` is `dedent` followed by
+// dropping blank lines at both ends. `reindent` dedents and then applies a new
+// prefix, which is the tool for moving a block to a different nesting level.
+//
+// Nothing here reflows text: each line keeps its own content and internal
+// whitespace.
+
+import { StringBuilder } from std.text.stringbuilder
+
+/// The lines of `text`, split on `\n` and keeping empty fields.
+fn splitLines(text: string) -> List<string> {
+    var out: List<string> = [""]
+    out.remove(0)
+    let bs = bytes(text)
+    var start = 0
+    var i = 0
+    while (i < len(bs)) {
+        if (bs[i] == 10) {
+            out.push(sliceOf(bs, start, i))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    out.push(sliceOf(bs, start, len(bs)))
+    out
+}
+
+/// The bytes `bs[lo..hi)` as a string.
+fn sliceOf(bs: List<byte>, lo: int, hi: int) -> string {
+    let out = bytes("")
+    var i = lo
+    while (i < hi) {
+        out.push(bs[i])
+        i = i + 1
+    }
+    str(out)
+}
+
+/// The lines joined with `\n`.
+fn joinLines(lines: List<string>) -> string {
+    let sb = StringBuilder()
+    var i = 0
+    while (i < len(lines)) {
+        if (i > 0) {
+            sb.append("\n")
+        }
+        sb.append(lines[i])
+        i = i + 1
+    }
+    sb.toString()
+}
+
+/// Whether `b` is an indentation byte (space or tab).
+fn isIndentByte(b: byte) -> bool {
+    b == 32 || b == 9
+}
+
+/// Whether `line` holds nothing but indentation (an optional trailing `\r`).
+fn isBlank(line: string) -> bool {
+    let bs = bytes(line)
+    var i = 0
+    while (i < len(bs)) {
+        let b = bs[i]
+        if (!isIndentByte(b) && b != 13) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+/// The leading spaces and tabs of `line`.
+fn leadingWs(line: string) -> string {
+    let bs = bytes(line)
+    var i = 0
+    while (i < len(bs) && isIndentByte(bs[i])) {
+        i = i + 1
+    }
+    sliceOf(bs, 0, i)
+}
+
+/// The longest common prefix of `a` and `b`.
+fn commonPrefix(a: string, b: string) -> string {
+    let ab = bytes(a)
+    let bb = bytes(b)
+    var i = 0
+    while (i < len(ab) && i < len(bb) && ab[i] == bb[i]) {
+        i = i + 1
+    }
+    sliceOf(ab, 0, i)
+}
+
+/// `line` without the leading `prefix` (returns `line` if it does not start
+/// with it).
+fn withoutPrefix(line: string, prefix: string) -> string {
+    let lb = bytes(line)
+    let pb = bytes(prefix)
+    if (len(pb) > len(lb)) {
+        return line
+    }
+    var i = 0
+    while (i < len(pb)) {
+        if (lb[i] != pb[i]) {
+            return line
+        }
+        i = i + 1
+    }
+    sliceOf(lb, len(pb), len(lb))
+}
+
+/// `text` with `prefix` added to every non-blank line.
+fn indent(text: string, prefix: string) -> string {
+    let lines = splitLines(text)
+    var out: List<string> = [""]
+    out.remove(0)
+    var i = 0
+    while (i < len(lines)) {
+        if (isBlank(lines[i])) {
+            out.push(lines[i])
+        } else {
+            out.push(prefix + lines[i])
+        }
+        i = i + 1
+    }
+    joinLines(out)
+}
+
+/// `text` indented by `count` spaces on every non-blank line.
+fn indentSpaces(text: string, count: int) -> string {
+    indent(text, spaces(count))
+}
+
+/// `count` spaces as a string (an empty string for a non-positive count).
+fn spaces(count: int) -> string {
+    let sb = StringBuilder()
+    var i = 0
+    while (i < count) {
+        sb.append(" ")
+        i = i + 1
+    }
+    sb.toString()
+}
+
+/// The longest leading whitespace prefix shared by every non-blank line.
+fn margin(text: string) -> string {
+    let lines = splitLines(text)
+    var found = false
+    var prefix = ""
+    var i = 0
+    while (i < len(lines)) {
+        if (!isBlank(lines[i])) {
+            let ws = leadingWs(lines[i])
+            if (!found) {
+                prefix = ws
+                found = true
+            } else {
+                prefix = commonPrefix(prefix, ws)
+            }
+        }
+        i = i + 1
+    }
+    prefix
+}
+
+/// `text` with the common leading margin removed from every line; lines that
+/// are nothing but whitespace become empty.
+fn dedent(text: string) -> string {
+    let prefix = margin(text)
+    let lines = splitLines(text)
+    var out: List<string> = [""]
+    out.remove(0)
+    var i = 0
+    while (i < len(lines)) {
+        let line = lines[i]
+        if (isBlank(line)) {
+            let lb = bytes(line)
+            if (len(lb) > 0 && lb[len(lb) - 1] == 13) {
+                out.push("\r")
+            } else {
+                out.push("")
+            }
+        } else {
+            out.push(withoutPrefix(line, prefix))
+        }
+        i = i + 1
+    }
+    joinLines(out)
+}
+
+/// `text` without blank lines at either end.
+fn trimBlankLines(text: string) -> string {
+    let lines = splitLines(text)
+    var lo = 0
+    var hi = len(lines)
+    while (lo < hi && isBlank(lines[lo])) {
+        lo = lo + 1
+    }
+    while (hi > lo && isBlank(lines[hi - 1])) {
+        hi = hi - 1
+    }
+    var out: List<string> = [""]
+    out.remove(0)
+    var i = lo
+    while (i < hi) {
+        out.push(lines[i])
+        i = i + 1
+    }
+    joinLines(out)
+}
+
+/// `dedent(text)` without blank lines at either end.
+fn stripIndent(text: string) -> string {
+    trimBlankLines(dedent(text))
+}
+
+/// `dedent(text)` with `prefix` added to every non-blank line.
+fn reindent(text: string, prefix: string) -> string {
+    indent(dedent(text), prefix)
+}

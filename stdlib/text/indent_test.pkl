@@ -1,0 +1,113 @@
+module std.text.indent_test
+
+import { indent, indentSpaces, dedent, stripIndent, trimBlankLines, reindent } from std.text.indent
+import { StringBuilder } from std.text.stringbuilder
+
+/// `text` rendered one bracket per line with literal `\n` separators, so every
+/// leading and trailing space stays visible in an assertion.
+fn show(text: string) -> string {
+    let bs = bytes(text)
+    let sb = StringBuilder()
+    sb.append("[")
+    var i = 0
+    while (i < len(bs)) {
+        if (bs[i] == 10) {
+            sb.append("]\\n[")
+        } else {
+            sb.appendByte(bs[i])
+        }
+        i = i + 1
+    }
+    sb.append("]")
+    sb.toString()
+}
+
+test fn indent_prefixes_every_non_blank_line() {
+    expect(show(indent("a\nb", "> "))).toBe("[> a]\\n[> b]")
+    expect(show(indent("a", "> "))).toBe("[> a]")
+    expect(show(indent("", "> "))).toBe("[]")
+    expect(show(indent("  a", "> "))).toBe("[>   a]")
+}
+
+test fn indent_leaves_blank_lines_alone() {
+    expect(show(indent("a\n\nb", "> "))).toBe("[> a]\\n[]\\n[> b]")
+    expect(show(indent("a\n  \nb", "> "))).toBe("[> a]\\n[  ]\\n[> b]")
+    expect(show(indent("a\n\t\nb", "> "))).toBe("[> a]\\n[\t]\\n[> b]")
+}
+
+test fn indenting_with_spaces() {
+    expect(show(indentSpaces("a\nb", 3))).toBe("[   a]\\n[   b]")
+    expect(show(indentSpaces("a\n\nb", 2))).toBe("[  a]\\n[]\\n[  b]")
+    expect(show(indentSpaces("a", 0))).toBe("[a]")
+    expect(show(indentSpaces("a", -4))).toBe("[a]")
+}
+
+test fn dedent_removes_a_shared_margin() {
+    expect(show(dedent("  a\n  b"))).toBe("[a]\\n[b]")
+    expect(show(dedent("    a\n    b\n    c"))).toBe("[a]\\n[b]\\n[c]")
+    expect(show(dedent("a"))).toBe("[a]")
+    expect(show(dedent(""))).toBe("[]")
+}
+
+test fn dedent_uses_the_shortest_margin() {
+    expect(show(dedent("    a\n  b"))).toBe("[  a]\\n[b]")
+    expect(show(dedent("  a\n      b"))).toBe("[a]\\n[    b]")
+    expect(show(dedent("\ta\n\t  b"))).toBe("[a]\\n[  b]")
+}
+
+test fn dedent_ignores_blank_lines_when_measuring() {
+    expect(show(dedent("    a\n\n    b"))).toBe("[a]\\n[]\\n[b]")
+    expect(show(dedent("  \n    a\n    b"))).toBe("[]\\n[a]\\n[b]")
+    expect(show(dedent("    a\n      \n    b"))).toBe("[a]\\n[]\\n[b]")
+}
+
+test fn dedent_leaves_an_unsplittable_margin() {
+    expect(show(dedent("\ta\n  b"))).toBe("[\ta]\\n[  b]")
+    expect(show(dedent("a\n  b"))).toBe("[a]\\n[  b]")
+}
+
+test fn dedent_handles_whitespace_only_text() {
+    expect(show(dedent("\n\n"))).toBe("[]\\n[]\\n[]")
+    expect(show(dedent("   "))).toBe("[]")
+    expect(show(dedent("   \n\t\n"))).toBe("[]\\n[]\\n[]")
+}
+
+test fn stripping_removes_outer_blank_lines() {
+    expect(show(stripIndent("\n    a\n    b\n\n"))).toBe("[a]\\n[b]")
+    expect(show(stripIndent("    a"))).toBe("[a]")
+    expect(show(stripIndent(""))).toBe("[]")
+    expect(show(stripIndent("  \n  \n"))).toBe("[]")
+}
+
+test fn trimming_only_touches_the_ends() {
+    expect(show(trimBlankLines("\n a \n\n b \n"))).toBe("[ a ]\\n[]\\n[ b ]")
+    expect(show(trimBlankLines("a\n\nb"))).toBe("[a]\\n[]\\n[b]")
+    expect(show(trimBlankLines("a"))).toBe("[a]")
+}
+
+test fn reindenting_moves_a_block() {
+    expect(show(reindent("    a\n      b\n    c", "\t"))).toBe("[\ta]\\n[\t  b]\\n[\tc]")
+    expect(show(reindent("a\nb", "    "))).toBe("[    a]\\n[    b]")
+    expect(show(reindent("  a", ""))).toBe("[a]")
+}
+
+test fn crlf_line_endings_survive() {
+    expect(show(dedent("  a\r\n  b\r\n"))).toBe("[a\r]\\n[b\r]\\n[]")
+    expect(show(indent("a\r\n\r\nb\r\n", "  "))).toBe("[  a\r]\\n[\r]\\n[  b\r]\\n[]")
+    expect(show(trimBlankLines("\r\n  a\r\n\r\n"))).toBe("[  a\r]")
+}
+
+test fn indent_and_dedent_round_trip() {
+    let text = "a\n\n  b\n    c"
+    expect(dedent(indent(text, "    "))).toBe(text)
+    expect(dedent(indent(text, "\t"))).toBe(text)
+    expect(reindent(text, "  ")).toBe("  a\n\n    b\n      c")
+}
+
+test fn a_multiline_string_layout() {
+    let block = "\n    fn main() {{\n        let x = 1\n        print(x)\n    }}\n"
+    let tidy = stripIndent(block)
+    expect(tidy).toBe("fn main() {{\n    let x = 1\n    print(x)\n}}")
+    let nested = indent(tidy, "  ")
+    expect(show(nested)).toBe("[  fn main() {{]\\n[      let x = 1]\\n[      print(x)]\\n[  }}]")
+}
