@@ -14,18 +14,18 @@ Seeds (see `docs/08-stdlib.md`, office `port/` tracker):
   flat `pickle/compiler/{lexer,parser,resolve,check,emit}.pkl` slices took
   over lexing/parsing/checking, and this tree is where `std.*`/`runtime.*`
   seeds live (`text/{utf8,stringbuilder,format,lexer,ccm,casing,diff,wrap,template,regex,unicode,table,slug,words}`, `collections/*`,
-  `encoding/{base64,csv,hex,url,toml,yaml,base32,xml}`, `math/{basic,random,statistics,interpolation,matrix,vector,fraction,prime,geometry,combinatorics,radix,complex}`, `fs`, `os`, `json`, `io`,
+  `encoding/{base64,csv,hex,url,toml,yaml,base32,xml}`, `math/{basic,random,statistics,interpolation,matrix,vector,fraction,prime,geometry,combinatorics,radix,complex,polynomial}`, `fs`, `os`, `json`, `io`,
   `logging`, `process`, `test`, `time`, `thread`).
 - `collections/` — `List`/`Map` wrappers plus `Set`, `Multiset`, `Deque`,
   `Vec`, `BitSet`, `LruCache`
 - `fs/`, `os/`, `time/`, `test/` — shipped flat (`fs.pkl`, `os.pkl`, ...);
   `math/` has `basic.pkl`, `random.pkl`, `statistics.pkl`,
-  `interpolation.pkl`, `matrix.pkl`, `vector.pkl`, `fraction.pkl`, `prime.pkl`, `geometry.pkl`, `combinatorics.pkl`, `radix.pkl`, and `complex.pkl`;
+  `interpolation.pkl`, `matrix.pkl`, `vector.pkl`, `fraction.pkl`, `prime.pkl`, `geometry.pkl`, `combinatorics.pkl`, `radix.pkl`, `complex.pkl`, and `polynomial.pkl`;
   `logging.pkl`
   ships flat (see the plan doc); `encoding/` has `base64`, `csv`, `hex`,
   `url`, `toml`, `yaml`, `base32`, and `xml`
 
-Status (2026-09-26): the whole `stdlib/**/*_test.pkl` tree (50 files) is gated
+Status (2026-09-26): the whole `stdlib/**/*_test.pkl` tree (51 files) is gated
 by **GATE11** in `tools/battery_full.ps1` — the ported test driver must run
 each file byte-identical (stdout + exit) to Rust `pickle test`.
 The compiler registers builtins (`print`, `println`, `len`, `abs`, ...)
