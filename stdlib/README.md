@@ -24,7 +24,7 @@ Seeds (see `docs/08-stdlib.md`, office `port/` tracker):
   ships flat (see the plan doc); `encoding/` has `base64`, `csv`, `hex`,
   `url`, `toml`, and `yaml`
 
-Status (2026-09-26): the whole `stdlib/**/*_test.pkl` tree (37 files) is gated
+Status (2026-09-26): the whole `stdlib/**/*_test.pkl` tree (38 files) is gated
 by **GATE11** in `tools/battery_full.ps1` — the ported test driver must run
 each file byte-identical (stdout + exit) to Rust `pickle test`.
 The compiler registers builtins (`print`, `println`, `len`, `abs`, ...)
