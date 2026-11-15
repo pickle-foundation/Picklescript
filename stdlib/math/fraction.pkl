@@ -1,0 +1,241 @@
+module std.math.fraction
+
+// Exact rational numbers.
+//
+// A `Fraction` always stores a reduced form: the denominator is positive, the
+// sign lives in the numerator, and the numerator and denominator share no
+// common divisor. `make` is the only checked entry point, so a value
+// constructed through it is canonical (except one built with the raw
+// constructor).
+//
+// The zero denominator is not a fraction: `make`, `parse`, and `div` return
+// `none` for it, and `inverse` returns `none` for zero. Arithmetic is exact
+// integer arithmetic, so results are bit-identical everywhere; the only
+// limitation is the size of `int` - products of large numerators can overflow,
+// and this module does not detect that.
+
+/// A rational number in reduced form.
+class Fraction {
+    var num: int
+    var den: int
+
+    constructor(n: int, d: int) {
+        this.num = n
+        this.den = d
+    }
+}
+
+/// The absolute value of `n`.
+fn absInt(n: int) -> int {
+    if (n < 0) {
+        return 0 - n
+    }
+    n
+}
+
+/// The greatest common divisor of `a` and `b` (both taken as absolute values);
+/// `gcdInt(0, 0)` is 0.
+fn gcdInt(a: int, b: int) -> int {
+    var x = absInt(a)
+    var y = absInt(b)
+    while (y != 0) {
+        let r = x % y
+        x = y
+        y = r
+    }
+    x
+}
+
+/// The numerator of `f`.
+fn numOf(f: Fraction) -> int {
+    f.num
+}
+
+/// The denominator of `f` (always positive for canonical values).
+fn denOf(f: Fraction) -> int {
+    f.den
+}
+
+/// A canonical fraction with denominator `d`; `none` when `d` is zero.
+fn make(n: int, d: int) -> Fraction? {
+    if (d == 0) {
+        return none
+    }
+    if (n == 0) {
+        return Fraction(0, 1)
+    }
+    let g = gcdInt(n, d)
+    var nn = n / g
+    var dd = d / g
+    if (dd < 0) {
+        nn = 0 - nn
+        dd = 0 - dd
+    }
+    Fraction(nn, dd)
+}
+
+/// The integer `n` as a fraction.
+fn fromInt(n: int) -> Fraction {
+    Fraction(n, 1)
+}
+
+/// Whether `b` is an ASCII digit.
+fn isDigitByte(b: int) -> bool {
+    b >= 48 && b <= 57
+}
+
+/// Parse `"n"`, `"-n"`, `"n/d"`, or `"-n/d"`; `none` on any other shape,
+/// including a zero denominator. Whitespace is not accepted.
+fn parse(s: string) -> Fraction? {
+    let bs = bytes(s)
+    if (len(bs) == 0) {
+        return none
+    }
+    var i = 0
+    var negative = false
+    if ((bs[0] as int) == 45) {
+        negative = true
+        i = 1
+    }
+    var n = 0
+    var nDigits = 0
+    while (i < len(bs) && isDigitByte(bs[i] as int)) {
+        n = n * 10 + ((bs[i] as int) - 48)
+        nDigits = nDigits + 1
+        i = i + 1
+    }
+    if (nDigits == 0) {
+        return none
+    }
+    var d = 1
+    if (i < len(bs)) {
+        if ((bs[i] as int) != 47) {
+            return none
+        }
+        i = i + 1
+        var parsed = 0
+        var dDigits = 0
+        while (i < len(bs) && isDigitByte(bs[i] as int)) {
+            parsed = parsed * 10 + ((bs[i] as int) - 48)
+            dDigits = dDigits + 1
+            i = i + 1
+        }
+        if (dDigits == 0) {
+            return none
+        }
+        d = parsed
+    }
+    if (i != len(bs)) {
+        return none
+    }
+    if (negative) {
+        n = 0 - n
+    }
+    make(n, d)
+}
+
+/// `a + b`.
+fn add(a: Fraction, b: Fraction) -> Fraction {
+    let nn = a.num * b.den + b.num * a.den
+    let dd = a.den * b.den
+    match (make(nn, dd)) {
+    case some(v) -> v
+    case none -> Fraction(0, 1)
+    }
+}
+
+/// `a - b`.
+fn sub(a: Fraction, b: Fraction) -> Fraction {
+    let nn = a.num * b.den - b.num * a.den
+    let dd = a.den * b.den
+    match (make(nn, dd)) {
+    case some(v) -> v
+    case none -> Fraction(0, 1)
+    }
+}
+
+/// `a * b`.
+fn mul(a: Fraction, b: Fraction) -> Fraction {
+    let nn = a.num * b.num
+    let dd = a.den * b.den
+    match (make(nn, dd)) {
+    case some(v) -> v
+    case none -> Fraction(0, 1)
+    }
+}
+
+/// `a / b`; `none` when `b` is zero.
+fn div(a: Fraction, b: Fraction) -> Fraction? {
+    if (b.num == 0) {
+        return none
+    }
+    make(a.num * b.den, a.den * b.num)
+}
+
+/// `-a`.
+fn neg(a: Fraction) -> Fraction {
+    Fraction(0 - a.num, a.den)
+}
+
+/// `|a|`.
+fn absOf(a: Fraction) -> Fraction {
+    if (a.num < 0) {
+        return Fraction(0 - a.num, a.den)
+    }
+    Fraction(a.num, a.den)
+}
+
+/// `1/a`; `none` when `a` is zero.
+fn inverse(a: Fraction) -> Fraction? {
+    if (a.num == 0) {
+        return none
+    }
+    make(a.den, a.num)
+}
+
+/// -1, 0, or 1 according to whether `a` is less than, equal to, or greater
+/// than `b`.
+fn compare(a: Fraction, b: Fraction) -> int {
+    let left = a.num * b.den
+    let right = b.num * a.den
+    if (left < right) {
+        return -1
+    }
+    if (left > right) {
+        return 1
+    }
+    0
+}
+
+/// Whether `a` and `b` are the same rational number.
+fn equals(a: Fraction, b: Fraction) -> bool {
+    a.num == b.num && a.den == b.den
+}
+
+/// Whether `a` is zero.
+fn isZero(a: Fraction) -> bool {
+    a.num == 0
+}
+
+/// Whether `a` is an integer.
+fn isInteger(a: Fraction) -> bool {
+    a.den == 1
+}
+
+/// Whether `a` is negative.
+fn isNegative(a: Fraction) -> bool {
+    a.num < 0
+}
+
+/// The nearest `float` value of `a`.
+fn toFloat(a: Fraction) -> float {
+    (a.num as float) / (a.den as float)
+}
+
+/// `"n/d"`, or `"n"` for an integer.
+fn render(a: Fraction) -> string {
+    if (a.den == 1) {
+        return "{a.num}"
+    }
+    "{a.num}/{a.den}"
+}

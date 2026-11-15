@@ -1,0 +1,202 @@
+module std.math.fraction_test
+
+import { Fraction, make, fromInt, parse, add, sub, mul, div, neg, absOf, inverse, compare, equals, isZero, isInteger, isNegative, toFloat, render, numOf, denOf } from std.math.fraction
+
+/// A fraction from `n/d`, falling back to zero for an invalid denominator.
+fn fr(n: int, d: int) -> Fraction {
+    match (make(n, d)) {
+    case some(v) -> v
+    case none -> Fraction(0, 1)
+    }
+}
+
+/// A rendered optional fraction (`<none>` for `none`).
+fn showF(f: Fraction?) -> string {
+    match (f) {
+    case some(v) -> render(v)
+    case none -> "<none>"
+    }
+}
+
+test fn construction_normalizes() {
+    expect(showF(make(2, 4))).toBe("1/2")
+    expect(showF(make(-2, 4))).toBe("-1/2")
+    expect(showF(make(2, -4))).toBe("-1/2")
+    expect(showF(make(-2, -4))).toBe("1/2")
+    expect(showF(make(3, 1))).toBe("3")
+    expect(showF(make(0, 5))).toBe("0")
+    expect(showF(make(10, 5))).toBe("2")
+    expect(showF(make(1, 0))).toBe("<none>")
+    expect(showF(make(0, 0))).toBe("<none>")
+}
+
+test fn divided_fields_are_canonical() {
+    let f = fr(6, -8)
+    expect(numOf(f)).toBe(-3)
+    expect(denOf(f)).toBe(4)
+    expect(render(f)).toBe("-3/4")
+    expect(render(fromInt(7))).toBe("7")
+    expect(render(fromInt(-7))).toBe("-7")
+    expect(render(fromInt(0))).toBe("0")
+}
+
+test fn parsing_accepts_plain_forms() {
+    expect(showF(parse("3/4"))).toBe("3/4")
+    expect(showF(parse("-3/4"))).toBe("-3/4")
+    expect(showF(parse("5"))).toBe("5")
+    expect(showF(parse("-5"))).toBe("-5")
+    expect(showF(parse("0/9"))).toBe("0")
+    expect(showF(parse("8/12"))).toBe("2/3")
+    expect(showF(parse("10/5"))).toBe("2")
+    expect(showF(parse("007/014"))).toBe("1/2")
+}
+
+test fn parsing_rejects_bad_forms() {
+    expect(showF(parse(""))).toBe("<none>")
+    expect(showF(parse("-"))).toBe("<none>")
+    expect(showF(parse("/"))).toBe("<none>")
+    expect(showF(parse("1/"))).toBe("<none>")
+    expect(showF(parse("1/0"))).toBe("<none>")
+    expect(showF(parse("a/b"))).toBe("<none>")
+    expect(showF(parse("1.5"))).toBe("<none>")
+    expect(showF(parse("1 / 2"))).toBe("<none>")
+    expect(showF(parse("1/-2"))).toBe("<none>")
+    expect(showF(parse("1/2/3"))).toBe("<none>")
+    expect(showF(parse("--1/2"))).toBe("<none>")
+}
+
+test fn addition() {
+    expect(render(add(fr(1, 2), fr(1, 3)))).toBe("5/6")
+    expect(render(add(fr(1, 2), fr(1, 2)))).toBe("1")
+    expect(render(add(fr(2, 3), fr(1, 6)))).toBe("5/6")
+    expect(render(add(fr(-1, 2), fr(1, 2)))).toBe("0")
+    expect(render(add(fr(3, 4), fr(-1, 4)))).toBe("1/2")
+    expect(render(add(fr(0, 1), fr(0, 1)))).toBe("0")
+}
+
+test fn subtraction() {
+    expect(render(sub(fr(1, 2), fr(1, 3)))).toBe("1/6")
+    expect(render(sub(fr(1, 3), fr(1, 2)))).toBe("-1/6")
+    expect(render(sub(fr(3, 4), fr(3, 4)))).toBe("0")
+    expect(render(sub(fr(0, 1), fr(5, 6)))).toBe("-5/6")
+}
+
+test fn multiplication() {
+    expect(render(mul(fr(2, 3), fr(3, 4)))).toBe("1/2")
+    expect(render(mul(fr(-2, 3), fr(3, 2)))).toBe("-1")
+    expect(render(mul(fr(5, 7), fr(0, 1)))).toBe("0")
+    expect(render(mul(fr(-5, 7), fr(-7, 5)))).toBe("1")
+    expect(render(mul(fr(4, 9), fr(3, 8)))).toBe("1/6")
+}
+
+test fn division() {
+    expect(showF(div(fr(1, 2), fr(3, 4)))).toBe("2/3")
+    expect(showF(div(fr(1, 2), fr(2, 1)))).toBe("1/4")
+    expect(showF(div(fr(-3, 5), fr(9, 10)))).toBe("-2/3")
+    expect(showF(div(fr(1, 2), fr(0, 1)))).toBe("<none>")
+    expect(showF(div(fr(0, 1), fr(5, 6)))).toBe("0")
+}
+
+test fn negation_abs_and_inverse() {
+    expect(render(neg(fr(3, 4)))).toBe("-3/4")
+    expect(render(neg(fr(-3, 4)))).toBe("3/4")
+    expect(render(neg(fr(0, 1)))).toBe("0")
+    expect(render(absOf(fr(-3, 4)))).toBe("3/4")
+    expect(render(absOf(fr(3, 4)))).toBe("3/4")
+    expect(showF(inverse(fr(2, 5)))).toBe("5/2")
+    expect(showF(inverse(fr(-2, 5)))).toBe("-5/2")
+    expect(showF(inverse(fr(0, 1)))).toBe("<none>")
+    expect(showF(inverse(fromInt(4)))).toBe("1/4")
+}
+
+test fn ordering() {
+    expect(compare(fr(1, 2), fr(2, 4))).toBe(0)
+    expect(compare(fr(1, 3), fr(1, 2))).toBe(-1)
+    expect(compare(fr(3, 2), fr(1, 1))).toBe(1)
+    expect(compare(fr(-1, 2), fr(1, 2))).toBe(-1)
+    expect(compare(fr(-1, 2), fr(-1, 3))).toBe(-1)
+    expect(equals(fr(1, 2), fr(2, 4))).toBe(true)
+    expect(equals(fr(1, 2), fr(1, 3))).toBe(false)
+}
+
+test fn predicates() {
+    expect(isZero(fr(0, 7))).toBe(true)
+    expect(isZero(fr(1, 7))).toBe(false)
+    expect(isInteger(fr(6, 3))).toBe(true)
+    expect(isInteger(fr(1, 3))).toBe(false)
+    expect(isNegative(fr(-1, 3))).toBe(true)
+    expect(isNegative(fr(1, 3))).toBe(false)
+    expect(isNegative(fr(0, 1))).toBe(false)
+}
+
+test fn float_conversion() {
+    expect(toFloat(fr(1, 2))).toBe(0.5)
+    expect(toFloat(fr(3, 4))).toBe(0.75)
+    expect(toFloat(fr(-1, 4))).toBe(-0.25)
+    expect(toFloat(fr(3, 1))).toBe(3.0)
+    let third = toFloat(fr(1, 3))
+    expect(third > 0.333).toBe(true)
+    expect(third < 0.334).toBe(true)
+}
+
+test fn render_round_trips() {
+    let sources: List<Fraction> = [fr(7, 3), fr(-7, 3), fr(5, 1), fr(0, 1), fr(22, 7)]
+    var i = 0
+    while (i < len(sources)) {
+        let f = sources[i]
+        let text = render(f)
+        match (parse(text)) {
+        case some(back) -> {
+            expect(equals(back, f)).toBe(true)
+            expect(numOf(back)).toBe(numOf(f))
+            expect(denOf(back)).toBe(denOf(f))
+        }
+        case none -> expect(false).toBe(true)
+        }
+        i = i + 1
+    }
+}
+
+test fn arithmetic_identities() {
+    let sources: List<Fraction> = [fr(1, 2), fr(-3, 4), fr(5, 1), fr(0, 1), fr(22, 7)]
+    var i = 0
+    while (i < len(sources)) {
+        let a = sources[i]
+        expect(isZero(add(a, neg(a)))).toBe(true)
+        expect(isZero(sub(a, a))).toBe(true)
+        expect(equals(mul(a, fromInt(1)), a)).toBe(true)
+        match (inverse(a)) {
+        case some(inv) -> expect(equals(mul(a, inv), fromInt(1))).toBe(true)
+        case none -> expect(isZero(a)).toBe(true)
+        }
+        i = i + 1
+    }
+}
+
+test fn accumulating_a_sum() {
+    var total = fr(0, 1)
+    var d = 1
+    while (d <= 5) {
+        total = add(total, fr(1, d))
+        d = d + 1
+    }
+    expect(render(total)).toBe("137/60")
+    expect(toFloat(total) > 2.28).toBe(true)
+    expect(toFloat(total) < 2.29).toBe(true)
+}
+
+test fn larger_values_stay_exact() {
+    let big = fr(1000000, 3)
+    expect(numOf(big)).toBe(1000000)
+    expect(denOf(big)).toBe(3)
+    expect(render(big)).toBe("1000000/3")
+    expect(render(mul(big, fr(3, 1000000)))).toBe("1")
+    expect(render(sub(fr(123456789, 1000), fr(123456789, 1000)))).toBe("0")
+}
+
+test fn common_denominators_reduce() {
+    expect(render(add(fr(5, 12), fr(7, 18)))).toBe("29/36")
+    expect(render(sub(fr(5, 12), fr(7, 18)))).toBe("1/36")
+    expect(render(mul(fr(5, 12), fr(7, 18)))).toBe("35/216")
+    expect(showF(div(fr(5, 12), fr(7, 18)))).toBe("15/14")
+}
