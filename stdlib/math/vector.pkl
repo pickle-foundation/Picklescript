@@ -1,0 +1,280 @@
+module std.math.vector
+
+// Dense float vectors.
+//
+// A vector is a plain `List<float>`, so callers can build one with a literal or
+// with `zeros`/`ones`. Every operation that combines two vectors checks that
+// their lengths agree and returns `none` instead of reading out of range. The
+// empty vector has length 0 and is treated as valid input everywhere a length
+// check is the only requirement.
+//
+// Arithmetic is plain IEEE addition, subtraction, multiplication, and division
+// in a fixed order, so results are bit-identical across implementations. The
+// square root used by `norm`, `distance`, and `normalize` is Newton's method
+// with a fixed iteration count (also deterministic); comparisons of computed
+// magnitudes should use a tolerance.
+
+/// A typed empty vector.
+fn emptyVec() -> List<float> {
+    var out: List<float> = [0.0]
+    out.remove(0)
+    out
+}
+
+/// The absolute value of `x`.
+fn fabs(x: float) -> float {
+    if (x < 0.0) {
+        return 0.0 - x
+    }
+    x
+}
+
+/// The square root of `x` by Newton's method (fixed 64 halvings); returns 0
+/// for `x <= 0`, including the negative case.
+fn sqrt(x: float) -> float {
+    if (x <= 0.0) {
+        return 0.0
+    }
+    var guess = x
+    if (guess < 1.0) {
+        guess = 1.0
+    }
+    var i = 0
+    while (i < 64) {
+        guess = 0.5 * (guess + x / guess)
+        i = i + 1
+    }
+    guess
+}
+
+/// The number of components.
+fn length(v: List<float>) -> int {
+    len(v)
+}
+
+/// Whether the vector has no components.
+fn isEmpty(v: List<float>) -> bool {
+    len(v) == 0
+}
+
+/// An independent copy of `v`.
+fn copyOf(v: List<float>) -> List<float> {
+    var out = emptyVec()
+    var i = 0
+    while (i < len(v)) {
+        out.push(v[i])
+        i = i + 1
+    }
+    out
+}
+
+/// A vector of `n` zeros; `none` when `n` is negative.
+fn zeros(n: int) -> List<float>? {
+    if (n < 0) {
+        return none
+    }
+    var out = emptyVec()
+    var i = 0
+    while (i < n) {
+        out.push(0.0)
+        i = i + 1
+    }
+    out
+}
+
+/// A vector of `n` ones; `none` when `n` is negative.
+fn ones(n: int) -> List<float>? {
+    if (n < 0) {
+        return none
+    }
+    var out = emptyVec()
+    var i = 0
+    while (i < n) {
+        out.push(1.0)
+        i = i + 1
+    }
+    out
+}
+
+/// Component `i`; `none` when out of range.
+fn get(v: List<float>, i: int) -> float? {
+    if (i < 0 || i >= len(v)) {
+        return none
+    }
+    v[i]
+}
+
+/// The component-wise sum; `none` when the lengths differ.
+fn add(a: List<float>, b: List<float>) -> List<float>? {
+    if (len(a) != len(b)) {
+        return none
+    }
+    var out = emptyVec()
+    var i = 0
+    while (i < len(a)) {
+        out.push(a[i] + b[i])
+        i = i + 1
+    }
+    out
+}
+
+/// The component-wise difference; `none` when the lengths differ.
+fn sub(a: List<float>, b: List<float>) -> List<float>? {
+    if (len(a) != len(b)) {
+        return none
+    }
+    var out = emptyVec()
+    var i = 0
+    while (i < len(a)) {
+        out.push(a[i] - b[i])
+        i = i + 1
+    }
+    out
+}
+
+/// Every component multiplied by `k`.
+fn scale(v: List<float>, k: float) -> List<float> {
+    var out = emptyVec()
+    var i = 0
+    while (i < len(v)) {
+        out.push(v[i] * k)
+        i = i + 1
+    }
+    out
+}
+
+/// The sum of the components; 0 for the empty vector.
+fn sum(v: List<float>) -> float {
+    var total = 0.0
+    var i = 0
+    while (i < len(v)) {
+        total = total + v[i]
+        i = i + 1
+    }
+    total
+}
+
+/// The dot product; `none` when the lengths differ.
+fn dot(a: List<float>, b: List<float>) -> float? {
+    if (len(a) != len(b)) {
+        return none
+    }
+    var total = 0.0
+    var i = 0
+    while (i < len(a)) {
+        total = total + a[i] * b[i]
+        i = i + 1
+    }
+    total
+}
+
+/// The 3D cross product; `none` unless both vectors have three components.
+fn cross(a: List<float>, b: List<float>) -> List<float>? {
+    if (len(a) != 3 || len(b) != 3) {
+        return none
+    }
+    var out = emptyVec()
+    out.push(a[1] * b[2] - a[2] * b[1])
+    out.push(a[2] * b[0] - a[0] * b[2])
+    out.push(a[0] * b[1] - a[1] * b[0])
+    out
+}
+
+/// The squared magnitude; 0 for the empty vector.
+fn normSquared(v: List<float>) -> float {
+    var total = 0.0
+    var i = 0
+    while (i < len(v)) {
+        total = total + v[i] * v[i]
+        i = i + 1
+    }
+    total
+}
+
+/// The magnitude (`sqrt(normSquared(v))`).
+fn norm(v: List<float>) -> float {
+    sqrt(normSquared(v))
+}
+
+/// The squared distance between two points; `none` when the lengths differ.
+fn distanceSquared(a: List<float>, b: List<float>) -> float? {
+    if (len(a) != len(b)) {
+        return none
+    }
+    var total = 0.0
+    var i = 0
+    while (i < len(a)) {
+        let d = a[i] - b[i]
+        total = total + d * d
+        i = i + 1
+    }
+    total
+}
+
+/// The distance between two points; `none` when the lengths differ.
+fn distance(a: List<float>, b: List<float>) -> float? {
+    match (distanceSquared(a, b)) {
+    case some(d) -> sqrt(d)
+    case none -> none
+    }
+}
+
+/// A unit vector in the same direction; `none` for an empty or zero vector.
+fn normalize(v: List<float>) -> List<float>? {
+    let n = norm(v)
+    if (n <= 0.0) {
+        return none
+    }
+    var out = emptyVec()
+    var i = 0
+    while (i < len(v)) {
+        out.push(v[i] / n)
+        i = i + 1
+    }
+    out
+}
+
+/// The component-wise linear blend `a + (b - a) * t` (extrapolates outside
+/// `[0, 1]`); `none` when the lengths differ.
+fn blend(a: List<float>, b: List<float>, t: float) -> List<float>? {
+    if (len(a) != len(b)) {
+        return none
+    }
+    var out = emptyVec()
+    var i = 0
+    while (i < len(a)) {
+        out.push(a[i] + (b[i] - a[i]) * t)
+        i = i + 1
+    }
+    out
+}
+
+/// Whether `a` and `b` have the same length and every component differs by at
+/// most `eps` in absolute value.
+fn approxEq(a: List<float>, b: List<float>, eps: float) -> bool {
+    if (len(a) != len(b)) {
+        return false
+    }
+    var i = 0
+    while (i < len(a)) {
+        if (fabs(a[i] - b[i]) > eps) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+/// A compact rendering: `[1, 2, 3]`.
+fn render(v: List<float>) -> string {
+    var out = "["
+    var i = 0
+    while (i < len(v)) {
+        if (i > 0) {
+            out = out + ", "
+        }
+        out = out + "{v[i]}"
+        i = i + 1
+    }
+    out + "]"
+}
