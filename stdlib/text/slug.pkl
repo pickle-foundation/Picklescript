@@ -1,0 +1,270 @@
+module std.text.slug
+
+import { scalars } from std.text.unicode
+
+// URL slugs and ASCII folding.
+//
+// `asciiFold` transliterates a string to lowercase ASCII: Latin-1 and common
+// Latin Extended letters lose their accents or expand to ASCII digraphs
+// (`ß` -> `ss`, `Æ` -> `ae`, `Ł` -> `l`), ASCII letters and digits pass
+// through, and every other scalar becomes a word separator. Runs of
+// separators collapse to one space and the result is trimmed.
+//
+// `slugify` is the same pipeline with spaces replaced by `-`; `slugifyWith`
+// takes a custom separator. The output is always safe for a URL path segment:
+// it contains only `a-z`, `0-9`, and the separator. `isSlug` checks that shape
+// without allocating.
+//
+// Nothing depends on the host locale: the transliteration table is fixed, so
+// every implementation produces the same slug for the same input.
+
+/// The one-byte ASCII string for `cp` (which must be ASCII).
+fn asciiChar(cp: int) -> string {
+    var out = bytes("")
+    out.push(cp as byte)
+    str(out)
+}
+
+/// The ASCII mapping of a Latin-1 supplement scalar, or the empty string when
+/// it has none.
+fn latin1Ascii(cp: int) -> string {
+    if ((cp >= 0xC0 && cp <= 0xC5) || (cp >= 0xE0 && cp <= 0xE5)) {
+        return "a"
+    }
+    if (cp == 0xC6 || cp == 0xE6) {
+        return "ae"
+    }
+    if (cp == 0xC7 || cp == 0xE7) {
+        return "c"
+    }
+    if ((cp >= 0xC8 && cp <= 0xCB) || (cp >= 0xE8 && cp <= 0xEB)) {
+        return "e"
+    }
+    if ((cp >= 0xCC && cp <= 0xCF) || (cp >= 0xEC && cp <= 0xEF)) {
+        return "i"
+    }
+    if (cp == 0xD0 || cp == 0xF0) {
+        return "d"
+    }
+    if (cp == 0xD1 || cp == 0xF1) {
+        return "n"
+    }
+    if ((cp >= 0xD2 && cp <= 0xD6) || (cp >= 0xF2 && cp <= 0xF6)) {
+        return "o"
+    }
+    if (cp == 0xD8 || cp == 0xF8) {
+        return "o"
+    }
+    if ((cp >= 0xD9 && cp <= 0xDC) || (cp >= 0xF9 && cp <= 0xFC)) {
+        return "u"
+    }
+    if (cp == 0xDD || cp == 0xFD || cp == 0xFF) {
+        return "y"
+    }
+    if (cp == 0xDE) {
+        return "th"
+    }
+    if (cp == 0xFE) {
+        return "th"
+    }
+    if (cp == 0xDF) {
+        return "ss"
+    }
+    ""
+}
+
+/// The ASCII mapping of a Latin Extended-A scalar, or the empty string when it
+/// has none.
+fn latinExtAscii(cp: int) -> string {
+    if (cp == 0x100 || cp == 0x101 || cp == 0x102 || cp == 0x103) {
+        return "a"
+    }
+    if (cp == 0x104 || cp == 0x105) {
+        return "a"
+    }
+    if (cp == 0x106 || cp == 0x107 || cp == 0x10C || cp == 0x10D) {
+        return "c"
+    }
+    if (cp == 0x10E || cp == 0x10F || cp == 0x110 || cp == 0x111) {
+        return "d"
+    }
+    if (cp == 0x118 || cp == 0x119 || cp == 0x11A || cp == 0x11B || cp == 0x11E || cp == 0x11F) {
+        return "e"
+    }
+    if (cp == 0x11C || cp == 0x11D || cp == 0x120 || cp == 0x121 || cp == 0x122 || cp == 0x123) {
+        return "g"
+    }
+    if (cp == 0x124 || cp == 0x125) {
+        return "h"
+    }
+    if (cp == 0x128 || cp == 0x129 || cp == 0x12A || cp == 0x12B || cp == 0x12E || cp == 0x12F) {
+        return "i"
+    }
+    if (cp == 0x130) {
+        return "i"
+    }
+    if (cp == 0x131) {
+        return "i"
+    }
+    if (cp == 0x132 || cp == 0x133) {
+        return "ij"
+    }
+    if (cp == 0x134 || cp == 0x135) {
+        return "j"
+    }
+    if (cp == 0x136 || cp == 0x137 || cp == 0x138) {
+        return "k"
+    }
+    if (cp == 0x139 || cp == 0x13A || cp == 0x13B || cp == 0x13C || cp == 0x13D || cp == 0x13E) {
+        return "l"
+    }
+    if (cp == 0x141 || cp == 0x142) {
+        return "l"
+    }
+    if (cp == 0x143 || cp == 0x144 || cp == 0x145 || cp == 0x146) {
+        return "n"
+    }
+    if (cp == 0x147 || cp == 0x148) {
+        return "n"
+    }
+    if (cp == 0x14C || cp == 0x14D || cp == 0x150 || cp == 0x151) {
+        return "o"
+    }
+    if (cp == 0x154 || cp == 0x155 || cp == 0x158 || cp == 0x159) {
+        return "r"
+    }
+    if (cp == 0x15A || cp == 0x15B || cp == 0x15E || cp == 0x15F || cp == 0x160 || cp == 0x161) {
+        return "s"
+    }
+    if (cp == 0x164 || cp == 0x165 || cp == 0x162 || cp == 0x163) {
+        return "t"
+    }
+    if (cp == 0x168 || cp == 0x169 || cp == 0x16A || cp == 0x16B || cp == 0x16E || cp == 0x16F) {
+        return "u"
+    }
+    if (cp == 0x170 || cp == 0x171) {
+        return "u"
+    }
+    if (cp == 0x172 || cp == 0x173) {
+        return "u"
+    }
+    if (cp == 0x174 || cp == 0x175) {
+        return "w"
+    }
+    if (cp == 0x176 || cp == 0x177) {
+        return "y"
+    }
+    if (cp == 0x179 || cp == 0x17A || cp == 0x17B || cp == 0x17C || cp == 0x17D || cp == 0x17E) {
+        return "z"
+    }
+    if (cp == 0x152 || cp == 0x153) {
+        return "oe"
+    }
+    if (cp == 0x178) {
+        return "y"
+    }
+    ""
+}
+
+/// The lowercase ASCII form of `cp`, or the empty string when `cp` has no
+/// mapping (and therefore acts as a word separator).
+fn asciiOf(cp: int) -> string {
+    if (cp >= 65 && cp <= 90) {
+        return asciiChar(cp + 32)
+    }
+    if ((cp >= 97 && cp <= 122) || (cp >= 48 && cp <= 57)) {
+        return asciiChar(cp)
+    }
+    let latin1 = latin1Ascii(cp)
+    if (latin1 != "") {
+        return latin1
+    }
+    latinExtAscii(cp)
+}
+
+/// The ASCII-folded words of `s`, in order. Every run of unmapped scalars is a
+/// separator, so no word is empty.
+fn slugWords(s: string) -> List<string> {
+    var words: List<string> = [""]
+    words.remove(0)
+    var current = bytes("")
+    let cps = scalars(s)
+    var i = 0
+    while (i < len(cps)) {
+        let mapped = asciiOf(cps[i])
+        if (mapped == "") {
+            if (len(current) > 0) {
+                words.push(str(current))
+                current = bytes("")
+            }
+        } else {
+            let add = bytes(mapped)
+            var k = 0
+            while (k < len(add)) {
+                current.push(add[k])
+                k = k + 1
+            }
+        }
+        i = i + 1
+    }
+    if (len(current) > 0) {
+        words.push(str(current))
+    }
+    words
+}
+
+/// The words of `s` joined by `sep`.
+fn joinWords(words: List<string>, sep: string) -> string {
+    var out = ""
+    var i = 0
+    while (i < len(words)) {
+        if (i > 0) {
+            out = out + sep
+        }
+        out = out + words[i]
+        i = i + 1
+    }
+    out
+}
+
+/// `s` transliterated to lowercase ASCII words separated by single spaces.
+fn asciiFold(s: string) -> string {
+    joinWords(slugWords(s), " ")
+}
+
+/// A URL slug: `s` transliterated to lowercase ASCII words joined by `-`.
+fn slugify(s: string) -> string {
+    joinWords(slugWords(s), "-")
+}
+
+/// A URL slug with a custom separator.
+fn slugifyWith(s: string, sep: string) -> string {
+    joinWords(slugWords(s), sep)
+}
+
+/// Whether `s` is already a slug: non-empty, only `a-z`, `0-9`, and `-`, with
+/// no leading, trailing, or doubled hyphen.
+fn isSlug(s: string) -> bool {
+    if (len(s) == 0) {
+        return false
+    }
+    let bs = bytes(s)
+    if ((bs[0] as int) == 45 || (bs[len(bs) - 1] as int) == 45) {
+        return false
+    }
+    var i = 0
+    while (i < len(bs)) {
+        let b = bs[i] as int
+        let lower = b >= 97 && b <= 122
+        let digit = b >= 48 && b <= 57
+        let dash = b == 45
+        if (!lower && !digit && !dash) {
+            return false
+        }
+        if (dash && (bs[i - 1] as int) == 45) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}

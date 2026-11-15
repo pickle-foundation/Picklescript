@@ -1,0 +1,156 @@
+module std.text.slug_test
+
+import { asciiFold, slugify, slugifyWith, slugWords, isSlug } from std.text.slug
+
+/// Words joined by `|` so a test can see the split.
+fn showWords(words: List<string>) -> string {
+    var out = ""
+    var i = 0
+    while (i < len(words)) {
+        if (i > 0) {
+            out = out + "|"
+        }
+        out = out + words[i]
+        i = i + 1
+    }
+    out
+}
+
+test fn basic_slugs() {
+    expect(slugify("Hello, World!")).toBe("hello-world")
+    expect(slugify("hello world")).toBe("hello-world")
+    expect(slugify("HelloWorld")).toBe("helloworld")
+    expect(slugify("UPPER_case")).toBe("upper-case")
+    expect(slugify("a")).toBe("a")
+}
+
+test fn latin1_accents_are_folded() {
+    expect(slugify("Crème brûlée")).toBe("creme-brulee")
+    expect(slugify("naïve café")).toBe("naive-cafe")
+    expect(slugify("ÀÉÎÕÜ")).toBe("aeiou")
+    expect(slugify("àéîõü")).toBe("aeiou")
+    expect(slugify("Ça va")).toBe("ca-va")
+    expect(slugify("Señor")).toBe("senor")
+    expect(slugify("Øre")).toBe("ore")
+}
+
+test fn digraphs_expand() {
+    expect(slugify("straße")).toBe("strasse")
+    expect(slugify("Æther")).toBe("aether")
+    expect(slugify("Œuvre")).toBe("oeuvre")
+    expect(slugify("Þingvellir")).toBe("thingvellir")
+    expect(slugify("ðe")).toBe("de")
+}
+
+test fn latin_extended_letters() {
+    expect(slugify("Łódź")).toBe("lodz")
+    expect(slugify("Škoda")).toBe("skoda")
+    expect(slugify("Žižek")).toBe("zizek")
+    expect(slugify("Ćma")).toBe("cma")
+    expect(slugify("Ąę")).toBe("ae")
+    expect(slugify("Ĳsselmeer")).toBe("ijsselmeer")
+}
+
+test fn separators_collapse() {
+    expect(slugify("  Multiple   spaces  ")).toBe("multiple-spaces")
+    expect(slugify("a--b")).toBe("a-b")
+    expect(slugify("a.b,c")).toBe("a-b-c")
+    expect(slugify("v1.2.3")).toBe("v1-2-3")
+    expect(slugify("one\ttwo\nthree")).toBe("one-two-three")
+    expect(slugify("!!!")).toBe("")
+}
+
+test fn numbers_survive() {
+    expect(slugify("Top 10 Songs of 2026")).toBe("top-10-songs-of-2026")
+    expect(slugify("42")).toBe("42")
+    expect(slugify("3D")).toBe("3d")
+}
+
+test fn unmapped_scalars_are_separators() {
+    expect(slugify("日本語")).toBe("")
+    expect(slugify("東京 2026")).toBe("2026")
+    expect(slugify("a-東-b")).toBe("a-b")
+    expect(slugify("emoji 🎉 here")).toBe("emoji-here")
+}
+
+test fn combining_marks_are_separators() {
+    expect(slugify("cafe\u{301}")).toBe("cafe")
+    expect(slugify("e\u{301}\u{302}x")).toBe("e-x")
+}
+
+test fn empty_input() {
+    expect(slugify("")).toBe("")
+    expect(asciiFold("")).toBe("")
+    expect(showWords(slugWords(""))).toBe("")
+    expect(isSlug("")).toBe(false)
+}
+
+test fn ascii_fold_keeps_spaces() {
+    expect(asciiFold("Crème Brûlée!")).toBe("creme brulee")
+    expect(asciiFold("  a   b ")).toBe("a b")
+    expect(asciiFold("Hello, World")).toBe("hello world")
+    expect(asciiFold("straße")).toBe("strasse")
+    expect(asciiFold("日本語")).toBe("")
+}
+
+test fn words_split() {
+    expect(showWords(slugWords("Hello, World 2026"))).toBe("hello|world|2026")
+    expect(showWords(slugWords("one_two"))).toBe("one|two")
+    expect(showWords(slugWords("Crème brûlée"))).toBe("creme|brulee")
+    expect(showWords(slugWords("x"))).toBe("x")
+}
+
+test fn custom_separator() {
+    expect(slugifyWith("Hello World", "_")).toBe("hello_world")
+    expect(slugifyWith("Hello World", "+")).toBe("hello+world")
+    expect(slugifyWith("Hello World", "")).toBe("helloworld")
+    expect(slugifyWith("Crème brûlée", ".")).toBe("creme.brulee")
+    expect(slugifyWith("", "_")).toBe("")
+}
+
+test fn slug_detection() {
+    expect(isSlug("hello-world")).toBe(true)
+    expect(isSlug("a")).toBe(true)
+    expect(isSlug("hello2")).toBe(true)
+    expect(isSlug("a-1")).toBe(true)
+    expect(isSlug("2026")).toBe(true)
+    expect(isSlug("Hello-world")).toBe(false)
+    expect(isSlug("hello world")).toBe(false)
+    expect(isSlug("-hello")).toBe(false)
+    expect(isSlug("hello-")).toBe(false)
+    expect(isSlug("hello--world")).toBe(false)
+    expect(isSlug("hello_world")).toBe(false)
+    expect(isSlug("cafe\u{301}")).toBe(false)
+}
+
+test fn slugs_are_idempotent() {
+    let sources: List<string> = ["Hello, World!", "Crème brûlée", "straße", "Top 10", "日本語", "a--b"]
+    var i = 0
+    while (i < len(sources)) {
+        let once = slugify(sources[i])
+        expect(slugify(once)).toBe(once)
+        expect(isSlug(once)).toBe(len(once) > 0)
+        i = i + 1
+    }
+}
+
+test fn slug_output_is_url_safe() {
+    let sources: List<string> = ["Hello, World!", "Crème brûlée", "Łódź", "Þingvellir", "a.b,c"]
+    var i = 0
+    while (i < len(sources)) {
+        let s = slugify(sources[i])
+        let bs = bytes(s)
+        var k = 0
+        var safe = true
+        while (k < len(bs)) {
+            let b = bs[k] as int
+            let ok = (b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b == 45
+            if (!ok) {
+                safe = false
+            }
+            k = k + 1
+        }
+        expect(safe).toBe(true)
+        i = i + 1
+    }
+}
