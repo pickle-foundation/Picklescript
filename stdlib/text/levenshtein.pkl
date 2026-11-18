@@ -1,0 +1,143 @@
+module std.text.levenshtein
+
+// Edit distances over UTF-8 strings.
+//
+// All comparisons are byte-for-byte, so a multi-byte scalar counts as its
+// bytes: the distance between `"café"` and `"cafe"` is 2 (substitute one byte
+// and delete the other), not 1. That keeps the algorithms exact and cheap, and
+// matches the byte-oriented `std.text.search` module.
+//
+// `distance` is the plain Levenshtein distance (insert, delete, substitute;
+// each costs 1). It uses two rows and does not build the full matrix, so memory
+// is linear in the shorter input. `damerauDistance` additionally allows
+// transposing two adjacent bytes at cost 1 (optimal string alignment, the
+// restricted Damerau-Levenshtein variant), which needs the full matrix.
+//
+// `similarity` turns a distance into an integer percentage of the longer
+// string: `100` for equal strings (including two empty ones), `0` when one side
+// is empty, and floor division otherwise. It is a convenience for ranking
+// candidates, not a metric.
+
+/// The smaller of `a` and `b`.
+fn minOf2(a: int, b: int) -> int {
+    if (a < b) {
+        return a
+    }
+    b
+}
+
+/// The smallest of `a`, `b`, and `c`.
+fn minOf3(a: int, b: int, c: int) -> int {
+    minOf2(minOf2(a, b), c)
+}
+
+/// The Levenshtein distance between `a` and `b`.
+fn distance(a: string, b: string) -> int {
+    let ab = bytes(a)
+    let bb = bytes(b)
+    if (len(ab) == 0) {
+        return len(bb)
+    }
+    if (len(bb) == 0) {
+        return len(ab)
+    }
+    var prev: List<int> = [0]
+    prev.remove(0)
+    var j = 0
+    while (j <= len(bb)) {
+        prev.push(j)
+        j = j + 1
+    }
+    var i = 1
+    while (i <= len(ab)) {
+        var cur: List<int> = [0]
+        cur.remove(0)
+        cur.push(i)
+        j = 1
+        while (j <= len(bb)) {
+            var cost = 1
+            if (ab[i - 1] == bb[j - 1]) {
+                cost = 0
+            }
+            var best = minOf3(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+            cur.push(best)
+            j = j + 1
+        }
+        prev = cur
+        i = i + 1
+    }
+    prev[len(bb)]
+}
+
+/// The restricted Damerau-Levenshtein distance (adjacent transpositions cost 1).
+fn damerauDistance(a: string, b: string) -> int {
+    let ab = bytes(a)
+    let bb = bytes(b)
+    let n = len(ab)
+    let m = len(bb)
+    if (n == 0) {
+        return m
+    }
+    if (m == 0) {
+        return n
+    }
+    let w = m + 1
+    var d: List<int> = [0]
+    d.remove(0)
+    var fill = 0
+    while (fill < (n + 1) * w) {
+        d.push(0)
+        fill = fill + 1
+    }
+    var i = 0
+    while (i <= n) {
+        d[i * w] = i
+        i = i + 1
+    }
+    var j = 0
+    while (j <= m) {
+        d[j] = j
+        j = j + 1
+    }
+    i = 1
+    while (i <= n) {
+        j = 1
+        while (j <= m) {
+            var cost = 1
+            if (ab[i - 1] == bb[j - 1]) {
+                cost = 0
+            }
+            var best = minOf3(d[(i - 1) * w + j] + 1, d[i * w + j - 1] + 1, d[(i - 1) * w + j - 1] + cost)
+            if (i > 1 && j > 1 && ab[i - 1] == bb[j - 2] && ab[i - 2] == bb[j - 1]) {
+                let swapped = d[(i - 2) * w + j - 2] + 1
+                if (swapped < best) {
+                    best = swapped
+                }
+            }
+            d[i * w + j] = best
+            j = j + 1
+        }
+        i = i + 1
+    }
+    d[n * w + m]
+}
+
+/// The longer of the two byte lengths.
+fn longerBytes(a: string, b: string) -> int {
+    let la = len(bytes(a))
+    let lb = len(bytes(b))
+    if (la > lb) {
+        return la
+    }
+    lb
+}
+
+/// Edit similarity as an integer percentage of the longer string.
+fn similarity(a: string, b: string) -> int {
+    let n = longerBytes(a, b)
+    if (n == 0) {
+        return 100
+    }
+    let d = distance(a, b)
+    100 * (n - d) / n
+}

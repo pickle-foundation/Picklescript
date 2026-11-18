@@ -1,0 +1,169 @@
+module std.text.levenshtein_test
+
+import { distance, damerauDistance, similarity } from std.text.levenshtein
+
+/// A string built by repeating `part` `times` times.
+fn repeats(part: string, times: int) -> string {
+    var out = ""
+    var i = 0
+    while (i < times) {
+        out = out + part
+        i = i + 1
+    }
+    out
+}
+
+/// The candidate most similar to `query` (first one wins on a tie).
+fn bestMatch(query: string, candidates: List<string>) -> string {
+    var best = ""
+    var bestScore = -1
+    var i = 0
+    while (i < len(candidates)) {
+        let score = similarity(query, candidates[i])
+        if (score > bestScore) {
+            bestScore = score
+            best = candidates[i]
+        }
+        i = i + 1
+    }
+    best
+}
+
+test fn classic_vectors() {
+    expect(distance("kitten", "sitting")).toBe(3)
+    expect(distance("flaw", "lawn")).toBe(2)
+    expect(distance("saturday", "sunday")).toBe(3)
+    expect(distance("gumbo", "gambol")).toBe(2)
+}
+
+test fn identical_strings_are_zero() {
+    expect(distance("", "")).toBe(0)
+    expect(distance("abc", "abc")).toBe(0)
+    expect(distance("héllo café", "héllo café")).toBe(0)
+    expect(damerauDistance("", "")).toBe(0)
+    expect(damerauDistance("abc", "abc")).toBe(0)
+    expect(damerauDistance("héllo", "héllo")).toBe(0)
+}
+
+test fn empty_inputs() {
+    expect(distance("", "abc")).toBe(3)
+    expect(distance("abc", "")).toBe(3)
+    expect(distance("", "a")).toBe(1)
+    expect(distance("a", "")).toBe(1)
+    expect(damerauDistance("", "abcd")).toBe(4)
+    expect(damerauDistance("abcd", "")).toBe(4)
+}
+
+test fn single_edits() {
+    expect(distance("abc", "abd")).toBe(1)
+    expect(distance("abc", "ab")).toBe(1)
+    expect(distance("abc", "abcd")).toBe(1)
+    expect(distance("a", "b")).toBe(1)
+    expect(distance("abcd", "xbcd")).toBe(1)
+    expect(distance("abcd", "abxd")).toBe(1)
+    expect(distance("abcd", "abcx")).toBe(1)
+    expect(distance("abc", "aXc")).toBe(1)
+}
+
+test fn plain_distance_has_no_transpositions() {
+    expect(distance("ab", "ba")).toBe(2)
+    expect(distance("abc", "acb")).toBe(2)
+    expect(distance("teh", "the")).toBe(2)
+    expect(distance("abcd", "badc")).toBe(3)
+}
+
+test fn transpositions_cost_one() {
+    expect(damerauDistance("ab", "ba")).toBe(1)
+    expect(damerauDistance("abc", "acb")).toBe(1)
+    expect(damerauDistance("teh", "the")).toBe(1)
+    expect(damerauDistance("abcd", "abdc")).toBe(1)
+    expect(damerauDistance("abcdef", "abdcef")).toBe(1)
+    expect(damerauDistance("abcd", "badc")).toBe(2)
+    expect(damerauDistance("abab", "baba")).toBe(2)
+}
+
+test fn damerau_is_the_restricted_variant() {
+    // The classic optimal-string-alignment case: transposing `CA` and
+    // inserting `B` needs two edits, but OSA cannot see the transpose once the
+    // insertion is in between, so it reports three.
+    expect(damerauDistance("CA", "ABC")).toBe(3)
+    expect(damerauDistance("ABC", "CA")).toBe(3)
+}
+
+test fn symmetry_and_bounds() {
+    let left = ["kitten", "flaw", "gumbo", "abc", "", "café", "abcdef", "x", "saturday"]
+    let right = ["sitting", "lawn", "gambol", "acb", "abc", "cafe", "fedcba", "y", "sunday"]
+    var i = 0
+    while (i < len(left)) {
+        let a = left[i]
+        let b = right[i]
+        expect(distance(a, b)).toBe(distance(b, a))
+        expect(damerauDistance(a, b)).toBe(damerauDistance(b, a))
+        expect(similarity(a, b)).toBe(similarity(b, a))
+        expect(damerauDistance(a, b) <= distance(a, b)).toBe(true)
+        expect(similarity(a, b) >= 0).toBe(true)
+        expect(similarity(a, b) <= 100).toBe(true)
+        i = i + 1
+    }
+}
+
+test fn byte_semantics_for_unicode() {
+    // Multi-byte scalars count as their bytes: `é` is two bytes.
+    expect(distance("café", "cafe")).toBe(2)
+    expect(damerauDistance("café", "cafe")).toBe(2)
+    expect(distance("é", "e")).toBe(2)
+    expect(distance("é", "è")).toBe(1)
+    expect(distance("héllo", "hello")).toBe(2)
+    expect(distance("héllo", "hallo")).toBe(2)
+    expect(similarity("café", "cafe")).toBe(60)
+    expect(similarity("é", "e")).toBe(0)
+}
+
+test fn similarity_extremes() {
+    expect(similarity("", "")).toBe(100)
+    expect(similarity("abc", "abc")).toBe(100)
+    expect(similarity("", "abc")).toBe(0)
+    expect(similarity("abc", "")).toBe(0)
+    expect(similarity("abc", "xyz")).toBe(0)
+    expect(similarity("a", "b")).toBe(0)
+}
+
+test fn similarity_percentages() {
+    expect(similarity("kitten", "sitting")).toBe(57)
+    expect(similarity("gumbo", "gambol")).toBe(66)
+    expect(similarity("flaw", "lawn")).toBe(50)
+    expect(similarity("saturday", "sunday")).toBe(62)
+    expect(similarity("abc", "abd")).toBe(66)
+    expect(similarity("abcd", "abce")).toBe(75)
+    expect(similarity("a", "a")).toBe(100)
+}
+
+test fn long_inputs() {
+    let a200 = repeats("a", 200)
+    let b200 = repeats("b", 200)
+    expect(distance(a200, a200)).toBe(0)
+    expect(distance(a200, b200)).toBe(200)
+    expect(damerauDistance(a200, b200)).toBe(200)
+    expect(distance(a200 + "x", a200)).toBe(1)
+    expect(distance(a200, a200 + "x")).toBe(1)
+    expect(damerauDistance(a200 + "x", a200)).toBe(1)
+}
+
+test fn long_alternating_inputs() {
+    let ab = repeats("ab", 100)
+    let ba = repeats("ba", 100)
+    expect(len(bytes(ab))).toBe(200)
+    expect(distance(ab, ab)).toBe(0)
+    expect(distance(ab, ba)).toBe(2)
+    expect(damerauDistance(ab, ba)).toBe(2)
+    expect(similarity(ab, ba)).toBe(99)
+}
+
+test fn a_small_pipeline() {
+    let candidates = ["kitten", "sitting", "mitten"]
+    expect(bestMatch("kitten", candidates)).toBe("kitten")
+    expect(bestMatch("sittin", candidates)).toBe("sitting")
+    expect(bestMatch("mittn", candidates)).toBe("mitten")
+    expect(bestMatch("zzzz", candidates)).toBe("kitten")
+    expect(similarity("sittin", "sitting")).toBe(85)
+}
