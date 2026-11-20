@@ -17,6 +17,11 @@ const IPPROTO_TCP: int = 6
 const IPPROTO_UDP: int = 17
 const SOL_SOCKET: int = 65535
 const SO_REUSEADDR: int = 4
+const SO_KEEPALIVE: int = 8
+const SO_BROADCAST: int = 32
+const SO_RCVTIMEO: int = 4102  // 0x1006 (DWORD ms on Windows)
+const SO_SNDTIMEO: int = 4101  // 0x1005 (DWORD ms on Windows)
+const TCP_NODELAY: int = 1
 const SD_RECEIVE: int = 0
 const SD_SEND: int = 1
 const SD_BOTH: int = 2
@@ -24,6 +29,9 @@ const SOMAXCONN: int = 128
 const INVALID_SOCKET: int = -1
 const SOCKET_ERROR: int = -1
 const WSA_VERSION: int = 514 // 0x0202
+const AI_PASSIVE: int = 1
+const NI_NUMERICHOST: int = 2
+const NI_NUMERICSERV: int = 8
 
 var wsaReady: int = 0
 
@@ -152,13 +160,56 @@ fn platRecv(s: int, buf: *int, n: int) -> int {
     return win_recv(s, buf as int, n, 0)
 }
 
-fn platSetsockoptReuseAddr(s: int, on: int) -> int {
+fn platSetsockoptInt(s: int, level: int, opt: int, val: int) -> int {
     unsafe {
         let p = alloc(int, 1)
-        p[0] = on
-        let rc = win_setsockopt(s, SOL_SOCKET, SO_REUSEADDR, p as int, 4)
+        p[0] = val
+        let rc = win_setsockopt(s, level, opt, p as int, 4)
         free(p)
         return rc
+    }
+}
+
+fn platSetsockoptReuseAddr(s: int, on: int) -> int {
+    return platSetsockoptInt(s, SOL_SOCKET, SO_REUSEADDR, on)
+}
+
+fn platSetNoDelay(s: int, on: int) -> int {
+    return platSetsockoptInt(s, IPPROTO_TCP, TCP_NODELAY, on)
+}
+
+fn platSetKeepAlive(s: int, on: int) -> int {
+    return platSetsockoptInt(s, SOL_SOCKET, SO_KEEPALIVE, on)
+}
+
+fn platSetBroadcast(s: int, on: int) -> int {
+    return platSetsockoptInt(s, SOL_SOCKET, SO_BROADCAST, on)
+}
+
+fn platSetRecvTimeoutMs(s: int, ms: int) -> int {
+    // Windows expects DWORD milliseconds for SO_RCVTIMEO/SO_SNDTIMEO.
+    var v = ms
+    if (v < 0) { v = 0 }
+    return platSetsockoptInt(s, SOL_SOCKET, SO_RCVTIMEO, v)
+}
+
+fn platSetSendTimeoutMs(s: int, ms: int) -> int {
+    var v = ms
+    if (v < 0) { v = 0 }
+    return platSetsockoptInt(s, SOL_SOCKET, SO_SNDTIMEO, v)
+}
+
+// Fill meta[0..4]=a,b,c,d,port from sockaddr_in at sa. Returns 0 on success.
+fn readSockaddrIn4(sa: *int, meta: *int) -> int {
+    unsafe {
+        meta[0] = rawByteAtBuf(sa, 4)
+        meta[1] = rawByteAtBuf(sa, 5)
+        meta[2] = rawByteAtBuf(sa, 6)
+        meta[3] = rawByteAtBuf(sa, 7)
+        let p0 = rawByteAtBuf(sa, 2)
+        let p1 = rawByteAtBuf(sa, 3)
+        meta[4] = p0 * 256 + p1
+        return 0
     }
 }
 
@@ -204,6 +255,46 @@ fn platPeerPort4(s: int) -> int {
     }
 }
 
+// Write local IPv4 endpoint into meta[0..4]=a,b,c,d,port. Returns 0 or -1.
+fn platLocalAddr4(s: int, meta: *int) -> int {
+    unsafe {
+        let sa = alloc(int, 4)
+        zeroBuf(sa, 4)
+        let lenp = alloc(int, 1)
+        lenp[0] = 16
+        let rc = win_getsockname(s, sa as int, lenp as int)
+        if (rc != 0) {
+            free(lenp)
+            free(sa)
+            return -1
+        }
+        let _ = readSockaddrIn4(sa, meta)
+        free(lenp)
+        free(sa)
+        return 0
+    }
+}
+
+// Write peer IPv4 endpoint into meta[0..4]=a,b,c,d,port. Returns 0 or -1.
+fn platPeerAddr4(s: int, meta: *int) -> int {
+    unsafe {
+        let sa = alloc(int, 4)
+        zeroBuf(sa, 4)
+        let lenp = alloc(int, 1)
+        lenp[0] = 16
+        let rc = win_getpeername(s, sa as int, lenp as int)
+        if (rc != 0) {
+            free(lenp)
+            free(sa)
+            return -1
+        }
+        let _ = readSockaddrIn4(sa, meta)
+        free(lenp)
+        free(sa)
+        return 0
+    }
+}
+
 fn platSendTo4(s: int, buf: *int, n: int, a: int, b: int, c: int, d: int, port: int) -> int {
     unsafe {
         let sa = alloc(int, 2)
@@ -246,7 +337,74 @@ fn netLastError() -> int {
     return win_wsa_get_last_error()
 }
 
-// --- portable ABI surface (v1 minimal) ---
+fn platUdpConnect4(s: int, a: int, b: int, c: int, d: int, port: int) -> int {
+    return platConnect4(s, a, b, c, d, port)
+}
+
+// Resolve an IPv4 host string (numeric or "localhost") into the first address.
+// Writes meta[0..3]=a,b,c,d and returns 0, or -1 if not a deterministic local
+// numeric/localhost form. OS DNS for arbitrary hostnames is exposed separately.
+fn platResolveLocal4(meta: *int, host: *int, hostLen: int) -> int {
+    unsafe {
+        // "localhost" (9 chars)
+        if (hostLen == 9) {
+            let l0 = rawByteAtBuf(host, 0)
+            let l1 = rawByteAtBuf(host, 1)
+            let l2 = rawByteAtBuf(host, 2)
+            let l3 = rawByteAtBuf(host, 3)
+            let l4 = rawByteAtBuf(host, 4)
+            let l5 = rawByteAtBuf(host, 5)
+            let l6 = rawByteAtBuf(host, 6)
+            let l7 = rawByteAtBuf(host, 7)
+            let l8 = rawByteAtBuf(host, 8)
+            if (l0 == 108 && l1 == 111 && l2 == 99 && l3 == 97 && l4 == 108 && l5 == 104 && l6 == 111 && l7 == 115 && l8 == 116) {
+                meta[0] = 127
+                meta[1] = 0
+                meta[2] = 0
+                meta[3] = 1
+                return 0
+            }
+        }
+        // numeric dotted quad
+        var oct = 0
+        var digits = 0
+        var val = 0
+        var a = -1
+        var b = -1
+        var c = -1
+        var d = -1
+        var i = 0
+        while (i < hostLen) {
+            let ch = rawByteAtBuf(host, i)
+            if (ch == 46) {
+                if (digits == 0 || oct >= 3) { return -1 }
+                if (oct == 0) { a = val }
+                if (oct == 1) { b = val }
+                if (oct == 2) { c = val }
+                oct = oct + 1
+                digits = 0
+                val = 0
+            } else {
+                if (ch < 48 || ch > 57) { return -1 }
+                if (digits >= 3) { return -1 }
+                val = val * 10 + (ch - 48)
+                if (val > 255) { return -1 }
+                digits = digits + 1
+            }
+            i = i + 1
+        }
+        if (oct != 3 || digits == 0) { return -1 }
+        d = val
+        if (a < 0 || b < 0 || c < 0) { return -1 }
+        meta[0] = a
+        meta[1] = b
+        meta[2] = c
+        meta[3] = d
+        return 0
+    }
+}
+
+// --- portable ABI surface (v2) ---
 
 #[symbol("pickle_net_tcp_socket")]
 fn net_tcp_socket() -> int {
@@ -333,5 +491,57 @@ fn net_sendto4(s: int, buf: int, n: int, a: int, b: int, c: int, d: int, port: i
 fn net_recvfrom4(s: int, buf: int, n: int, meta: int) -> int {
     unsafe {
         return platRecvFrom4(s, buf as *int, n, meta as *int)
+    }
+}
+
+#[symbol("pickle_net_udp_connect4")]
+fn net_udp_connect4(s: int, a: int, b: int, c: int, d: int, port: int) -> int {
+    return platUdpConnect4(s, a, b, c, d, port)
+}
+
+#[symbol("pickle_net_local_addr4")]
+fn net_local_addr4(s: int, meta: int) -> int {
+    unsafe {
+        return platLocalAddr4(s, meta as *int)
+    }
+}
+
+#[symbol("pickle_net_peer_addr4")]
+fn net_peer_addr4(s: int, meta: int) -> int {
+    unsafe {
+        return platPeerAddr4(s, meta as *int)
+    }
+}
+
+#[symbol("pickle_net_set_nodelay")]
+fn net_set_nodelay(s: int, on: int) -> int {
+    return platSetNoDelay(s, on)
+}
+
+#[symbol("pickle_net_set_keepalive")]
+fn net_set_keepalive(s: int, on: int) -> int {
+    return platSetKeepAlive(s, on)
+}
+
+#[symbol("pickle_net_set_broadcast")]
+fn net_set_broadcast(s: int, on: int) -> int {
+    return platSetBroadcast(s, on)
+}
+
+#[symbol("pickle_net_set_recv_timeout_ms")]
+fn net_set_recv_timeout_ms(s: int, ms: int) -> int {
+    return platSetRecvTimeoutMs(s, ms)
+}
+
+#[symbol("pickle_net_set_send_timeout_ms")]
+fn net_set_send_timeout_ms(s: int, ms: int) -> int {
+    return platSetSendTimeoutMs(s, ms)
+}
+
+// Resolve numeric/localhost host bytes into meta[0..3]. Returns 0 or -1.
+#[symbol("pickle_net_resolve_local4")]
+fn net_resolve_local4(hostBuf: int, hostLen: int, meta: int) -> int {
+    unsafe {
+        return platResolveLocal4(meta as *int, hostBuf as *int, hostLen)
     }
 }

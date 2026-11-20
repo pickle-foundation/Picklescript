@@ -1,0 +1,600 @@
+module std.net.http
+
+// Minimal HTTP/1.1 request/response support over std.net TCP streams.
+// Designed for loopback-deterministic tests and practical basic client/server use.
+// Supports: request/status lines, headers, Content-Length bodies, Connection: close,
+// and simple client helpers. Chunked transfer encoding is not implemented in v2.
+
+import { TcpStream, TcpListener, formatAddr } from std.net
+import { filled } from std.collections.list
+
+class HttpHeaders {
+    var names: List<string>
+    var values: List<string>
+
+    constructor() {
+        this.names = filled("", 0)
+        this.values = filled("", 0)
+    }
+
+    fn clear() {
+        this.names = filled("", 0)
+        this.values = filled("", 0)
+    }
+
+    fn lenHeaders() -> int {
+        len(this.names)
+    }
+
+    fn nameAt(i: int) -> string {
+        if (i < 0 || i >= len(this.names)) { return "" }
+        this.names[i]
+    }
+
+    fn valueAt(i: int) -> string {
+        if (i < 0 || i >= len(this.values)) { return "" }
+        this.values[i]
+    }
+
+    fn lowerAscii(s: string) -> string {
+        var out = ""
+        var i = 0
+        let n = len(s)
+        while (i < n) {
+            let c = s[i] as int
+            if (c >= 65 && c <= 90) {
+                out = out + str((c + 32) as char)
+            } else {
+                out = out + substringSafe(s, i, i + 1)
+            }
+            i = i + 1
+        }
+        out
+    }
+
+    fn eqIgnoreCase(a: string, b: string) -> bool {
+        this.lowerAscii(a) == this.lowerAscii(b)
+    }
+
+    fn set(name: string, value: string) {
+        var i = 0
+        while (i < len(this.names)) {
+            if (this.eqIgnoreCase(this.names[i], name)) {
+                this.values[i] = value
+                return
+            }
+            i = i + 1
+        }
+        this.names.push(name)
+        this.values.push(value)
+    }
+
+    fn add(name: string, value: string) {
+        this.names.push(name)
+        this.values.push(value)
+    }
+
+    fn get(name: string) -> string? {
+        var i = 0
+        while (i < len(this.names)) {
+            if (this.eqIgnoreCase(this.names[i], name)) {
+                return this.values[i]
+            }
+            i = i + 1
+        }
+        none
+    }
+
+    fn getOr(name: string, fallback: string) -> string {
+        match (this.get(name)) {
+            case some(v) -> v
+            case none -> fallback
+        }
+    }
+
+    fn has(name: string) -> bool {
+        match (this.get(name)) {
+            case some(_) -> true
+            case none -> false
+        }
+    }
+
+    fn remove(name: string) {
+        var nn = filled("", 0)
+        var vv = filled("", 0)
+        var i = 0
+        while (i < len(this.names)) {
+            if (!this.eqIgnoreCase(this.names[i], name)) {
+                nn.push(this.names[i])
+                vv.push(this.values[i])
+            }
+            i = i + 1
+        }
+        this.names = nn
+        this.values = vv
+    }
+}
+
+class HttpRequest {
+    var method: string
+    var target: string
+    var version: string
+    var headers: HttpHeaders
+    var body: List<byte>
+
+    constructor(method: string, target: string) {
+        this.method = method
+        this.target = target
+        this.version = "HTTP/1.1"
+        this.headers = HttpHeaders()
+        this.body = bytes("")
+    }
+
+    fn setHeader(name: string, value: string) {
+        this.headers.set(name, value)
+    }
+
+    fn header(name: string) -> string? {
+        this.headers.get(name)
+    }
+
+    fn bodyText() -> string {
+        str(this.body)
+    }
+
+    fn setBodyBytes(data: List<byte>) {
+        this.body = data
+        this.headers.set("Content-Length", str(len(data)))
+    }
+
+    fn setBodyText(text: string) {
+        this.setBodyBytes(bytes(text))
+    }
+}
+
+class HttpResponse {
+    var version: string
+    var status: int
+    var reason: string
+    var headers: HttpHeaders
+    var body: List<byte>
+
+    constructor(status: int, reason: string) {
+        this.version = "HTTP/1.1"
+        this.status = status
+        this.reason = reason
+        this.headers = HttpHeaders()
+        this.body = bytes("")
+    }
+
+    fn setHeader(name: string, value: string) {
+        this.headers.set(name, value)
+    }
+
+    fn header(name: string) -> string? {
+        this.headers.get(name)
+    }
+
+    fn bodyText() -> string {
+        str(this.body)
+    }
+
+    fn setBodyBytes(data: List<byte>) {
+        this.body = data
+        this.headers.set("Content-Length", str(len(data)))
+    }
+
+    fn setBodyText(text: string) {
+        this.setBodyBytes(bytes(text))
+    }
+
+    fn ok() -> bool {
+        this.status >= 200 && this.status < 300
+    }
+}
+
+fn reasonForStatus(status: int) -> string {
+    if (status == 200) { return "OK" }
+    if (status == 201) { return "Created" }
+    if (status == 204) { return "No Content" }
+    if (status == 301) { return "Moved Permanently" }
+    if (status == 302) { return "Found" }
+    if (status == 304) { return "Not Modified" }
+    if (status == 400) { return "Bad Request" }
+    if (status == 401) { return "Unauthorized" }
+    if (status == 403) { return "Forbidden" }
+    if (status == 404) { return "Not Found" }
+    if (status == 405) { return "Method Not Allowed" }
+    if (status == 500) { return "Internal Server Error" }
+    if (status == 502) { return "Bad Gateway" }
+    if (status == 503) { return "Service Unavailable" }
+    "Unknown"
+}
+
+fn response(status: int) -> HttpResponse {
+    HttpResponse(status, reasonForStatus(status))
+}
+
+fn indexOfChar(s: string, ch: int, start: int) -> int {
+    var i = start
+    let n = len(s)
+    while (i < n) {
+        if ((s[i] as int) == ch) { return i }
+        i = i + 1
+    }
+    -1
+}
+
+fn substringSafe(s: string, start: int, end: int) -> string {
+    var a = start
+    var b = end
+    if (a < 0) { a = 0 }
+    if (b < a) { b = a }
+    let n = len(s)
+    if (a > n) { a = n }
+    if (b > n) { b = n }
+    var out = bytes("")
+    let src = bytes(s)
+    var i = a
+    while (i < b) {
+        out.push(src[i])
+        i = i + 1
+    }
+    str(out)
+}
+
+fn trimSpaces(s: string) -> string {
+    var a = 0
+    var b = len(s)
+    while (a < b) {
+        let c = s[a] as int
+        if (c == 32 || c == 9 || c == 13 || c == 10) { a = a + 1 } else { break }
+    }
+    while (b > a) {
+        let c = s[b - 1] as int
+        if (c == 32 || c == 9 || c == 13 || c == 10) { b = b - 1 } else { break }
+    }
+    substringSafe(s, a, b)
+}
+
+fn parseIntSafe(s: string) -> int {
+    let t = trimSpaces(s)
+    let n = len(t)
+    if (n <= 0) { return -1 }
+    var i = 0
+    var neg = false
+    if ((t[0] as int) == 45) {
+        neg = true
+        i = 1
+    }
+    if (i >= n) { return -1 }
+    var v = 0
+    while (i < n) {
+        let c = t[i] as int
+        if (c < 48 || c > 57) { return -1 }
+        v = v * 10 + (c - 48)
+        i = i + 1
+    }
+    if (neg) { return 0 - v }
+    v
+}
+
+fn bytesToStringRaw(data: List<byte>) -> string {
+    str(data)
+}
+
+fn splitLinesCRLF(text: string) -> List<string> {
+    var out = filled("", 0)
+    var cur = ""
+    var i = 0
+    let n = len(text)
+    while (i < n) {
+        let c = text[i] as int
+        if (c == 13) { // \r
+            if (i + 1 < n && (text[i + 1] as int) == 10) {
+                out.push(cur)
+                cur = ""
+                i = i + 2
+                continue
+            }
+            out.push(cur)
+            cur = ""
+            i = i + 1
+            continue
+        }
+        if (c == 10) { // \n
+            out.push(cur)
+            cur = ""
+            i = i + 1
+            continue
+        }
+        cur = cur + substringSafe(text, i, i + 1)
+        i = i + 1
+    }
+    out.push(cur)
+    out
+}
+
+fn parseRequest(text: string) -> HttpRequest? {
+    let lines = splitLinesCRLF(text)
+    if (len(lines) <= 0) { return none }
+    let start = lines[0]
+    let sp1 = indexOfChar(start, 32, 0)
+    if (sp1 < 0) { return none }
+    let sp2 = indexOfChar(start, 32, sp1 + 1)
+    if (sp2 < 0) { return none }
+    let method = substringSafe(start, 0, sp1)
+    let target = substringSafe(start, sp1 + 1, sp2)
+    let version = substringSafe(start, sp2 + 1, len(start))
+    var req = HttpRequest(method, target)
+    req.version = version
+    var i = 1
+    var inBody = false
+    var body = ""
+    while (i < len(lines)) {
+        let line = lines[i]
+        if (!inBody) {
+            if (line == "") {
+                inBody = true
+                i = i + 1
+                continue
+            }
+            let colon = indexOfChar(line, 58, 0)
+            if (colon > 0) {
+                let name = trimSpaces(substringSafe(line, 0, colon))
+                let value = trimSpaces(substringSafe(line, colon + 1, len(line)))
+                req.headers.add(name, value)
+            }
+        } else {
+            if (body == "") { body = line } else { body = body + "\n" + line }
+        }
+        i = i + 1
+    }
+    req.body = bytes(body)
+    req
+}
+
+fn parseResponse(text: string) -> HttpResponse? {
+    let lines = splitLinesCRLF(text)
+    if (len(lines) <= 0) { return none }
+    let start = lines[0]
+    let sp1 = indexOfChar(start, 32, 0)
+    if (sp1 < 0) { return none }
+    let sp2 = indexOfChar(start, 32, sp1 + 1)
+    let version = substringSafe(start, 0, sp1)
+    var statusStr = ""
+    var reason = ""
+    if (sp2 < 0) {
+        statusStr = substringSafe(start, sp1 + 1, len(start))
+        reason = ""
+    } else {
+        statusStr = substringSafe(start, sp1 + 1, sp2)
+        reason = substringSafe(start, sp2 + 1, len(start))
+    }
+    let status = parseIntSafe(statusStr)
+    if (status < 0) { return none }
+    var res = HttpResponse(status, reason)
+    res.version = version
+    var i = 1
+    var inBody = false
+    var body = ""
+    while (i < len(lines)) {
+        let line = lines[i]
+        if (!inBody) {
+            if (line == "") {
+                inBody = true
+                i = i + 1
+                continue
+            }
+            let colon = indexOfChar(line, 58, 0)
+            if (colon > 0) {
+                let name = trimSpaces(substringSafe(line, 0, colon))
+                let value = trimSpaces(substringSafe(line, colon + 1, len(line)))
+                res.headers.add(name, value)
+            }
+        } else {
+            if (body == "") { body = line } else { body = body + "\n" + line }
+        }
+        i = i + 1
+    }
+    res.body = bytes(body)
+    res
+}
+
+fn serializeRequest(req: HttpRequest) -> string {
+    var out = req.method + " " + req.target + " " + req.version + "\r\n"
+    // Ensure Content-Length if body present
+    if (!req.headers.has("Content-Length")) {
+        req.headers.set("Content-Length", str(len(req.body)))
+    }
+    var i = 0
+    while (i < req.headers.lenHeaders()) {
+        out = out + req.headers.nameAt(i) + ": " + req.headers.valueAt(i) + "\r\n"
+        i = i + 1
+    }
+    out = out + "\r\n"
+    out = out + str(req.body)
+    out
+}
+
+fn serializeResponse(res: HttpResponse) -> string {
+    var reason = res.reason
+    if (reason == "") { reason = reasonForStatus(res.status) }
+    var out = res.version + " " + str(res.status) + " " + reason + "\r\n"
+    if (!res.headers.has("Content-Length")) {
+        res.headers.set("Content-Length", str(len(res.body)))
+    }
+    var i = 0
+    while (i < res.headers.lenHeaders()) {
+        out = out + res.headers.nameAt(i) + ": " + res.headers.valueAt(i) + "\r\n"
+        i = i + 1
+    }
+    out = out + "\r\n"
+    out = out + str(res.body)
+    out
+}
+
+fn writeRequest(stream: TcpStream, req: HttpRequest) -> bool {
+    stream.writeAll(bytes(serializeRequest(req)))
+}
+
+fn writeResponse(stream: TcpStream, res: HttpResponse) -> bool {
+    stream.writeAll(bytes(serializeResponse(res)))
+}
+
+fn readHttpMessage(stream: TcpStream, maxBytes: int) -> string? {
+    // Read until end of headers; then read Content-Length body if present.
+    var limit = maxBytes
+    if (limit <= 0) { limit = 65536 }
+    var buf = ""
+    while (len(buf) < limit) {
+        let chunk = stream.read(1024)
+        let got = len(chunk)
+        if (got <= 0) { break }
+        buf = buf + str(chunk)
+        let end = indexOfString(buf, "\r\n\r\n")
+        if (end >= 0) {
+            // found headers end
+            let headerPart = substringSafe(buf, 0, end + 4)
+            var rest = substringSafe(buf, end + 4, len(buf))
+            let tmp = splitLinesCRLF(headerPart)
+            var contentLen = 0
+            var hasLen = false
+            var i = 1
+            while (i < len(tmp)) {
+                let line = tmp[i]
+                if (line == "") { break }
+                let colon = indexOfChar(line, 58, 0)
+                if (colon > 0) {
+                    let name = trimSpaces(substringSafe(line, 0, colon))
+                    let value = trimSpaces(substringSafe(line, colon + 1, len(line)))
+                    if (eqAsciiIgnoreCaseSimple(name, "Content-Length")) {
+                        contentLen = parseIntSafe(value)
+                        if (contentLen < 0) { contentLen = 0 }
+                        hasLen = true
+                    }
+                }
+                i = i + 1
+            }
+            if (hasLen) {
+                while (len(rest) < contentLen && len(headerPart) + len(rest) < limit) {
+                    let more = stream.read(contentLen - len(rest))
+                    if (len(more) <= 0) { break }
+                    rest = rest + str(more)
+                }
+                if (len(rest) > contentLen) {
+                    rest = substringSafe(rest, 0, contentLen)
+                }
+                return headerPart + rest
+            }
+            // No Content-Length: for responses to requests we often close; return what we have.
+            return headerPart + rest
+        }
+    }
+    if (len(buf) > 0) { return buf }
+    none
+}
+
+fn indexOfString(s: string, needle: string) -> int {
+    let n = len(s)
+    let m = len(needle)
+    if (m <= 0) { return 0 }
+    if (m > n) { return -1 }
+    var i = 0
+    while (i <= n - m) {
+        var ok = true
+        var j = 0
+        while (j < m) {
+            if ((s[i + j] as int) != (needle[j] as int)) {
+            ok = false
+            break
+        }
+            j = j + 1
+        }
+        if (ok) { return i }
+        i = i + 1
+    }
+    -1
+}
+
+fn eqAsciiIgnoreCaseSimple(a: string, b: string) -> bool {
+    let n = len(a)
+    if (n != len(b)) { return false }
+    var i = 0
+    while (i < n) {
+        var ca = a[i] as int
+        var cb = b[i] as int
+        if (ca >= 65 && ca <= 90) { ca = ca + 32 }
+        if (cb >= 65 && cb <= 90) { cb = cb + 32 }
+        if (ca != cb) { return false }
+        i = i + 1
+    }
+    true
+}
+
+fn readRequest(stream: TcpStream) -> HttpRequest? {
+    match (readHttpMessage(stream, 65536)) {
+        case some(text) -> parseRequest(text)
+        case none -> none
+    }
+}
+
+fn readResponse(stream: TcpStream) -> HttpResponse? {
+    match (readHttpMessage(stream, 65536)) {
+        case some(text) -> parseResponse(text)
+        case none -> none
+    }
+}
+
+fn request(method: string, host: string, port: int, target: string, bodyText: string) -> HttpResponse? {
+    match (TcpStream.connect(host, port)) {
+        case some(s) -> {
+            var req = HttpRequest(method, target)
+            req.setHeader("Host", formatAddr(host, port))
+            req.setHeader("Connection", "close")
+            if (len(bodyText) > 0) {
+                req.setBodyText(bodyText)
+            } else {
+                req.setHeader("Content-Length", "0")
+            }
+            let _ = writeRequest(s, req)
+            let res = readResponse(s)
+            s.close()
+            res
+        }
+        case none -> none
+    }
+}
+
+fn get(host: string, port: int, target: string) -> HttpResponse? {
+    request("GET", host, port, target, "")
+}
+
+fn post(host: string, port: int, target: string, bodyText: string) -> HttpResponse? {
+    request("POST", host, port, target, bodyText)
+}
+
+// Serve one accepted connection with a handler that returns an HttpResponse.
+// Returns true if a request was handled.
+fn serveOnce(listener: TcpListener, handler: fn(HttpRequest) -> HttpResponse) -> bool {
+    match (listener.accept()) {
+        case some(s) -> {
+            match (readRequest(s)) {
+                case some(req) -> {
+                    var res = handler(req)
+                    if (!res.headers.has("Connection")) {
+                        res.headers.set("Connection", "close")
+                    }
+                    let _ = writeResponse(s, res)
+                    s.close()
+                    return true
+                }
+                case none -> {
+                    s.close()
+                    return false
+                }
+            }
+        }
+        case none -> false
+    }
+}

@@ -1,16 +1,70 @@
-﻿module std.net_test
+module std.net_test
 
-import { TcpListener, TcpStream, UdpSocket, SHUT_WR } from std.net
+import { TcpListener, TcpStream, UdpSocket, SHUT_WR, SHUT_RD, SHUT_RDWR, parseIPv4, isIPv4, resolve4, resolve4Octets, formatAddr, lastError } from std.net
+import { HttpRequest, HttpResponse, readRequest, readResponse, writeRequest, writeResponse, parseRequest, parseResponse, serializeRequest, serializeResponse, request, get, post, serveOnce, response, HttpHeaders } from std.net.http
+import { spawn, sleep } from std.thread
 
-test fn loopback_roundtrip() {
+test fn parse_and_resolve_helpers() {
+    expect(isIPv4("127.0.0.1")).toBe(true)
+    expect(isIPv4("256.0.0.1")).toBe(false)
+    expect(isIPv4("localhost")).toBe(false)
+    match (parseIPv4("10.0.2.15")) {
+        case some(o) -> {
+            expect(o[0]).toBe(10)
+            expect(o[1]).toBe(0)
+            expect(o[2]).toBe(2)
+            expect(o[3]).toBe(15)
+        }
+        case none -> { expect(false).toBe(true) }
+    }
+    match (resolve4("localhost")) {
+        case some(h) -> { expect(h).toBe("127.0.0.1") }
+        case none -> { expect(false).toBe(true) }
+    }
+    match (resolve4("127.0.0.1")) {
+        case some(h) -> { expect(h).toBe("127.0.0.1") }
+        case none -> { expect(false).toBe(true) }
+    }
+    match (resolve4Octets("localhost")) {
+        case some(o) -> {
+            expect(o[0]).toBe(127)
+            expect(o[1]).toBe(0)
+            expect(o[2]).toBe(0)
+            expect(o[3]).toBe(1)
+        }
+        case none -> { expect(false).toBe(true) }
+    }
+    expect(formatAddr("127.0.0.1", 8080)).toBe("127.0.0.1:8080")
+    // lastError callable
+    let _e = lastError()
+    expect(true).toBe(true)
+}
+
+test fn tcp_loopback_roundtrip_and_addrs() {
     match (TcpListener.bind("127.0.0.1", 0)) {
         case some(l) -> {
             let port = l.localPort()
             expect(port > 0).toBe(true)
+            match (l.localHost()) {
+                case some(h) -> { expect(h).toBe("127.0.0.1") }
+                case none -> { expect(false).toBe(true) }
+            }
             match (TcpStream.connect("127.0.0.1", port)) {
                 case some(c) -> {
+                    expect(c.setNoDelay(true)).toBe(true)
+                    expect(c.setKeepAlive(false)).toBe(true)
+                    match (c.peerHost()) {
+                        case some(h) -> { expect(h).toBe("127.0.0.1") }
+                        case none -> { expect(false).toBe(true) }
+                    }
+                    expect(c.peerPort()).toBe(port)
                     match (l.accept()) {
                         case some(s) -> {
+                            match (s.peerHost()) {
+                                case some(h) -> { expect(h).toBe("127.0.0.1") }
+                                case none -> { expect(false).toBe(true) }
+                            }
+                            expect(s.peerPort() > 0).toBe(true)
                             // client -> server
                             var msg = [0x68 as byte, 0x69 as byte, 0x0a as byte] // "hi\n"
                             let sent = c.write(msg)
@@ -29,21 +83,41 @@ test fn loopback_roundtrip() {
                             expect(got2[1] as int).toBe(107)
                             s.close()
                         }
-                        case none -> {
-                            expect(false).toBe(true)
-                        }
+                        case none -> { expect(false).toBe(true) }
                     }
                     c.close()
                 }
-                case none -> {
-                    expect(false).toBe(true)
-                }
+                case none -> { expect(false).toBe(true) }
             }
             l.close()
         }
-        case none -> {
-            expect(false).toBe(true)
+        case none -> { expect(false).toBe(true) }
+    }
+}
+
+test fn tcp_localhost_connect_and_read_helpers() {
+    match (TcpListener.bind("localhost", 0)) {
+        case some(l) -> {
+            let port = l.localPort()
+            match (TcpStream.connect("localhost", port)) {
+                case some(c) -> {
+                    match (l.accept()) {
+                        case some(s) -> {
+                            expect(s.writeAll(bytes("hello"))).toBe(true)
+                            expect(s.shutdown(SHUT_WR) >= -1).toBe(true)
+                            let all = c.readAll(64)
+                            expect(str(all)).toBe("hello")
+                            s.close()
+                        }
+                        case none -> { expect(false).toBe(true) }
+                    }
+                    c.close()
+                }
+                case none -> { expect(false).toBe(true) }
+            }
+            l.close()
         }
+        case none -> { expect(false).toBe(true) }
     }
 }
 
@@ -65,37 +139,24 @@ test fn write_all_read_exact_and_shutdown() {
                                     expect(got[2] as int).toBe(99)
                                     expect(got[3] as int).toBe(100)
                                 }
-                                case none -> {
-                                    expect(false).toBe(true)
-                                }
+                                case none -> { expect(false).toBe(true) }
                             }
-                            // signal EOF to peer readExact
                             expect(c.shutdown(SHUT_WR) >= -1).toBe(true)
                             match (s.readExact(1)) {
-                                case some(_) -> {
-                                    expect(false).toBe(true)
-                                }
-                                case none -> {
-                                    expect(true).toBe(true)
-                                }
+                                case some(_) -> { expect(false).toBe(true) }
+                                case none -> { expect(true).toBe(true) }
                             }
                             s.close()
                         }
-                        case none -> {
-                            expect(false).toBe(true)
-                        }
+                        case none -> { expect(false).toBe(true) }
                     }
                     c.close()
                 }
-                case none -> {
-                    expect(false).toBe(true)
-                }
+                case none -> { expect(false).toBe(true) }
             }
             l.close()
         }
-        case none -> {
-            expect(false).toBe(true)
-        }
+        case none -> { expect(false).toBe(true) }
     }
 }
 
@@ -117,13 +178,11 @@ test fn invalid_numeric_ipv4_rejected() {
             l.close()
             expect(false).toBe(true)
         }
-        case none -> {
-            expect(true).toBe(true)
-        }
+        case none -> { expect(true).toBe(true) }
     }
 }
 
-test fn udp_loopback_roundtrip() {
+test fn udp_loopback_roundtrip_and_connected() {
     match (UdpSocket.bind("127.0.0.1", 0)) {
         case some(a) -> {
             match (UdpSocket.bind("127.0.0.1", 0)) {
@@ -132,6 +191,7 @@ test fn udp_loopback_roundtrip() {
                     let bp = b.localPort()
                     expect(ap > 0).toBe(true)
                     expect(bp > 0).toBe(true)
+                    expect(a.setBroadcast(false)).toBe(true)
                     var msg = [0x70 as byte, 0x69 as byte, 0x6e as byte, 0x67 as byte] // "ping"
                     let sent = a.sendTo(msg, "127.0.0.1", bp)
                     expect(sent).toBe(4)
@@ -145,21 +205,166 @@ test fn udp_loopback_roundtrip() {
                             expect(d.host).toBe("127.0.0.1")
                             expect(d.port).toBe(ap)
                         }
-                        case none -> {
-                            expect(false).toBe(true)
-                        }
+                        case none -> { expect(false).toBe(true) }
                     }
                     expect(a.sendTo(msg, "256.0.0.1", bp)).toBe(-1)
+                    // connected UDP
+                    expect(a.connect("127.0.0.1", bp)).toBe(true)
+                    var msg2 = [0x6f as byte, 0x6b as byte] // "ok"
+                    expect(a.send(msg2)).toBe(2)
+                    match (b.recvFrom(16)) {
+                        case some(d2) -> {
+                            expect(str(d2.data)).toBe("ok")
+                        }
+                        case none -> { expect(false).toBe(true) }
+                    }
+                    expect(b.connect("127.0.0.1", ap)).toBe(true)
+                    expect(b.send(bytes("yo"))).toBe(2)
+                    match (a.recv(16)) {
+                        case some(r) -> { expect(str(r)).toBe("yo") }
+                        case none -> { expect(false).toBe(true) }
+                    }
                     b.close()
                 }
-                case none -> {
-                    expect(false).toBe(true)
-                }
+                case none -> { expect(false).toBe(true) }
             }
             a.close()
         }
-        case none -> {
-            expect(false).toBe(true)
+        case none -> { expect(false).toBe(true) }
+    }
+}
+
+test fn http_parse_and_serialize() {
+    let rawReq = "GET /hello HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Test: yes\r\nContent-Length: 5\r\n\r\nworld"
+    match (parseRequest(rawReq)) {
+        case some(req) -> {
+            expect(req.method).toBe("GET")
+            expect(req.target).toBe("/hello")
+            expect(req.version).toBe("HTTP/1.1")
+            match (req.header("Host")) {
+                case some(v) -> { expect(v).toBe("127.0.0.1") }
+                case none -> { expect(false).toBe(true) }
+            }
+            match (req.header("x-test")) {
+                case some(v) -> { expect(v).toBe("yes") }
+                case none -> { expect(false).toBe(true) }
+            }
+            expect(req.bodyText()).toBe("world")
+            let sreq = serializeRequest(req)
+            expect(len(sreq) > 0).toBe(true)
         }
+        case none -> { expect(false).toBe(true) }
+    }
+    let rawRes = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok"
+    match (parseResponse(rawRes)) {
+        case some(res) -> {
+            expect(res.status).toBe(200)
+            expect(res.reason).toBe("OK")
+            expect(res.ok()).toBe(true)
+            expect(res.bodyText()).toBe("ok")
+            match (res.header("content-type")) {
+                case some(v) -> { expect(v).toBe("text/plain") }
+                case none -> { expect(false).toBe(true) }
+            }
+        }
+        case none -> { expect(false).toBe(true) }
+    }
+    var h = HttpHeaders()
+    h.set("A", "1")
+    h.set("a", "2")
+    expect(h.lenHeaders()).toBe(1)
+    expect(h.getOr("A", "x")).toBe("2")
+    h.add("B", "3")
+    expect(h.has("b")).toBe(true)
+    h.remove("a")
+    expect(h.has("A")).toBe(false)
+}
+
+test fn http_client_server_loopback() {
+    // Single-threaded loopback: connect queues in listen backlog, then accept.
+    match (TcpListener.bind("127.0.0.1", 0)) {
+        case some(l) -> {
+            let port = l.localPort()
+            match (TcpStream.connect("127.0.0.1", port)) {
+                case some(c) -> {
+                    match (l.accept()) {
+                        case some(s) -> {
+                            var req = HttpRequest("GET", "/ping")
+                            req.setHeader("Host", "127.0.0.1:" + str(port))
+                            req.setHeader("Connection", "close")
+                            req.setHeader("Content-Length", "0")
+                            expect(writeRequest(c, req)).toBe(true)
+                            match (readRequest(s)) {
+                                case some(rq) -> {
+                                    expect(rq.method).toBe("GET")
+                                    expect(rq.target).toBe("/ping")
+                                    var res = response(200)
+                                    res.setHeader("Content-Type", "text/plain")
+                                    res.setBodyText("pong")
+                                    expect(writeResponse(s, res)).toBe(true)
+                                }
+                                case none -> { expect(false).toBe(true) }
+                            }
+                            s.close()
+                            match (readResponse(c)) {
+                                case some(res) -> {
+                                    expect(res.status).toBe(200)
+                                    expect(res.bodyText()).toBe("pong")
+                                }
+                                case none -> { expect(false).toBe(true) }
+                            }
+                        }
+                        case none -> { expect(false).toBe(true) }
+                    }
+                    c.close()
+                }
+                case none -> { expect(false).toBe(true) }
+            }
+            l.close()
+        }
+        case none -> { expect(false).toBe(true) }
+    }
+    // POST roundtrip
+    match (TcpListener.bind("127.0.0.1", 0)) {
+        case some(l2) -> {
+            let port2 = l2.localPort()
+            match (TcpStream.connect("127.0.0.1", port2)) {
+                case some(c2) -> {
+                    match (l2.accept()) {
+                        case some(s2) -> {
+                            var req2 = HttpRequest("POST", "/submit")
+                            req2.setHeader("Host", "127.0.0.1:" + str(port2))
+                            req2.setHeader("Connection", "close")
+                            req2.setBodyText("data")
+                            expect(writeRequest(c2, req2)).toBe(true)
+                            match (readRequest(s2)) {
+                                case some(rq2) -> {
+                                    expect(rq2.method).toBe("POST")
+                                    expect(rq2.bodyText()).toBe("data")
+                                    var res2 = response(200)
+                                    res2.setHeader("Content-Type", "text/plain")
+                                    res2.setBodyText("echo:" + rq2.bodyText())
+                                    expect(writeResponse(s2, res2)).toBe(true)
+                                }
+                                case none -> { expect(false).toBe(true) }
+                            }
+                            s2.close()
+                            match (readResponse(c2)) {
+                                case some(res2) -> {
+                                    expect(res2.status).toBe(200)
+                                    expect(res2.bodyText()).toBe("echo:data")
+                                }
+                                case none -> { expect(false).toBe(true) }
+                            }
+                        }
+                        case none -> { expect(false).toBe(true) }
+                    }
+                    c2.close()
+                }
+                case none -> { expect(false).toBe(true) }
+            }
+            l2.close()
+        }
+        case none -> { expect(false).toBe(true) }
     }
 }

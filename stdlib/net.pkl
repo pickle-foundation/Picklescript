@@ -1,16 +1,18 @@
 module std.net
 
-// TCP-first networking v1 (blocking, loopback-deterministic). Byte-oriented I/O.
-// Endpoints are numeric IPv4 dotted quads (e.g. "127.0.0.1") for portability
-// and golden determinism; no DNS in v1.
+// std.net v2: blocking TCP/UDP sockets, IPv4 address helpers, deterministic
+// local resolution (numeric dotted-quad and "localhost"), socket options, and
+// portable runtime ABI seam (Windows/Winsock now, plat*/pickle_net_* for future
+// POSIX). Byte-oriented I/O. Higher-level protocols (HTTP) live in std.net.http.
 
-import { net_tcp_socket, net_close, net_shutdown, net_bind4, net_listen, net_accept, net_connect4, net_send, net_recv, net_local_port4, net_peer_port4, net_set_reuseaddr, net_udp_socket, net_sendto4, net_recvfrom4 } from runtime.abi_net
+import { net_tcp_socket, net_close, net_shutdown, net_bind4, net_listen, net_accept, net_connect4, net_send, net_recv, net_local_port4, net_peer_port4, net_local_addr4, net_peer_addr4, net_set_reuseaddr, net_set_nodelay, net_set_keepalive, net_set_broadcast, net_set_recv_timeout_ms, net_set_send_timeout_ms, net_last_error, net_udp_socket, net_sendto4, net_recvfrom4, net_udp_connect4, net_resolve_local4 } from runtime.abi_net
 
 const INVALID: int = -1
 const SHUT_RD: int = 0
 const SHUT_WR: int = 1
 const SHUT_RDWR: int = 2
 
+/// Parse numeric IPv4 dotted quad "a.b.c.d" into [a,b,c,d], or none.
 fn parseIPv4(host: string) -> List<int>? {
     let n = len(host)
     if (n <= 0) { return none }
@@ -47,6 +49,86 @@ fn parseIPv4(host: string) -> List<int>? {
     [a, b, c, d]
 }
 
+/// True for a valid numeric IPv4 dotted quad.
+fn isIPv4(host: string) -> bool {
+    match (parseIPv4(host)) {
+        case some(_) -> true
+        case none -> false
+    }
+}
+
+fn ipv4ToString(a: int, b: int, c: int, d: int) -> string {
+    str(a) + "." + str(b) + "." + str(c) + "." + str(d)
+}
+
+/// Format host:port for IPv4 endpoints.
+fn formatAddr(host: string, port: int) -> string {
+    host + ":" + str(port)
+}
+
+/// Resolve a host to an IPv4 address string. Deterministic for numeric dotted
+/// quads and "localhost" (127.0.0.1). Returns none for other/unknown hosts.
+fn resolve4(host: string) -> string? {
+    match (parseIPv4(host)) {
+        case some(o) -> {
+            return ipv4ToString(o[0], o[1], o[2], o[3])
+        }
+        case none -> {}
+    }
+    if (host == "localhost") {
+        return "127.0.0.1"
+    }
+    // Try runtime local resolver (numeric/localhost fast path over raw bytes).
+    let b = bytes(host)
+    let n = len(b)
+    if (n <= 0) { return none }
+    unsafe {
+        var words = (n + 7) / 8
+        if (words < 1) { words = 1 }
+        let buf = alloc(int, words)
+        var i = 0
+        while (i < words) {
+            buf[i] = 0
+            i = i + 1
+        }
+        i = 0
+        while (i < n) {
+            let sh = (i & 7) * 8
+            let mask = 255 << sh
+            let v = b[i] as int
+            buf[i >> 3] = (buf[i >> 3] & ((0 - 1) ^ mask)) | ((v & 255) << sh)
+            i = i + 1
+        }
+        let meta = alloc(int, 4)
+        var m = 0
+        while (m < 4) {
+            meta[m] = 0
+            m = m + 1
+        }
+        let rc = net_resolve_local4(buf as int, n, meta as int)
+        var out: string? = none
+        if (rc == 0) {
+            out = ipv4ToString(meta[0], meta[1], meta[2], meta[3])
+        }
+        free(meta)
+        free(buf)
+        return out
+    }
+}
+
+/// Resolve host and return [a,b,c,d] octets, or none.
+fn resolve4Octets(host: string) -> List<int>? {
+    match (resolve4(host)) {
+        case some(h) -> parseIPv4(h)
+        case none -> none
+    }
+}
+
+/// Last socket/runtime network error code (platform-specific; 0 if none).
+fn lastError() -> int {
+    net_last_error()
+}
+
 class TcpStream {
     var fd: int
     var closed: bool
@@ -56,9 +138,9 @@ class TcpStream {
         this.closed = false
     }
 
-    /// Connect to numeric IPv4 host:port. Returns none on failure.
+    /// Connect to host:port (numeric IPv4 or "localhost"). Returns none on failure.
     static fn connect(host: string, port: int) -> TcpStream? {
-        match (parseIPv4(host)) {
+        match (resolve4Octets(host)) {
             case some(o) -> {
                 let fd = net_tcp_socket()
                 if (fd == INVALID || fd == 0) {
@@ -169,6 +251,33 @@ class TcpStream {
         true
     }
 
+    /// Read until EOF/error. Returns all bytes received.
+    fn readAll(maxTotal: int) -> List<byte> {
+        var out = bytes("")
+        var total = 0
+        var limit = maxTotal
+        if (limit <= 0) { limit = 1048576 }
+        while (total < limit) {
+            var want = limit - total
+            if (want > 4096) { want = 4096 }
+            let chunk = this.read(want)
+            let got = len(chunk)
+            if (got <= 0) { break }
+            var i = 0
+            while (i < got) {
+                out.push(chunk[i])
+                i = i + 1
+            }
+            total = total + got
+        }
+        out
+    }
+
+    /// Read all available data as UTF-8 text best-effort (raw bytes -> string).
+    fn readText(maxTotal: int) -> string {
+        str(this.readAll(maxTotal))
+    }
+
     /// Best-effort close.
     fn close() {
         if (!this.closed) {
@@ -192,6 +301,80 @@ class TcpStream {
         if (this.closed) { return -1 }
         net_peer_port4(this.fd)
     }
+
+    fn localHost() -> string? {
+        if (this.closed) { return none }
+        unsafe {
+            let meta = alloc(int, 5)
+            var i = 0
+            while (i < 5) {
+                meta[i] = 0
+                i = i + 1
+            }
+            let rc = net_local_addr4(this.fd, meta as int)
+            var out: string? = none
+            if (rc == 0) {
+                out = ipv4ToString(meta[0], meta[1], meta[2], meta[3])
+            }
+            free(meta)
+            return out
+        }
+    }
+
+    fn peerHost() -> string? {
+        if (this.closed) { return none }
+        unsafe {
+            let meta = alloc(int, 5)
+            var i = 0
+            while (i < 5) {
+                meta[i] = 0
+                i = i + 1
+            }
+            let rc = net_peer_addr4(this.fd, meta as int)
+            var out: string? = none
+            if (rc == 0) {
+                out = ipv4ToString(meta[0], meta[1], meta[2], meta[3])
+            }
+            free(meta)
+            return out
+        }
+    }
+
+    fn localAddr() -> string? {
+        match (this.localHost()) {
+            case some(h) -> formatAddr(h, this.localPort())
+            case none -> none
+        }
+    }
+
+    fn peerAddr() -> string? {
+        match (this.peerHost()) {
+            case some(h) -> formatAddr(h, this.peerPort())
+            case none -> none
+        }
+    }
+
+    fn setNoDelay(on: bool) -> bool {
+        if (this.closed) { return false }
+        let v = if (on) { 1 } else { 0 }
+        net_set_nodelay(this.fd, v) == 0
+    }
+
+    fn setKeepAlive(on: bool) -> bool {
+        if (this.closed) { return false }
+        let v = if (on) { 1 } else { 0 }
+        net_set_keepalive(this.fd, v) == 0
+    }
+
+    fn setRecvTimeoutMs(ms: int) -> bool {
+        if (this.closed) { return false }
+        net_set_recv_timeout_ms(this.fd, ms) == 0
+    }
+
+    fn setSendTimeoutMs(ms: int) -> bool {
+        if (this.closed) { return false }
+        net_set_send_timeout_ms(this.fd, ms) == 0
+    }
 }
 
 class TcpListener {
@@ -203,9 +386,9 @@ class TcpListener {
         this.closed = false
     }
 
-    /// Bind to numeric IPv4 host:port and listen. port 0 = ephemeral.
+    /// Bind to host:port (numeric IPv4 or "localhost") and listen. port 0 = ephemeral.
     static fn bind(host: string, port: int) -> TcpListener? {
-        match (parseIPv4(host)) {
+        match (resolve4Octets(host)) {
             case some(o) -> {
                 let fd = net_tcp_socket()
                 if (fd == INVALID || fd == 0) {
@@ -245,6 +428,32 @@ class TcpListener {
         net_local_port4(this.fd)
     }
 
+    fn localHost() -> string? {
+        if (this.closed) { return none }
+        unsafe {
+            let meta = alloc(int, 5)
+            var i = 0
+            while (i < 5) {
+                meta[i] = 0
+                i = i + 1
+            }
+            let rc = net_local_addr4(this.fd, meta as int)
+            var out: string? = none
+            if (rc == 0) {
+                out = ipv4ToString(meta[0], meta[1], meta[2], meta[3])
+            }
+            free(meta)
+            return out
+        }
+    }
+
+    fn localAddr() -> string? {
+        match (this.localHost()) {
+            case some(h) -> formatAddr(h, this.localPort())
+            case none -> none
+        }
+    }
+
     fn close() {
         if (!this.closed) {
             let _ = net_close(this.fd)
@@ -275,9 +484,9 @@ class UdpSocket {
         this.closed = false
     }
 
-    /// Bind to numeric IPv4 host:port. port 0 = ephemeral.
+    /// Bind to host:port (numeric IPv4 or "localhost"). port 0 = ephemeral.
     static fn bind(host: string, port: int) -> UdpSocket? {
-        match (parseIPv4(host)) {
+        match (resolve4Octets(host)) {
             case some(o) -> {
                 let fd = net_udp_socket()
                 if (fd == INVALID || fd == 0) {
@@ -297,15 +506,118 @@ class UdpSocket {
         }
     }
 
+    /// Connect UDP socket to default peer (numeric IPv4 or "localhost").
+    fn connect(host: string, port: int) -> bool {
+        if (this.closed) { return false }
+        match (resolve4Octets(host)) {
+            case some(o) -> {
+                net_udp_connect4(this.fd, o[0], o[1], o[2], o[3], port) == 0
+            }
+            case none -> false
+        }
+    }
+
+    /// Send on connected UDP socket.
+    fn send(data: List<byte>) -> int {
+        if (this.closed) { return -1 }
+        let n = len(data)
+        if (n <= 0) { return 0 }
+        unsafe {
+            var words = (n + 7) / 8
+            if (words < 1) { words = 1 }
+            let buf = alloc(int, words)
+            var i = 0
+            while (i < words) {
+                buf[i] = 0
+                i = i + 1
+            }
+            i = 0
+            while (i < n) {
+                let sh = (i & 7) * 8
+                let mask = 255 << sh
+                let v = data[i] as int
+                buf[i >> 3] = (buf[i >> 3] & ((0 - 1) ^ mask)) | ((v & 255) << sh)
+                i = i + 1
+            }
+            let sent = net_send(this.fd, buf as int, n)
+            free(buf)
+            return sent
+        }
+    }
+
+    /// Receive on connected UDP socket. Returns none on error.
+    fn recv(max: int) -> List<byte>? {
+        if (this.closed || max <= 0) { return none }
+        unsafe {
+            var words = (max + 7) / 8
+            if (words < 1) { words = 1 }
+            let buf = alloc(int, words)
+            var i = 0
+            while (i < words) {
+                buf[i] = 0
+                i = i + 1
+            }
+            let got = net_recv(this.fd, buf as int, max)
+            if (got < 0) {
+                free(buf)
+                return none
+            }
+            var out = bytes("")
+            var j = 0
+            while (j < got) {
+                let b = (buf[j >> 3] >> ((j & 7) * 8)) & 255
+                out.push(b as byte)
+                j = j + 1
+            }
+            free(buf)
+            return out
+        }
+    }
+
     fn localPort() -> int {
         if (this.closed) { return -1 }
         net_local_port4(this.fd)
     }
 
-    /// Send datagram to numeric IPv4 host:port. Returns bytes sent or -1.
+    fn localHost() -> string? {
+        if (this.closed) { return none }
+        unsafe {
+            let meta = alloc(int, 5)
+            var i = 0
+            while (i < 5) {
+                meta[i] = 0
+                i = i + 1
+            }
+            let rc = net_local_addr4(this.fd, meta as int)
+            var out: string? = none
+            if (rc == 0) {
+                out = ipv4ToString(meta[0], meta[1], meta[2], meta[3])
+            }
+            free(meta)
+            return out
+        }
+    }
+
+    fn setBroadcast(on: bool) -> bool {
+        if (this.closed) { return false }
+        let v = if (on) { 1 } else { 0 }
+        net_set_broadcast(this.fd, v) == 0
+    }
+
+    fn setRecvTimeoutMs(ms: int) -> bool {
+        if (this.closed) { return false }
+        net_set_recv_timeout_ms(this.fd, ms) == 0
+    }
+
+    fn setSendTimeoutMs(ms: int) -> bool {
+        if (this.closed) { return false }
+        net_set_send_timeout_ms(this.fd, ms) == 0
+    }
+
+    /// Send datagram to host:port (numeric IPv4 or "localhost"). Returns bytes sent or -1.
     fn sendTo(data: List<byte>, host: string, port: int) -> int {
         if (this.closed) { return -1 }
-        match (parseIPv4(host)) {
+        match (resolve4Octets(host)) {
             case some(o) -> {
                 let n = len(data)
                 if (n < 0) { return -1 }
@@ -346,7 +658,7 @@ class UdpSocket {
         }
     }
 
-    /// Receive a datagram (blocking). Returns none on error.
+    /// Receive a datagram (blocking). Returns none on error/timeout.
     fn recvFrom(max: int) -> UdpDatagram? {
         if (this.closed || max <= 0) { return none }
         unsafe {
