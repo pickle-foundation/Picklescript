@@ -19,13 +19,13 @@ Seeds (see `docs/08-stdlib.md`, office `port/` tracker):
 - `collections/` â€” `List`/`Map` wrappers plus `Set`, `Multiset`, `Deque`,
   `Vec`, `BitSet`, `LruCache`
 - `fs/`, `os/`, `time/`, `test/` â€” shipped flat (`fs.pkl`, `os.pkl`, ...);
-  `math/` has `basic.pkl`, `collatz.pkl`, `digits.pkl`, `fibonacci.pkl`, `random.pkl`, `statistics.pkl`,
+  `math/` has `basic.pkl`, `collatz.pkl`, `digits.pkl`, `fibonacci.pkl`, `ipow.pkl`, `random.pkl`, `statistics.pkl`,
   `interpolation.pkl`, `matrix.pkl`, `vector.pkl`, `fraction.pkl`, `prime.pkl`, `geometry.pkl`, `combinatorics.pkl`, `radix.pkl`, `complex.pkl`, `polynomial.pkl`, and `roman.pkl`;
   `logging.pkl`
   ships flat (see the plan doc); `encoding/` has `base64`, `csv`, `hex`,
   `url`, `toml`, `yaml`, `base32`, `base58`, `base85`, and `xml`
 
-Status (2026-09-26): the whole `stdlib/**/*_test.pkl` tree (70 files) is gated
+Status (2026-09-26): the whole `stdlib/**/*_test.pkl` tree (71 files) is gated
 by **GATE11** in `tools/battery_full.ps1` â€” the ported test driver must run
 each file byte-identical (stdout + exit) to Rust `pickle test`.
 The compiler registers builtins (`print`, `println`, `len`, `abs`, ...)
