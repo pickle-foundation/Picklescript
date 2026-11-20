@@ -1,6 +1,6 @@
 ﻿module std.net_test
 
-import { TcpListener, TcpStream, SHUT_WR } from std.net
+import { TcpListener, TcpStream, UdpSocket, SHUT_WR } from std.net
 
 test fn loopback_roundtrip() {
     match (TcpListener.bind("127.0.0.1", 0)) {
@@ -119,6 +119,47 @@ test fn invalid_numeric_ipv4_rejected() {
         }
         case none -> {
             expect(true).toBe(true)
+        }
+    }
+}
+
+test fn udp_loopback_roundtrip() {
+    match (UdpSocket.bind("127.0.0.1", 0)) {
+        case some(a) -> {
+            match (UdpSocket.bind("127.0.0.1", 0)) {
+                case some(b) -> {
+                    let ap = a.localPort()
+                    let bp = b.localPort()
+                    expect(ap > 0).toBe(true)
+                    expect(bp > 0).toBe(true)
+                    var msg = [0x70 as byte, 0x69 as byte, 0x6e as byte, 0x67 as byte] // "ping"
+                    let sent = a.sendTo(msg, "127.0.0.1", bp)
+                    expect(sent).toBe(4)
+                    match (b.recvFrom(16)) {
+                        case some(d) -> {
+                            expect(len(d.data)).toBe(4)
+                            expect(d.data[0] as int).toBe(112)
+                            expect(d.data[1] as int).toBe(105)
+                            expect(d.data[2] as int).toBe(110)
+                            expect(d.data[3] as int).toBe(103)
+                            expect(d.host).toBe("127.0.0.1")
+                            expect(d.port).toBe(ap)
+                        }
+                        case none -> {
+                            expect(false).toBe(true)
+                        }
+                    }
+                    expect(a.sendTo(msg, "256.0.0.1", bp)).toBe(-1)
+                    b.close()
+                }
+                case none -> {
+                    expect(false).toBe(true)
+                }
+            }
+            a.close()
+        }
+        case none -> {
+            expect(false).toBe(true)
         }
     }
 }

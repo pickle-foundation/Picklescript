@@ -4,7 +4,7 @@ module std.net
 // Endpoints are numeric IPv4 dotted quads (e.g. "127.0.0.1") for portability
 // and golden determinism; no DNS in v1.
 
-import { net_tcp_socket, net_close, net_shutdown, net_bind4, net_listen, net_accept, net_connect4, net_send, net_recv, net_local_port4, net_peer_port4, net_set_reuseaddr } from runtime.abi_net
+import { net_tcp_socket, net_close, net_shutdown, net_bind4, net_listen, net_accept, net_connect4, net_send, net_recv, net_local_port4, net_peer_port4, net_set_reuseaddr, net_udp_socket, net_sendto4, net_recvfrom4 } from runtime.abi_net
 
 const INVALID: int = -1
 const SHUT_RD: int = 0
@@ -243,6 +243,146 @@ class TcpListener {
     fn localPort() -> int {
         if (this.closed) { return -1 }
         net_local_port4(this.fd)
+    }
+
+    fn close() {
+        if (!this.closed) {
+            let _ = net_close(this.fd)
+            this.closed = true
+            this.fd = INVALID
+        }
+    }
+}
+
+class UdpDatagram {
+    var data: List<byte>
+    var host: string
+    var port: int
+
+    constructor(data: List<byte>, host: string, port: int) {
+        this.data = data
+        this.host = host
+        this.port = port
+    }
+}
+
+class UdpSocket {
+    var fd: int
+    var closed: bool
+
+    constructor(fd: int) {
+        this.fd = fd
+        this.closed = false
+    }
+
+    /// Bind to numeric IPv4 host:port. port 0 = ephemeral.
+    static fn bind(host: string, port: int) -> UdpSocket? {
+        match (parseIPv4(host)) {
+            case some(o) -> {
+                let fd = net_udp_socket()
+                if (fd == INVALID || fd == 0) {
+                    return none
+                }
+                let _ = net_set_reuseaddr(fd, 1)
+                let br = net_bind4(fd, o[0], o[1], o[2], o[3], port)
+                if (br != 0) {
+                    let _ = net_close(fd)
+                    return none
+                }
+                return UdpSocket(fd)
+            }
+            case none -> {
+                return none
+            }
+        }
+    }
+
+    fn localPort() -> int {
+        if (this.closed) { return -1 }
+        net_local_port4(this.fd)
+    }
+
+    /// Send datagram to numeric IPv4 host:port. Returns bytes sent or -1.
+    fn sendTo(data: List<byte>, host: string, port: int) -> int {
+        if (this.closed) { return -1 }
+        match (parseIPv4(host)) {
+            case some(o) -> {
+                let n = len(data)
+                if (n < 0) { return -1 }
+                if (n == 0) {
+                    unsafe {
+                        let buf = alloc(int, 1)
+                        buf[0] = 0
+                        let sent = net_sendto4(this.fd, buf as int, 0, o[0], o[1], o[2], o[3], port)
+                        free(buf)
+                        return sent
+                    }
+                }
+                unsafe {
+                    var words = (n + 7) / 8
+                    if (words < 1) { words = 1 }
+                    let buf = alloc(int, words)
+                    var i = 0
+                    while (i < words) {
+                        buf[i] = 0
+                        i = i + 1
+                    }
+                    i = 0
+                    while (i < n) {
+                        let sh = (i & 7) * 8
+                        let mask = 255 << sh
+                        let v = data[i] as int
+                        buf[i >> 3] = (buf[i >> 3] & ((0 - 1) ^ mask)) | ((v & 255) << sh)
+                        i = i + 1
+                    }
+                    let sent = net_sendto4(this.fd, buf as int, n, o[0], o[1], o[2], o[3], port)
+                    free(buf)
+                    return sent
+                }
+            }
+            case none -> {
+                return -1
+            }
+        }
+    }
+
+    /// Receive a datagram (blocking). Returns none on error.
+    fn recvFrom(max: int) -> UdpDatagram? {
+        if (this.closed || max <= 0) { return none }
+        unsafe {
+            var words = (max + 7) / 8
+            if (words < 1) { words = 1 }
+            let buf = alloc(int, words)
+            var i = 0
+            while (i < words) {
+                buf[i] = 0
+                i = i + 1
+            }
+            let meta = alloc(int, 5)
+            var m = 0
+            while (m < 5) {
+                meta[m] = 0
+                m = m + 1
+            }
+            let got = net_recvfrom4(this.fd, buf as int, max, meta as int)
+            if (got < 0) {
+                free(meta)
+                free(buf)
+                return none
+            }
+            var out = bytes("")
+            var j = 0
+            while (j < got) {
+                let b = (buf[j >> 3] >> ((j & 7) * 8)) & 255
+                out.push(b as byte)
+                j = j + 1
+            }
+            let host = str(meta[0]) + "." + str(meta[1]) + "." + str(meta[2]) + "." + str(meta[3])
+            let port = meta[4]
+            free(meta)
+            free(buf)
+            return UdpDatagram(out, host, port)
+        }
     }
 
     fn close() {

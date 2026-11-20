@@ -12,7 +12,9 @@ import { abiRawAlloc } from runtime.abi_raw
 
 const AF_INET: int = 2
 const SOCK_STREAM: int = 1
+const SOCK_DGRAM: int = 2
 const IPPROTO_TCP: int = 6
+const IPPROTO_UDP: int = 17
 const SOL_SOCKET: int = 65535
 const SO_REUSEADDR: int = 4
 const SD_RECEIVE: int = 0
@@ -69,6 +71,11 @@ fn netEnsureWsa() -> int {
 fn platSocketTcp() -> int {
     let _rc = netEnsureWsa()
     return win_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+}
+
+fn platSocketUdp() -> int {
+    let _rc = netEnsureWsa()
+    return win_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
 }
 
 fn platClose(s: int) -> int {
@@ -197,6 +204,44 @@ fn platPeerPort4(s: int) -> int {
     }
 }
 
+fn platSendTo4(s: int, buf: *int, n: int, a: int, b: int, c: int, d: int, port: int) -> int {
+    unsafe {
+        let sa = alloc(int, 2)
+        fillSockaddrIn4(sa, a, b, c, d, port)
+        let rc = win_sendto(s, buf as int, n, 0, sa as int, 16)
+        free(sa)
+        return rc
+    }
+}
+
+// Receive a UDP datagram. On success returns bytes received and writes
+// meta[0..4] = source a,b,c,d,port (host order). Returns -1 on error.
+fn platRecvFrom4(s: int, buf: *int, n: int, meta: *int) -> int {
+    unsafe {
+        let sa = alloc(int, 4)
+        zeroBuf(sa, 4)
+        let lenp = alloc(int, 1)
+        lenp[0] = 16
+        let rc = win_recvfrom(s, buf as int, n, 0, sa as int, lenp as int)
+        if (rc >= 0) {
+            let a = rawByteAtBuf(sa, 4)
+            let b = rawByteAtBuf(sa, 5)
+            let c = rawByteAtBuf(sa, 6)
+            let d = rawByteAtBuf(sa, 7)
+            let p0 = rawByteAtBuf(sa, 2)
+            let p1 = rawByteAtBuf(sa, 3)
+            meta[0] = a
+            meta[1] = b
+            meta[2] = c
+            meta[3] = d
+            meta[4] = p0 * 256 + p1
+        }
+        free(lenp)
+        free(sa)
+        return rc
+    }
+}
+
 fn netLastError() -> int {
     return win_wsa_get_last_error()
 }
@@ -270,4 +315,23 @@ fn net_set_reuseaddr(s: int, on: int) -> int {
 #[symbol("pickle_net_last_error")]
 fn net_last_error() -> int {
     return netLastError()
+}
+
+#[symbol("pickle_net_udp_socket")]
+fn net_udp_socket() -> int {
+    return platSocketUdp()
+}
+
+#[symbol("pickle_net_sendto4")]
+fn net_sendto4(s: int, buf: int, n: int, a: int, b: int, c: int, d: int, port: int) -> int {
+    unsafe {
+        return platSendTo4(s, buf as *int, n, a, b, c, d, port)
+    }
+}
+
+#[symbol("pickle_net_recvfrom4")]
+fn net_recvfrom4(s: int, buf: int, n: int, meta: int) -> int {
+    unsafe {
+        return platRecvFrom4(s, buf as *int, n, meta as *int)
+    }
 }
