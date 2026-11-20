@@ -1,0 +1,124 @@
+module std.text.hamming_test
+
+import { distance, similarity } from std.text.hamming
+
+/// A string built by repeating `part` `times` times.
+fn repeats(part: string, times: int) -> string {
+    var out = ""
+    var i = 0
+    while (i < times) {
+        out = out + part
+        i = i + 1
+    }
+    out
+}
+
+test fn identical_strings() {
+    expect(distance("", "")).toBe(0)
+    expect(distance("a", "a")).toBe(0)
+    expect(distance("abc", "abc")).toBe(0)
+    expect(distance("karolin", "karolin")).toBe(0)
+}
+
+test fn classic_vectors() {
+    expect(distance("karolin", "kathrin")).toBe(3)
+    expect(distance("karolin", "kerstin")).toBe(3)
+    expect(distance("1011101", "1001001")).toBe(2)
+    expect(distance("2173896", "2233796")).toBe(3)
+    expect(distance("0000", "1111")).toBe(4)
+    expect(distance("abcd", "abce")).toBe(1)
+    expect(distance("abcd", "wxyz")).toBe(4)
+}
+
+test fn unequal_lengths_are_undefined() {
+    expect(distance("", "a")).toBe(-1)
+    expect(distance("a", "")).toBe(-1)
+    expect(distance("abc", "ab")).toBe(-1)
+    expect(distance("ab", "abc")).toBe(-1)
+    expect(distance("short", "longer")).toBe(-1)
+}
+
+test fn every_position_differs() {
+    expect(distance("aaaa", "bbbb")).toBe(4)
+    expect(distance("abcd", "dcba")).toBe(4)
+    expect(distance("abc", "xyz")).toBe(3)
+}
+
+test fn byte_semantics_for_unicode() {
+    // Multi-byte UTF-8 scalars count as their bytes. `é` is C3 A9 and `e` is
+    // a single byte, so "café"/"cafe" differ in byte length and are undefined.
+    expect(distance("é", "e")).toBe(-1)
+    expect(distance("café", "cafe")).toBe(-1)
+    expect(distance("héllo", "hello")).toBe(-1)
+    expect(distance("é", "è")).toBe(1)
+    expect(distance("café", "cafè")).toBe(1)
+    expect(distance("aéb", "aèb")).toBe(1)
+}
+
+test fn unicode_equal_length_pairs() {
+    expect(distance("café", "café")).toBe(0)
+    expect(distance("héllo", "hêllo")).toBe(1)
+    expect(distance("aéb", "aêb")).toBe(1)
+    expect(distance("café", "cafë")).toBe(1)
+}
+
+test fn similarity_equal_strings() {
+    expect(similarity("", "")).toBe(100)
+    expect(similarity("a", "a")).toBe(100)
+    expect(similarity("abc", "abc")).toBe(100)
+    expect(similarity("café", "café")).toBe(100)
+}
+
+test fn similarity_percentages() {
+    expect(similarity("karolin", "kathrin")).toBe(57)
+    expect(similarity("karolin", "kerstin")).toBe(57)
+    expect(similarity("1011101", "1001001")).toBe(71)
+    expect(similarity("2173896", "2233796")).toBe(57)
+    expect(similarity("abcd", "abce")).toBe(75)
+    expect(similarity("abcd", "wxyz")).toBe(0)
+}
+
+test fn similarity_for_unequal_lengths() {
+    expect(similarity("", "a")).toBe(0)
+    expect(similarity("abc", "ab")).toBe(0)
+    expect(similarity("short", "longer")).toBe(0)
+    expect(similarity("café", "cafe")).toBe(0)
+}
+
+test fn long_inputs() {
+    let a200 = repeats("a", 200)
+    let b200 = repeats("b", 200)
+    let mixed = repeats("ab", 100)
+    let sameMixed = repeats("ab", 100)
+    let alt = repeats("ba", 100)
+    expect(distance(a200, a200)).toBe(0)
+    expect(distance(a200, b200)).toBe(200)
+    expect(distance(mixed, sameMixed)).toBe(0)
+    expect(distance(mixed, alt)).toBe(200)
+    expect(similarity(a200, b200)).toBe(0)
+    expect(similarity(mixed, alt)).toBe(0)
+}
+
+test fn a_small_pipeline() {
+    let received = "1011101"
+    let candidates = ["1001001", "1011101", "0011100", "1111111"]
+    var best = ""
+    var bestScore = -1
+    var i = 0
+    while (i < len(candidates)) {
+        let d = distance(received, candidates[i])
+        var score = -1
+        if (d >= 0) {
+            score = similarity(received, candidates[i])
+        }
+        if (score > bestScore) {
+            bestScore = score
+            best = candidates[i]
+        }
+        i = i + 1
+    }
+    expect(best).toBe("1011101")
+    expect(bestScore).toBe(100)
+    expect(distance(received, "0011100")).toBe(2)
+    expect(similarity(received, "0011100")).toBe(71)
+}
