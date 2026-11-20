@@ -1,0 +1,273 @@
+﻿module runtime.abi_net
+
+// TCP-first networking seam (v1, Windows/Winsock now; plat* split for future
+// POSIX/Linux). High-level stdlib API lives in std.net; this module owns raw
+// socket operations and handle/state management behind a portable ABI.
+//
+// Sockets are UINT_PTR (int) on x64. INVALID_SOCKET == -1. All pointers/sizes
+// passed to win_* intrinsics are ints. Byte buffers are *int word arrays with
+// raw-byte helpers for struct/IO marshalling.
+
+import { abiRawAlloc } from runtime.abi_raw
+
+const AF_INET: int = 2
+const SOCK_STREAM: int = 1
+const IPPROTO_TCP: int = 6
+const SOL_SOCKET: int = 65535
+const SO_REUSEADDR: int = 4
+const SD_RECEIVE: int = 0
+const SD_SEND: int = 1
+const SD_BOTH: int = 2
+const SOMAXCONN: int = 128
+const INVALID_SOCKET: int = -1
+const SOCKET_ERROR: int = -1
+const WSA_VERSION: int = 514 // 0x0202
+
+var wsaReady: int = 0
+
+fn rawByteAtBuf(p: *int, i: int) -> int {
+    unsafe {
+        return (p[i >> 3] >> ((i & 7) * 8)) & 255
+    }
+}
+
+fn putRawByteBuf(buf: *int, b: int, v: int) {
+    unsafe {
+        let sh = (b & 7) * 8
+        let mask = 255 << sh
+        buf[b >> 3] = (buf[b >> 3] & ((0 - 1) ^ mask)) | ((v & 255) << sh)
+    }
+}
+
+fn zeroBuf(buf: *int, words: int) {
+    unsafe {
+        var i = 0
+        while (i < words) {
+            buf[i] = 0
+            i = i + 1
+        }
+    }
+}
+
+// Ensure Winsock is initialized. Returns 0 on success, else WSA error code.
+fn netEnsureWsa() -> int {
+    if (wsaReady == 1) {
+        return 0
+    }
+    unsafe {
+        let wsa = alloc(int, 64) // >= sizeof(WSADATA) on x64
+        zeroBuf(wsa, 64)
+        let rc = win_wsa_startup(WSA_VERSION, wsa as int)
+        free(wsa)
+        if (rc == 0) {
+            wsaReady = 1
+        }
+        return rc
+    }
+}
+
+fn platSocketTcp() -> int {
+    let _rc = netEnsureWsa()
+    return win_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+}
+
+fn platClose(s: int) -> int {
+    if (s == INVALID_SOCKET || s == 0) {
+        return 0
+    }
+    return win_closesocket(s)
+}
+
+fn platShutdown(s: int, how: int) -> int {
+    return win_shutdown(s, how)
+}
+
+// Build IPv4 sockaddr_in (16 bytes) in buf for numeric dotted host + port.
+fn fillSockaddrIn4(buf: *int, a: int, b: int, c: int, d: int, port: int) {
+    unsafe {
+        zeroBuf(buf, 2)
+        // sin_family AF_INET (u16 LE)
+        putRawByteBuf(buf, 0, AF_INET & 255)
+        putRawByteBuf(buf, 1, 0)
+        // sin_port network byte order (big-endian)
+        putRawByteBuf(buf, 2, (port >> 8) & 255)
+        putRawByteBuf(buf, 3, port & 255)
+        // sin_addr
+        putRawByteBuf(buf, 4, a & 255)
+        putRawByteBuf(buf, 5, b & 255)
+        putRawByteBuf(buf, 6, c & 255)
+        putRawByteBuf(buf, 7, d & 255)
+    }
+}
+
+fn platBind4(s: int, a: int, b: int, c: int, d: int, port: int) -> int {
+    unsafe {
+        let sa = alloc(int, 2)
+        fillSockaddrIn4(sa, a, b, c, d, port)
+        let rc = win_bind(s, sa as int, 16)
+        free(sa)
+        return rc
+    }
+}
+
+fn platListen(s: int, backlog: int) -> int {
+    return win_listen(s, backlog)
+}
+
+fn platAccept(s: int) -> int {
+    unsafe {
+        let sa = alloc(int, 16) // room for storage + len
+        zeroBuf(sa, 16)
+        let lenp = alloc(int, 1)
+        lenp[0] = 16
+        let client = win_accept(s, sa as int, lenp as int)
+        free(lenp)
+        free(sa)
+        return client
+    }
+}
+
+fn platConnect4(s: int, a: int, b: int, c: int, d: int, port: int) -> int {
+    unsafe {
+        let sa = alloc(int, 2)
+        fillSockaddrIn4(sa, a, b, c, d, port)
+        let rc = win_connect(s, sa as int, 16)
+        free(sa)
+        return rc
+    }
+}
+
+fn platSend(s: int, buf: *int, n: int) -> int {
+    return win_send(s, buf as int, n, 0)
+}
+
+fn platRecv(s: int, buf: *int, n: int) -> int {
+    return win_recv(s, buf as int, n, 0)
+}
+
+fn platSetsockoptReuseAddr(s: int, on: int) -> int {
+    unsafe {
+        let p = alloc(int, 1)
+        p[0] = on
+        let rc = win_setsockopt(s, SOL_SOCKET, SO_REUSEADDR, p as int, 4)
+        free(p)
+        return rc
+    }
+}
+
+// Return local port for an IPv4 socket, or -1 on error.
+fn platLocalPort4(s: int) -> int {
+    unsafe {
+        let sa = alloc(int, 4)
+        zeroBuf(sa, 4)
+        let lenp = alloc(int, 1)
+        lenp[0] = 16
+        let rc = win_getsockname(s, sa as int, lenp as int)
+        if (rc != 0) {
+            free(lenp)
+            free(sa)
+            return -1
+        }
+        let p0 = rawByteAtBuf(sa, 2)
+        let p1 = rawByteAtBuf(sa, 3)
+        free(lenp)
+        free(sa)
+        // network byte order to host
+        return p0 * 256 + p1
+    }
+}
+
+fn platPeerPort4(s: int) -> int {
+    unsafe {
+        let sa = alloc(int, 4)
+        zeroBuf(sa, 4)
+        let lenp = alloc(int, 1)
+        lenp[0] = 16
+        let rc = win_getpeername(s, sa as int, lenp as int)
+        if (rc != 0) {
+            free(lenp)
+            free(sa)
+            return -1
+        }
+        let p0 = rawByteAtBuf(sa, 2)
+        let p1 = rawByteAtBuf(sa, 3)
+        free(lenp)
+        free(sa)
+        return p0 * 256 + p1
+    }
+}
+
+fn netLastError() -> int {
+    return win_wsa_get_last_error()
+}
+
+// --- portable ABI surface (v1 minimal) ---
+
+#[symbol("pickle_net_tcp_socket")]
+fn net_tcp_socket() -> int {
+    return platSocketTcp()
+}
+
+#[symbol("pickle_net_close")]
+fn net_close(s: int) -> int {
+    return platClose(s)
+}
+
+#[symbol("pickle_net_shutdown")]
+fn net_shutdown(s: int, how: int) -> int {
+    return platShutdown(s, how)
+}
+
+#[symbol("pickle_net_bind4")]
+fn net_bind4(s: int, a: int, b: int, c: int, d: int, port: int) -> int {
+    return platBind4(s, a, b, c, d, port)
+}
+
+#[symbol("pickle_net_listen")]
+fn net_listen(s: int, backlog: int) -> int {
+    return platListen(s, backlog)
+}
+
+#[symbol("pickle_net_accept")]
+fn net_accept(s: int) -> int {
+    return platAccept(s)
+}
+
+#[symbol("pickle_net_connect4")]
+fn net_connect4(s: int, a: int, b: int, c: int, d: int, port: int) -> int {
+    return platConnect4(s, a, b, c, d, port)
+}
+
+#[symbol("pickle_net_send")]
+fn net_send(s: int, buf: int, n: int) -> int {
+    unsafe {
+        return platSend(s, buf as *int, n)
+    }
+}
+
+#[symbol("pickle_net_recv")]
+fn net_recv(s: int, buf: int, n: int) -> int {
+    unsafe {
+        return platRecv(s, buf as *int, n)
+    }
+}
+
+#[symbol("pickle_net_local_port4")]
+fn net_local_port4(s: int) -> int {
+    return platLocalPort4(s)
+}
+
+#[symbol("pickle_net_peer_port4")]
+fn net_peer_port4(s: int) -> int {
+    return platPeerPort4(s)
+}
+
+#[symbol("pickle_net_set_reuseaddr")]
+fn net_set_reuseaddr(s: int, on: int) -> int {
+    return platSetsockoptReuseAddr(s, on)
+}
+
+#[symbol("pickle_net_last_error")]
+fn net_last_error() -> int {
+    return netLastError()
+}

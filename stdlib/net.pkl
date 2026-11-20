@@ -1,0 +1,171 @@
+module std.net
+
+// TCP-first networking v1 (blocking, loopback-deterministic). Byte-oriented I/O.
+// Endpoints are numeric IPv4 dotted quads (e.g. "127.0.0.1") for portability
+// and golden determinism; no DNS in v1.
+
+import { net_tcp_socket, net_close, net_shutdown, net_bind4, net_listen, net_accept, net_connect4, net_send, net_recv, net_local_port4, net_peer_port4, net_set_reuseaddr } from runtime.abi_net
+
+const INVALID: int = -1
+
+class TcpStream {
+    var fd: int
+    var closed: bool
+
+    constructor(fd: int) {
+        this.fd = fd
+        this.closed = false
+    }
+
+    /// Connect to numeric IPv4 host:port. Returns none on failure.
+    static fn connect(host: string, port: int) -> TcpStream? {
+        if (host == "127.0.0.1") {
+            let fd = net_tcp_socket()
+            if (fd == INVALID || fd == 0) {
+                return none
+            }
+            let rc = net_connect4(fd, 127, 0, 0, 1, port)
+            if (rc != 0) {
+                let _ = net_close(fd)
+                return none
+            }
+            return TcpStream(fd)
+        }
+        none
+    }
+
+    /// Read up to n bytes. Returns empty list on EOF/error.
+    fn read(n: int) -> List<byte> {
+        var out = bytes("")
+        if (this.closed || n <= 0) { return out }
+        unsafe {
+            var words = (n + 7) / 8
+            if (words < 1) { words = 1 }
+            let buf = alloc(int, words)
+            var i = 0
+            while (i < words) {
+                buf[i] = 0
+                i = i + 1
+            }
+            let got = net_recv(this.fd, buf as int, n)
+            if (got > 0) {
+                var j = 0
+                while (j < got) {
+                    let b = (buf[j >> 3] >> ((j & 7) * 8)) & 255
+                    out.push(b as byte)
+                    j = j + 1
+                }
+            }
+            free(buf)
+        }
+        out
+    }
+
+    /// Write bytes, returns number sent (may be less on error).
+    fn write(data: List<byte>) -> int {
+        if (this.closed) { return -1 }
+        let n = len(data)
+        if (n <= 0) { return 0 }
+        unsafe {
+            var words = (n + 7) / 8
+            if (words < 1) { words = 1 }
+            let buf = alloc(int, words)
+            var i = 0
+            while (i < words) {
+                buf[i] = 0
+                i = i + 1
+            }
+            i = 0
+            while (i < n) {
+                let sh = (i & 7) * 8
+                let mask = 255 << sh
+                let v = data[i] as int
+                buf[i >> 3] = (buf[i >> 3] & ((0 - 1) ^ mask)) | ((v & 255) << sh)
+                i = i + 1
+            }
+            let sent = net_send(this.fd, buf as int, n)
+            free(buf)
+            return sent
+        }
+    }
+
+    /// Best-effort close.
+    fn close() {
+        if (!this.closed) {
+            let _ = net_close(this.fd)
+            this.closed = true
+            this.fd = INVALID
+        }
+    }
+
+    fn shutdown(how: int) -> int {
+        if (this.closed) { return -1 }
+        net_shutdown(this.fd, how)
+    }
+
+    fn localPort() -> int {
+        if (this.closed) { return -1 }
+        net_local_port4(this.fd)
+    }
+
+    fn peerPort() -> int {
+        if (this.closed) { return -1 }
+        net_peer_port4(this.fd)
+    }
+}
+
+class TcpListener {
+    var fd: int
+    var closed: bool
+
+    constructor(fd: int) {
+        this.fd = fd
+        this.closed = false
+    }
+
+    /// Bind to numeric IPv4 host:port and listen. port 0 = ephemeral.
+    static fn bind(host: string, port: int) -> TcpListener? {
+        if (host == "127.0.0.1") {
+            let fd = net_tcp_socket()
+            if (fd == INVALID || fd == 0) {
+                return none
+            }
+            let _ = net_set_reuseaddr(fd, 1)
+            let br = net_bind4(fd, 127, 0, 0, 1, port)
+            if (br != 0) {
+                let _ = net_close(fd)
+                return none
+            }
+            let lr = net_listen(fd, 128)
+            if (lr != 0) {
+                let _ = net_close(fd)
+                return none
+            }
+            return TcpListener(fd)
+        }
+        none
+    }
+
+    /// Accept a connection (blocking). Returns none on failure.
+    fn accept() -> TcpStream? {
+        if (this.closed) { return none }
+        let cfd = net_accept(this.fd)
+        if (cfd == INVALID || cfd == 0) {
+            return none
+        }
+        TcpStream(cfd)
+    }
+
+    fn localPort() -> int {
+        if (this.closed) { return -1 }
+        net_local_port4(this.fd)
+    }
+
+    fn close() {
+        if (!this.closed) {
+            let _ = net_close(this.fd)
+            this.closed = true
+            this.fd = INVALID
+        }
+    }
+}

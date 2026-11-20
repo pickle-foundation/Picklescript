@@ -1,0 +1,48 @@
+﻿module std.net_test
+
+import { TcpListener, TcpStream } from std.net
+
+test fn loopback_roundtrip() {
+    match (TcpListener.bind("127.0.0.1", 0)) {
+        case some(l) -> {
+            let port = l.localPort()
+            expect(port > 0).toBe(true)
+            match (TcpStream.connect("127.0.0.1", port)) {
+                case some(c) -> {
+                    match (l.accept()) {
+                        case some(s) -> {
+                            // client -> server
+                            var msg = [0x68 as byte, 0x69 as byte, 0x0a as byte] // "hi\n"
+                            let sent = c.write(msg)
+                            expect(sent).toBe(3)
+                            let got = s.read(3)
+                            expect(len(got)).toBe(3)
+                            expect(got[0] as int).toBe(104)
+                            expect(got[1] as int).toBe(105)
+                            expect(got[2] as int).toBe(10)
+                            // server -> client
+                            var reply = [0x6f as byte, 0x6b as byte]
+                            expect(s.write(reply)).toBe(2)
+                            let got2 = c.read(2)
+                            expect(len(got2)).toBe(2)
+                            expect(got2[0] as int).toBe(111)
+                            expect(got2[1] as int).toBe(107)
+                            s.close()
+                        }
+                        case none -> {
+                            expect(false).toBe(true)
+                        }
+                    }
+                    c.close()
+                }
+                case none -> {
+                    expect(false).toBe(true)
+                }
+            }
+            l.close()
+        }
+        case none -> {
+            expect(false).toBe(true)
+        }
+    }
+}
