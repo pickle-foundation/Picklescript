@@ -7,6 +7,45 @@ module std.net
 import { net_tcp_socket, net_close, net_shutdown, net_bind4, net_listen, net_accept, net_connect4, net_send, net_recv, net_local_port4, net_peer_port4, net_set_reuseaddr } from runtime.abi_net
 
 const INVALID: int = -1
+const SHUT_RD: int = 0
+const SHUT_WR: int = 1
+const SHUT_RDWR: int = 2
+
+fn parseIPv4(host: string) -> List<int>? {
+    let n = len(host)
+    if (n <= 0) { return none }
+    var oct = 0
+    var digits = 0
+    var val = 0
+    var a = -1
+    var b = -1
+    var c = -1
+    var d = -1
+    var i = 0
+    while (i < n) {
+        let ch = host[i] as int
+        if (ch == 46) { // '.'
+            if (digits == 0 || oct >= 3) { return none }
+            if (oct == 0) { a = val }
+            if (oct == 1) { b = val }
+            if (oct == 2) { c = val }
+            oct = oct + 1
+            digits = 0
+            val = 0
+        } else {
+            if (ch < 48 || ch > 57) { return none }
+            if (digits >= 3) { return none }
+            val = val * 10 + (ch - 48)
+            if (val > 255) { return none }
+            digits = digits + 1
+        }
+        i = i + 1
+    }
+    if (oct != 3 || digits == 0) { return none }
+    d = val
+    if (a < 0 || b < 0 || c < 0) { return none }
+    [a, b, c, d]
+}
 
 class TcpStream {
     var fd: int
@@ -19,19 +58,23 @@ class TcpStream {
 
     /// Connect to numeric IPv4 host:port. Returns none on failure.
     static fn connect(host: string, port: int) -> TcpStream? {
-        if (host == "127.0.0.1") {
-            let fd = net_tcp_socket()
-            if (fd == INVALID || fd == 0) {
+        match (parseIPv4(host)) {
+            case some(o) -> {
+                let fd = net_tcp_socket()
+                if (fd == INVALID || fd == 0) {
+                    return none
+                }
+                let rc = net_connect4(fd, o[0], o[1], o[2], o[3], port)
+                if (rc != 0) {
+                    let _ = net_close(fd)
+                    return none
+                }
+                return TcpStream(fd)
+            }
+            case none -> {
                 return none
             }
-            let rc = net_connect4(fd, 127, 0, 0, 1, port)
-            if (rc != 0) {
-                let _ = net_close(fd)
-                return none
-            }
-            return TcpStream(fd)
         }
-        none
     }
 
     /// Read up to n bytes. Returns empty list on EOF/error.
@@ -57,6 +100,25 @@ class TcpStream {
                 }
             }
             free(buf)
+        }
+        out
+    }
+
+    /// Read exactly n bytes. Returns none on EOF/error before n bytes.
+    fn readExact(n: int) -> List<byte>? {
+        if (n <= 0) { return bytes("") }
+        var out = bytes("")
+        var need = n
+        while (need > 0) {
+            let chunk = this.read(need)
+            let got = len(chunk)
+            if (got <= 0) { return none }
+            var i = 0
+            while (i < got) {
+                out.push(chunk[i])
+                i = i + 1
+            }
+            need = need - got
         }
         out
     }
@@ -87,6 +149,24 @@ class TcpStream {
             free(buf)
             return sent
         }
+    }
+
+    /// Write all bytes. Returns true only if the full buffer was sent.
+    fn writeAll(data: List<byte>) -> bool {
+        let n = len(data)
+        var off = 0
+        while (off < n) {
+            var chunk = bytes("")
+            var i = off
+            while (i < n) {
+                chunk.push(data[i])
+                i = i + 1
+            }
+            let sent = this.write(chunk)
+            if (sent <= 0) { return false }
+            off = off + sent
+        }
+        true
     }
 
     /// Best-effort close.
@@ -125,25 +205,29 @@ class TcpListener {
 
     /// Bind to numeric IPv4 host:port and listen. port 0 = ephemeral.
     static fn bind(host: string, port: int) -> TcpListener? {
-        if (host == "127.0.0.1") {
-            let fd = net_tcp_socket()
-            if (fd == INVALID || fd == 0) {
+        match (parseIPv4(host)) {
+            case some(o) -> {
+                let fd = net_tcp_socket()
+                if (fd == INVALID || fd == 0) {
+                    return none
+                }
+                let _ = net_set_reuseaddr(fd, 1)
+                let br = net_bind4(fd, o[0], o[1], o[2], o[3], port)
+                if (br != 0) {
+                    let _ = net_close(fd)
+                    return none
+                }
+                let lr = net_listen(fd, 128)
+                if (lr != 0) {
+                    let _ = net_close(fd)
+                    return none
+                }
+                return TcpListener(fd)
+            }
+            case none -> {
                 return none
             }
-            let _ = net_set_reuseaddr(fd, 1)
-            let br = net_bind4(fd, 127, 0, 0, 1, port)
-            if (br != 0) {
-                let _ = net_close(fd)
-                return none
-            }
-            let lr = net_listen(fd, 128)
-            if (lr != 0) {
-                let _ = net_close(fd)
-                return none
-            }
-            return TcpListener(fd)
         }
-        none
     }
 
     /// Accept a connection (blocking). Returns none on failure.

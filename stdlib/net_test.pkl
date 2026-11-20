@@ -1,6 +1,6 @@
 ﻿module std.net_test
 
-import { TcpListener, TcpStream } from std.net
+import { TcpListener, TcpStream, SHUT_WR } from std.net
 
 test fn loopback_roundtrip() {
     match (TcpListener.bind("127.0.0.1", 0)) {
@@ -43,6 +43,82 @@ test fn loopback_roundtrip() {
         }
         case none -> {
             expect(false).toBe(true)
+        }
+    }
+}
+
+test fn write_all_read_exact_and_shutdown() {
+    match (TcpListener.bind("127.0.0.1", 0)) {
+        case some(l) -> {
+            let port = l.localPort()
+            match (TcpStream.connect("127.0.0.1", port)) {
+                case some(c) -> {
+                    match (l.accept()) {
+                        case some(s) -> {
+                            var msg = [0x61 as byte, 0x62 as byte, 0x63 as byte, 0x64 as byte]
+                            expect(c.writeAll(msg)).toBe(true)
+                            match (s.readExact(4)) {
+                                case some(got) -> {
+                                    expect(len(got)).toBe(4)
+                                    expect(got[0] as int).toBe(97)
+                                    expect(got[1] as int).toBe(98)
+                                    expect(got[2] as int).toBe(99)
+                                    expect(got[3] as int).toBe(100)
+                                }
+                                case none -> {
+                                    expect(false).toBe(true)
+                                }
+                            }
+                            // signal EOF to peer readExact
+                            expect(c.shutdown(SHUT_WR) >= -1).toBe(true)
+                            match (s.readExact(1)) {
+                                case some(_) -> {
+                                    expect(false).toBe(true)
+                                }
+                                case none -> {
+                                    expect(true).toBe(true)
+                                }
+                            }
+                            s.close()
+                        }
+                        case none -> {
+                            expect(false).toBe(true)
+                        }
+                    }
+                    c.close()
+                }
+                case none -> {
+                    expect(false).toBe(true)
+                }
+            }
+            l.close()
+        }
+        case none -> {
+            expect(false).toBe(true)
+        }
+    }
+}
+
+test fn invalid_numeric_ipv4_rejected() {
+    match (TcpStream.connect("256.0.0.1", 1)) {
+        case some(_) -> { expect(false).toBe(true) }
+        case none -> { expect(true).toBe(true) }
+    }
+    match (TcpStream.connect("1.2.3", 1)) {
+        case some(_) -> { expect(false).toBe(true) }
+        case none -> { expect(true).toBe(true) }
+    }
+    match (TcpStream.connect("abc", 1)) {
+        case some(_) -> { expect(false).toBe(true) }
+        case none -> { expect(true).toBe(true) }
+    }
+    match (TcpListener.bind("1.2.3.4.5", 0)) {
+        case some(l) -> {
+            l.close()
+            expect(false).toBe(true)
+        }
+        case none -> {
+            expect(true).toBe(true)
         }
     }
 }
