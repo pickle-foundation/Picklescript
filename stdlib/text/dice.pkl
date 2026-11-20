@@ -1,0 +1,86 @@
+module std.text.dice
+
+// Sorensen-Dice coefficient over byte bigrams.
+//
+// A bigram is a pair of adjacent bytes. `coefficientPercent` returns
+// `200 * common / (bigrams(a) + bigrams(b))` as an integer percentage with
+// floor division, where `common` counts bigrams present in both strings with
+// multiplicity. When either string has fewer than two bytes there are no
+// bigrams: the result is `100` if the strings are byte-identical and `0`
+// otherwise.
+//
+// Comparisons are byte-for-byte, so a multi-byte UTF-8 scalar counts as its
+// bytes. This is cheap and deterministic, suited to fuzzy matching rather than
+// linguistic comparison.
+
+/// The number of byte bigrams in `s` (`len(bytes(s)) - 1`, at least 0).
+fn bigramCount(s: string) -> int {
+    let n = len(bytes(s))
+    if (n < 2) {
+        return 0
+    }
+    n - 1
+}
+
+/// Byte bigrams of `s`, in order, each stored as a two-byte string.
+fn bigrams(s: string) -> List<string> {
+    let bs = bytes(s)
+    var out: List<string> = [""]
+    out.remove(0)
+    if (len(bs) < 2) {
+        return out
+    }
+    var i = 0
+    while (i + 1 < len(bs)) {
+        var pair: List<byte> = [0 as byte]
+        pair.remove(0)
+        pair.push(bs[i])
+        pair.push(bs[i + 1])
+        out.push(str(pair))
+        i = i + 1
+    }
+    out
+}
+
+/// Number of bigrams common to `a` and `b`, counting multiplicity.
+fn commonCount(a: string, b: string) -> int {
+    let aa = bigrams(a)
+    let bb = bigrams(b)
+    var used: List<bool> = [false]
+    used.remove(0)
+    var j = 0
+    while (j < len(bb)) {
+        used.push(false)
+        j = j + 1
+    }
+    var common = 0
+    var i = 0
+    while (i < len(aa)) {
+        var found = false
+        j = 0
+        while (j < len(bb) && !found) {
+            if (!used[j] && aa[i] == bb[j]) {
+                used[j] = true
+                found = true
+                common = common + 1
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    common
+}
+
+/// Sorensen-Dice coefficient as an integer percentage (0-100).
+fn coefficientPercent(a: string, b: string) -> int {
+    let na = bigramCount(a)
+    let nb = bigramCount(b)
+    if (na == 0 || nb == 0) {
+        if (a == b) {
+            return 100
+        }
+        return 0
+    }
+    let common = commonCount(a, b)
+    200 * common / (na + nb)
+}

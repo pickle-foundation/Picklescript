@@ -1,0 +1,108 @@
+module std.text.dice_test
+
+import { bigramCount, bigrams, commonCount, coefficientPercent } from std.text.dice
+
+/// A string list rendered as `[a|b|c]`.
+fn showParts(xs: List<string>) -> string {
+    var out = "["
+    var i = 0
+    while (i < len(xs)) {
+        if (i > 0) {
+            out = out + "|"
+        }
+        out = out + xs[i]
+        i = i + 1
+    }
+    out + "]"
+}
+
+/// A string built by repeating `part` `times` times.
+fn repeats(part: string, times: int) -> string {
+    var out = ""
+    var i = 0
+    while (i < times) {
+        out = out + part
+        i = i + 1
+    }
+    out
+}
+
+test fn bigram_counts() {
+    expect(bigramCount("")).toBe(0)
+    expect(bigramCount("a")).toBe(0)
+    expect(bigramCount("ab")).toBe(1)
+    expect(bigramCount("abc")).toBe(2)
+    expect(bigramCount("night")).toBe(4)
+}
+
+test fn bigram_lists() {
+    expect(showParts(bigrams(""))).toBe("[]")
+    expect(showParts(bigrams("a"))).toBe("[]")
+    expect(showParts(bigrams("ab"))).toBe("[ab]")
+    expect(showParts(bigrams("abc"))).toBe("[ab|bc]")
+    expect(showParts(bigrams("night"))).toBe("[ni|ig|gh|ht]")
+    expect(showParts(bigrams("aaaa"))).toBe("[aa|aa|aa]")
+}
+
+test fn common_bigrams() {
+    expect(commonCount("night", "nacht")).toBe(1)
+    expect(commonCount("abc", "abc")).toBe(2)
+    expect(commonCount("abc", "xyz")).toBe(0)
+    expect(commonCount("aaaa", "aa")).toBe(1)
+    expect(commonCount("abcd", "abdc")).toBe(1)
+}
+
+test fn classic_vectors() {
+    expect(coefficientPercent("night", "nacht")).toBe(25)
+    expect(coefficientPercent("abc", "abc")).toBe(100)
+    expect(coefficientPercent("abc", "xyz")).toBe(0)
+    expect(coefficientPercent("abcd", "abdc")).toBe(33)
+    expect(coefficientPercent("context", "contact")).toBe(50)
+}
+
+test fn short_and_empty_inputs() {
+    expect(coefficientPercent("", "")).toBe(100)
+    expect(coefficientPercent("a", "a")).toBe(100)
+    expect(coefficientPercent("a", "b")).toBe(0)
+    expect(coefficientPercent("", "a")).toBe(0)
+    expect(coefficientPercent("a", "")).toBe(0)
+    expect(coefficientPercent("ab", "")).toBe(0)
+    expect(coefficientPercent("", "ab")).toBe(0)
+    expect(coefficientPercent("ab", "a")).toBe(0)
+}
+
+test fn symmetry() {
+    let left = ["night", "abc", "context", "aaaa", "", "héllo"]
+    let right = ["nacht", "xyz", "contact", "aa", "x", "hallo"]
+    var i = 0
+    while (i < len(left)) {
+        expect(coefficientPercent(left[i], right[i])).toBe(coefficientPercent(right[i], left[i]))
+        i = i + 1
+    }
+}
+
+test fn byte_semantics_for_unicode() {
+    // Multi-byte UTF-8 scalars count as their bytes. "café" and "cafe" share
+    // the leading bytes "ca" and "af" as bigrams.
+    expect(bigramCount("café")).toBe(4)
+    expect(bigramCount("cafe")).toBe(3)
+    expect(coefficientPercent("café", "cafe")).toBe(57)
+    expect(coefficientPercent("héllo", "héllo")).toBe(100)
+    expect(coefficientPercent("héllo", "hallo")).toBe(44)
+}
+
+test fn repeated_bigrams_count_with_multiplicity() {
+    expect(coefficientPercent("aaaa", "aaaa")).toBe(100)
+    expect(coefficientPercent("aaaa", "aa")).toBe(50)
+    expect(coefficientPercent("abab", "baba")).toBe(66)
+}
+
+test fn long_inputs() {
+    let a200 = repeats("a", 200)
+    let b200 = repeats("b", 200)
+    let ab = repeats("ab", 50)
+    expect(coefficientPercent(a200, a200)).toBe(100)
+    expect(coefficientPercent(a200, b200)).toBe(0)
+    expect(coefficientPercent(ab, ab)).toBe(100)
+    expect(coefficientPercent(ab, repeats("ab", 25))).toBe(66)
+}
