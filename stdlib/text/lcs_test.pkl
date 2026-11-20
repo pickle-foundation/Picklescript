@@ -1,0 +1,133 @@
+module std.text.lcs_test
+
+import { length, distance, similarity } from std.text.lcs
+
+/// A string built by repeating `part` `times` times.
+fn repeats(part: string, times: int) -> string {
+    var out = ""
+    var i = 0
+    while (i < times) {
+        out = out + part
+        i = i + 1
+    }
+    out
+}
+
+/// The candidate with the longest common subsequence with `query`.
+fn bestMatch(query: string, candidates: List<string>) -> string {
+    var best = ""
+    var bestLen = -1
+    var i = 0
+    while (i < len(candidates)) {
+        let l = length(query, candidates[i])
+        if (l > bestLen) {
+            bestLen = l
+            best = candidates[i]
+        }
+        i = i + 1
+    }
+    best
+}
+
+test fn empty_inputs() {
+    expect(length("", "")).toBe(0)
+    expect(length("", "abc")).toBe(0)
+    expect(length("abc", "")).toBe(0)
+    expect(distance("", "")).toBe(0)
+    expect(distance("", "abc")).toBe(3)
+    expect(distance("abc", "")).toBe(3)
+}
+
+test fn identical_strings() {
+    expect(length("abc", "abc")).toBe(3)
+    expect(length("a", "a")).toBe(1)
+    expect(length("abcde", "abcde")).toBe(5)
+    expect(distance("abc", "abc")).toBe(0)
+    expect(distance("abcde", "abcde")).toBe(0)
+}
+
+test fn no_common_subsequence() {
+    expect(length("abc", "xyz")).toBe(0)
+    expect(length("aaaa", "bbbb")).toBe(0)
+    expect(distance("abc", "xyz")).toBe(6)
+}
+
+test fn classic_vectors() {
+    expect(length("ABCBDAB", "BDCABA")).toBe(4)
+    expect(length("AGGTAB", "GXTXAYB")).toBe(4)
+    expect(length("XMJYAUZ", "MZJAWXU")).toBe(4)
+    expect(length("abcdgh", "aedfhr")).toBe(3)
+    expect(length("abc", "ac")).toBe(2)
+    expect(length("abcdef", "ace")).toBe(3)
+    expect(length("abcde", "ace")).toBe(3)
+}
+
+test fn insert_delete_distance() {
+    expect(distance("ABCBDAB", "BDCABA")).toBe(5)
+    expect(distance("AGGTAB", "GXTXAYB")).toBe(5)
+    expect(distance("abcdgh", "aedfhr")).toBe(6)
+    expect(distance("abc", "ac")).toBe(1)
+    expect(distance("kitten", "sitting")).toBe(5)
+}
+
+test fn symmetry_and_bounds() {
+    let left = ["ABCBDAB", "kitten", "abc", "", "café", "abcdef"]
+    let right = ["BDCABA", "sitting", "acb", "xyz", "cafe", "ace"]
+    var i = 0
+    while (i < len(left)) {
+        let a = left[i]
+        let b = right[i]
+        expect(length(a, b)).toBe(length(b, a))
+        expect(distance(a, b)).toBe(distance(b, a))
+        expect(similarity(a, b)).toBe(similarity(b, a))
+        let la = len(bytes(a))
+        let lb = len(bytes(b))
+        let l = length(a, b)
+        expect(l >= 0).toBe(true)
+        expect(l <= la).toBe(true)
+        expect(l <= lb).toBe(true)
+        expect(distance(a, b)).toBe(la + lb - 2 * l)
+        i = i + 1
+    }
+}
+
+test fn byte_semantics_for_unicode() {
+    // Multi-byte UTF-8 scalars count as their bytes.
+    expect(length("café", "cafe")).toBe(3)
+    expect(distance("café", "cafe")).toBe(3)
+    expect(length("é", "e")).toBe(0)
+    expect(distance("é", "e")).toBe(3)
+    expect(length("héllo", "hello")).toBe(4)
+}
+
+test fn similarity_values() {
+    expect(similarity("", "")).toBe(100)
+    expect(similarity("abc", "abc")).toBe(100)
+    expect(similarity("", "abc")).toBe(0)
+    expect(similarity("abc", "xyz")).toBe(0)
+    expect(similarity("abc", "ac")).toBe(66)
+    expect(similarity("abcdgh", "aedfhr")).toBe(50)
+    expect(similarity("café", "cafe")).toBe(60)
+}
+
+test fn long_inputs() {
+    let a200 = repeats("a", 200)
+    let b200 = repeats("b", 200)
+    let ab = repeats("ab", 100)
+    let ac = repeats("ac", 100)
+    expect(length(a200, a200)).toBe(200)
+    expect(length(a200, b200)).toBe(0)
+    expect(distance(a200, b200)).toBe(400)
+    expect(length(ab, ab)).toBe(200)
+    expect(length(ab, ac)).toBe(100)
+    expect(distance(ab, ac)).toBe(200)
+}
+
+test fn a_small_pipeline() {
+    let candidates = ["ABCBDAB", "BDCABA", "AGGTAB", "zzzzz"]
+    expect(bestMatch("ABCBDAB", candidates)).toBe("ABCBDAB")
+    expect(bestMatch("BDCAB", candidates)).toBe("BDCABA")
+    expect(length("BDCAB", "ABCBDAB")).toBe(4)
+    expect(length("BDCAB", "BDCABA")).toBe(5)
+    expect(distance("ABCBDAB", "BDCABA")).toBe(5)
+}
