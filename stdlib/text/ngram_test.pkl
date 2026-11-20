@@ -1,0 +1,123 @@
+module std.text.ngram_test
+
+import { count, ngrams, bigrams, trigrams } from std.text.ngram
+
+/// A string list rendered as `[a|b|c]`.
+fn showParts(xs: List<string>) -> string {
+    var out = "["
+    var i = 0
+    while (i < len(xs)) {
+        if (i > 0) {
+            out = out + "|"
+        }
+        out = out + xs[i]
+        i = i + 1
+    }
+    out + "]"
+}
+
+/// A string built by repeating `part` `times` times.
+fn repeats(part: string, times: int) -> string {
+    var out = ""
+    var i = 0
+    while (i < times) {
+        out = out + part
+        i = i + 1
+    }
+    out
+}
+
+test fn counts() {
+    expect(count("", 1)).toBe(0)
+    expect(count("abc", 0)).toBe(0)
+    expect(count("abc", -1)).toBe(0)
+    expect(count("abc", 1)).toBe(3)
+    expect(count("abc", 2)).toBe(2)
+    expect(count("abc", 3)).toBe(1)
+    expect(count("abc", 4)).toBe(0)
+    expect(count("aaaa", 2)).toBe(3)
+}
+
+test fn unigrams() {
+    expect(showParts(ngrams("", 1))).toBe("[]")
+    expect(showParts(ngrams("abc", 1))).toBe("[a|b|c]")
+    expect(showParts(ngrams("ab", 1))).toBe("[a|b]")
+}
+
+test fn bigrams_and_trigrams() {
+    expect(showParts(bigrams("abc"))).toBe("[ab|bc]")
+    expect(showParts(bigrams("abcd"))).toBe("[ab|bc|cd]")
+    expect(showParts(bigrams("a"))).toBe("[]")
+    expect(showParts(trigrams("abcd"))).toBe("[abc|bcd]")
+    expect(showParts(trigrams("abc"))).toBe("[abc]")
+    expect(showParts(trigrams("ab"))).toBe("[]")
+}
+
+test fn larger_n() {
+    expect(showParts(ngrams("abcdef", 4))).toBe("[abcd|bcde|cdef]")
+    expect(showParts(ngrams("abcdef", 6))).toBe("[abcdef]")
+    expect(showParts(ngrams("abcdef", 7))).toBe("[]")
+}
+
+test fn overlaps_and_repeats() {
+    expect(showParts(ngrams("aaaa", 2))).toBe("[aa|aa|aa]")
+    expect(showParts(ngrams("abab", 2))).toBe("[ab|ba|ab]")
+    expect(showParts(ngrams("banana", 2))).toBe("[ba|an|na|an|na]")
+}
+
+test fn byte_semantics_for_unicode() {
+    // "é" is 2 bytes (C3 A9), so "café" is 5 bytes: c,a,f,C3,A9.
+    expect(count("café", 2)).toBe(4)
+    let bg = bigrams("café")
+    expect(len(bg)).toBe(4)
+    expect(bg[0]).toBe("ca")
+    expect(bg[1]).toBe("af")
+    expect(bg[3]).toBe("é")
+    var broken: List<byte> = [0x66 as byte]
+    broken.remove(0)
+    broken.push(0x66 as byte)
+    broken.push(0xC3 as byte)
+    expect(bg[2]).toBe(str(broken))
+    expect(count("hé", 1)).toBe(3)
+    let ug = ngrams("hé", 1)
+    expect(len(ug)).toBe(3)
+    expect(ug[0]).toBe("h")
+    var e1: List<byte> = [0xC3 as byte]
+    e1.remove(0)
+    e1.push(0xC3 as byte)
+    var e2: List<byte> = [0xA9 as byte]
+    e2.remove(0)
+    e2.push(0xA9 as byte)
+    expect(ug[1]).toBe(str(e1))
+    expect(ug[2]).toBe(str(e2))
+}
+
+test fn consistency() {
+    let samples = ["", "a", "ab", "abc", "abcdef", "café"]
+    var i = 0
+    while (i < len(samples)) {
+        let s = samples[i]
+        var n = 0
+        while (n <= 5) {
+            let gs = ngrams(s, n)
+            expect(len(gs)).toBe(count(s, n))
+            if (n == 2) {
+                expect(showParts(gs)).toBe(showParts(bigrams(s)))
+            }
+            if (n == 3) {
+                expect(showParts(gs)).toBe(showParts(trigrams(s)))
+            }
+            n = n + 1
+        }
+        i = i + 1
+    }
+}
+
+test fn long_inputs() {
+    let a200 = repeats("a", 200)
+    let gs = ngrams(a200, 3)
+    expect(len(gs)).toBe(198)
+    expect(gs[0]).toBe("aaa")
+    expect(gs[197]).toBe("aaa")
+    expect(showParts(ngrams(repeats("ab", 3), 2))).toBe("[ab|ba|ab|ba|ab]")
+}
