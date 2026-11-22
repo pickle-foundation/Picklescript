@@ -3938,6 +3938,68 @@ class X64Emitter {
         this.cb.stsd(0, this.kOfTemp(d))
     }
 
+    /// `pickle_unbox_bool` inlined: `abiUnboxBool` is `boxBits(obj) != 0`, one
+    /// payload load and a comparison. The result is materialised as a byte so
+    /// it matches the 8-bit representation every Bool temp uses.
+    fn emitInlineUnboxBool(d: int, objT: int) {
+        this.loadTmp(1, 64, objT)
+        this.cb.u8(0x48)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x41)
+        this.cb.u8(24)
+        this.cb.u8(0x48)
+        this.cb.u8(0x85)
+        this.cb.u8(0xC0)
+        this.cb.u8(0x0F)
+        this.cb.u8(0x95)
+        this.cb.u8(0xC0)
+        this.putRes(d, 8, this.kOfTemp(d))
+    }
+
+    /// `pickle_box_bool`'s two shared singletons, inlined. After the first use
+    /// of each value `abiBoxBool` is a global load and a return; reaching it
+    /// through the extern still costs a call and the shadow frame its
+    /// allocating first-use path needs. Probe the matching singleton here and
+    /// fall back to the real entry point when it is still zero. The argument
+    /// stays in rcx for the fallback.
+    fn emitInlineBoxBool(d: int, arg: int) {
+        this.loadTmp(1, 8, arg)
+        let slow = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        let isFalse = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        let joined = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        let done = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        // test cl, cl; je isFalse
+        this.cb.u8(0x84)
+        this.cb.u8(0xC9)
+        this.emitJcc(0x04, isFalse)
+        this.cb.movabsReloc(0, "pkl_global_trueBox")
+        this.emitJmp(joined)
+        this.starts[isFalse] = this.cb.size()
+        this.cb.movabsReloc(0, "pkl_global_falseBox")
+        this.starts[joined] = this.cb.size()
+        // rax = *slot; a zero singleton is the allocating path.
+        this.cb.u8(0x48)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x00)
+        this.cb.u8(0x48)
+        this.cb.u8(0x85)
+        this.cb.u8(0xC0)
+        this.emitJcc(0x04, slow)
+        this.emitJmp(done)
+        this.starts[slow] = this.cb.size()
+        this.cb.movabsReloc(10, "pickle_box_bool")
+        this.cb.u8(0x41)
+        this.cb.u8(0xFF)
+        this.cb.u8(0xD2)
+        this.starts[done] = this.cb.size()
+        this.clobberRcx()
+        this.putRes(d, 64, this.kOfTemp(d))
+    }
+
     /// `pickle_box_i64`'s shared-small-value cache, inlined. The benchmark's
     /// map updates box `0..48` on every `m[k] = m[k] + 1`, and `abiBoxI64`
     /// answers those from `smallBoxTab` without allocating. Reaching that
@@ -4924,6 +4986,24 @@ class X64Emitter {
             match (d) {
                 case some(dd) -> {
                     this.emitInlineUnbox(dd, args[0])
+                    return
+                }
+                case none -> {}
+            }
+        }
+        if (sum == "pickle_unbox_bool" && len(args) == 1) {
+            match (d) {
+                case some(dd) -> {
+                    this.emitInlineUnboxBool(dd, args[0])
+                    return
+                }
+                case none -> {}
+            }
+        }
+        if (sum == "pickle_box_bool" && len(args) == 1) {
+            match (d) {
+                case some(dd) -> {
+                    this.emitInlineBoxBool(dd, args[0])
                     return
                 }
                 case none -> {}
