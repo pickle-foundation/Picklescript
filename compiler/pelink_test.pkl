@@ -1,0 +1,77 @@
+module compiler.pelink_test
+
+import { baseRelocBlob, read64, write64 } from compiler.pelink
+
+test fn read64_reassembles_little_endian() {
+    let bs = [0xE0, 0xA9, 0x05, 0x40, 0x01, 0, 0, 0]
+    expect(read64(bs, 0)).toBe(0x14005A9E0)
+}
+
+test fn read64_sign_extends_the_top_bit() {
+    let bs = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+    expect(read64(bs, 0)).toBe(0 - 1)
+}
+
+test fn read64_honours_the_offset() {
+    let bs = [0xAA, 0xBB, 0x34, 0x12, 0, 0, 0, 0, 0, 0]
+    expect(read64(bs, 2)).toBe(0x1234)
+}
+
+test fn type1_site_preserves_its_addend() {
+    let bs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    write64(bs, 2, 0x20)
+    write64(bs, 2, 0x140000000 + read64(bs, 2))
+    expect(read64(bs, 2)).toBe(0x140000020)
+}
+
+test fn reloc_blob_groups_by_page_and_pads() {
+    let blob = baseRelocBlob([0x1006, 0x1006, 0x1010, 0x2004])
+    expect(len(blob)).toBe(24)
+    expect(blob[0]).toBe(0x00)
+    expect(blob[1]).toBe(0x10)
+    expect(blob[2]).toBe(0x00)
+    expect(blob[3]).toBe(0x00)
+    expect(blob[4]).toBe(0x0C)
+    expect(blob[5]).toBe(0x00)
+    expect(blob[6]).toBe(0x00)
+    expect(blob[7]).toBe(0x00)
+    expect(blob[8]).toBe(0x06)
+    expect(blob[9]).toBe(0xA0)
+    expect(blob[10]).toBe(0x10)
+    expect(blob[11]).toBe(0xA0)
+    expect(blob[12]).toBe(0x00)
+    expect(blob[13]).toBe(0x20)
+    expect(blob[14]).toBe(0x00)
+    expect(blob[15]).toBe(0x00)
+    expect(blob[16]).toBe(0x0C)
+    expect(blob[17]).toBe(0x00)
+    expect(blob[18]).toBe(0x00)
+    expect(blob[19]).toBe(0x00)
+    expect(blob[20]).toBe(0x04)
+    expect(blob[21]).toBe(0xA0)
+    expect(blob[22]).toBe(0x00)
+    expect(blob[23]).toBe(0x00)
+}
+
+test fn reloc_blob_sorts_sites() {
+    let blob = baseRelocBlob([0x2004, 0x1010, 0x1006])
+    expect(len(blob)).toBe(24)
+    expect(blob[0]).toBe(0x00)
+    expect(blob[1]).toBe(0x10)
+    expect(blob[8]).toBe(0x06)
+    expect(blob[10]).toBe(0x10)
+    expect(blob[13]).toBe(0x20)
+}
+
+test fn reloc_blob_handles_many_pages() {
+    let blob = baseRelocBlob([0x1006, 0x2004, 0x3002])
+    expect(len(blob)).toBe(36)
+    expect(blob[1]).toBe(0x10)
+    expect(blob[13]).toBe(0x20)
+    expect(blob[25]).toBe(0x30)
+}
+
+test fn reloc_blob_of_no_sites_is_empty() {
+    let blob = baseRelocBlob(List<int>())
+    expect(len(blob)).toBe(0)
+}

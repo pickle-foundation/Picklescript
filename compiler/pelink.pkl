@@ -46,6 +46,47 @@ fn push64(bs: List<int>, v: int) {
     }
 }
 
+fn push32(bs: List<int>, v: int) {
+    var i = 0
+    while (i < 4) {
+        bs.push((v >> (8 * i)) & 255)
+        i = i + 1
+    }
+}
+
+/// PE base-relocation blob (`IMAGE_BASE_RELOCATION` blocks) for every 8-byte
+/// absolute site the linker writes. The sites are RVAs. Windows relocates an
+/// image whose preferred base is taken (mandatory ASLR / ForceRelocateImages),
+/// and without this table every baked-in absolute VA points at the old base.
+/// Entries are `IMAGE_REL_BASED_DIR64` (type 10); each block is padded to a
+/// 4-byte boundary with an `IMAGE_REL_BASED_ABSOLUTE` (type 0) entry.
+fn baseRelocBlob(sites: List<int>) -> List<int> {
+    sites.sort()
+    var out = List<int>()
+    var i = 0
+    while (i < len(sites)) {
+        let page = (sites[i] / 4096) * 4096
+        let entries = List<int>()
+        while (i < len(sites) && sites[i] < page + 4096) {
+            let word = 0xA000 + (sites[i] - page)
+            if (len(entries) == 0 || entries[len(entries) - 1] != word) {
+                entries.push(word)
+            }
+            i = i + 1
+        }
+        if (len(entries) % 2 == 1) {
+            entries.push(0)
+        }
+        push32(out, page)
+        push32(out, 8 + 2 * len(entries))
+        for (e in entries) {
+            out.push(e & 255)
+            out.push((e >> 8) & 255)
+        }
+    }
+    out
+}
+
 fn write64(bs: List<int>, at: int, v: int) {
     var i = 0
     while (i < 8) {
@@ -73,6 +114,18 @@ fn read32s(bs: List<int>, at: int) -> int {
         v = v - 0x100000000
     }
     return v
+}
+
+/// Read an 8-byte little-endian addend. `int` is 64-bit two's complement, so a
+/// value with the top bit set is already sign-extended after the final OR.
+fn read64(bs: List<int>, at: int) -> int {
+    var v = 0
+    var i = 0
+    while (i < 8) {
+        v = v | (bs[at + i] << (8 * i))
+        i = i + 1
+    }
+    v
 }
 
 fn zerosInts(n: int) -> List<int> {
@@ -299,7 +352,8 @@ fn buildExe(ob: CoffObj, mainName: string, fb: FailBox) -> List<int>? {
         ri0 = ri0 + 1
     }
 
-    var sectionCount = 1
+    // .text is always present; the synthesized .reloc section is always last.
+    var sectionCount = 2
     var ri = 0
     while (ri < len(ob.secs)) {
         let cs = ob.secs[ri]
@@ -543,6 +597,12 @@ fn buildExe(ob: CoffObj, mainName: string, fb: FailBox) -> List<int>? {
     }
     let importsFileSize = algn(importsSize, 0x200)
 
+    // `.reloc` follows `.idata`. Its byte size is known only after the
+    // relocation pass below fills `relocSites`, but both addresses can be
+    // reserved now: the blob is last, so it cannot move anything else.
+    let relocRva = algn(importsRva + importsSize, 0x1000)
+    let relocFileOff = algn(importsFileOff + importsFileSize, 0x200)
+
     var body = [0]
     body.pop()
     var b = 0
@@ -594,9 +654,13 @@ fn buildExe(ob: CoffObj, mainName: string, fb: FailBox) -> List<int>? {
     let initVa = imageBase + secRva[0] + preText + ob.syms[initIdx].value
     let mainVa = imageBase + secRva[0] + preText + ob.syms[mainIdx].value
     let flushVa = imageBase + secRva[0] + preText + ob.syms[flushIdx].value
+    var relocSites = List<int>()
     write64(body, 6, initVa)
+    relocSites.push(textRva + 6)
     write64(body, 21, mainVa)
+    relocSites.push(textRva + 21)
     write64(body, 34, flushVa)
+    relocSites.push(textRva + 34)
     let ex = importIndex(importIndexMap, "ExitProcess")
     if (ex < 0) {
         fb.text = "no ExitProcess import"
@@ -604,6 +668,7 @@ fn buildExe(ob: CoffObj, mainName: string, fb: FailBox) -> List<int>? {
     }
     if (let some(es) = iatSlot.get("ExitProcess")) {
         write64(body, 49, imageBase + importsRva + es)
+        relocSites.push(textRva + 49)
     }
 
     ri = 0
@@ -657,11 +722,18 @@ fn buildExe(ob: CoffObj, mainName: string, fb: FailBox) -> List<int>? {
                     return none
                 }
                 if (rl.type == 1) {
-                    write64(body, site, tgt)
+                    // IMAGE_REL_AMD64_ADDR64 is S + A: preserve the COFF addend
+                    // normally stored at the site by the assembler.
+                    let addend = read64(body, site)
+                    write64(body, site, tgt + addend)
+                    relocSites.push(siteAbs - imageBase)
                 } else if (rl.type == 4) {
+                    // IMAGE_REL_AMD64_REL32 is S + A - P; P is the field end.
                     write32(body, site, tgt + read32s(body, site) - (siteAbs + 4))
                 } else if (rl.type == 3) {
-                    u32wBlob(body, site, tgt - imageBase)
+                    // IMAGE_REL_AMD64_ADDR32NB is S + A - ImageBase.
+                    let addend = read32s(body, site)
+                    u32wBlob(body, site, tgt - imageBase + addend)
                 } else {
                     fb.text = "unsupported reloc type " + str(rl.type)
                     return none
@@ -672,6 +744,12 @@ fn buildExe(ob: CoffObj, mainName: string, fb: FailBox) -> List<int>? {
         ri = ri + 1
     }
 
+    let relocBlob = baseRelocBlob(relocSites)
+    if (len(relocBlob) == 0) {
+        fb.text = "no base relocation sites"
+        return none
+    }
+    let relocFileSize = algn(len(relocBlob), 0x200)
     let textSz = secFileSize[0]
     var initDataSize = 0
     var uninitDataSize = 0
@@ -688,8 +766,20 @@ fn buildExe(ob: CoffObj, mainName: string, fb: FailBox) -> List<int>? {
         }
         ri = ri + 1
     }
-    initDataSize = initDataSize + importsFileSize
-    let sizeOfImage = algn(importsRva + algn(importsSize, 0x1000), 0x1000)
+    initDataSize = initDataSize + importsFileSize + relocFileSize
+    let sizeOfImage = algn(relocRva + algn(len(relocBlob), 0x1000), 0x1000)
+
+    while (len(body) < relocFileOff) {
+        body.push(0)
+    }
+    var rb = 0
+    while (rb < len(relocBlob)) {
+        body.push(relocBlob[rb])
+        rb = rb + 1
+    }
+    while (len(body) < relocFileOff + relocFileSize) {
+        body.push(0)
+    }
 
     var head = [0]
     head.pop()
@@ -739,7 +829,9 @@ fn buildExe(ob: CoffObj, mainName: string, fb: FailBox) -> List<int>? {
     u32wBlob(head, 0xD4, headerSize)
     u32wBlob(head, 0xD8, 0)
     u16Blob(head, 0xDC, 3)
-    u16Blob(head, 0xDE, 0)
+    // DYNAMICBASE: the image carries a .reloc table, so let the loader pick an
+    // ASLR base. Mandatory ASLR would relocate it anyway when configured.
+    u16Blob(head, 0xDE, 0x40)
     // Stack reserve/commit. Pickle's lowering is recursive and its per-function
     // frames are large (every managed value needs a GC root cell), so the
     // linker's 1 MiB default runs out while compiling even small programs. The
@@ -753,6 +845,8 @@ fn buildExe(ob: CoffObj, mainName: string, fb: FailBox) -> List<int>? {
     u32wBlob(head, 0x104, 16)
     u32wBlob(head, 0x110, importsRva)
     u32wBlob(head, 0x114, 20 * (dllCount + 1))
+    u32wBlob(head, 0x130, relocRva)
+    u32wBlob(head, 0x134, len(relocBlob))
 
     var headerCount = 0
     var hDst = 0x188
@@ -779,6 +873,9 @@ fn buildExe(ob: CoffObj, mainName: string, fb: FailBox) -> List<int>? {
         ri = ri + 1
     }
     secHdr(head, hDst, ".idata", importsSize, importsRva, importsFileSize, importsFileOff + headerSize, 0xC0000040)
+    headerCount = headerCount + 1
+    hDst = hDst + 40
+    secHdr(head, hDst, ".reloc", len(relocBlob), relocRva, relocFileSize, relocFileOff + headerSize, 0x42000040)
     headerCount = headerCount + 1
     if (headerCount != sectionCount) {
         fb.text = "section count mismatch"
