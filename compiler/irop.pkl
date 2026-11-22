@@ -1,0 +1,786 @@
+module compiler.irop
+
+import { Callee, IrBlock, IrFunc, IrInstr, IrModule, IrTerm, IrTy, IrConst, IrUnOp, IrBinOp } from compiler.ir
+
+// ---------------------------------------------------------------------------
+// IR optimisation, run before x64 lowering.
+//
+// The emitter in `compiler.x64` lowers each IR instruction literally: every
+// temp gets its own stack home, every constant is materialised into a temp, and
+// every `load slot` re-reads memory. That is a faithful first backend, but the
+// generated code spends most of its instructions moving values between homes.
+//
+// The pass is deliberately local (per straight-line block) so it needs no
+// dominance or liveness machinery:
+//
+//   * load CSE      - `load slot s` after another `load slot s` in the same
+//                     block aliases the earlier temp. A store to `s`, `&s`, a
+//                     raw store or a call (when `s`'s address escaped anywhere
+//                     in the function) invalidates the alias.
+//   * copy prop     - `t = copy v` renames `t` to `v`.
+//   * constant fold - Int/UnOp/BinOp whose operands are constants defined
+//                     earlier in the same block.
+//   * algebraic ids - `x + 0`, `x * 1`, `x & -1`, `x ^ x`, `x == x`, ...
+//   * DCE           - drops pure definitions nothing uses, iterated to a fixed
+//                     point. Div/Mod and raw loads stay: they can trap.
+//
+// Temps are assigned once in the IR (`emitcore` allocates a fresh id per
+// definition), so aliasing a temp to an earlier one cannot change a later
+// definition's meaning. A temp is only dropped when every use of it lives in
+// the same block - a use in another block still needs a real definition.
+// ---------------------------------------------------------------------------
+
+/// A no-op with type `Empty`, so a match arm ending in control flow still types
+/// as unit. Folding zero instructions must not change the arm's type.
+fn oUnit() {
+}
+
+/// Type of a constant. Mirrors `compiler.x64.constTy`; duplicated because
+/// `compiler.x64` imports this pass and importing the backend back would be a
+/// module cycle.
+fn oConstTy(c: IrConst) -> IrTy {
+    match (c) {
+        case IrConst.Int(_) -> IrTy.Int
+        case IrConst.Float(_) -> IrTy.Float
+        case IrConst.Bool(_) -> IrTy.Bool
+        case IrConst.Char(_) -> IrTy.Char
+        case IrConst.Null -> IrTy.Ptr
+        case IrConst.Str(_) -> IrTy.Str
+        case IrConst.StrAddr(_) -> IrTy.Int
+        case IrConst.FuncAddr(_) -> IrTy.Int
+    }
+}
+
+fn oDefTy(types: Map<int, IrTy>, v: int) -> IrTy {
+    if (types.has(v)) {
+        types[v]
+    } else {
+        IrTy.Ptr
+    }
+}
+
+fn oIsCmp(op: IrBinOp) -> bool {
+    match (op) {
+        case IrBinOp.Eq -> true
+        case IrBinOp.Ne -> true
+        case IrBinOp.Lt -> true
+        case IrBinOp.Le -> true
+        case IrBinOp.Gt -> true
+        case IrBinOp.Ge -> true
+        case _ -> false
+    }
+}
+
+fn oI64Min() -> int {
+    (0 - 0x7FFFFFFFFFFFFFFF) - 1
+}
+
+fn oAbs(v: int) -> int {
+    if (v < 0) {
+        0 - v
+    } else {
+        v
+    }
+}
+
+/// Solve the alias chain for `t`, stopping on a temp with no alias.
+fn oResolve(alias: Map<int, int>, t: int) -> int {
+    var cur = t
+    var hops = 0
+    while (alias.has(cur) && hops < 1000000) {
+        cur = alias[cur]
+        hops = hops + 1
+    }
+    cur
+}
+
+/// A folded constant plus whether folding was possible. A plain `IrConst`
+/// cannot represent "no fold" without an option, and the checker wants every
+/// match arm on an option to agree on its type, so the pair is a class.
+class OFold {
+    var ok: bool
+    var c: IrConst
+
+    constructor(ok: bool, c: IrConst) {
+        this.ok = ok
+        this.c = c
+    }
+}
+
+/// which temp holds each slot's current value in this block
+class OAlias {
+    var alias: Map<int, int>
+    var slotVal: Map<int, int>
+
+    constructor() {
+        this.alias = Map<int, int>()
+        this.slotVal = Map<int, int>()
+    }
+}
+
+/// Slots whose address was taken anywhere in the function. A call or a raw
+/// store can write through such an escaped pointer, so the load cache has to be
+/// dropped at those barriers. A slot that is never addressed cannot be reached
+/// from outside the block and survives calls.
+class OAddrs {
+    var taken: Map<int, bool>
+    var any: bool
+
+    constructor() {
+        this.taken = Map<int, bool>()
+        this.any = false
+    }
+}
+
+/// Where each temp is defined and whether it is used outside that block. A
+/// temp with a foreign use cannot be renamed away: the other block still reads
+/// its home, so the defining instruction has to stay.
+class OUses {
+    var defBlock: Map<int, int>
+    var foreign: Map<int, bool>
+
+    constructor() {
+        this.defBlock = Map<int, int>()
+        this.foreign = Map<int, bool>()
+    }
+}
+
+fn oSetTy(types: Map<int, IrTy>, d: int, ty: IrTy) {
+    types[d] = ty
+}
+
+fn oTyOfUn(types: Map<int, IrTy>, d: int, op: IrUnOp, v: int) {
+    if (op == IrUnOp.Not) {
+        types[d] = IrTy.Bool
+    } else {
+        types[d] = oDefTy(types, v)
+    }
+}
+
+fn oTyOfBin(types: Map<int, IrTy>, d: int, op: IrBinOp, a: int) {
+    if (oIsCmp(op)) {
+        types[d] = IrTy.Bool
+    } else {
+        types[d] = oDefTy(types, a)
+    }
+}
+
+fn oTyOfCall(m: IrModule, types: Map<int, IrTy>, d: int?, callee: Callee) {
+    if (let some(dd) = d) {
+        match (callee) {
+            case Callee.Func(id) -> types[dd] = m.funcs[id].ret
+            case Callee.Extern(id) -> types[dd] = m.externs[id].ret
+        }
+    }
+}
+
+fn oTypesOf(m: IrModule, f: IrFunc) -> Map<int, IrTy> {
+    var types = Map<int, IrTy>()
+    for (b in f.blocks) {
+        for (ins in b.instrs) {
+            match (ins) {
+                case IrInstr.Const(d, c) -> oSetTy(types, d, oConstTy(c))
+                case IrInstr.UnOp(d, op, v) -> oTyOfUn(types, d, op, v)
+                case IrInstr.BinOp(d, op, a, b2) -> oTyOfBin(types, d, op, a)
+                case IrInstr.Copy(d, v) -> oSetTy(types, d, oDefTy(types, v))
+                case IrInstr.Itof(d, v) -> oSetTy(types, d, IrTy.Float)
+                case IrInstr.Ftoi(d, v) -> oSetTy(types, d, IrTy.Int)
+                case IrInstr.Chartoi(d, v) -> oSetTy(types, d, IrTy.Int)
+                case IrInstr.Itochar(d, v) -> oSetTy(types, d, IrTy.Char)
+                case IrInstr.LoadSlot(d, s) -> oSetTy(types, d, f.slots[s])
+                case IrInstr.StoreSlot(s, v) -> oUnit()
+                case IrInstr.LocalAddr(d, s) -> oSetTy(types, d, IrTy.Int)
+                case IrInstr.LoadRaw(d, addr, ty) -> oSetTy(types, d, ty)
+                case IrInstr.StoreRaw(addr, v, ty) -> oUnit()
+                case IrInstr.GlobalAddr(d, id) -> oSetTy(types, d, IrTy.Int)
+                case IrInstr.LoadGlobal(d, id, ty) -> oSetTy(types, d, ty)
+                case IrInstr.StoreGlobal(id, v, ty) -> oUnit()
+                case IrInstr.Call(d, callee, args) -> oTyOfCall(m, types, d, callee)
+                case IrInstr.CallInd(d, fnAddr, params, ret, args) -> {
+                    if (let some(dd) = d) {
+                        types[dd] = ret
+                    }
+                    oUnit()
+                }
+            }
+        }
+    }
+    types
+}
+
+fn oMarkAddr(a: OAddrs, s: int) {
+    a.taken[s] = true
+    a.any = true
+}
+
+fn oAddrTaken(f: IrFunc) -> OAddrs {
+    var out = OAddrs()
+    for (b in f.blocks) {
+        for (ins in b.instrs) {
+            match (ins) {
+                case IrInstr.LocalAddr(d, s) -> oMarkAddr(out, s)
+                case _ -> oUnit()
+            }
+        }
+    }
+    out
+}
+
+/// Def temp of an instruction, or -1 for instructions with no destination.
+fn oDstOf(ins: IrInstr) -> int {
+    match (ins) {
+        case IrInstr.Const(d, c) -> d
+        case IrInstr.UnOp(d, op, v) -> d
+        case IrInstr.BinOp(d, op, a, b) -> d
+        case IrInstr.Copy(d, v) -> d
+        case IrInstr.Itof(d, v) -> d
+        case IrInstr.Ftoi(d, v) -> d
+        case IrInstr.Chartoi(d, v) -> d
+        case IrInstr.Itochar(d, v) -> d
+        case IrInstr.LoadSlot(d, s) -> d
+        case IrInstr.StoreSlot(s, v) -> -1
+        case IrInstr.LocalAddr(d, s) -> d
+        case IrInstr.LoadRaw(d, addr, ty) -> d
+        case IrInstr.StoreRaw(addr, v, ty) -> -1
+        case IrInstr.GlobalAddr(d, id) -> d
+        case IrInstr.LoadGlobal(d, id, ty) -> d
+        case IrInstr.StoreGlobal(id, v, ty) -> -1
+        case IrInstr.Call(d, callee, args) -> {
+            var out = -1
+            if (let some(dd) = d) {
+                out = dd
+            }
+            out
+        }
+        case IrInstr.CallInd(d, fnAddr, params, ret, args) -> {
+            var out = -1
+            if (let some(dd) = d) {
+                out = dd
+            }
+            out
+        }
+    }
+}
+
+/// Record the block each temp is defined in, then flag temps whose definition
+/// block differs from a use block.
+fn oUsesOf(f: IrFunc) -> OUses {
+    var u = OUses()
+    for (b in f.blocks) {
+        for (ins in b.instrs) {
+            let d = oDstOf(ins)
+            if (d >= 0) {
+                u.defBlock[d] = b.id
+            }
+        }
+    }
+    for (b in f.blocks) {
+        for (ins in b.instrs) {
+            oNoteUses(ins, b.id, u)
+        }
+        oNoteTermUses(b.term, b.id, u)
+    }
+    u
+}
+
+fn oNoteUse(t: int, blk: int, u: OUses) {
+    if (u.defBlock.has(t) && u.defBlock[t] != blk) {
+        u.foreign[t] = true
+    }
+}
+
+fn oNoteUses(ins: IrInstr, blk: int, u: OUses) {
+    match (ins) {
+        case IrInstr.Const(d, c) -> oUnit()
+        case IrInstr.UnOp(d, op, v) -> oNoteUse(v, blk, u)
+        case IrInstr.BinOp(d, op, a, b) -> {
+            oNoteUse(a, blk, u)
+            oNoteUse(b, blk, u)
+        }
+        case IrInstr.Copy(d, v) -> oNoteUse(v, blk, u)
+        case IrInstr.Itof(d, v) -> oNoteUse(v, blk, u)
+        case IrInstr.Ftoi(d, v) -> oNoteUse(v, blk, u)
+        case IrInstr.Chartoi(d, v) -> oNoteUse(v, blk, u)
+        case IrInstr.Itochar(d, v) -> oNoteUse(v, blk, u)
+        case IrInstr.LoadSlot(d, s) -> oUnit()
+        case IrInstr.StoreSlot(s, v) -> oNoteUse(v, blk, u)
+        case IrInstr.LocalAddr(d, s) -> oUnit()
+        case IrInstr.LoadRaw(d, addr, ty) -> oNoteUse(addr, blk, u)
+        case IrInstr.StoreRaw(addr, v, ty) -> {
+            oNoteUse(addr, blk, u)
+            oNoteUse(v, blk, u)
+        }
+        case IrInstr.GlobalAddr(d, id) -> oUnit()
+        case IrInstr.LoadGlobal(d, id, ty) -> oUnit()
+        case IrInstr.StoreGlobal(id, v, ty) -> oNoteUse(v, blk, u)
+        case IrInstr.Call(d, callee, args) -> {
+            for (a in args) {
+                oNoteUse(a, blk, u)
+            }
+            oUnit()
+        }
+        case IrInstr.CallInd(d, fnAddr, params, ret, args) -> {
+            oNoteUse(fnAddr, blk, u)
+            for (a in args) {
+                oNoteUse(a, blk, u)
+            }
+            oUnit()
+        }
+    }
+}
+
+fn oNoteTermUses(term: IrTerm, blk: int, u: OUses) {
+    match (term) {
+        case IrTerm.Branch(target) -> oUnit()
+        case IrTerm.BranchIf(cond, thenV, elseV) -> oNoteUse(cond, blk, u)
+        case IrTerm.Return(v) -> {
+            if (let some(vv) = v) {
+                oNoteUse(vv, blk, u)
+            }
+            oUnit()
+        }
+        case IrTerm.Unreachable -> oUnit()
+    }
+}
+
+/// Constant result of an integer binary op, or `ok == false` when folding would
+/// change the instruction's observable behaviour (division by zero, or the
+/// `i64::MIN` cases where the hardware traps or the magnitude overflows).
+fn oFoldBin(op: IrBinOp, a: int, b: int) -> OFold {
+    match (op) {
+        case IrBinOp.Add -> OFold(true, IrConst.Int(a + b))
+        case IrBinOp.Sub -> OFold(true, IrConst.Int(a - b))
+        case IrBinOp.Mul -> OFold(true, IrConst.Int(a * b))
+        case IrBinOp.Div -> {
+            if (b == 0 || a == oI64Min() || b == oI64Min()) {
+                OFold(false, IrConst.Int(0))
+            } else {
+                let q = oAbs(a) / oAbs(b)
+                if ((a < 0) != (b < 0)) {
+                    OFold(true, IrConst.Int(0 - q))
+                } else {
+                    OFold(true, IrConst.Int(q))
+                }
+            }
+        }
+        case IrBinOp.Mod -> {
+            if (b == 0 || a == oI64Min() || b == oI64Min()) {
+                OFold(false, IrConst.Int(0))
+            } else {
+                let r = oAbs(a) % oAbs(b)
+                if (a < 0) {
+                    OFold(true, IrConst.Int(0 - r))
+                } else {
+                    OFold(true, IrConst.Int(r))
+                }
+            }
+        }
+        case IrBinOp.Shl -> {
+            // x86 masks a 64-bit shift count to 6 bits; fold the same way.
+            OFold(true, IrConst.Int(a << (b & 63)))
+        }
+        case IrBinOp.Shr -> OFold(true, IrConst.Int(a >> (b & 63)))
+        case IrBinOp.BitAnd -> OFold(true, IrConst.Int(a & b))
+        case IrBinOp.BitOr -> OFold(true, IrConst.Int(a | b))
+        case IrBinOp.BitXor -> OFold(true, IrConst.Int(a ^ b))
+        case IrBinOp.Eq -> OFold(true, IrConst.Bool(a == b))
+        case IrBinOp.Ne -> OFold(true, IrConst.Bool(a != b))
+        case IrBinOp.Lt -> OFold(true, IrConst.Bool(a < b))
+        case IrBinOp.Le -> OFold(true, IrConst.Bool(a <= b))
+        case IrBinOp.Gt -> OFold(true, IrConst.Bool(a > b))
+        case IrBinOp.Ge -> OFold(true, IrConst.Bool(a >= b))
+    }
+}
+
+/// When `x op k` (or `k op x`) is exactly `x`, return the operand temp id;
+/// otherwise -1. Only called for non-float operand types.
+fn oIdentity(op: IrBinOp, a: int, b: int, consts: Map<int, int>) -> int {
+    match (op) {
+        case IrBinOp.Add -> {
+            if (consts.has(b) && consts[b] == 0) {
+                a
+            } else if (consts.has(a) && consts[a] == 0) {
+                b
+            } else {
+                -1
+            }
+        }
+        case IrBinOp.Sub -> {
+            if (consts.has(b) && consts[b] == 0) {
+                a
+            } else {
+                -1
+            }
+        }
+        case IrBinOp.Mul -> {
+            if (consts.has(b) && consts[b] == 1) {
+                a
+            } else if (consts.has(a) && consts[a] == 1) {
+                b
+            } else {
+                -1
+            }
+        }
+        case IrBinOp.Div -> {
+            if (consts.has(b) && consts[b] == 1) {
+                a
+            } else {
+                -1
+            }
+        }
+        case IrBinOp.BitAnd -> {
+            if (consts.has(b) && consts[b] == 0 - 1) {
+                a
+            } else if (consts.has(a) && consts[a] == 0 - 1) {
+                b
+            } else {
+                -1
+            }
+        }
+        case IrBinOp.BitOr -> {
+            if (consts.has(b) && consts[b] == 0) {
+                a
+            } else if (consts.has(a) && consts[a] == 0) {
+                b
+            } else {
+                -1
+            }
+        }
+        case IrBinOp.BitXor -> {
+            if (consts.has(b) && consts[b] == 0) {
+                a
+            } else if (consts.has(a) && consts[a] == 0) {
+                b
+            } else {
+                -1
+            }
+        }
+        case IrBinOp.Shl -> {
+            if (consts.has(b) && consts[b] == 0) {
+                a
+            } else {
+                -1
+            }
+        }
+        case IrBinOp.Shr -> {
+            if (consts.has(b) && consts[b] == 0) {
+                a
+            } else {
+                -1
+            }
+        }
+        case _ -> -1
+    }
+}
+
+/// Ops whose result is the constant zero for a zero operand (or for identical
+/// operands). `x / 0` and `x % 0` are deliberately absent - they trap.
+fn oIsZeroResult(op: IrBinOp, a: int, b: int, consts: Map<int, int>) -> bool {
+    match (op) {
+        case IrBinOp.Mul -> (consts.has(a) && consts[a] == 0) || (consts.has(b) && consts[b] == 0)
+        case IrBinOp.Mod -> consts.has(b) && consts[b] == 1
+        case IrBinOp.BitAnd -> (consts.has(a) && consts[a] == 0) || (consts.has(b) && consts[b] == 0)
+        case IrBinOp.Sub -> a == b
+        case IrBinOp.BitXor -> a == b
+        case _ -> false
+    }
+}
+
+fn oRecordConst(d: int, c: IrConst, ints: Map<int, int>, bools: Map<int, bool>) {
+    if (let IrConst.Int(v) = c) {
+        ints[d] = v
+    }
+    if (let IrConst.Bool(bv) = c) {
+        bools[d] = bv
+    }
+}
+
+fn oClearIfAddressed(st: OAlias, addrs: OAddrs) {
+    if (addrs.any) {
+        st.slotVal = Map<int, int>()
+    }
+}
+
+fn oResolveList(alias: Map<int, int>, ts: List<int>) -> List<int> {
+    var out = List<int>()
+    for (t in ts) {
+        out.push(oResolve(alias, t))
+    }
+    out
+}
+
+fn oRewriteBlock(f: IrFunc, types: Map<int, IrTy>, addrs: OAddrs, foreign: Map<int, bool>, blk: IrBlock) -> IrBlock {
+    let st = OAlias()
+    var out = List<IrInstr>()
+    var ints = Map<int, int>()
+    var bools = Map<int, bool>()
+    for (ins in blk.instrs) {
+        match (ins) {
+            case IrInstr.Const(d, c) -> {
+                oRecordConst(d, c, ints, bools)
+                out.push(ins)
+            }
+            case IrInstr.UnOp(d, op, v) -> {
+                let rv = oResolve(st.alias, v)
+                let tv = oDefTy(types, rv)
+                var done = false
+                if (op == IrUnOp.Not && bools.has(rv)) {
+                    let nb = !bools[rv]
+                    oRecordConst(d, IrConst.Bool(nb), ints, bools)
+                    out.push(IrInstr.Const(d, IrConst.Bool(nb)))
+                    done = true
+                }
+                if (!done && op == IrUnOp.Neg && tv == IrTy.Int && ints.has(rv)) {
+                    let nv = 0 - ints[rv]
+                    oRecordConst(d, IrConst.Int(nv), ints, bools)
+                    out.push(IrInstr.Const(d, IrConst.Int(nv)))
+                    done = true
+                }
+                if (!done && op == IrUnOp.BitNot && tv == IrTy.Int && ints.has(rv)) {
+                    let nv = ~ints[rv]
+                    oRecordConst(d, IrConst.Int(nv), ints, bools)
+                    out.push(IrInstr.Const(d, IrConst.Int(nv)))
+                    done = true
+                }
+                if (!done) {
+                    out.push(IrInstr.UnOp(d, op, rv))
+                }
+                oUnit()
+            }
+            case IrInstr.BinOp(d, op, a, b) -> {
+                let ra = oResolve(st.alias, a)
+                let rb = oResolve(st.alias, b)
+                let ta = oDefTy(types, ra)
+                let tb = oDefTy(types, rb)
+                var done = false
+                var folded: OFold? = none
+                if (ta == IrTy.Int && tb == IrTy.Int && ints.has(ra) && ints.has(rb)) {
+                    let fr = oFoldBin(op, ints[ra], ints[rb])
+                    if (fr.ok) {
+                        folded = fr
+                        done = true
+                    }
+                }
+                if (let some(fr) = folded) {
+                    oRecordConst(d, fr.c, ints, bools)
+                    out.push(IrInstr.Const(d, fr.c))
+                }
+                if (!done && ta != IrTy.Float && oIsCmp(op) && ra == rb) {
+                    let tv = op == IrBinOp.Eq || op == IrBinOp.Le || op == IrBinOp.Ge
+                    oRecordConst(d, IrConst.Bool(tv), ints, bools)
+                    out.push(IrInstr.Const(d, IrConst.Bool(tv)))
+                    done = true
+                }
+                if (!done && ta != IrTy.Float && !foreign.has(d)) {
+                    let id = oIdentity(op, ra, rb, ints)
+                    if (id >= 0) {
+                        st.alias[d] = id
+                        done = true
+                    }
+                }
+                if (!done && ta != IrTy.Float && oIsZeroResult(op, ra, rb, ints)) {
+                    oRecordConst(d, IrConst.Int(0), ints, bools)
+                    out.push(IrInstr.Const(d, IrConst.Int(0)))
+                    done = true
+                }
+                if (!done) {
+                    out.push(IrInstr.BinOp(d, op, ra, rb))
+                }
+                oUnit()
+            }
+            case IrInstr.Copy(d, v) -> {
+                let rv = oResolve(st.alias, v)
+                var done = false
+                if (!foreign.has(d) && oDefTy(types, rv) == oDefTy(types, d)) {
+                    st.alias[d] = rv
+                    done = true
+                }
+                if (!done) {
+                    out.push(IrInstr.Copy(d, rv))
+                }
+                oUnit()
+            }
+            case IrInstr.Itof(d, v) -> out.push(IrInstr.Itof(d, oResolve(st.alias, v)))
+            case IrInstr.Ftoi(d, v) -> out.push(IrInstr.Ftoi(d, oResolve(st.alias, v)))
+            case IrInstr.Chartoi(d, v) -> out.push(IrInstr.Chartoi(d, oResolve(st.alias, v)))
+            case IrInstr.Itochar(d, v) -> out.push(IrInstr.Itochar(d, oResolve(st.alias, v)))
+            case IrInstr.LoadSlot(d, s) -> {
+                var done = false
+                if (!foreign.has(d) && st.slotVal.has(s) && oDefTy(types, st.slotVal[s]) == oDefTy(types, d)) {
+                    st.alias[d] = st.slotVal[s]
+                    done = true
+                }
+                if (!done) {
+                    out.push(IrInstr.LoadSlot(d, s))
+                    st.slotVal[s] = d
+                }
+                oUnit()
+            }
+            case IrInstr.StoreSlot(s, v) -> {
+                let rv = oResolve(st.alias, v)
+                if (oDefTy(types, rv) == f.slots[s]) {
+                    st.slotVal[s] = rv
+                }
+                if (!(oDefTy(types, rv) == f.slots[s])) {
+                    st.slotVal.remove(s)
+                }
+                out.push(IrInstr.StoreSlot(s, rv))
+            }
+            case IrInstr.LocalAddr(d, s) -> {
+                st.slotVal.remove(s)
+                out.push(IrInstr.LocalAddr(d, s))
+            }
+            case IrInstr.LoadRaw(d, addr, ty) -> out.push(IrInstr.LoadRaw(d, oResolve(st.alias, addr), ty))
+            case IrInstr.StoreRaw(addr, v, ty) -> {
+                out.push(IrInstr.StoreRaw(oResolve(st.alias, addr), oResolve(st.alias, v), ty))
+                oClearIfAddressed(st, addrs)
+            }
+            case IrInstr.GlobalAddr(d, id) -> out.push(ins)
+            case IrInstr.LoadGlobal(d, id, ty) -> out.push(ins)
+            case IrInstr.StoreGlobal(id, v, ty) -> out.push(IrInstr.StoreGlobal(id, oResolve(st.alias, v), ty))
+            case IrInstr.Call(d, callee, args) -> {
+                out.push(IrInstr.Call(d, callee, oResolveList(st.alias, args)))
+                oClearIfAddressed(st, addrs)
+            }
+            case IrInstr.CallInd(d, fnAddr, params, ret, args) -> {
+                out.push(IrInstr.CallInd(d, oResolve(st.alias, fnAddr), params, ret, oResolveList(st.alias, args)))
+                oClearIfAddressed(st, addrs)
+            }
+        }
+    }
+    var term = blk.term
+    if (let IrTerm.BranchIf(cond, thenV, elseV) = blk.term) {
+        term = IrTerm.BranchIf(oResolve(st.alias, cond), thenV, elseV)
+    }
+    if (let IrTerm.Return(v) = blk.term) {
+        if (let some(vv) = v) {
+            term = IrTerm.Return(oResolve(st.alias, vv))
+        }
+    }
+    IrBlock(blk.id, out, term)
+}
+
+fn oMarkUses(instrs: List<IrInstr>, term: IrTerm, used: Map<int, bool>) {
+    for (ins in instrs) {
+        match (ins) {
+            case IrInstr.Const(d, c) -> oUnit()
+            case IrInstr.UnOp(d, op, v) -> oUseTmp(used, v)
+            case IrInstr.BinOp(d, op, a, b) -> {
+                oUseTmp(used, a)
+                oUseTmp(used, b)
+            }
+            case IrInstr.Copy(d, v) -> oUseTmp(used, v)
+            case IrInstr.Itof(d, v) -> oUseTmp(used, v)
+            case IrInstr.Ftoi(d, v) -> oUseTmp(used, v)
+            case IrInstr.Chartoi(d, v) -> oUseTmp(used, v)
+            case IrInstr.Itochar(d, v) -> oUseTmp(used, v)
+            case IrInstr.LoadSlot(d, s) -> oUnit()
+            case IrInstr.StoreSlot(s, v) -> oUseTmp(used, v)
+            case IrInstr.LocalAddr(d, s) -> oUnit()
+            case IrInstr.GlobalAddr(d, id) -> oUnit()
+            case IrInstr.LoadGlobal(d, id, ty) -> oUnit()
+            case IrInstr.StoreGlobal(id, v, ty) -> oUseTmp(used, v)
+            case IrInstr.LoadRaw(d, addr, ty) -> oUseTmp(used, addr)
+            case IrInstr.StoreRaw(addr, v, ty) -> {
+                oUseTmp(used, addr)
+                oUseTmp(used, v)
+            }
+            case IrInstr.Call(d, callee, args) -> {
+                for (a in args) {
+                    oUseTmp(used, a)
+                }
+                oUnit()
+            }
+            case IrInstr.CallInd(d, fnAddr, params, ret, args) -> {
+                oUseTmp(used, fnAddr)
+                for (a in args) {
+                    oUseTmp(used, a)
+                }
+                oUnit()
+            }
+        }
+    }
+    match (term) {
+        case IrTerm.Branch(target) -> oUnit()
+        case IrTerm.BranchIf(cond, thenV, elseV) -> oUseTmp(used, cond)
+        case IrTerm.Return(v) -> {
+            if (let some(vv) = v) {
+                oUseTmp(used, vv)
+            }
+            oUnit()
+        }
+        case IrTerm.Unreachable -> oUnit()
+    }
+}
+
+fn oUseTmp(used: Map<int, bool>, t: int) {
+    used[t] = true
+}
+
+/// True when dropping an unused definition cannot lose an observable effect.
+/// `Div`/`Mod` are excluded because a zero divisor traps, `LoadRaw`/`StoreRaw`
+/// because a bad address faults, and calls/stores are always kept.
+fn oIsPureDef(ins: IrInstr) -> bool {
+    match (ins) {
+        case IrInstr.Const(d, c) -> true
+        case IrInstr.UnOp(d, op, v) -> true
+        case IrInstr.BinOp(d, op, a, b) -> !(op == IrBinOp.Div || op == IrBinOp.Mod)
+        case IrInstr.Copy(d, v) -> true
+        case IrInstr.Itof(d, v) -> true
+        case IrInstr.Ftoi(d, v) -> true
+        case IrInstr.Chartoi(d, v) -> true
+        case IrInstr.Itochar(d, v) -> true
+        case IrInstr.LoadSlot(d, s) -> true
+        case IrInstr.LocalAddr(d, s) -> true
+        case IrInstr.GlobalAddr(d, id) -> true
+        case IrInstr.LoadGlobal(d, id, ty) -> true
+        case _ -> false
+    }
+}
+
+/// One DCE round; returns whether anything was dropped. Callers iterate to the
+/// fixed point so chains of dead definitions collapse too.
+fn oDceRound(f: IrFunc) -> bool {
+    var used = Map<int, bool>()
+    for (b in f.blocks) {
+        oMarkUses(b.instrs, b.term, used)
+    }
+    var changed = false
+    for (b in f.blocks) {
+        var kept = List<IrInstr>()
+        for (ins in b.instrs) {
+            let d = oDstOf(ins)
+            if (d >= 0 && oIsPureDef(ins) && !used.has(d)) {
+                changed = true
+            } else {
+                kept.push(ins)
+            }
+        }
+        b.instrs = kept
+    }
+    changed
+}
+
+fn optimizeFunc(m: IrModule, f: IrFunc) {
+    let types = oTypesOf(m, f)
+    let addrs = oAddrTaken(f)
+    let uses = oUsesOf(f)
+    var i = 0
+    while (i < len(f.blocks)) {
+        f.blocks[i] = oRewriteBlock(f, types, addrs, uses.foreign, f.blocks[i])
+        i = i + 1
+    }
+    var rounds = 0
+    var changed = true
+    while (changed && rounds < 8) {
+        changed = oDceRound(f)
+        rounds = rounds + 1
+    }
+}
+
+fn optimizeModule(m: IrModule) -> IrModule {
+    for (f in m.funcs) {
+        optimizeFunc(m, f)
+    }
+    m
+}
