@@ -51,7 +51,7 @@ import { abiStrCmp } from runtime.abi_string
 // the raw-allocation slots must travel with them. See `abi_raw.pkl`.
 // `abiRegisterObject` is here for the list *object*; the element span is raw
 // backing, never registered.
-import { abiRawAlloc, abiManagedAlloc, abiRegisterObject } from runtime.abi_raw
+import { abiRawAlloc, abiRawFree, abiManagedAlloc, abiRegisterObject } from runtime.abi_raw
 
 const LEN_WORD: int = 3
 const CAP_WORD: int = 4
@@ -314,9 +314,76 @@ fn elemLt(kind: int, a: *int, b: *int) -> bool {
     }
 }
 
+/// Merge two adjacent ascending int runs. Payload comparison is inlined: the
+/// generic `elemLt` seam costs a full function call per comparison, which
+/// dominated every int sort.
+fn mergeRunInt(data: *int, scratch: *int, lo: int, mid: int, hi: int) {
+    unsafe {
+        var i = lo
+        var j = mid
+        var k = lo
+        while (i < mid && j < hi) {
+            if ((data[j] as *int)[3] < (data[i] as *int)[3]) {
+                scratch[k] = data[j]
+                j = j + 1
+            } else {
+                scratch[k] = data[i]
+                i = i + 1
+            }
+            k = k + 1
+        }
+        while (i < mid) {
+            scratch[k] = data[i]
+            i = i + 1
+            k = k + 1
+        }
+        while (j < hi) {
+            scratch[k] = data[j]
+            j = j + 1
+            k = k + 1
+        }
+    }
+}
+
+/// Merge two adjacent ascending runs `[lo, mid)` and `[mid, hi)` from `data`
+/// into `scratch`. Stability comes from taking the right element only when it
+/// is strictly less than the left one, so equal keys keep their input order.
+fn mergeRun(data: *int, scratch: *int, lo: int, mid: int, hi: int, kind: int) {
+    unsafe {
+        var i = lo
+        var j = mid
+        var k = lo
+        while (i < mid && j < hi) {
+            if (elemLt(kind, data[j] as *int, data[i] as *int)) {
+                scratch[k] = data[j]
+                j = j + 1
+            } else {
+                scratch[k] = data[i]
+                i = i + 1
+            }
+            k = k + 1
+        }
+        while (i < mid) {
+            scratch[k] = data[i]
+            i = i + 1
+            k = k + 1
+        }
+        while (j < hi) {
+            scratch[k] = data[j]
+            j = j + 1
+            k = k + 1
+        }
+    }
+}
+
 /// In-place ascending order sort over boxed elements. Mirrors `pickle_list_sort`:
-/// insertion sort, stable for equal keys, so the result is byte-identical to the native
-/// body for every input including ones with duplicates.
+/// stable for equal keys, so the result is byte-identical to the native body for
+/// every input including ones with duplicates.
+///
+/// Bottom-up merge sort: O(n log n) time and O(n) scratch words, instead of the
+/// insertion sort's O(n^2). Each pass merges into raw scratch and copies back, so
+/// the list's element span always holds every live reference while the sort runs;
+/// the scratch block is deliberately raw and untraced.
 #[symbol("pickle_list_sort")]
 fn abiListSort(list: *int, kind: int) {
     unsafe {
@@ -325,17 +392,38 @@ fn abiListSort(list: *int, kind: int) {
             return
         }
         var data = list[DATA_WORD] as *int
-        var i = 1
-        while (i < n) {
-            var key = data[i] as *int
-            var j = i
-            while (j > 0 && elemLt(kind, key, data[j - 1] as *int)) {
-                data[j] = data[j - 1]
-                j = j - 1
+        var scratch = abiRawAlloc(n * 8) as *int
+        var width = 1
+        while (width < n) {
+            var i = 0
+            while (i < n) {
+                var mid = i + width
+                if (mid > n) {
+                    mid = n
+                }
+                var hi = mid + width
+                if (hi > n) {
+                    hi = n
+                }
+                if (mid < hi) {
+                    if (kind == SORT_INT) {
+                        mergeRunInt(data, scratch, i, mid, hi)
+                    } else {
+                        mergeRun(data, scratch, i, mid, hi, kind)
+                    }
+                } else {
+                    var c = i
+                    while (c < hi) {
+                        scratch[c] = data[c]
+                        c = c + 1
+                    }
+                }
+                i = i + width * 2
             }
-            data[j] = key as int
-            i = i + 1
+            memcpy(data, scratch, n * 8)
+            width = width * 2
         }
+        abiRawFree(scratch as int)
     }
 }
 
