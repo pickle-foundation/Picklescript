@@ -1018,7 +1018,10 @@ fn externMayCollect(sym: string) -> bool {
         || sym == "pickle_unbox_i64" || sym == "pickle_unbox_char"
         || sym == "pickle_unbox_bool" || sym == "pickle_unbox_f64"
         || sym == "pickle_fmod"
-        || sym == "pickle_obj_slot_get" || sym == "pickle_tuple_field"
+        || sym == "pickle_obj_slot_get" || sym == "pickle_obj_slot_set"
+        || sym == "pickle_tuple_field"
+        || sym == "pickle_enum_tag" || sym == "pickle_enum_field"
+        || sym == "pickle_enum_set_field"
         || sym == "pickle_enum_eq" || sym == "pickle_union_eq"
         || sym == "pickle_class_is" || sym == "pickle_int_pow"
         // Win32/CRT primitives: the heap, TLS, memory-copy and process-exit
@@ -2512,6 +2515,51 @@ class X64Emitter {
             case IrInstr.Itochar(d, v) -> {
                 return v == t && w == 64
             }
+            // Calls load their arguments before emitting the `call`, so a
+            // deferred result that is argument 0 is consumed by that first
+            // load. This is what keeps a just-computed slot/tag read from
+            // being stored and immediately reloaded for the unbox that
+            // follows it. Restrict to the shapes whose lowering really does
+            // start with `loadTmp(argReg, ..., args[0])`:
+            //   * the append-fuse rewrite drops or reorders `pickle_str_concat`
+            //     arguments, so it keeps the flush;
+            //   * the indirect-call address load comes after the arguments, so
+            //     only a plain argument-0 use qualifies there.
+            case IrInstr.Call(d, callee, args) -> {
+                if (len(args) == 0 || args[0] != t) {
+                    return false
+                }
+                var pt: IrTy = this.typeOfT(args[0])
+                match (callee) {
+                    case Callee.Func(id) -> {
+                        let f = this.m.funcs[id]
+                        if (len(f.params) == 0) {
+                            return false
+                        }
+                        pt = f.params[0].ty
+                    }
+                    case Callee.Extern(id) -> {
+                        let e = this.m.externs[id]
+                        if (e.symbol == "pickle_str_concat" && len(args) == 2) {
+                            return false
+                        }
+                        if (len(e.params) == 0) {
+                            return false
+                        }
+                        pt = e.params[0]
+                    }
+                }
+                if (isFloatTy(pt)) {
+                    return false
+                }
+                return tyWidth(pt) == w
+            }
+            case IrInstr.CallInd(d, fnAddr, params, ret, args) -> {
+                if (len(args) == 0 || args[0] != t || len(params) == 0) {
+                    return false
+                }
+                return !isFloatTy(params[0]) && tyWidth(params[0]) == w
+            }
             case _ -> {
                 return false
             }
@@ -3658,6 +3706,190 @@ class X64Emitter {
         this.putRes(d, 64, this.kOfTemp(d))
     }
 
+    /// `pickle_obj_slot_get(obj, slot)` inlined for a constant, non-negative
+    /// slot. Mirrors `abiObjSlotGet`: a null object answers null, and the bound
+    /// is `(size - 32) / 8` derived from the object's own stored size. The
+    /// runtime treats a size below `HEADER + 8` as -1, so every non-negative
+    /// slot is out of range there; a signed shift also leaves the bound
+    /// negative for every 8-aligned size below 32, which is the only shape the
+    /// allocator can store. Reading `slots` and the payload word is otherwise
+    /// exactly the two loads the runtime body performs.
+    ///
+    /// Every class field site in the front end passes `intConst`, so the index
+    /// never needs a register; the caller falls back to the real entry point
+    /// for a non-constant or wide index.
+    fn emitInlineObjSlotGet(d: int, objT: int, slot: int) {
+        this.loadTmp(1, 64, objT)
+        let nullL = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        let done = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        // test rcx, rcx; je null
+        this.cb.u8(0x48)
+        this.cb.u8(0x85)
+        this.cb.u8(0xC9)
+        this.emitJcc(0x04, nullL)
+        // rax = obj.size (word 2, byte 16)
+        this.cb.u8(0x48)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x41)
+        this.cb.u8(16)
+        // The runtime bound is `slot > (size - 32) / 8`. For an integer slot
+        // that is exactly `size < 32 + 8*slot`, which also covers every size
+        // below HEADER + 8 (where the runtime returns -1) without the
+        // subtract and shift.
+        // cmp rax, 32 + 8*slot; jl null
+        this.cb.u8(0x48)
+        this.cb.u8(0x3D)
+        this.cb.u32le(32 + 8 * slot)
+        this.emitJcc(0x0C, nullL)
+        // rax = obj.slots[slot] (byte 24 + 8*slot)
+        let disp = 24 + 8 * slot
+        this.cb.u8(0x48)
+        this.cb.u8(0x8B)
+        if (disp <= 127) {
+            this.cb.u8(0x41)
+            this.cb.u8(disp)
+        } else {
+            this.cb.u8(0x81)
+            this.cb.u32le(disp)
+        }
+        this.emitJmp(done)
+        this.starts[nullL] = this.cb.size()
+        // xor eax, eax
+        this.cb.u8(0x31)
+        this.cb.u8(0xC0)
+        this.starts[done] = this.cb.size()
+        this.putRes(d, 64, this.kOfTemp(d))
+    }
+
+    /// `pickle_obj_slot_set(obj, slot, value)` inlined for a constant,
+    /// non-negative slot. Same null and `(size - 32) >> 3` guard as the getter;
+    /// an out-of-range write is a silent no-op, exactly like `abiObjSlotSet`.
+    fn emitInlineObjSlotSet(objT: int, slot: int, valT: int) {
+        this.loadTmp(1, 64, objT)
+        this.loadTmp(2, 64, valT)
+        let done = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        // test rcx, rcx; je done
+        this.cb.u8(0x48)
+        this.cb.u8(0x85)
+        this.cb.u8(0xC9)
+        this.emitJcc(0x04, done)
+        // rax = obj.size
+        this.cb.u8(0x48)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x41)
+        this.cb.u8(16)
+        // `slot > (size - 32) / 8` is exactly `size < 32 + 8*slot` for an
+        // integer slot, and a size below HEADER + 8 leaves the bound negative
+        // either way, so the subtract and shift fold away.
+        // cmp rax, 32 + 8*slot; jl done
+        this.cb.u8(0x48)
+        this.cb.u8(0x3D)
+        this.cb.u32le(32 + 8 * slot)
+        this.emitJcc(0x0C, done)
+        // obj.slots[slot] = rdx
+        let disp = 24 + 8 * slot
+        this.cb.u8(0x48)
+        this.cb.u8(0x89)
+        if (disp <= 127) {
+            this.cb.u8(0x51)
+            this.cb.u8(disp)
+        } else {
+            this.cb.u8(0x91)
+            this.cb.u32le(disp)
+        }
+        this.starts[done] = this.cb.size()
+    }
+
+    /// `pickle_enum_tag(obj)` inlined: the tag is payload word 0, one
+    /// unchecked load at byte 24. `abiEnumTag` has no null test either, so a
+    /// null object faults at the same place the call did.
+    fn emitInlineEnumTag(d: int, objT: int) {
+        this.loadTmp(1, 64, objT)
+        this.cb.u8(0x48)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x41)
+        this.cb.u8(24)
+        this.putRes(d, 64, this.kOfTemp(d))
+    }
+
+    /// `pickle_enum_field(obj, index)` inlined for a constant, non-negative
+    /// index. Mirrors `abiEnumField`: the count is `(size - 32) / 8` with a
+    /// saturating subtract, an index equal to the count is out of range, and
+    /// the answer for one is null. No null-object test: the runtime reads the
+    /// size word with no test either.
+    fn emitInlineEnumField(d: int, objT: int, index: int) {
+        this.loadTmp(1, 64, objT)
+        let nullL = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        let done = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        // rax = obj.size
+        this.cb.u8(0x48)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x41)
+        this.cb.u8(16)
+        // `index >= (size - 32) / 8` is exactly `size < 40 + 8*index`; a size
+        // at or below HEADER + 8 yields a count of 0, which the same compare
+        // covers.
+        // cmp rax, 40 + 8*index; jl null
+        this.cb.u8(0x48)
+        this.cb.u8(0x3D)
+        this.cb.u32le(40 + 8 * index)
+        this.emitJcc(0x0C, nullL)
+        // rax = obj.fields[index] (byte 32 + 8*index)
+        let disp = 32 + 8 * index
+        this.cb.u8(0x48)
+        this.cb.u8(0x8B)
+        if (disp <= 127) {
+            this.cb.u8(0x41)
+            this.cb.u8(disp)
+        } else {
+            this.cb.u8(0x81)
+            this.cb.u32le(disp)
+        }
+        this.emitJmp(done)
+        this.starts[nullL] = this.cb.size()
+        this.cb.u8(0x31)
+        this.cb.u8(0xC0)
+        this.starts[done] = this.cb.size()
+        this.putRes(d, 64, this.kOfTemp(d))
+    }
+
+    /// `pickle_enum_set_field(obj, index, value)` inlined for a constant,
+    /// non-negative index. Same count guard as the field read; an index at or
+    /// past the count is a silent no-op.
+    fn emitInlineEnumSetField(objT: int, index: int, valT: int) {
+        this.loadTmp(1, 64, objT)
+        this.loadTmp(2, 64, valT)
+        let done = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        // rax = obj.size
+        this.cb.u8(0x48)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x41)
+        this.cb.u8(16)
+        // cmp rax, 40 + 8*index; jl done   (index >= count is out of range)
+        this.cb.u8(0x48)
+        this.cb.u8(0x3D)
+        this.cb.u32le(40 + 8 * index)
+        this.emitJcc(0x0C, done)
+        // obj.fields[index] = rdx
+        let disp = 32 + 8 * index
+        this.cb.u8(0x48)
+        this.cb.u8(0x89)
+        if (disp <= 127) {
+            this.cb.u8(0x51)
+            this.cb.u8(disp)
+        } else {
+            this.cb.u8(0x91)
+            this.cb.u32le(disp)
+        }
+        this.starts[done] = this.cb.size()
+    }
+
     /// `pickle_list_len` / `pickle_str_len` / `pickle_map_len` inlined: each
     /// reads its object's `len` word at offset 24 (`LEN_WORD` is 3 everywhere).
     fn emitInlineObjLen(d: int, objT: int) {
@@ -4704,6 +4936,78 @@ class X64Emitter {
                     return
                 }
                 case none -> {}
+            }
+        }
+        // Class field access always passes a statically-known slot. Inline the
+        // two slot helpers rather than paying a call that is pure loads and a
+        // compare; anything unusual (a wide or negative index, a result taken
+        // from a void store) keeps the real entry point.
+        if (sum == "pickle_obj_slot_get" && len(args) == 2) {
+            match (d) {
+                case some(dd) -> {
+                    if (this.plan.constVals.has(args[1])) {
+                        let s = this.plan.constVals[args[1]]
+                        if (s >= 0 && s <= 268435452) {
+                            this.emitInlineObjSlotGet(dd, args[0], s)
+                            return
+                        }
+                    }
+                }
+                case none -> {}
+            }
+        }
+        if (sum == "pickle_obj_slot_set" && len(args) == 3) {
+            match (d) {
+                case none -> {
+                    if (this.plan.constVals.has(args[1])) {
+                        let s = this.plan.constVals[args[1]]
+                        if (s >= 0 && s <= 268435452) {
+                            this.emitInlineObjSlotSet(args[0], s, args[2])
+                            return
+                        }
+                    }
+                }
+                case some(_) -> {}
+            }
+        }
+        // Enum tag/field access: the tag is one load, and both field helpers
+        // are a size-derived bound plus one load/store. Matching on an enum
+        // emits a tag call followed by a field call for the arm it binds.
+        if (sum == "pickle_enum_tag" && len(args) == 1) {
+            match (d) {
+                case some(dd) -> {
+                    this.emitInlineEnumTag(dd, args[0])
+                    return
+                }
+                case none -> {}
+            }
+        }
+        if (sum == "pickle_enum_field" && len(args) == 2) {
+            match (d) {
+                case some(dd) -> {
+                    if (this.plan.constVals.has(args[1])) {
+                        let s = this.plan.constVals[args[1]]
+                        if (s >= 0 && s <= 268435449) {
+                            this.emitInlineEnumField(dd, args[0], s)
+                            return
+                        }
+                    }
+                }
+                case none -> {}
+            }
+        }
+        if (sum == "pickle_enum_set_field" && len(args) == 3) {
+            match (d) {
+                case none -> {
+                    if (this.plan.constVals.has(args[1])) {
+                        let s = this.plan.constVals[args[1]]
+                        if (s >= 0 && s <= 268435449) {
+                            this.emitInlineEnumSetField(args[0], s, args[2])
+                            return
+                        }
+                    }
+                }
+                case some(_) -> {}
             }
         }
         let n = len(args)
