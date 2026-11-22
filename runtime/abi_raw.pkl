@@ -1,6 +1,8 @@
 module runtime.abi_raw
 
 import { abiEngineAllocCount, abiEngineAllocBytes, abiEngineResetCounters, abiEngineRegister, abiEngineUnregister, abiEngineRegisteredCount, abiEngineRegisteredAt, abiEngineRegisteredBytes, abiEngineTempRoot, abiEngineTempUnroot, abiEngineTempCount } from runtime.abi_gcengine
+import { writeStderr } from runtime.abi_stdio
+import { STR_BYTES_OFF } from runtime.layout
 
 /// Port of `runtime/src/raw.rs`: the two-slot manual-allocation pair behind
 /// `alloc(int, n)` and `free(p)`.
@@ -89,6 +91,15 @@ fn abiRawAlloc(size: int) -> int {
     var heap = win_get_process_heap()
     let addr = win_heap_alloc(heap, 0, n)
     if (addr == 0) {
+        // Distinguish OOM from a compile error. The old path exited silently
+        // with code 1, which reads exactly like a lowering failure and cost an
+        // hour of misdiagnosis under commit pressure. The literal is a static
+        // descriptor, so this write does not re-enter allocation.
+        let msg = "fatal: pickle: raw allocation failed\n"
+        unsafe {
+            var p = &msg
+            let _ = writeStderr((p as int) + STR_BYTES_OFF, len(msg))
+        }
         win_exit(1)
     }
     return addr
