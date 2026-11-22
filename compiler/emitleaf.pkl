@@ -17,64 +17,64 @@ import * from compiler.emitprim
 import * from compiler.emitreadsglobal
 
 fn recordConstInit(em: Emitter, name: string, value: Expr) {
-   em.constsInits[name] = value
-   }
+        em.constsInits[name] = value
+    }
 
 fn registerGlobals(em: Emitter) {
-   var next = 0
-   for (info in em.resolved.globals) {
-   let name = info.name
-   if (em.globalIds.has(name)) {
-   em.globalFailures.push(GlobalFailure(name, info.span, "top-level `var " + name + "` is declared more than once"))
-   continue
-   }
-   var slot: IrTy? = none
-   if (let some(t) = globalIrTy(info.ty)) {
-   slot = t
-   } else {
-   em.globalFailures.push(GlobalFailure(name, info.span, "top-level `var " + name + "` has type `" + tyDbg(em, info.ty) + "`, which has no global lowering yet"))
-   continue
-   }
-   var decl: GlobalDecl? = none
-   if (em.globalDecls.has(name)) {
-   decl = em.globalDecls[name]
-   }
-   if (let some(d) = decl) {
-   if (let some(ity) = slot) {
-   var res = globalInitBytes(d.value, ity, name)
-if (res.err != "") {
-    em.globalFailures.push(GlobalFailure(name, info.span, res.err))
-    continue
+        var next = 0
+        for (info in em.resolved.globals) {
+            let name = info.name
+            if (em.globalIds.has(name)) {
+                em.globalFailures.push(GlobalFailure(name, info.span, "top-level `var " + name + "` is declared more than once"))
+                continue
+            }
+            var slot: IrTy? = none
+            if (let some(t) = globalIrTy(info.ty)) {
+                slot = t
+            } else {
+                em.globalFailures.push(GlobalFailure(name, info.span, "top-level `var " + name + "` has type `" + tyDbg(em, info.ty) + "`, which has no global lowering yet"))
+                continue
+            }
+            var decl: GlobalDecl? = none
+            if (em.globalDecls.has(name)) {
+                decl = em.globalDecls[name]
+            }
+            if (let some(d) = decl) {
+                if (let some(ity) = slot) {
+                    var res = globalInitBytes(d.value, ity, name)
+                    if (res.err != "") {
+                        em.globalFailures.push(GlobalFailure(name, info.span, res.err))
+                        continue
+                    }
+                    let gid = next
+                    next += 1
+                    em.globalIds[name] = gid
+                    em.irModule.globals.push(IrGlobal(globalSymbol(name), ity, hasTypeExpr(d.ty), res.bytes))
+                    if (ity == IrTy.Str || ity == IrTy.Ptr) {
+                        // A managed initializer is real run-time code, so it may call and allocate,
+                        // but it may not read another global. `pkl_globals_init` roots every slot
+                        // before it evaluates any initializer, so every slot is still null while
+                        // initializers run; reject the read here rather than hand back a null
+                        // dereference.
+                        //
+                        // The slot and its id are registered above, before this check, exactly as on
+                        // the native path. A rejected global is still a declared global, so a later
+                        // read of it must not turn into a second, misleading "not lowered yet"
+                        // diagnostic -- only the root cause should be reported.
+                        if (let some(other) = globalInitReadsGlobal(em, d.value)) {
+                            em.globalFailures.push(GlobalFailure(name, info.span,
+                                "the initializer of top-level `var " + name + "` reads `" + other + "`, but global initializers run after every slot is rooted and before any is filled, so it would read a null value"))
+                            continue
+                        }
+                        em.managedGlobalInits.push(ManagedGlobalInit(gid, ity, d.value))
+                    }
+                }
+            } else {
+                em.globalFailures.push(GlobalFailure(name, info.span, "top-level `var " + name + "` has no initializer"))
+                continue
+            }
+        }
 }
-let gid = next
-     next += 1
-     em.globalIds[name] = gid
-     em.irModule.globals.push(IrGlobal(globalSymbol(name), ity, hasTypeExpr(d.ty), res.bytes))
-if (ity == IrTy.Str || ity == IrTy.Ptr) {
-    // A managed initializer is real run-time code, so it may call and allocate,
-    // but it may not read another global. `pkl_globals_init` roots every slot
-    // before it evaluates any initializer, so every slot is still null while
-    // initializers run; reject the read here rather than hand back a null
-    // dereference.
-    //
-    // The slot and its id are registered above, before this check, exactly as on
-    // the native path. A rejected global is still a declared global, so a later
-    // read of it must not turn into a second, misleading "not lowered yet"
-    // diagnostic -- only the root cause should be reported.
-    if (let some(other) = globalInitReadsGlobal(em, d.value)) {
-        em.globalFailures.push(GlobalFailure(name, info.span,
-            "the initializer of top-level `var " + name + "` reads `" + other + "`, but global initializers run after every slot is rooted and before any is filled, so it would read a null value"))
-        continue
-    }
-        em.managedGlobalInits.push(ManagedGlobalInit(gid, ity, d.value))
-     }
-   }
-   } else {
-   em.globalFailures.push(GlobalFailure(name, info.span, "top-level `var " + name + "` has no initializer"))
-   continue
-   }
-   }
-   }
 
 fn recordFnDecl(em: Emitter, name: string, f: FnDecl) {
         em.fnDecls[name] = f
