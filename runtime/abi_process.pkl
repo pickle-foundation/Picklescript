@@ -1142,12 +1142,21 @@ fn abiRunCmd(argv: List<string>, cwd: string?, envs: Map<string, string>?, envRe
             } else {
                 // `Stdio::Null`: `\\.\NUL`, opened read-only — the same
                 // `GENERIC_READ` a `File::open` would ask for. `CreateFile`
-                // answers the all-bits handle on failure.
+                // answers the all-bits handle on failure. `CreateFileW` gets
+                // no security attributes here, so the handle starts
+                // non-inheritable; the child must still receive it as stdin.
+                // Leaving it non-inheritable makes the child start with a
+                // stale handle, and a grandchild spawn that forwards its std
+                // handles (rustc -> link.exe) then fails with os error 50.
                 let nulW = wideBuf("\\\\.\\NUL")
                 hNul = win_create_file_w(nulW, GENERIC_READ, FILE_SHARE_ALL, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0)
                 free(nulW)
                 if (dword(hNul) == INVALID_FILE_ATTRIBUTES) {
                     capOk = false
+                    hNul = 0
+                } else if (dword(win_set_handle_information(hNul, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)) == 0) {
+                    capOk = false
+                    closeIf(hNul)
                     hNul = 0
                 }
             }

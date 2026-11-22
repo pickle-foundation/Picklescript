@@ -885,6 +885,22 @@ fn abiStrAppendTwoCopy(a: *int, b: *int, c: *int, la: int, lb: int, lc: int, n: 
     }
 }
 
+/// In-place variant for pieces wider than one word. The caller has already
+/// checked that the combined length fits `a`'s capacity (with the usual four
+/// spare words) and that neither piece aliases `a`, so this is two `memcpy`s
+/// and one header publish: exactly the bytes two sequential in-place appends
+/// would produce, without the second capacity check. Keeping this path in
+/// place matters for loops like `all = all + line + "\n"` - routing every wide
+/// piece through the allocating copy path would make the accumulator quadratic.
+fn abiStrAppendTwoLong(a: *int, b: *int, c: *int, la: int, lb: int, lc: int, n: int, capBytes: int) -> *int {
+    unsafe {
+        var dst = (a as int) + BYTES_WORD * 8
+        memcpy((dst + la) as *int, ((b as int) + BYTES_WORD * 8) as *int, lb)
+        memcpy((dst + la + lb) as *int, ((c as int) + BYTES_WORD * 8) as *int, lc)
+        return abiStrAppendMark(a, n, capBytes)
+    }
+}
+
 /// Append two pieces in one call: exactly
 /// `abiStrAppendOwned(abiStrAppendOwned(a, b), c)`.
 ///
@@ -892,9 +908,11 @@ fn abiStrAppendTwoCopy(a: *int, b: *int, c: *int, la: int, lb: int, lc: int, n: 
 /// symbol; the IR still declares both calls as `pickle_str_concat`. The fast
 /// path packs both one-word pieces and publishes the header once, which is the
 /// whole point of the fusion - two prologues, two capacity checks and two
-/// length updates per token otherwise. Every rare shape (an operand aliasing
-/// `a`, a shared/static buffer, a piece wider than a word) delegates to the
-/// sequential bodies, so the observable result is exactly the two-call result.
+/// length updates per token otherwise. An operand that aliases `a`, or a
+/// shared/static first buffer, delegates to the sequential bodies, so the
+/// observable result is exactly the two-call result. A piece wider than one
+/// word skips the packed stores but still appends in place when the capacity
+/// check above passed (see `abiStrAppendTwoLong`).
 #[symbol("pickle_str_append_two")]
 fn abiStrAppendTwo(a: *int, b: *int, c: *int) -> *int {
     unsafe {
@@ -910,8 +928,14 @@ fn abiStrAppendTwo(a: *int, b: *int, c: *int) -> *int {
         var n = la + lb + lc
         var flags = a[SIZE_WORD]
         var capBytes = flags & (0 - 8)
-        if ((flags & FLAG_HEAP) == 0 || (flags & FLAG_SHARED) != 0 || n > capBytes - BYTES_WORD * 8 || lb > 8 || lc > 8) {
+        if ((flags & FLAG_HEAP) == 0 || (flags & FLAG_SHARED) != 0 || n > capBytes - BYTES_WORD * 8) {
             return abiStrAppendTwoCopy(a, b, c, la, lb, lc, n)
+        }
+        // A wide piece cannot use the packed word stores below, but the
+        // capacity check above already proved both pieces fit, so it does not
+        // need a fresh block either.
+        if (lb > 8 || lc > 8) {
+            return abiStrAppendTwoLong(a, b, c, la, lb, lc, n, capBytes)
         }
         // First piece. Same word-store rule as `abiStrAppendOwned`: keep the
         // destination's low `pos & 7` bytes, shift the piece in, and spill the

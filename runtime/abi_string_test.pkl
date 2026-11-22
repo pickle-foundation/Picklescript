@@ -1557,6 +1557,39 @@ test fn append_two_handles_wide_pieces() {
     expect(abiStrLen(got)).toBe(15)
 }
 
+/// A wide piece used to force the allocating copy path even with plenty of
+/// spare capacity, so a loop appending whole lines to one accumulator was
+/// quadratic. The in-place branch must be taken whenever the combined length
+/// fits, for every unaligned start offset, and must leave the same bytes the
+/// sequential two-append reference produces. A buffer without room still grows
+/// and is then reused.
+test fn append_two_wide_pieces_stay_in_place() {
+    let wideB = makeCapString(11, 17, 11)
+    let wideC = makeCapString(9, 29, 9)
+
+    var la = 0
+    while (la <= 7) {
+        let a = makeCapString(la, 1, la + 64)
+        let refa = makeCapString(la, 1, la)
+        let want = abiStrAppendOwned(abiStrAppendOwned(refa, wideB), wideC)
+        let got = abiStrAppendTwo(a, wideB, wideC)
+        expect((got as int) == (a as int)).toBe(true)
+        expectSameBytes(got, want)
+        expect(abiStrLen(got)).toBe(la + 20)
+        la = la + 1
+    }
+
+    // A fresh minimum-size buffer has no room for both pieces: grow, then the
+    // grown capacity must serve the next wide append in place.
+    let tight = makeCapString(0, 3, 0)
+    let grew = abiStrAppendTwo(tight, wideB, wideC)
+    expect((grew as int) == (tight as int)).toBe(false)
+    expectSameBytes(grew, abiStrAppendOwned(abiStrAppendOwned(makeCapString(0, 3, 0), wideB), wideC))
+    let again = abiStrAppendTwo(grew, wideB, wideC)
+    expect((again as int) == (grew as int)).toBe(true)
+    expect(abiStrLen(again)).toBe(40)
+}
+
 /// The header update is shared with append: capacity bits survive, the heap bit
 /// is set, and the cached hash is cleared.
 test fn append_two_invalidates_the_cached_hash() {
