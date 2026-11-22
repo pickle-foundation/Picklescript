@@ -158,41 +158,69 @@ fn abiBoxI64(v: int) -> *int {
             if (hit != 0) {
                 return hit as *int
             }
-            var fresh = abiManagedAlloc(BOX_WORDS * 8) as *int
-            fresh[0] = 0
-            fresh[1] = PICKLE_CLASS_BOX_INT
-            fresh[2] = BOX_WORDS * 8
-            fresh[3] = v
-            abiEngineRegister(fresh as int)
-            (tab as *int)[v] = fresh as int
-            return fresh
+            // Keep the hot path in raw ints: a `*int` local is a managed home
+            // and puts a shadow-frame push/pop on every fresh box.
+            var fresh = abiManagedAlloc(BOX_WORDS * 8)
+            (fresh as *int)[0] = 0
+            (fresh as *int)[1] = PICKLE_CLASS_BOX_INT
+            (fresh as *int)[2] = BOX_WORDS * 8
+            (fresh as *int)[3] = v
+            abiEngineRegister(fresh)
+            (tab as *int)[v] = fresh
+            return fresh as *int
         }
-        var p = abiManagedAlloc(BOX_WORDS * 8) as *int
-        p[0] = 0
-        p[1] = PICKLE_CLASS_BOX_INT
-        p[2] = BOX_WORDS * 8
-        p[3] = v
-        abiEngineRegister(p as int)
-        return p
+        var p = abiManagedAlloc(BOX_WORDS * 8)
+        (p as *int)[0] = 0
+        (p as *int)[1] = PICKLE_CLASS_BOX_INT
+        (p as *int)[2] = BOX_WORDS * 8
+        (p as *int)[3] = v
+        abiEngineRegister(p)
+        return p as *int
     }
 }
 
+/// The two shared bool boxes. There are only two distinct bool payloads and the
+/// payload is immutable, so - exactly like `abiBoxI64`'s small-value table - one
+/// object per value is enough. This matters for `List<bool>`: a sieve or any
+/// bool array otherwise allocates and registers one 32-byte box per element,
+/// which makes a 1.5M-element fill 1.5M allocations (prime sieve: ~250ms before
+/// the cache, dominated by this).
+var falseBox: int = 0
+var trueBox: int = 0
+
 /// Box a `bool` as a managed object (`0`/`1` payload).
 /// Mirrors `boxscalar.rs::pickle_box_bool`, which stores `v as i64`.
+///
+/// The box is shared per value. A swept singleton stays readable forever
+/// because managed blocks come from the bump arena, which is never reused
+/// (same argument as the small-int table above).
 #[symbol("pickle_box_bool")]
 fn abiBoxBool(v: bool) -> *int {
-    var bits = 0
-    if (v) {
-        bits = 1
-    }
     unsafe {
-        var p = abiManagedAlloc(BOX_WORDS * 8) as *int
-        p[0] = 0
-        p[1] = PICKLE_CLASS_BOX_BOOL
-        p[2] = BOX_WORDS * 8
-        p[3] = bits
-        abiEngineRegister(p as int)
-        return p
+        if (v) {
+            if (trueBox != 0) {
+                return trueBox as *int
+            }
+            var t = abiManagedAlloc(BOX_WORDS * 8)
+            (t as *int)[0] = 0
+            (t as *int)[1] = PICKLE_CLASS_BOX_BOOL
+            (t as *int)[2] = BOX_WORDS * 8
+            (t as *int)[3] = 1
+            abiEngineRegister(t)
+            trueBox = t
+            return t as *int
+        }
+        if (falseBox != 0) {
+            return falseBox as *int
+        }
+        var f = abiManagedAlloc(BOX_WORDS * 8)
+        (f as *int)[0] = 0
+        (f as *int)[1] = PICKLE_CLASS_BOX_BOOL
+        (f as *int)[2] = BOX_WORDS * 8
+        (f as *int)[3] = 0
+        abiEngineRegister(f)
+        falseBox = f
+        return f as *int
     }
 }
 

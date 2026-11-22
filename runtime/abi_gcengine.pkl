@@ -543,12 +543,23 @@ fn abiEngineRegister(objAddr: int) {
                 return
     }
     var size = geRegObjSize(objAddr)
+    // Read the environment first, and only once. `PKL_NO_AUTO_GC` and
+    // `PKL_GC_THRESHOLD` are fixed after this block, so the pin decision below
+    // can use the final value instead of reading the global a second time on
+    // every registration. The init path allocates only raw memory, so it cannot
+    // re-enter this function.
+    if (envInited == 0) {
+        envPhase = 1
+        abiEngineInitFromEnv()
+        envPhase = 0
+    }
+    var noGc = noAutoGc
     // Only pay for the pin when a collection is possible. With
     // `PKL_NO_AUTO_GC` set the trigger section below is unreachable, so the
     // mark would be written and cleared untouched - two stores and two calls
     // per allocation for nothing. Benchmarks run with it set.
     var pinning = 0
-    if (noAutoGc == 0) {
+    if (noGc == 0) {
         geRegPin(objAddr)
         pinning = 1
     }
@@ -556,29 +567,27 @@ fn abiEngineRegister(objAddr: int) {
     // is two calls per allocated object; the capacity check is the whole
     // condition they compute, so guard the pair here and call them only on the
     // geometric growth boundary. Measured on micro9: register_only 210ns
-    // before, ~90ns after.
-    if (regCount >= regCap) {
-        regBase = geRegGrow(regBase, regCap, regCount)
-        regCap = geRegCapGrown(regCap, regCount)
+    // before, ~90ns after. `count` is read once and reused for the store and
+    // the increment: the emitter has no global CSE, so each `regCount` mention
+    // used to be its own `movabs`+load.
+    var count = regCount
+    if (count >= regCap) {
+        regBase = geRegGrow(regBase, regCap, count)
+        regCap = geRegCapGrown(regCap, count)
     }
     unsafe {
-        (regBase as *int)[regCount] = objAddr
+        (regBase as *int)[count] = objAddr
     }
-    regCount = regCount + 1
+    regCount = count + 1
     regBytes = regBytes + size
     rawAllocCount = rawAllocCount + 1
     rawAllocBytes = rawAllocBytes + size
-    // The pin (when armed) covers the rest of the register: env-init and a
-    // threshold crossing both run inside this function, and neither can see an
-    // object the constructor has not yet published to a frame slot or a root
-    // cell. Native `Gc::alloc` does mark -> maybe_collect -> unmark, so an
-    // in-flight value always survives the cycle it triggers.
-    if (envInited == 0) {
-        envPhase = 1
-        abiEngineInitFromEnv()
-        envPhase = 0
-    }
-    if (noAutoGc != 0) {
+    // The pin (when armed) covers the rest of the register: a threshold
+    // crossing runs inside this function, and it cannot see an object the
+    // constructor has not yet published to a frame slot or a root cell. Native
+    // `Gc::alloc` does mark -> maybe_collect -> unmark, so an in-flight value
+    // always survives the cycle it triggers.
+    if (noGc != 0) {
         return
     }
     var th = threshold

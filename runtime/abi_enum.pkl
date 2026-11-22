@@ -36,12 +36,16 @@ module runtime.abi_enum
 /// into the documented out-of-range result.
 
 import { PICKLE_CLASS_ENUM, PICKLE_CLASS_BOX_INT, PICKLE_CLASS_BOX_BOOL, PICKLE_CLASS_BOX_CHAR, PICKLE_CLASS_BOX_FLOAT, PICKLE_CLASS_STRING } from runtime.object
-import { HEADER, ENUM_TAG_OFF, ENUM_FIELDS_OFF, enumObjectSize, enumFieldCountFromSize } from runtime.layout
+import { ENUM_TAG_OFF, ENUM_FIELDS_OFF, enumFieldCountFromSize } from runtime.layout
 import { boxBits } from runtime.abi_box
 import { abiStrCmp } from runtime.abi_string
-// The enum payload comes from `alloc(int, n)`, so the raw-allocation slots must
-// travel with it. See `abi_raw.pkl`.
-import { abiRawAlloc, abiRegisterObject } from runtime.abi_raw
+// Enum objects are managed allocations from the same bump arena as boxes and
+// lists: `abiManagedAlloc` is a leaf that never collects, and registration is
+// the engine's own entry point (skipping `abi_raw`'s delegating wrapper).
+// `alloc(int, n)` used to back these objects, which put a Win32 `HeapAlloc`
+// (measured ~36 ns) on every variant construction.
+import { abiManagedAlloc } from runtime.abi_raw
+import { abiEngineRegister } from runtime.abi_gcengine
 
 /// Word index of the variant tag. `ENUM_TAG_OFF` is a byte offset (24).
 const TAG_WORD: int = ENUM_TAG_OFF / 8
@@ -94,30 +98,37 @@ fn fieldAt(obj: *int, index: int) -> *int {
 /// Create an enum object holding `tag` and `fieldCount` null payload fields.
 /// Mirrors `enum.rs::enum_new` -> `enum_init`: write the header and the tag, then
 /// zero every payload field so an uninitialised slot is never traced. The fields
-/// are written explicitly because `alloc` does not zero memory (see
-/// `runtime.abi_list` and the `zeroed` helper in `runtime.abi_map`).
-fn enumNew(tag: int, fieldCount: int) -> *int {
+/// are written explicitly because arena memory is not zeroed.
+///
+/// The address stays an unmanaged `int` throughout: a `*int` local would give
+/// this body a managed home and therefore a shadow-frame push/pop on the
+/// construction path (the same reason `abiBoxI64` keeps raw ints).
+fn enumNewAddr(tag: int, fieldCount: int) -> int {
     unsafe {
-        var obj = alloc(int, FIELDS_WORD + fieldCount)
-        obj[0] = 0
-        obj[1] = PICKLE_CLASS_ENUM
-        obj[2] = enumObjectSize(fieldCount)
-        obj[TAG_WORD] = tag
+        var obj = abiManagedAlloc(ENUM_FIELDS_OFF + fieldCount * 8)
+        (obj as *int)[0] = 0
+        (obj as *int)[1] = PICKLE_CLASS_ENUM
+        (obj as *int)[2] = ENUM_FIELDS_OFF + fieldCount * 8
+        (obj as *int)[TAG_WORD] = tag
         var i = 0
         while (i < fieldCount) {
-            obj[FIELDS_WORD + i] = 0
+            (obj as *int)[FIELDS_WORD + i] = 0
             i = i + 1
         }
-        abiRegisterObject(obj as int)
+        abiEngineRegister(obj)
         return obj
     }
+}
+
+fn enumNew(tag: int, fieldCount: int) -> *int {
+    return enumNewAddr(tag, fieldCount) as *int
 }
 
 /// Create an enum object with `tag` and `fieldCount` null payload fields.
 /// Mirrors `pickle_enum_new`.
 #[symbol("pickle_enum_new")]
 fn abiEnumNew(tag: int, fieldCount: int) -> *int {
-    return enumNew(tag, fieldCount)
+    return enumNewAddr(tag, fieldCount) as *int
 }
 
 /// The variant tag. Mirrors `pickle_enum_tag`.
