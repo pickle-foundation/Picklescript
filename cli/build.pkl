@@ -8,7 +8,7 @@ fn main() {
     let argv = args()
     if (len(argv) < 3) {
         println("BUILD NO ARGS")
-        return
+        exit(1)
     }
     let target = argv[0]
     let runtimeLib = argv[1]
@@ -27,21 +27,29 @@ fn main() {
                 }
                 if (let some(errorText) = linkExe(objects, outputExe, program.overrides)) {
                     println("BUILD FAIL: " + errorText)
-                    return
+                    exit(1)
                 }
                 let joined = len(objects)
                 printDiags(sinks)
+                // The sink can still hold error-severity diagnostics on a
+                // lowering that produced a program. Exit codes are the signal
+                // scripted checks trust, so never report success in that case.
+                if (sinks.anyError()) {
+                    println("BUILD FAIL: source " + target + " had error diagnostics")
+                    exit(1)
+                }
                 println("BUILD OK objects=" + str(joined) + " exe=" + outputExe)
                 return
             }
             println("BUILD FAIL: cannot read runtime lib " + runtimeLib)
-            return
+            exit(1)
         }
         printDiags(sinks)
         println("BUILD FAIL: source " + target + " did not lower to COFF")
-        return
+        exit(1)
     }
     println("BUILD FAIL: cannot read source " + target)
+    exit(1)
 }
 
 fn printDiags(diags: DiagnosticSink) {
