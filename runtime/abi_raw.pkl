@@ -75,6 +75,11 @@ import { abiEngineAllocCount, abiEngineAllocBytes, abiEngineResetCounters, abiEn
 /// same divergence every unreachable-native-panic path takes here and exits.
 /// Handing the null back would turn a failed commit into writes at address 0
 /// two lowering steps later.
+///
+/// MEASURED: a size-class slab over `HeapAlloc` was tried here and is ~5%
+/// SLOWER on the benchmark (231.8 ms vs 220.3 ms median), because the 16-byte
+/// block header it needs cuts object density for these tiny allocations. The
+/// direct pair below stays until a header-free design is measured faster.
 #[symbol("pickle_raw_alloc")]
 fn abiRawAlloc(size: int) -> int {
     var n = size
@@ -95,6 +100,83 @@ fn abiRawAlloc(size: int) -> int {
 fn abiRawFree(ptr: int) {
     var heap = win_get_process_heap()
     win_heap_free(heap, 0, ptr)
+}
+
+// ------------------------------------------------------- managed bump arena
+// Managed objects (strings, boxes, lists, maps) are never released by the
+// program: the collector unregisters them and leaves the block alone, and no
+// ABI body calls `free` on one. Their constructors therefore do not need a
+// general-purpose allocator - a bump pointer over large chunks is enough, and
+// it removes the Win32 `HeapAlloc` call (measured 33 ns of the 36 ns an
+// `alloc(int, 4)` costs) from every object creation.
+//
+// The public `alloc`/`free` pair is deliberately untouched: raw allocations a
+// program makes can still be freed, because they still come from `HeapAlloc`.
+// This helper is reached only by the managed-object constructors in
+// `abi_box`, `abi_string`, `abi_list` and `abi_map`.
+//
+// A request larger than a quarter chunk goes straight to `abiRawAlloc`, so a
+// giant string or element buffer cannot waste the rest of a chunk.
+
+const MANAGED_CHUNK: int = 1048576
+const MANAGED_MAX_BUMP: int = 262144
+/// Chunk header in front of the bump area: `[previous chunk, chunk size]`.
+/// `abiManagedRelease` walks this list to recognise arena blocks.
+const MANAGED_CHUNK_HEADER: int = 16
+
+var managedArenaBase: int = 0
+var managedArenaUsed: int = 0
+var managedArenaCap: int = 0
+var managedArenaChunk: int = 0
+
+/// Allocate `size` bytes for a managed object, 8-byte aligned.
+fn abiManagedAlloc(size: int) -> int {
+    var n = size
+    if (n < 8) {
+        n = 8
+    }
+    n = (n + 7) & (0 - 8)
+    if (n > MANAGED_MAX_BUMP) {
+        return abiRawAlloc(n)
+    }
+    if (managedArenaUsed + n > managedArenaCap) {
+        var raw = abiRawAlloc(MANAGED_CHUNK)
+        unsafe {
+            (raw as *int)[0] = managedArenaChunk
+            (raw as *int)[1] = MANAGED_CHUNK
+        }
+        managedArenaChunk = raw
+        managedArenaBase = raw + MANAGED_CHUNK_HEADER
+        managedArenaUsed = 0
+        managedArenaCap = MANAGED_CHUNK - MANAGED_CHUNK_HEADER
+    }
+    var addr = managedArenaBase + managedArenaUsed
+    managedArenaUsed = managedArenaUsed + n
+    return addr
+}
+
+/// Release a managed block the collector has proven dead. Arena-backed blocks
+/// stay in their chunk - that memory is not a Heap block, so handing it to
+/// `abiRawFree` would corrupt the process heap. Oversized blocks that went
+/// straight to `abiRawAlloc` are still real allocations and must be freed.
+fn abiManagedRelease(addr: int) {
+    if (addr == 0) {
+        return
+    }
+    var chunk = managedArenaChunk
+    while (chunk != 0) {
+        var next = 0
+        var size = 0
+        unsafe {
+            next = (chunk as *int)[0]
+            size = (chunk as *int)[1]
+        }
+        if (addr >= chunk && addr < chunk + size) {
+            return
+        }
+        chunk = next
+    }
+    abiRawFree(addr)
 }
 
 // ---------------------------------------- delegating wrappers (see abi_gcengine)
@@ -121,7 +203,12 @@ fn abiRawResetCounters() {
 /// Record a managed object as part of the port's live population. Reads the
 /// byte size from header word 2, bumps the seam counters, and runs the
 /// auto-collect trigger (native's `Gc::alloc` moment). Null is ignored.
-fn abiRegisterObject(obj: *int) {
+///
+/// The address is an unmanaged `int`: a `*int` parameter would give this
+/// forwarder a managed shadow cell, which is enough to force a frame (zeroing +
+/// push/pop) on the path every single allocation takes. The callee pins the
+/// object explicitly across its trigger, so nothing here needs tracing.
+fn abiRegisterObject(obj: int) {
     abiEngineRegister(obj)
 }
 

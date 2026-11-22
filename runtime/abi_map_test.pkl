@@ -10,9 +10,10 @@ module runtime.abi_map_test
 /// constants all reproduce the standard algorithm. `0xCBF29CE484222325` is written as
 /// `(0 - 0x340D631B7BDDDCDB)` because Pickle rejects literals above `i64::MAX`.
 
-import { abiMapNew, abiMapSet, abiMapGet, abiMapGetBoxed, abiMapHas, abiMapRemove, abiMapMerge, abiMapClear, abiMapEntries } from runtime.abi_map
-import { abiMapLen, abiMapKeys, abiMapValues, keyHash, keyEq, deepHash, mapNew, entriesCount, needsGrow, isLiveKey, occupiedCount } from runtime.abi_map
-import { LEN_WORD, CAP_WORD, ENTRIES_WORD, GOLDEN, CYCLIC_HASH } from runtime.abi_map
+import { abiMapNew, abiMapSet, abiMapSetSlow, abiMapGet, abiMapGetSlow, abiMapGetBoxed, abiMapHas, abiMapRemove, abiMapMerge, abiMapClear, abiMapEntries } from runtime.abi_map
+import { abiMapLen, abiMapKeys, abiMapValues, keyHash, keyEq, deepHash, mapNew, mapGet, entriesCount, needsGrow, isLiveKey } from runtime.abi_map
+import { LEN_WORD, CAP_WORD, OCCUPIED_WORD, ENTRIES_WORD, GOLDEN, CYCLIC_HASH, keyScratch, KEY_FLAG_OFF } from runtime.abi_map
+import { llKey } from runtime.abi_map
 import { abiTupleField } from runtime.abi_tuple
 import { abiBoxI64, abiUnboxI64, abiBoxBool, newBox } from runtime.abi_box
 import { abiListLen, abiListGet, abiListPush, listNew } from runtime.abi_list
@@ -73,6 +74,17 @@ fn listOf(vals: List<int>) -> *int {
 
 fn isNull(p: *int) -> bool { return (p as int) == 0 }
 
+/// Build a string object of arbitrary length from explicit byte values.
+fn mkStrBytes(bs: List<int>) -> *int {
+    var o = newStr(len(bs))
+    var i = 0
+    while (i < len(bs)) {
+        byteInto(o, i, bs[i])
+        i = i + 1
+    }
+    return o
+}
+
 // ---------------------------------------------------------------------------
 // 64-bit arithmetic pins
 // ---------------------------------------------------------------------------
@@ -125,10 +137,16 @@ test fn a_revisited_ancestor_reports_the_cyclic_hash() {
     // recurse forever, and report cyclic = true.
     var selfRef = listNew(0)
     abiListPush(selfRef, selfRef)
-    var path: List<int> = [0]
-    path.pop()
-    let (h, cyclic) = deepHash(selfRef, path)
-    expect(cyclic).toBe(true)
+    var cyclic = 0
+    var h = 0
+    unsafe {
+        let path = keyScratch()
+        let flag = (path + KEY_FLAG_OFF) as *int
+        flag[0] = 0
+        h = deepHash(selfRef, path as *int, 0, flag)
+        cyclic = flag[0]
+    }
+    expect(cyclic != 0).toBe(true)
     // The *inner* revisit reports CYCLIC_HASH, but the outer call keeps mixing: its
     // result is mix(FNV_OFFSET, PICKLE_CLASS_LIST) then mix(that, CYCLIC_HASH).
     // Pinning the composed value checks both that the revisit was detected and that
@@ -205,6 +223,172 @@ test fn many_keys_grow() {
     expect(abiMapLen(m)).toBe(500)
 }
 
+test fn bloom_filter_never_hides_a_live_key() {
+    var m = mapNew(0)
+    var i = 0
+    while (i < 300) {
+        abiMapSet(m, abiStrFromI64(i), abiBoxI64(i + 5))
+        i = i + 1
+    }
+    // Growth has rehashed and rebuilt the filter several times.
+    i = 0
+    while (i < 300) {
+        expect(abiUnboxI64(abiMapGet(m, abiStrFromI64(i)))).toBe(i + 5)
+        i = i + 1
+    }
+    // Removal leaves stale bits; stale bits may only cause extra probes.
+    expect(abiUnboxI64(abiMapRemove(m, abiStrFromI64(7)))).toBe(12)
+    expect(isNull(abiMapGet(m, abiStrFromI64(7)))).toBe(true)
+    i = 0
+    while (i < 300) {
+        if (i != 7) {
+            expect(abiUnboxI64(abiMapGet(m, abiStrFromI64(i)))).toBe(i + 5)
+        }
+        i = i + 1
+    }
+    // `clear` resets the table and the filter together.
+    abiMapClear(m)
+    expect(abiMapLen(m)).toBe(0)
+    expect(isNull(abiMapGet(m, abiStrFromI64(8)))).toBe(true)
+    abiMapSet(m, abiStrFromI64(8), abiBoxI64(88))
+    expect(abiUnboxI64(abiMapGet(m, abiStrFromI64(8)))).toBe(88)
+    expect(isNull(abiMapGet(m, abiStrFromI64(9)))).toBe(true)
+}
+
+/// The inlined bloom rejection answers an absent key without entering the
+/// runtime. The first get has no cached hash and takes the slow leg; that leg
+/// caches the hash on the heap key, so every later get here reaches the
+/// two-bit probe. A negative answer must stay null, and the following set must
+/// still insert (the inline deliberately does not touch the get->set cache).
+test fn bloom_negative_inline_answers_absent_keys() {
+    var m = mapNew(0)
+    abiMapSet(m, mkAlpha(), abiBoxI64(1))
+    let absent = mkStr(122, 101, 116, 97, 33)
+    expect(isNull(abiMapGet(m, absent))).toBe(true)
+    var i = 0
+    while (i < 100) {
+        expect(isNull(abiMapGet(m, absent))).toBe(true)
+        i = i + 1
+    }
+    abiMapSet(m, absent, abiBoxI64(42))
+    expect(abiUnboxI64(abiMapGet(m, absent))).toBe(42)
+}
+
+/// Long keys (> 8 bytes) get their hash cached by the set path, so the inline
+/// probe runs for them too. A bloom hit must delegate to the full probe, both
+/// before and after removal (removal leaves stale bits behind).
+test fn bloom_inline_handles_long_keys() {
+    var m = mapNew(0)
+    let k = newStr(12)
+    var i = 0
+    while (i < 12) {
+        byteInto(k, i, 97 + i)
+        i = i + 1
+    }
+    abiMapSet(m, k, abiBoxI64(7))
+    expect(abiUnboxI64(abiMapGet(m, k))).toBe(7)
+    expect(abiUnboxI64(abiMapRemove(m, k))).toBe(7)
+    expect(isNull(abiMapGet(m, k))).toBe(true)
+}
+
+/// The inline's negative answer never enters the runtime, so it also skips the
+/// get->set last-lookup stamp. That is the one observable difference from the
+/// slow path, and pinning it proves the filter (not a full probe) answered.
+test fn bloom_negative_inline_skips_the_get_set_cache() {
+    var m = mapNew(0)
+    let alpha = mkAlpha()
+    abiMapSet(m, alpha, abiBoxI64(3))
+    expect(abiUnboxI64(abiMapGet(m, alpha))).toBe(3)
+    let absent = mkStr(122, 101, 116, 97, 33)
+    // First touch has no cached hash, so the runtime hashes, caches and stamps.
+    expect(isNull(abiMapGet(m, absent))).toBe(true)
+    expect(abiUnboxI64(abiMapGet(m, alpha))).toBe(3)
+    let before = llKey
+    expect(before).toBe(alpha as int)
+    // Second touch: the hash is cached and both filter bits are clear. A full
+    // probe would overwrite llKey with `absent`; the inline must not.
+    expect(isNull(abiMapGet(m, absent))).toBe(true)
+    expect(llKey).toBe(before)
+}
+
+test fn a_text_equal_get_lets_the_set_reuse_its_slot() {
+    var m = mapNew(0)
+    let stored = mkAlpha()
+    let v1 = abiBoxI64(11)
+    abiMapSet(m, stored, v1)
+    // Split fields are always fresh objects, so the benchmark's `m[w]` set
+    // follows a get with a text-equal but pointer-different key. The get
+    // stamps the matched slot; the set must trust that stamp instead of
+    // falling through to a second probe (and must not append a duplicate).
+    let fresh = mkAlpha()
+    expect((fresh as int) != (stored as int)).toBe(true)
+    expect(abiUnboxI64(abiMapGet(m, fresh))).toBe(11)
+    let v2 = abiBoxI64(22)
+    abiMapSet(m, fresh, v2)
+    expect(abiMapLen(m)).toBe(1)
+    expect(abiUnboxI64(abiMapGet(m, stored))).toBe(22)
+    expect(abiUnboxI64(abiMapGet(m, fresh))).toBe(22)
+}
+
+/// The widened get->set cache relies on `mapVer` covering every structural
+/// mutation. `abiMapSetSlow` is reachable directly, so it must bump the
+/// version itself. Without that bump, a get's stamp survives a growth and the
+/// next set can overwrite whatever unrelated key landed on the old slot index.
+test fn a_direct_slow_set_invalidates_the_get_set_cache() {
+    var m = mapNew(0)
+    let a = mkAlpha()
+    abiMapSet(m, a, abiBoxI64(1))
+    let fresh = mkAlpha()
+    expect(abiUnboxI64(abiMapGet(m, fresh))).toBe(1)
+    // Force a rehash behind the cache's back.
+    var keys = List<*int>()
+    var i = 0
+    while (i < 20) {
+        let k = mkStrBytes([100, 48 + (i / 10), 48 + (i % 10)])
+        keys.push(k)
+        abiMapSetSlow(m, k, abiBoxI64(100 + i))
+        i = i + 1
+    }
+    abiMapSet(m, fresh, abiBoxI64(7))
+    expect(abiMapLen(m)).toBe(21)
+    expect(abiUnboxI64(abiMapGet(m, a))).toBe(7)
+    i = 0
+    while (i < 20) {
+        expect(abiUnboxI64(abiMapGet(m, keys[i]))).toBe(100 + i)
+        i = i + 1
+    }
+}
+
+/// `rehash` skips equality checks because a fresh table and pairwise-distinct
+/// live keys cannot produce a hit. Its placement rule must still be exactly
+/// `findSlot`'s: scan from `hash & mask` to the first EMPTY slot. Comparing a
+/// grown table with the same keys inserted into a table pre-sized to the final
+/// capacity pins keys, values, `occupied`, len and every slot word.
+test fn rehash_matches_a_pre_sized_insert_slot_for_slot() {
+    var grown = mapNew(0)
+    var keys = List<*int>()
+    var vals = List<*int>()
+    var i = 0
+    while (i < 300) {
+        let k = mkStrBytes([107, 48 + (i / 100), 48 + ((i / 10) % 10), 48 + (i % 10)])
+        let v = abiBoxI64(i)
+        keys.push(k)
+        vals.push(v)
+        abiMapSet(grown, k, v)
+        i = i + 1
+    }
+    unsafe {
+        let pre = mapNew(grown[CAP_WORD])
+        expect(pre[CAP_WORD]).toBe(grown[CAP_WORD])
+        i = 0
+        while (i < 300) {
+            abiMapSet(pre, keys[i], vals[i])
+            i = i + 1
+        }
+        expectSameTable(grown, pre)
+    }
+}
+
 test fn a_fresh_table_reports_zero_live_entries() {
     // Regression: `alloc` returns uninitialised memory (a fresh alloc(8) reads back with
     // all eight words non-zero), and an open-addressing table treats "this slot is
@@ -216,7 +400,8 @@ test fn a_fresh_table_reports_zero_live_entries() {
         var entries = m[ENTRIES_WORD] as *int
         var cap = m[CAP_WORD]
         expect(entriesCount(entries, cap)).toBe(0)
-        expect(needsGrow(entries, cap)).toBe(false)
+        expect(m[OCCUPIED_WORD]).toBe(0)
+        expect(needsGrow(m)).toBe(false)
         // Every slot must genuinely read null, not merely "not crash".
         var i = 0
         while (i < cap) {
@@ -275,7 +460,7 @@ test fn capacity_is_rounded_up_to_a_power_of_two() {
         expect(u[CAP_WORD]).toBe(64)
         // Header is class id MAP and size MAP_OBJECT_SIZE.
         expect(m[1]).toBe(PICKLE_CLASS_MAP)
-        expect(m[2]).toBe(48)
+        expect(m[2]).toBe(56)
     }
 }
 
@@ -308,8 +493,8 @@ test fn tombstones_count_toward_growth() {
     // `mapRemove` could fill every probe slot while the live count stayed low. The next
     // insert then called `findSlot` on a table with no empty slot to stop on and probed
     // forever. This is the smallest form of the real sequence (grow / churn / grow /
-    // churn / grow); it hung the harness before `occupiedCount` was folded into
-    // `needsGrow`.
+    // churn / grow); it hung the harness before tombstones were folded into occupied
+    // growth tracking.
     var m = mapNew(0)
     var i = 0
     while (i < 61) {
@@ -349,10 +534,9 @@ test fn tombstones_count_toward_growth() {
 
     expect(abiMapLen(m)).toBe(39)
     unsafe {
-        var entries = m[ENTRIES_WORD] as *int
         var cap = m[CAP_WORD]
         // A saturated table has no empty slot; `findSlot` needs one to terminate.
-        expect(occupiedCount(entries, cap) < cap).toBe(true)
+        expect(m[OCCUPIED_WORD] < cap).toBe(true)
         // Survivors reachable, removed keys gone.
         expect(abiUnboxI64(abiMapGet(m, abiStrFromI64(5)))).toBe(5)
         expect(abiUnboxI64(abiMapGet(m, abiStrFromI64(128)))).toBe(128)
@@ -815,4 +999,370 @@ test fn clear_empties_the_map_and_keeps_it_usable() {
     // Clearing an already-empty map is a no-op.
     abiMapClear(m)
     expect(abiMapLen(m)).toBe(0)
+}
+// ---------------------------------------------------------------------------
+// Differential: the string fast path against the general lookup
+//
+// `abiMapGet` specialises short string keys and delegates everything else to
+// `abiMapGetSlow`. These tests pin the specialisation against the general body
+// over the same tables: same hit, same absent result, and - because map values
+// are pointers - the exact same value object. The general body stays the
+// authority for every key class.
+// ---------------------------------------------------------------------------
+
+/// Both lookups must agree on presence and on the exact value object.
+fn expectSameLookup(m: *int, key: *int) {
+    expect(abiMapGet(m, key) as int).toBe(abiMapGetSlow(m, key) as int)
+}
+
+test fn fast_lookup_matches_the_general_lookup_for_short_strings() {
+    var m = abiMapNew(0)
+    let kAlpha = mkAlpha()
+    let kBeta = mkBeta()
+    abiMapSet(m, kAlpha, abiBoxI64(11))
+    abiMapSet(m, kBeta, abiBoxI64(22))
+    // Pointer-identical key: the identity shortcut.
+    expectSameLookup(m, kAlpha)
+    // Fresh but structurally equal key: exercises hash + byte compare.
+    let fresh = mkAlpha()
+    expect((fresh as int) != (kAlpha as int)).toBe(true)
+    expectSameLookup(m, fresh)
+    // Absent short key, and the empty string.
+    expectSameLookup(m, mkStr(122, 122, 122, 122, 122))
+    expectSameLookup(m, newStr(0))
+}
+
+test fn fast_lookup_matches_the_general_lookup_across_the_eight_byte_boundary() {
+    var m = abiMapNew(0)
+    let k0 = newStr(0)
+    let k7 = mkStrBytes([97, 98, 99, 100, 101, 102, 103])
+    let k8 = mkStrBytes([97, 98, 99, 100, 101, 102, 103, 104])
+    let k9 = mkStrBytes([97, 98, 99, 100, 101, 102, 103, 104, 105])
+    abiMapSet(m, k0, abiBoxI64(0))
+    abiMapSet(m, k7, abiBoxI64(7))
+    abiMapSet(m, k8, abiBoxI64(8))
+    abiMapSet(m, k9, abiBoxI64(9))
+    expectSameLookup(m, k0)
+    expectSameLookup(m, k7)
+    expectSameLookup(m, k8)
+    expectSameLookup(m, k9)
+    // Fresh copies on both sides of the fast-path cut-off.
+    expectSameLookup(m, mkStrBytes([97, 98, 99, 100, 101, 102, 103]))
+    expectSameLookup(m, mkStrBytes([97, 98, 99, 100, 101, 102, 103, 104]))
+    expectSameLookup(m, mkStrBytes([97, 98, 99, 100, 101, 102, 103, 104, 105]))
+    // Shares eight bytes with `k9` but not the ninth.
+    expectSameLookup(m, mkStrBytes([97, 98, 99, 100, 101, 102, 103, 104, 106]))
+    // Same prefix, shorter length: a length mismatch must not match bytes.
+    expectSameLookup(m, mkStrBytes([97, 98, 99, 100, 101, 102, 103]))
+}
+
+test fn fast_lookup_matches_the_general_lookup_across_tombstones() {
+    var m = abiMapNew(0)
+    var keys = List<*int>()
+    var i = 0
+    while (i < 24) {
+        let k = mkStrBytes([119, 48 + (i / 10), 48 + (i % 10), 33, 33, 33])
+        keys.push(k)
+        abiMapSet(m, k, abiBoxI64(i))
+        i = i + 1
+    }
+    // Punch alternating holes so probing has to step over tombstones.
+    i = 0
+    while (i < 24) {
+        if (i % 2 == 0) {
+            abiMapRemove(m, keys[i])
+        }
+        i = i + 1
+    }
+    i = 0
+    while (i < 24) {
+        expectSameLookup(m, keys[i])
+        // Fresh equal copies see exactly the same table state.
+        expectSameLookup(m, mkStrBytes([119, 48 + (i / 10), 48 + (i % 10), 33, 33, 33]))
+        i = i + 1
+    }
+    // Reinsert into the tombstoned slots and compare again.
+    i = 0
+    while (i < 24) {
+        if (i % 2 == 0) {
+            abiMapSet(m, keys[i], abiBoxI64(100 + i))
+        }
+        i = i + 1
+    }
+    i = 0
+    while (i < 24) {
+        expectSameLookup(m, keys[i])
+        i = i + 1
+    }
+}
+
+test fn fast_lookup_matches_the_general_lookup_for_grown_tables() {
+    var m = abiMapNew(0)
+    var i = 0
+    while (i < 200) {
+        let k = mkStrBytes([107, 48 + (i / 100), 48 + ((i / 10) % 10), 48 + (i % 10)])
+        abiMapSet(m, k, abiBoxI64(i))
+        i = i + 1
+    }
+    i = 0
+    while (i < 200) {
+        // Rebuild the same bytes at each length so every lookup hashes afresh.
+        let k = mkStrBytes([107, 48 + (i / 100), 48 + ((i / 10) % 10), 48 + (i % 10)])
+        expectSameLookup(m, k)
+        i = i + 1
+    }
+    expectSameLookup(m, mkStrBytes([107, 57, 57, 57]))
+}
+
+test fn fast_lookup_delegates_non_string_keys() {
+    var m = abiMapNew(0)
+    abiMapSet(m, abiBoxI64(7), abiBoxI64(70))
+    abiMapSet(m, abiBoxI64(8), abiBoxI64(80))
+    expectSameLookup(m, abiBoxI64(7))
+    expectSameLookup(m, abiBoxI64(8))
+    expectSameLookup(m, abiBoxI64(9))
+    // `none` is a real key, distinct from a boxed zero.
+    abiMapSet(m, 0 as *int, abiBoxI64(99))
+    expectSameLookup(m, 0 as *int)
+    expectSameLookup(m, abiBoxI64(0))
+}
+
+test fn fast_lookup_delegates_when_probing_over_a_foreign_key_class() {
+    var m = abiMapNew(0)
+    abiMapSet(m, mkAlpha(), abiBoxI64(1))
+    abiMapSet(m, abiBoxI64(42), abiBoxI64(2))
+    // Composite keys in the same table must still resolve by deep equality.
+    let lk = listOf([1, 2, 3])
+    abiMapSet(m, lk, abiBoxI64(3))
+    expectSameLookup(m, mkAlpha())
+    expectSameLookup(m, abiBoxI64(42))
+    expectSameLookup(m, mkBeta())
+    expectSameLookup(m, lk)
+    expectSameLookup(m, listOf([1, 2, 3]))
+    expectSameLookup(m, listOf([3, 2, 1]))
+}
+
+test fn fast_lookup_matches_the_general_lookup_on_an_empty_map() {
+    var m = abiMapNew(0)
+    expectSameLookup(m, mkAlpha())
+    expectSameLookup(m, newStr(0))
+    expectSameLookup(m, 0 as *int)
+    expectSameLookup(m, abiBoxI64(1))
+}
+
+// ---------------------------------------------------------------------------
+// Differential: the string fast path on insert against the general insert
+//
+// Both tables start from `abiMapNew(0)` and receive the same operations with
+// the same key and value objects, so a correct fast path must leave every
+// header word and every entry word pointer-identical to the general body's.
+// Growth, tombstone reuse and probe order are all observable this way.
+// ---------------------------------------------------------------------------
+
+/// Every observable word of the two tables must agree.
+fn expectSameTable(a: *int, b: *int) {
+    unsafe {
+        expect(a[LEN_WORD]).toBe(b[LEN_WORD])
+        expect(a[CAP_WORD]).toBe(b[CAP_WORD])
+        expect(a[OCCUPIED_WORD]).toBe(b[OCCUPIED_WORD])
+        let ea = a[ENTRIES_WORD] as *int
+        let eb = b[ENTRIES_WORD] as *int
+        let cap = a[CAP_WORD]
+        var i = 0
+        while (i < cap * 2) {
+            expect(ea[i]).toBe(eb[i])
+            i = i + 1
+        }
+    }
+}
+
+test fn fast_set_matches_the_general_set_for_short_strings() {
+    let fast = abiMapNew(0)
+    let slow = abiMapNew(0)
+    let kAlpha = mkAlpha()
+    let kBeta = mkBeta()
+    let v1 = abiBoxI64(11)
+    let v2 = abiBoxI64(22)
+    abiMapSet(fast, kAlpha, v1)
+    abiMapSetSlow(slow, kAlpha, v1)
+    abiMapSet(fast, kBeta, v2)
+    abiMapSetSlow(slow, kBeta, v2)
+    expectSameTable(fast, slow)
+    // Overwrite through a fresh, equal key: the slot is reused, not appended.
+    let fresh = mkAlpha()
+    let v3 = abiBoxI64(33)
+    abiMapSet(fast, fresh, v3)
+    abiMapSetSlow(slow, fresh, v3)
+    expectSameTable(fast, slow)
+    expect(abiMapLen(fast)).toBe(2)
+    expect(abiMapGet(fast, kAlpha) as int).toBe(v3 as int)
+}
+
+test fn fast_set_matches_the_general_set_across_short_lengths() {
+    let fast = abiMapNew(0)
+    let slow = abiMapNew(0)
+    var keys = List<*int>()
+    var vals = List<*int>()
+    var i = 0
+    while (i < 12) {
+        let k = mkStrBytes([97 + i, 98 + i, 99, 100, 101, 102, 103, 104])
+        // Trim to a different length for each key: 0..8 bytes.
+        let trimmed = newStr(i % 9)
+        var q = 0
+        while (q < i % 9) {
+            byteInto(trimmed, q, 97 + i + q)
+            q = q + 1
+        }
+        let _ = k
+        let v = abiBoxI64(i)
+        keys.push(trimmed)
+        vals.push(v)
+        abiMapSet(fast, trimmed, v)
+        abiMapSetSlow(slow, trimmed, v)
+        i = i + 1
+    }
+    expectSameTable(fast, slow)
+    i = 0
+    while (i < len(keys)) {
+        expect(abiMapGet(fast, keys[i]) as int).toBe(abiMapGet(slow, keys[i]) as int)
+        i = i + 1
+    }
+}
+
+test fn fast_set_matches_the_general_set_around_tombstones() {
+    let fast = abiMapNew(0)
+    let slow = abiMapNew(0)
+    var keys = List<*int>()
+    var i = 0
+    while (i < 20) {
+        let k = mkStrBytes([119, 48 + (i / 10), 48 + (i % 10)])
+        keys.push(k)
+        let v = abiBoxI64(i)
+        abiMapSet(fast, k, v)
+        abiMapSetSlow(slow, k, v)
+        i = i + 1
+    }
+    expectSameTable(fast, slow)
+    // Remove the odd slots, then insert fresh keys that must reuse the
+    // earliest tombstone exactly where the general body does.
+    i = 0
+    while (i < 20) {
+        if (i % 2 == 1) {
+            abiMapRemove(fast, keys[i])
+            abiMapRemove(slow, keys[i])
+        }
+        i = i + 1
+    }
+    expectSameTable(fast, slow)
+    i = 0
+    while (i < 10) {
+        let k = mkStrBytes([122, 48 + i, 33])
+        let v = abiBoxI64(100 + i)
+        abiMapSet(fast, k, v)
+        abiMapSetSlow(slow, k, v)
+        i = i + 1
+    }
+    expectSameTable(fast, slow)
+}
+
+test fn fast_set_matches_the_general_set_across_growth() {
+    let fast = abiMapNew(0)
+    let slow = abiMapNew(0)
+    var keys = List<*int>()
+    var i = 0
+    while (i < 200) {
+        let k = mkStrBytes([107, 48 + (i / 100), 48 + ((i / 10) % 10), 48 + (i % 10)])
+        keys.push(k)
+        let v = abiBoxI64(i)
+        abiMapSet(fast, k, v)
+        abiMapSetSlow(slow, k, v)
+        i = i + 1
+    }
+    expectSameTable(fast, slow)
+    i = 0
+    while (i < 200) {
+        expect(abiMapGet(fast, keys[i]) as int).toBe(abiMapGet(slow, keys[i]) as int)
+        i = i + 1
+    }
+}
+
+test fn fast_set_delegates_foreign_key_classes() {
+    let fast = abiMapNew(0)
+    let slow = abiMapNew(0)
+    let kLong = mkStrBytes([97, 98, 99, 100, 101, 102, 103, 104, 105])
+    let boxes = List<*int>()
+    var i = 0
+    while (i < 6) {
+        boxes.push(abiBoxI64(i))
+        i = i + 1
+    }
+    let lk = listOf([1, 2, 3])
+    abiMapSet(fast, kLong, boxes[0])
+    abiMapSetSlow(slow, kLong, boxes[0])
+    abiMapSet(fast, boxes[1], boxes[2])
+    abiMapSetSlow(slow, boxes[1], boxes[2])
+    abiMapSet(fast, 0 as *int, boxes[3])
+    abiMapSetSlow(slow, 0 as *int, boxes[3])
+    abiMapSet(fast, lk, boxes[4])
+    abiMapSetSlow(slow, lk, boxes[4])
+    let shortKey = mkAlpha()
+    abiMapSet(fast, shortKey, boxes[5])
+    abiMapSetSlow(slow, shortKey, boxes[5])
+    expectSameTable(fast, slow)
+    expect(abiMapLen(fast)).toBe(5)
+}
+
+test fn fast_set_matches_the_general_set_on_an_empty_map() {
+    let fast = abiMapNew(0)
+    let slow = abiMapNew(0)
+    expectSameTable(fast, slow)
+    let v = abiBoxI64(1)
+    let ek = newStr(0)
+    abiMapSet(fast, ek, v)
+    abiMapSetSlow(slow, ek, v)
+    expectSameTable(fast, slow)
+    expect(abiMapLen(fast)).toBe(1)
+}
+
+// ---------------------------------------------------- string hash cache
+/// The header cache is only a memo of the exact FNV value, but it must never be
+/// written into a static `.rdata` descriptor and must never survive a payload
+/// mutation. This pins both directions plus the fast-path insertion.
+test fn string_hash_cache_matches_the_reference_and_is_writable_only() {
+    let k = mkAlpha()
+    unsafe {
+        expect(k[0]).toBe(0)
+        expect((k[2] & 2) != 0).toBe(false)
+    }
+    // Reference value from `fnv1a_matches_the_reference_implementation`.
+    let h = keyHash(k)
+    expect(h).toBe(-8447022563750764501)
+    unsafe {
+        expect(k[0]).toBe(h)
+        expect((k[2] & 2) != 0).toBe(true)
+    }
+    // A second lookup must return the memo, and a map insert must populate the
+    // same memo through the inlined fast path.
+    expect(keyHash(k)).toBe(h)
+    let m = abiMapNew(0)
+    let k2 = mkBeta()
+    abiMapSet(m, k2, abiBoxI64(42))
+    unsafe {
+        expect((k2[2] & 2) != 0).toBe(true)
+    }
+    expect(keyHash(k2)).toBe(795837917815194981)
+
+    // Simulate a read-only static descriptor (no heap flag): hashing must
+    // compute the same value and leave the word untouched, because a static
+    // descriptor lives in `.rdata`.
+    let ro = mkAlpha()
+    unsafe {
+        ro[2] = ro[2] & (0 - 2)
+        ro[0] = 0
+    }
+    expect(keyHash(ro)).toBe(h)
+    unsafe {
+        expect(ro[0]).toBe(0)
+        expect((ro[2] & 2) != 0).toBe(false)
+    }
 }

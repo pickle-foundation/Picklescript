@@ -51,7 +51,7 @@ import { abiStrCmp } from runtime.abi_string
 // the raw-allocation slots must travel with them. See `abi_raw.pkl`.
 // `abiRegisterObject` is here for the list *object*; the element span is raw
 // backing, never registered.
-import { abiRawAlloc, abiRegisterObject } from runtime.abi_raw
+import { abiRawAlloc, abiManagedAlloc, abiRegisterObject } from runtime.abi_raw
 
 const LEN_WORD: int = 3
 const CAP_WORD: int = 4
@@ -74,19 +74,19 @@ const SORT_STR: int = 2
 /// floored at `INITIAL_CAP`, and a fresh zeroed element span.
 fn listNew(cap: int) -> *int {
     unsafe {
-        var obj = alloc(int, LIST_WORDS)
+        var obj = abiManagedAlloc(LIST_WORDS * 8) as *int
         var c = cap
         if (c < INITIAL_CAP) {
             c = INITIAL_CAP
         }
-        var data = alloc(int, c)
+        var data = abiManagedAlloc(c * 8) as *int
         obj[0] = 0
         obj[1] = PICKLE_CLASS_LIST
         obj[2] = LIST_BYTES
         obj[LEN_WORD] = 0
         obj[CAP_WORD] = c
         obj[DATA_WORD] = data as int
-        abiRegisterObject(obj)
+        abiRegisterObject(obj as int)
         return obj
     }
 }
@@ -116,7 +116,7 @@ fn requireCapacity(list: *int, need: int) {
             newCap = newCap * 2
         }
         var oldData = list[DATA_WORD] as *int
-        var fresh = alloc(int, newCap)
+        var fresh = abiManagedAlloc(newCap * 8) as *int
         if (oldData as int != 0) {
             var preserve = cap
             if (newCap < preserve) {

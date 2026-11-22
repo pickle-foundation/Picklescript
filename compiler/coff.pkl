@@ -8,6 +8,37 @@ fn pad16(bs: List<int>) {
        }
    }
 
+/// Append one 64-bit word to a byte list, little-endian - the byte order every
+/// payload word in the runtime uses.
+fn pushWordLE(bs: List<int>, v: int) {
+    var i = 0
+    while (i < 8) {
+        bs.push((v >> (i * 8)) & 0xFF)
+        i = i + 1
+    }
+}
+
+/// Emit the static `string` descriptor for a literal, followed by its bytes.
+///
+/// The descriptor is the exact layout `runtime/abi_string.pkl::newStr` builds at
+/// run time: `[0, class, size, len, payload...]`, where `class` 0 is
+/// `PICKLE_CLASS_STRING` and `size` is `32 + 8 * ceil(len / 8)` bytes. Returning
+/// a pointer to it makes `IrConst.Str` a single address load instead of a
+/// `pickle_str_from_bytes` allocation plus a byte-at-a-time copy, and the
+/// descriptor is immutable by construction (`abiStrSet` copies).
+fn pushStrDesc(rdata: List<int>, bytes: List<int>) {
+    var n = len(bytes)
+    pushWordLE(rdata, 0)
+    pushWordLE(rdata, 0)
+    pushWordLE(rdata, 32 + ((n + 7) / 8) * 8)
+    pushWordLE(rdata, n)
+    var i = 0
+    while (i < n) {
+        rdata.push(bytes[i])
+        i = i + 1
+    }
+}
+
    /// Storage for a global with no static initializer. The only global slot the
    /// emitter produces today is a zeroed `int64`, so this is eight bytes rather
    /// than a real `.bss` section: a `.bss` needs virtual-size > raw-size section
@@ -223,11 +254,7 @@ var rdata = [0]
     var s = 0
     while (s < len(m.strings)) {
         strStart.push(len(rdata))
-        var h = 0
-        while (h < len(m.strings[s])) {
-            rdata.push(m.strings[s][h])
-            h = h + 1
-        }
+        pushStrDesc(rdata, m.strings[s])
         pad16(rdata)
         s = s + 1
     }
@@ -266,7 +293,8 @@ var recs = List<SymRec>()
        }
     var si = 0
     while (si < len(m.strings)) {
-        pushSym(recs, "pkl_strdata_" + str(si), 2, strStart[si], 2)
+        pushSym(recs, "pkl_strdesc_" + str(si), 2, strStart[si], 2)
+        pushSym(recs, "pkl_strdata_" + str(si), 2, strStart[si] + 32, 2)
         si = si + 1
     }
     var ri = 0

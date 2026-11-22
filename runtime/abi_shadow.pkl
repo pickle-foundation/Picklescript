@@ -175,14 +175,42 @@ fn shadowEnsureRegisteredLocked() -> int {
 
 /// ABI: push `frame` onto the current thread's shadow stack (native
 /// `push_frame` under the registry lock, with auto-registration).
+///
+/// INLINED FOR SPEED. Every shadowed runtime function pays push+pop, and the
+/// measured cost of the helpers was almost entirely call overhead: with the
+/// lock, TLS lookup and node link inlined here, a push+pop pair fell from
+/// ~46-57ns to ~20ns (micro10: `realPushPop` vs `tlsGet`/`lockOnly`/`linkOnly`
+/// at 2-3ns/3ns/11ns). The helper forms below remain for `abi_gc`'s walk and
+/// MUST stay in sync with these bodies: same lock word, same TLS slot, same
+/// node layout, same `win_exit(1)` divergence on a failed node allocation.
 #[symbol("pickle_shadow_push")]
 fn abiShadowPush(frame: *int) {
     unsafe {
-        shadowRegistryLockAcquire()
-        var node = shadowEnsureRegisteredLocked()
+        while (shadowLock == 1) {
+            win_sleep(0)
+        }
+        shadowLock = 1
+        if (shadowTlsSlot == -1) {
+            shadowTlsSlot = win_tls_alloc()
+        }
+        var node = win_tls_get(shadowTlsSlot)
+        if (node == 0) {
+            var heap = win_get_process_heap()
+            node = win_heap_alloc(heap, 0, 24)
+            if (node == 0) {
+                shadowLock = 0
+                win_exit(1)
+            }
+            (node as *int)[0] = 0
+            (node as *int)[1] = shadowNextId
+            shadowNextId = shadowNextId + 1
+            (node as *int)[2] = shadowRegHead
+            shadowRegHead = node
+            let _ = win_tls_set(shadowTlsSlot, node)
+        }
         frame[0] = (node as *int)[0]
         (node as *int)[0] = frame as int
-        shadowRegistryLockRelease()
+        shadowLock = 0
     }
 }
 
@@ -191,19 +219,39 @@ fn abiShadowPush(frame: *int) {
 /// then the head unsticks and the popped frame's `prev` clears). Out-of-order
 /// pop takes the silent `win_exit(1)` divergence instead of native's panic
 /// message (the leaf cannot reach `writeStderr`).
+///
+/// Inlined for the same reason as `abiShadowPush`; the bodies must stay in
+/// sync with `shadowEnsureRegisteredLocked`.
 #[symbol("pickle_shadow_pop")]
 fn abiShadowPop(frame: *int) {
     unsafe {
         if (shadowTlsSlot != -1) {
-            shadowRegistryLockAcquire()
-            var node = shadowEnsureRegisteredLocked()
+            while (shadowLock == 1) {
+                win_sleep(0)
+            }
+            shadowLock = 1
+            var node = win_tls_get(shadowTlsSlot)
+            if (node == 0) {
+                var heap = win_get_process_heap()
+                node = win_heap_alloc(heap, 0, 24)
+                if (node == 0) {
+                    shadowLock = 0
+                    win_exit(1)
+                }
+                (node as *int)[0] = 0
+                (node as *int)[1] = shadowNextId
+                shadowNextId = shadowNextId + 1
+                (node as *int)[2] = shadowRegHead
+                shadowRegHead = node
+                let _ = win_tls_set(shadowTlsSlot, node)
+            }
             if ((node as *int)[0] != (frame as int)) {
-                shadowRegistryLockRelease()
+                shadowLock = 0
                 win_exit(1)
             }
             (node as *int)[0] = frame[0]
             frame[0] = 0
-            shadowRegistryLockRelease()
+            shadowLock = 0
         }
     }
 }

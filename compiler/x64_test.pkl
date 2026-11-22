@@ -1,7 +1,7 @@
 module compiler.x64_test
 
 import { IrTy, IrConst, IrUnOp, IrBinOp, IrInstr, IrTerm, IrParam, IrExtern, IrBlock, IrFunc, IrModule, Callee } from compiler.ir
-import { X64Func, X64Out, x64LowerModule, hex2, f64ToBits, x64Dump } from compiler.x64
+import { X64Func, X64Out, x64LowerModule, hex2, f64ToBits, x64Dump, magicDivConst, externMayCollect } from compiler.x64
 import { DiagnosticSink } from compiler.diag
 
 fn mkFunc(name: string, symbol: string, ret: IrTy, slots: List<IrTy>, blocks: List<IrBlock>) -> IrFunc {
@@ -13,29 +13,23 @@ fn mkFuncParams(name: string, symbol: string, params: List<IrParam>, ret: IrTy, 
 }
 
 fn mkModuleOne(f: IrFunc) -> IrModule {
-    var fs = [IrFunc("x", "", List<IrParam>(), IrTy.Unit, List<IrTy>(), 0, List<IrBlock>(), false, false, List<string>())]
-    fs.pop()
+    var fs: List<IrFunc> = []
     fs.push(f)
-    var es = [IrExtern("x", List<IrTy>(), IrTy.Unit)]
-    es.pop()
+    var es: List<IrExtern> = []
     var bn = {"::seed::": 0}
     bn.remove("::seed::")
-    var ss = [[0]]
-    ss.pop()
+    var ss: List<List<int>> = []
     IrModule(fs, es, bn, ss, List<IrGlobal>())
 }
 
 fn mkModuleExtern(f: IrFunc, e: IrExtern) -> IrModule {
-    var fs = [IrFunc("x", "", List<IrParam>(), IrTy.Unit, List<IrTy>(), 0, List<IrBlock>(), false, false, List<string>())]
-    fs.pop()
+    var fs: List<IrFunc> = []
     fs.push(f)
-    var es = [IrExtern("x", List<IrTy>(), IrTy.Unit)]
-    es.pop()
+    var es: List<IrExtern> = []
     es.push(e)
     var bn = {"::seed::": 0}
     bn.remove("::seed::")
-    var ss = [[0]]
-    ss.pop()
+    var ss: List<List<int>> = []
     IrModule(fs, es, bn, ss, List<IrGlobal>())
 }
 
@@ -83,8 +77,7 @@ fn assertBytes(xf: X64Func, expected: string) {
 }
 
 fn byteCat(a: List<int>, b: List<int>) -> List<int> {
-    var out = [0]
-    out.pop()
+    var out: List<int> = []
     var i = 0
     while (i < len(a)) {
         out.push(a[i])
@@ -172,8 +165,7 @@ test fn float_cmp_never_writes_two_setcc_into_al() {
 }
 
 fn oneBlockTerm(term: IrTerm, instrs: List<IrInstr>) -> List<IrBlock> {
-    var l = [IrBlock(0, List<IrInstr>(), IrTerm.Unreachable)]
-    l.pop()
+    var l: List<IrBlock> = []
     l.push(IrBlock(0, instrs, term))
     l
 }
@@ -231,7 +223,7 @@ test fn int_const_return() {
     let f = mkFunc("f", "pkl_f", IrTy.Int, List<IrTy>(), oneBlockTerm(
         IrTerm.Return(0), [IrInstr.Const(0, IrConst.Int(42))]))
     let xf = lowerF(f)
-    assertBytes(xf, "554889e54881ec2000000048b82a00000000000000488945e8488b45e84889ec5dc3")
+    assertBytes(xf, "554889e54881ec2000000048b82a000000000000004889ec5dc3")
     expect(xf.ncells).toBe(0)
     expect(xf.totalK).toBe(32)
     expect(len(xf.relocs)).toBe(0)
@@ -242,7 +234,7 @@ test fn bool_const_return() {
     let f = mkFunc("f", "pkl_f", IrTy.Bool, List<IrTy>(), oneBlockTerm(
         IrTerm.Return(0), [IrInstr.Const(0, IrConst.Bool(true))]))
     let xf = lowerF(f)
-    assertBytes(xf, "554889e54881ec20000000c645e8018a45e84889ec5dc3")
+    assertBytes(xf, "554889e54881ec2000000048b801000000000000004889ec5dc3")
     expect(xf.totalK).toBe(32)
 }
 
@@ -256,31 +248,36 @@ test fn unit_return() {
 }
 
 test fn int_add_return() {
-    let f = mkFunc("f", "pkl_f", IrTy.Int, List<IrTy>(), oneBlockTerm(
+    // Parameters, not constants: scalar constants are folded/rematerialised,
+    // so this must load real operands to cover the add lowering.
+    let f = mkFuncParams("f", "pkl_f", [IrParam("x", IrTy.Int), IrParam("y", IrTy.Int)], IrTy.Int, [IrTy.Int, IrTy.Int], oneBlockTerm(
         IrTerm.Return(2),
-        [IrInstr.Const(0, IrConst.Int(5)),
-         IrInstr.Const(1, IrConst.Int(7)),
+        [IrInstr.LoadSlot(0, 0),
+         IrInstr.LoadSlot(1, 1),
          IrInstr.BinOp(2, IrBinOp.Add, 0, 1)]))
     let xf = lowerF(f)
-    assertBytes(xf, "554889e54881ec3000000048b80500000000000000488945e848b80700000000000000488945e0488b45e8488b4de04801c8488945d8488b45d84889ec5dc3")
-    expect(xf.totalK).toBe(48)
+    assertBytes(xf, "554889e54881ec4000000048894de8488955e0488b45e8488945d8488b45e04889c1488b45d84801c84889ec5dc3")
+    expect(xf.totalK).toBe(64)
 }
 
 test fn int_div_return() {
-    let f = mkFunc("f", "pkl_f", IrTy.Int, List<IrTy>(), oneBlockTerm(
+    // Parameters keep the division lowering live (constant operands fold).
+    let f = mkFuncParams("f", "pkl_f", [IrParam("x", IrTy.Int), IrParam("y", IrTy.Int)], IrTy.Int, [IrTy.Int, IrTy.Int], oneBlockTerm(
         IrTerm.Return(2),
-        [IrInstr.Const(0, IrConst.Int(9)),
-         IrInstr.Const(1, IrConst.Int(4)),
+        [IrInstr.LoadSlot(0, 0),
+         IrInstr.LoadSlot(1, 1),
          IrInstr.BinOp(2, IrBinOp.Div, 0, 1)]))
     let xf = lowerF(f)
-    assertBytes(xf, "554889e54881ec3000000048b80900000000000000488945e848b80400000000000000488945e0488b45e8488b4de0489948f7f9488945d8488b45d84889ec5dc3")
+    assertBytes(xf, "554889e54881ec4000000048894de8488955e0488b45e8488945d8488b45e04889c1488b45d8489948f7f94889ec5dc3")
 }
 
 test fn float_const_return() {
     let f = mkFunc("f", "pkl_f", IrTy.Float, List<IrTy>(), oneBlockTerm(
         IrTerm.Return(0), [IrInstr.Const(0, IrConst.Float(2.5))]))
     let xf = lowerF(f)
-    assertBytes(xf, "554889e54881ec2000000048b8000000000000044066480f6ec0f20f1145e8f20f1045e84889ec5dc3")
+    // The float result stays in xmm0 for the return: the store keeps the home
+    // current but the reload is elided.
+    assertBytes(xf, "554889e54881ec2000000048b8000000000000044066480f6ec0f20f1145e84889ec5dc3")
     expect(xf.totalK).toBe(32)
 }
 
@@ -291,76 +288,104 @@ test fn float_cmp_lt_return() {
          IrInstr.Const(1, IrConst.Float(2.0)),
          IrInstr.BinOp(2, IrBinOp.Lt, 0, 1)]))
     let xf = lowerF(f)
-assertBytes(xf, "554889e54881ec3000000048b8000000000000f03f66480f6ec0f20f1145e848b8000000000000004066480f6ec0f20f1145e0f20f1045e8f20f104de0660f2ec10f92c00f9bc120c88845df8a45df4889ec5dc3")
+assertBytes(xf, "554889e54881ec3000000048b8000000000000f03f66480f6ec0f20f1145e848b8000000000000004066480f6ec0f20f1145e0f20f1045e8f20f104de0660f2ec10f92c00f9bc120c84889ec5dc3")
   }
 
 test fn unop_neg_return() {
-    let f = mkFunc("f", "pkl_f", IrTy.Int, List<IrTy>(), oneBlockTerm(
+    // A parameter keeps the neg lowering live (a constant operand folds).
+    let f = mkFuncParams("f", "pkl_f", [IrParam("x", IrTy.Int)], IrTy.Int, [IrTy.Int], oneBlockTerm(
         IrTerm.Return(1),
-        [IrInstr.Const(0, IrConst.Int(5)),
+        [IrInstr.LoadSlot(0, 0),
          IrInstr.UnOp(1, IrUnOp.Neg, 0)]))
     let xf = lowerF(f)
-    assertBytes(xf, "554889e54881ec2000000048b80500000000000000488945e8488b45e848f7d8488945e0488b45e04889ec5dc3")
-    expect(xf.totalK).toBe(32)
+    assertBytes(xf, "554889e54881ec3000000048894de8488b45e848f7d84889ec5dc3")
+    expect(xf.totalK).toBe(48)
 }
 
-/// A 1-byte home directly beneath an aligned 8-byte home must not overlap it.
-/// An access of width W at [rbp-K] consumes offsets [K-W+1, K], so Bool temps
-/// parked at 24 and 25 must force the next 8-byte temp to K >= 33, not to the
-/// 8-aligned 32 (whose footprint [25,32] would clobber the Bool at 25).
-test fn bool_then_int_temps_do_not_overlap() {
-    let f = mkFunc("f", "pkl_f", IrTy.Int, List<IrTy>(), oneBlockTerm(
-        IrTerm.Return(2),
-        [IrInstr.Const(0, IrConst.Bool(true)),
-         IrInstr.Const(1, IrConst.Bool(true)),
-         IrInstr.Const(2, IrConst.Int(7))]))
+/// The front end's implicit "return zero" tail emits `const 0` (Int) even in a
+/// float-returning function (e.g. `abiListSumF64` in the runtime). Scalar
+/// constants are rematerialised and own no home, so the float return path must
+/// materialise the constant's 64-bit pattern instead of asking for a home. The
+/// bits go through r11, not rax, because an already-loaded integer argument
+/// may still be live in rax.
+test fn float_return_of_int_const() {
+    let f = mkFunc("f", "pkl_f", IrTy.Float, List<IrTy>(), oneBlockTerm(
+        IrTerm.Return(0), [IrInstr.Const(0, IrConst.Int(0))]))
     let xf = lowerF(f)
-    expect(xf.totalK).toBe(48)
-    assertBytes(xf, "554889e54881ec30000000c645e801c645e70148b80700000000000000488945d8488b45d84889ec5dc3")
+    assertBytes(xf, "554889e54881ec2000000049bb000000000000000066490f6ec34889ec5dc3")
+    expect(xf.totalK).toBe(32)
+    expect(xf.ncells).toBe(0)
+}
+
+test fn float_return_of_nonzero_int_const_keeps_bits() {
+    let f = mkFunc("f", "pkl_f", IrTy.Float, List<IrTy>(), oneBlockTerm(
+        IrTerm.Return(0), [IrInstr.Const(0, IrConst.Int(7))]))
+    let xf = lowerF(f)
+    assertBytes(xf, "554889e54881ec2000000049bb070000000000000066490f6ec34889ec5dc3")
+}
+
+/// A 1-byte home beneath an aligned 8-byte home must not overlap it.
+/// An access of width W at [rbp-K] consumes offsets [K-W+1, K], so the Bool
+/// slots parked at 24 and 25 must force the next 8-byte home to K >= 33 --
+/// here it lands at 40 -- and the Bool temp's byte store at 41 must stay one
+/// byte. A qword access for the Int slot would consume [33,40] and clobber the
+/// Bool at 25.
+test fn bool_then_int_temps_do_not_overlap() {
+    let f = mkFunc("f", "pkl_f", IrTy.Int, [IrTy.Bool, IrTy.Bool, IrTy.Int], oneBlockTerm(
+        IrTerm.Return(3),
+        [IrInstr.LoadSlot(0, 0),
+         IrInstr.UnOp(1, IrUnOp.Not, 0),
+         IrInstr.BinOp(2, IrBinOp.Eq, 0, 1),
+         IrInstr.StoreSlot(1, 2),
+         IrInstr.LoadSlot(3, 2)]))
+    let xf = lowerF(f)
+    expect(xf.totalK).toBe(64)
+    assertBytes(xf, "554889e54881ec400000008a45e88845d784c00f94c089c18a45d738c80f94c08845e7488b45d84889ec5dc3")
 }
 
 /// `IrUnOp.Not` operates on a `Bool` temp. `tyWidth(Bool)` is 8 bits, so the
-/// load must be 8 bits -- and so must the store. Storing 8 bytes into the 1-byte
-/// slot would overrun the next temp and corrupt an unrelated flag.
+/// load and the temp's home store must be 8 bits -- a wider store would overrun
+/// the neighbouring 1-byte home and corrupt an unrelated flag.
 test fn unop_not_bool_is_one_byte() {
-    let f = mkFunc("f", "pkl_f", IrTy.Bool, [IrTy.Bool], oneBlockTerm(
-        IrTerm.Return(1),
-        [IrInstr.LoadSlot(0, 0), IrInstr.UnOp(1, IrUnOp.Not, 0)]))
+    let f = mkFunc("f", "pkl_f", IrTy.Bool, [IrTy.Bool, IrTy.Bool], oneBlockTerm(
+        IrTerm.Return(2),
+        [IrInstr.LoadSlot(0, 0),
+         IrInstr.UnOp(1, IrUnOp.Not, 0),
+         IrInstr.BinOp(2, IrBinOp.Eq, 0, 1)]))
     let xf = lowerF(f)
-    // Slot 0 (Bool, 1 byte) is at k = 24; temps 0 and 1 follow at 25 and 26.
-    // Both the load (`8a`, mov r8, r/m8) and the store (`88`, mov r/m8, r8) are
-    // the single-byte forms. A 64-bit store would encode a disp32 qword instead
-    // and overrun the neighbouring temp.
+    // Slot 0 (Bool) is at k = 24; temp 0's home is at 26 (1 byte). The load
+    // (`8a`) and the store (`88`) are the single-byte forms; a 64-bit store
+    // would encode a disp32 qword instead and overrun its neighbour.
     expect(xf.totalK).toBe(32)
-    assertBytes(xf, "554889e54881ec200000008a45e88845e78a45e784c00f94c08845e68a45e64889ec5dc3")
+    assertBytes(xf, "554889e54881ec200000008a45e88845e684c00f94c089c18a45e638c80f94c04889ec5dc3")
 }
 
 test fn unop_not_return() {
-    let f = mkFunc("f", "pkl_f", IrTy.Bool, List<IrTy>(), oneBlockTerm(
+    // A parameter keeps the Not lowering live (a constant operand folds).
+    let f = mkFuncParams("f", "pkl_f", [IrParam("b", IrTy.Bool)], IrTy.Bool, [IrTy.Bool], oneBlockTerm(
         IrTerm.Return(1),
-        [IrInstr.Const(0, IrConst.Bool(true)),
+        [IrInstr.LoadSlot(0, 0),
          IrInstr.UnOp(1, IrUnOp.Not, 0)]))
     let xf = lowerF(f)
-    assertBytes(xf, "554889e54881ec20000000c645e8018a45e884c00f94c08845e78a45e74889ec5dc3")
+    assertBytes(xf, "554889e54881ec20000000884de88a45e884c00f94c04889ec5dc3")
 }
 
 test fn param_seed_and_return() {
     let f = mkFuncParams("f", "pkl_f", [IrParam("x", IrTy.Int)], IrTy.Int, [IrTy.Int], oneBlockTerm(
         IrTerm.Return(0), [IrInstr.LoadSlot(0, 0)]))
     let xf = lowerF(f)
-    assertBytes(xf, "554889e54881ec2000000048894de8488b45e8488945e0488b45e04889ec5dc3")
+    assertBytes(xf, "554889e54881ec2000000048894de8488b45e84889ec5dc3")
 }
 
 test fn branch_fixup_patched() {
-    var bs = [IrBlock(0, List<IrInstr>(), IrTerm.Unreachable)]
-    bs.pop()
+    var bs: List<IrBlock> = []
     bs.push(IrBlock(0, [IrInstr.Const(0, IrConst.Bool(true))], IrTerm.BranchIf(0, 1, 2)))
     bs.push(IrBlock(1, List<IrInstr>(), IrTerm.Return(none)))
     bs.push(IrBlock(2, [IrInstr.Const(1, IrConst.Int(7))], IrTerm.Return(none)))
     let f = mkFunc("f", "pkl_f", IrTy.Unit, List<IrTy>(), bs)
     let xf = lowerF(f)
-    assertBytes(xf, "554889e54881ec20000000c645e8018a45e884c00f8505000000e9050000004889ec5dc348b80700000000000000488945e04889ec5dc3")
-    expect(len(xf.bytes)).toBe(55)
+    assertBytes(xf, "554889e54881ec2000000048b8010000000000000084c00f8505000000e9050000004889ec5dc34889ec5dc3")
+    expect(len(xf.bytes)).toBe(44)
 }
 
 test fn managed_slot_shadow_push_pop() {
@@ -373,15 +398,15 @@ test fn managed_slot_shadow_push_pop() {
         IrTerm.Return(0),
         [IrInstr.LoadSlot(0, 0), IrInstr.Const(1, IrConst.Int(0)), IrInstr.Call(2, Callee.Extern(0), [1])]))
     let xf = lowerFExt(f, e)
-    assertBytes(xf, "554889e54881ec300000004831c0488945f0488945f848b8020000003000005a488945e8488d4de049ba000000000000000041ffd2488b45f0488945f848b80000000000000000488945d8488b4dd849ba000000000000000041ffd2488945d0488d4de049ba000000000000000041ffd2488b45f84889ec5dc3")
+    assertBytes(xf, "554889e54881ec500000000f57e4f30f7f65f048b8020000003000005a488945e8488d4de049ba000000000000000041ffd2488b45f0488945f848b9000000000000000049ba000000000000000041ffd2488945d8488d4de049ba000000000000000041ffd2488b45f84889ec5dc3")
     expect(xf.ncells).toBe(2)
     expect(xf.totalK).toBe(48)
     expect(len(xf.relocs)).toBe(3)
-    expect(xf.relocs[0].off).toBe(42)
+    expect(xf.relocs[0].off).toBe(39)
     expect(xf.relocs[0].sym).toBe("pickle_shadow_push")
-    expect(xf.relocs[1].off).toBe(81)
+    expect(xf.relocs[1].off).toBe(70)
     expect(xf.relocs[1].sym).toBe("abiEngineRegister")
-    expect(xf.relocs[2].off).toBe(102)
+    expect(xf.relocs[2].off).toBe(91)
     expect(xf.relocs[2].sym).toBe("pickle_shadow_pop")
 }
 
@@ -392,7 +417,7 @@ test fn managed_slot_without_gc_call_has_no_shadow() {
     let f = mkFunc("f", "pkl_f", IrTy.Str, [IrTy.Str], oneBlockTerm(
         IrTerm.Return(0), [IrInstr.LoadSlot(0, 0)]))
     let xf = lowerF(f)
-    assertBytes(xf, "554889e54881ec30000000488b45f0488945f8488b45f84889ec5dc3")
+    assertBytes(xf, "554889e54881ec30000000488b45f04889ec5dc3")
     expect(xf.ncells).toBe(2)
     expect(xf.totalK).toBe(48)
     expect(len(xf.relocs)).toBe(0)
@@ -406,10 +431,33 @@ test fn extern_float_mod_call() {
          IrInstr.Const(1, IrConst.Float(2.0)),
          IrInstr.Call(2, Callee.Extern(0), [0, 1])]))
     let xf = lowerFExt(f, e)
-    assertBytes(xf, "554889e54881ec3000000048b8000000000000144066480f6ec0f20f1145e848b8000000000000004066480f6ec0f20f1145e0f20f1045e8f20f104de049ba000000000000000041ffd2f20f1145d8f20f1045d84889ec5dc3")
+    assertBytes(xf, "554889e54881ec5000000048b8000000000000144066480f6ec0f20f1145e848b8000000000000004066480f6ec0f20f1145e0f20f1045e8f20f104de049ba000000000000000041ffd2f20f1145d84889ec5dc3")
     expect(len(xf.relocs)).toBe(1)
     expect(xf.relocs[0].off).toBe(63)
     expect(xf.relocs[0].sym).toBe("pickle_fmod")
+}
+
+/// Win64 reserves 32 bytes of shadow space below the return address of every
+/// call, and a callee may spill its argument registers there. Calls with at
+/// most four arguments emit no per-call `sub rsp`, so the prologue has to keep
+/// that scratch area below every local home. Without it the callee tramples the
+/// bottom of the caller's frame - exactly where the pin saves live - and the
+/// restored register no longer belongs to the caller: `FindFirstFileW` wrote a
+/// 2 over `abiListDir`'s saved rdi, which restarted `std.test.runTests`'s loop
+/// at index 2 forever. `xf.totalK` stays the planned locals size; the extra 32
+/// bytes are prologue-only scratch.
+test fn call_frame_reserves_win64_shadow_space() {
+    let e = IrExtern("abiEngineRegister", [IrTy.Int], IrTy.Unit)
+    let f = mkFunc("f", "pkl_f", IrTy.Unit, List<IrTy>(), oneBlockTerm(
+        IrTerm.Return(none),
+        [IrInstr.Const(0, IrConst.Int(0)), IrInstr.Call(none, Callee.Extern(0), [0])]))
+    let xf = lowerFExt(f, e)
+    // Prologue: `55 48 89 e5 48 81 ec <imm32 little-endian>`.
+    let frame = xf.bytes[7] + xf.bytes[8] * 256 + xf.bytes[9] * 65536 + xf.bytes[10] * 16777216
+    expect(frame).toBe(xf.totalK + 32)
+    // The call has one argument, so it reserves nothing itself; the 32 bytes
+    // above are the only shadow space below the frame.
+    expect(len(xf.bytes) > 11).toBe(true)
 }
 
 test fn ftoi_saturating() {
@@ -418,7 +466,7 @@ test fn ftoi_saturating() {
         [IrInstr.Const(0, IrConst.Float(1.5)),
          IrInstr.Ftoi(1, 0)]))
     let xf = lowerF(f)
-    assertBytes(xf, "554889e54881ec2000000048b8000000000000f83f66480f6ec0f20f1145e8f20f1045e8660f2ec07a3148b9000000000000e04366480f6ec9660f2ec1732148b9000000000000e0c366480f6ed1660f2ec27218f2480f2cc0eb1b4831c0eb1648b8ffffffffffffff7feb0a48b80000000000000080488945e0488b45e04889ec5dc3")
+    assertBytes(xf, "554889e54881ec2000000048b8000000000000f83f66480f6ec0f20f1145e8660f2ec07a3148b9000000000000e04366480f6ec9660f2ec1732148b9000000000000e0c366480f6ec9660f2ec17218f2480f2cc0eb1b4831c0eb1648b8ffffffffffffff7feb0a48b800000000000000804889ec5dc3")
 }
 
 /// Regression guard for frame planning. `analyze` must size unmanaged slots and
@@ -438,13 +486,13 @@ test fn large_frame_sizes_slots_in_bytes() {
         [IrInstr.Const(0, IrConst.Int(7)), IrInstr.LoadSlot(1, 63)]))
     let xf = lowerF(f)
     // 16-byte shadow header + 8 reserved cell bytes = 24, then 64 * 8 = 512 for
-    // the slots, then two 8-byte temps, rounded up to 16.
+    // the slots, rounded up to 16. The const temp is rematerialised (no home)
+    // and the load temp is returned straight from rax.
     expect(xf.totalK).toBe(544)
-    // Slot 63 lands at k = 24 + 8*63 = 528 and the two temps at 536/544, so all
-    // three accesses are past the disp8 limit and must use disp32 (0xFFFFFDF0,
-    // 0xFFFFFDE8, 0xFFFFFDE0). Asserting the whole image keeps the large-frame
+    // Slot 63 lands at k = 528, past the disp8 limit, so the access must use
+    // disp32 (0xFFFFFDF0). Asserting the whole image keeps the large-frame
     // prologue and encoding path covered.
-    assertBytes(xf, "554889e54881ec2002000048b80700000000000000488985e8fdffff488b85f0fdffff488985e0fdffff488b85e0fdffff4889ec5dc3")
+    assertBytes(xf, "554889e54881ec20020000488b85f0fdffff4889ec5dc3")
 }
 
 test fn x64_dump_smoke() {
@@ -476,11 +524,466 @@ test fn long_forward_branch_chain_reaches_arm() {
     blocks.push(IrBlock(24, arm, IrTerm.Return(2)))
     let f = mkFunc("f", "pkl_f", IrTy.Int, List<IrTy>(), blocks)
     let xf = lowerF(f)
-    // Prologue, then the tag test in r8 (`mov r8,[rbp-0x18]; cmp r8,rax;
-    // sete al`) and a `jne` that must land on the arm at 0xad -- past all 24
-    // filler blocks. Each filler is a 5-byte `jmp rel32` back to block 1 at
-    // 0x3a, so filler k carries rel = -(5*(k+1)); the last is -0x73. Asserting
-    // the whole image pins every forward fixup: resolving one against the
-    // wrong block start lands elsewhere in this image and fails.
-    assertBytes(xf, "554889e54881ec3000000048b80500000000000000488945e8488b45e8488b4de84839c80f94c08845e78a45e784c00f8578000000e900000000e9fbffffffe9f6ffffffe9f1ffffffe9ecffffffe9e7ffffffe9e2ffffffe9ddffffffe9d8ffffffe9d3ffffffe9ceffffffe9c9ffffffe9c4ffffffe9bfffffffe9baffffffe9b5ffffffe9b0ffffffe9abffffffe9a6ffffffe9a1ffffffe99cffffffe997ffffffe992ffffffe98dffffff48b80100000000000000488945d8488b45d84889ec5dc3")
+    // Prologue, then the tag test in rax (`movabs 1` from the folded
+    // `Eq(5, 5)`, then `test al,al`) and a `jne` that must land on the arm past
+    // all 24 filler blocks. Each filler is a 5-byte `jmp rel32` back to block 1,
+    // so filler k carries rel = -(5*(k+1)); the last is -0x73. Asserting the
+    // whole image pins every forward fixup: resolving one against the wrong
+    // block start lands elsewhere in this image and fails.
+    assertBytes(xf, "554889e54881ec2000000048b8010000000000000084c00f8578000000e900000000e9fbffffffe9f6ffffffe9f1ffffffe9ecffffffe9e7ffffffe9e2ffffffe9ddffffffe9d8ffffffe9d3ffffffe9ceffffffe9c9ffffffe9c4ffffffe9bfffffffe9baffffffe9b5ffffffe9b0ffffffe9abffffffe9a6ffffffe9a1ffffffe99cffffffe997ffffffe992ffffffe98dffffff48b801000000000000004889ec5dc3")
 }
+
+/// The `[M, s]` pairs the strength reducer computes, pinned against values
+/// derived independently by long division. A wrong multiplier is a wrong
+/// answer for every input, so the table is worth asserting even though the
+/// runtime test below exercises the emitted sequence end to end.
+test fn magic_div_const_pairs() {
+    expect(magicDivConst(3)).toBe([0 - 6148914691236517205, 1])
+    expect(magicDivConst(7)).toBe([5270498306774157605, 1])
+    expect(magicDivConst(10)).toBe([7378697629483820647, 2])
+    expect(magicDivConst(100)).toBe([0 - 6640827866535438581, 6])
+    expect(magicDivConst(1000)).toBe([2361183241434822607, 7])
+    expect(magicDivConst(99991)).toBe([0 - 6356397746393801451, 16])
+    expect(magicDivConst(2147483647)).toBe([0 - 9223372032559808509, 30])
+    // Powers of two take the shift path, and the range ends at 2^31 - 1.
+    expect(magicDivConst(1)).toBe(none)
+    expect(magicDivConst(2)).toBe(none)
+    expect(magicDivConst(4)).toBe(none)
+    expect(magicDivConst(2147483648)).toBe(none)
+}
+
+test fn int_div_by_const_uses_magic_multiply() {
+    // A parameter numerator keeps the constant divisor un-folded, so the
+    // backend must pick the magic path: `mul r11`, not `cqo; idiv rcx`.
+    let f = mkFuncParams("f", "pkl_f", [IrParam("x", IrTy.Int)], IrTy.Int, [IrTy.Int], oneBlockTerm(
+        IrTerm.Return(2),
+        [IrInstr.LoadSlot(0, 0),
+         IrInstr.Const(1, IrConst.Int(7)),
+         IrInstr.BinOp(2, IrBinOp.Div, 0, 1)]))
+    let xf = lowerF(f)
+    expect(containsSeq(xf.bytes, [0x49, 0xF7, 0xE3])).toBe(true)
+    expect(containsSeq(xf.bytes, [0x48, 0xF7, 0xF9])).toBe(false)
+}
+
+test fn int_mod_by_const_uses_magic_multiply() {
+    let f = mkFuncParams("f", "pkl_f", [IrParam("x", IrTy.Int)], IrTy.Int, [IrTy.Int], oneBlockTerm(
+        IrTerm.Return(2),
+        [IrInstr.LoadSlot(0, 0),
+         IrInstr.Const(1, IrConst.Int(100)),
+         IrInstr.BinOp(2, IrBinOp.Mod, 0, 1)]))
+    let xf = lowerF(f)
+    expect(containsSeq(xf.bytes, [0x49, 0xF7, 0xE3])).toBe(true)
+    expect(containsSeq(xf.bytes, [0x48, 0xF7, 0xF9])).toBe(false)
+}
+
+/// Differential test: `q`/`r` are the strength-reduced `x / C` and `x % C`
+/// computed by the caller, while `x / d` and `x % d` inside this function use
+/// the hardware `idiv` (the divisor is not a compile-time constant here). The
+/// arithmetic must agree for every signed input, including truncation toward
+/// zero rather than flooring.
+fn expectConstMatchesIdiv(x: int, d: int, q: int, r: int) {
+    expect(q).toBe(x / d)
+    expect(r).toBe(x % d)
+}
+
+test fn const_div_mod_matches_idiv_on_signed_edges() {
+    let mins = (0 - 9223372036854775807) - 1
+    let maxs = 9223372036854775807
+    var xs = List<int>()
+    xs.push(0)
+    xs.push(1)
+    xs.push(0 - 1)
+    xs.push(6)
+    xs.push(7)
+    xs.push(8)
+    xs.push(0 - 6)
+    xs.push(0 - 7)
+    xs.push(0 - 8)
+    xs.push(mins)
+    xs.push(mins + 1)
+    xs.push(0 - 7 * 1000000000)
+    xs.push(maxs)
+    xs.push(maxs - 1)
+    xs.push(100)
+    xs.push(0 - 100)
+    xs.push(12345678901234567)
+    xs.push(0 - 12345678901234567)
+    // A deterministic sweep, so negative and positive values on both sides of
+    // many multiples of every divisor above are represented.
+    var state = 12345
+    var i = 0
+    while (i < 400) {
+        state = state * 6364136223846793005 + 1442695040888963407
+        xs.push(state)
+        i = i + 1
+    }
+    for (x in xs) {
+        // Magic-number path (all non-power-of-two divisors in (1, 2^31)).
+        expectConstMatchesIdiv(x, 3, x / 3, x % 3)
+        expectConstMatchesIdiv(x, 7, x / 7, x % 7)
+        expectConstMatchesIdiv(x, 9, x / 9, x % 9)
+        expectConstMatchesIdiv(x, 10, x / 10, x % 10)
+        expectConstMatchesIdiv(x, 100, x / 100, x % 100)
+        expectConstMatchesIdiv(x, 1000, x / 1000, x % 1000)
+        expectConstMatchesIdiv(x, 99991, x / 99991, x % 99991)
+        expectConstMatchesIdiv(x, 2147483647, x / 2147483647, x % 2147483647)
+        // Power-of-two shift path.
+        expectConstMatchesIdiv(x, 1, x / 1, x % 1)
+        expectConstMatchesIdiv(x, 2, x / 2, x % 2)
+        expectConstMatchesIdiv(x, 256, x / 256, x % 256)
+        expectConstMatchesIdiv(x, 2147483648, x / 2147483648, x % 2147483648)
+        // Negative divisors stay on `idiv`; this pins that truncation toward
+        // zero is identical on both operands and both operators.
+        expectConstMatchesIdiv(x, 0 - 7, x / (0 - 7), x % (0 - 7))
+        expectConstMatchesIdiv(x, 0 - 100, x / (0 - 100), x % (0 - 100))
+    }
+}
+
+/// Backend-only inlining pins. `emitCall` must spell these leaf helpers as
+/// their runtime bodies, so no call and no relocation is emitted. The IR/IRX
+/// oracles still see the original `IrInstr.Call`, which is why these image pins
+/// live only here.
+
+test fn inline_list_get_lowering() {
+    let e = IrExtern("pickle_list_get", [IrTy.Ptr, IrTy.Int], IrTy.Ptr)
+    let f = mkFuncParams("f", "pkl_f", [IrParam("xs", IrTy.Ptr)], IrTy.Ptr, [IrTy.Ptr], oneBlockTerm(
+        IrTerm.Return(2),
+        [IrInstr.LoadSlot(0, 0),
+         IrInstr.Const(1, IrConst.Int(0)),
+         IrInstr.Call(2, Callee.Extern(0), [0, 1])]))
+    let xf = lowerFExt(f, e)
+    assertBytes(xf, "554889e54881ec5000000048894de8488b45e8488945f04889c148ba0000000000000000488b41184839c27d0a488b4128488b04d0eb0231c04889ec5dc3")
+    expect(len(xf.relocs)).toBe(0)
+}
+
+test fn inline_list_len_lowering() {
+    let e = IrExtern("pickle_list_len", [IrTy.Ptr], IrTy.Int)
+    let f = mkFuncParams("f", "pkl_f", [IrParam("xs", IrTy.Ptr)], IrTy.Int, [IrTy.Ptr], oneBlockTerm(
+        IrTerm.Return(1),
+        [IrInstr.LoadSlot(0, 0), IrInstr.Call(1, Callee.Extern(0), [0])]))
+    let xf = lowerFExt(f, e)
+    assertBytes(xf, "554889e54881ec5000000048894df0488b45f0488945f84889c1488b41184889ec5dc3")
+    expect(len(xf.relocs)).toBe(0)
+}
+
+test fn inline_str_len_lowering() {
+    let e = IrExtern("pickle_str_len", [IrTy.Str], IrTy.Int)
+    let f = mkFuncParams("f", "pkl_f", [IrParam("s", IrTy.Str)], IrTy.Int, [IrTy.Str], oneBlockTerm(
+        IrTerm.Return(1),
+        [IrInstr.LoadSlot(0, 0), IrInstr.Call(1, Callee.Extern(0), [0])]))
+    let xf = lowerFExt(f, e)
+    assertBytes(xf, "554889e54881ec5000000048894df0488b45f0488945f84889c1488b41184889ec5dc3")
+    expect(len(xf.relocs)).toBe(0)
+}
+
+test fn inline_unbox_i64_lowering() {
+    let e = IrExtern("pickle_unbox_i64", [IrTy.Ptr], IrTy.Int)
+    let f = mkFuncParams("f", "pkl_f", [IrParam("b", IrTy.Ptr)], IrTy.Int, [IrTy.Ptr], oneBlockTerm(
+        IrTerm.Return(1),
+        [IrInstr.LoadSlot(0, 0), IrInstr.Call(1, Callee.Extern(0), [0])]))
+    let xf = lowerFExt(f, e)
+    assertBytes(xf, "554889e54881ec5000000048894df0488b45f0488945f84889c1488b41184889ec5dc3")
+    expect(len(xf.relocs)).toBe(0)
+}
+
+test fn inline_unbox_char_lowering() {
+    let e = IrExtern("pickle_unbox_char", [IrTy.Ptr], IrTy.Int)
+    let f = mkFuncParams("f", "pkl_f", [IrParam("b", IrTy.Ptr)], IrTy.Int, [IrTy.Ptr], oneBlockTerm(
+        IrTerm.Return(1),
+        [IrInstr.LoadSlot(0, 0), IrInstr.Call(1, Callee.Extern(0), [0])]))
+    let xf = lowerFExt(f, e)
+    expect(len(xf.relocs)).toBe(0)
+    assertBytes(xf, "554889e54881ec5000000048894df0488b45f0488945f84889c1488b41184889ec5dc3")
+}
+
+test fn inline_unbox_f64_lowering() {
+    let e = IrExtern("pickle_unbox_f64", [IrTy.Ptr], IrTy.Float)
+    let f = mkFuncParams("f", "pkl_f", [IrParam("b", IrTy.Ptr)], IrTy.Float, [IrTy.Ptr], oneBlockTerm(
+        IrTerm.Return(1),
+        [IrInstr.LoadSlot(0, 0), IrInstr.Call(1, Callee.Extern(0), [0])]))
+    let xf = lowerFExt(f, e)
+    expect(len(xf.relocs)).toBe(0)
+    assertBytes(xf, "554889e54881ec5000000048894df0488b45f0488945f84889c1f20f104118f20f1145d8f20f1045d84889ec5dc3")
+}
+
+/// `pickle_box_i64` is NOT a no-call inline: the shared-box cache is probed
+/// inline (one global load, an unsigned range check, one table load) and the
+/// real extern is called on a miss, a cold table, or an out-of-range value.
+/// Because the extern is may-collect, the function keeps its shadow frame and
+/// push/pop pair around the whole sequence - the slow leg still needs them.
+/// The relocations pin the frame pair, the cache probe and the fallback call.
+test fn inline_box_i64_lowering() {
+    let e = IrExtern("pickle_box_i64", [IrTy.Int], IrTy.Ptr)
+    let f = mkFuncParams("f", "pkl_f", [IrParam("v", IrTy.Int)], IrTy.Ptr, [IrTy.Int], oneBlockTerm(
+        IrTerm.Return(1),
+        [IrInstr.LoadSlot(0, 0), IrInstr.Call(1, Callee.Extern(0), [0])]))
+    let xf = lowerFExt(f, e)
+    assertBytes(xf, "554889e54881ec500000000f57e448b80000000000000000488945f848b8010000003000005a488945f048894de0488d4de849ba000000000000000041ffd2488b45e0488945d84889c148b80000000000000000488b004885c00f841f0000004881f9001000000f8312000000488b04c84885c00f8405000000e90d00000049ba000000000000000041ffd2488945f8488d4de849ba000000000000000041ffd2488b45f84889ec5dc3")
+    expect(len(xf.relocs)).toBe(4)
+    expect(xf.relocs[0].off).toBe(52)
+    expect(xf.relocs[0].sym).toBe("pickle_shadow_push")
+    expect(xf.relocs[1].off).toBe(76)
+    expect(xf.relocs[1].sym).toBe("pkl_global_smallBoxTab")
+    expect(xf.relocs[2].off).toBe(129)
+    expect(xf.relocs[2].sym).toBe("pickle_box_i64")
+    expect(xf.relocs[3].off).toBe(150)
+    expect(xf.relocs[3].sym).toBe("pickle_shadow_pop")
+}
+
+test fn inline_map_len_lowering() {
+    let e = IrExtern("pickle_map_len", [IrTy.Ptr], IrTy.Int)
+    let f = mkFuncParams("f", "pkl_f", [IrParam("m", IrTy.Ptr)], IrTy.Int, [IrTy.Ptr], oneBlockTerm(
+        IrTerm.Return(1),
+        [IrInstr.LoadSlot(0, 0), IrInstr.Call(1, Callee.Extern(0), [0])]))
+    let xf = lowerFExt(f, e)
+    assertBytes(xf, "554889e54881ec5000000048894df0488b45f0488945f84889c1488b41184889ec5dc3")
+    expect(len(xf.relocs)).toBe(0)
+}
+
+/// `pickle_map_get` keeps its call, but only after the bloom filter has
+/// rejected the key: a clear filter is a conservative "absent" because bits are
+/// only ever set. The byte pins below are the two-bit probe; the relocation pin
+/// proves the fallback still enters the real runtime with rcx/rdx untouched.
+test fn inline_map_get_bloom_lowering() {
+    let e = IrExtern("pickle_map_get", [IrTy.Ptr, IrTy.Ptr], IrTy.Ptr)
+    let f = mkFuncParams("f", "pkl_f", [IrParam("m", IrTy.Ptr), IrParam("k", IrTy.Ptr)], IrTy.Ptr, [IrTy.Ptr, IrTy.Ptr], oneBlockTerm(
+        IrTerm.Return(2),
+        [IrInstr.LoadSlot(0, 0), IrInstr.LoadSlot(1, 1), IrInstr.Call(2, Callee.Extern(0), [0, 1])]))
+    let xf = lowerFExt(f, e)
+    // cmp rdx, 2 ; jbe slow -- 0/1/2 are sentinels, never dereferenced.
+    expect(containsSeq(xf.bytes, [0x48, 0x83, 0xFA, 0x02, 0x0F, 0x86])).toBe(true)
+    // cmp qword [rdx+8], 0 ; jne slow -- only string keys may be answered.
+    expect(containsSeq(xf.bytes, [0x48, 0x83, 0x7A, 0x08, 0x00, 0x0F, 0x85])).toBe(true)
+    // test al, 2 ; je slow -- without a cached hash the index is unknown.
+    expect(containsSeq(xf.bytes, [0x48, 0xA8, 0x02, 0x0F, 0x84])).toBe(true)
+    // mov r8, [rcx+0x30] ; test r8, r8 ; je slow -- entry table is word 6.
+    expect(containsSeq(xf.bytes, [0x4C, 0x8B, 0x41, 0x30, 0x4D, 0x85, 0xC0, 0x0F, 0x84])).toBe(true)
+    // mov r9, [r8+r11*8-32] -- the filter lives 32 bytes before entries.
+    expect(containsSeq(xf.bytes, [0x4F, 0x8B, 0x4C, 0xD8, 0xE0])).toBe(true)
+    // bt r9, r11 ; jnc miss -- a clear bit answers without entering the map.
+    expect(containsSeq(xf.bytes, [0x4D, 0x0F, 0xA3, 0xD9, 0x0F, 0x83])).toBe(true)
+    var calls = 0
+    var shadows = 0
+    for (rr in xf.relocs) {
+        if (rr.sym == "pickle_map_get") { calls = calls + 1 }
+        if (rr.sym == "pickle_shadow_push" || rr.sym == "pickle_shadow_pop") { shadows = shadows + 1 }
+    }
+    expect(calls).toBe(1)
+    expect(shadows).toBe(0)
+}
+
+/// The may-collect whitelist is a correctness boundary, so pin both directions:
+/// pure/terminal leaves must be "cannot collect", while every allocating helper
+/// must stay conservative. A missing CRT entry made `abiRawAlloc` and therefore
+/// every string/map/list helper transitively may-GC, silently restoring a shadow
+/// frame around the hottest runtime operations.
+test fn extern_may_collect_pins() {
+    expect(externMayCollect("__imp_memcpy")).toBe(false)
+    expect(externMayCollect("__imp_memmove")).toBe(false)
+    expect(externMayCollect("__imp_memset")).toBe(false)
+    expect(externMayCollect("__imp_memcmp")).toBe(false)
+    expect(externMayCollect("__imp_ExitProcess")).toBe(false)
+    expect(externMayCollect("__imp_HeapAlloc")).toBe(false)
+    expect(externMayCollect("pickle_unbox_char")).toBe(false)
+    expect(externMayCollect("pickle_unbox_bool")).toBe(false)
+    expect(externMayCollect("pickle_unbox_f64")).toBe(false)
+    expect(externMayCollect("pickle_map_len")).toBe(false)
+    expect(externMayCollect("pickle_list_len")).toBe(false)
+    expect(externMayCollect("pickle_str_len")).toBe(false)
+    // Raw heap entry points behind `alloc`/`free`: HeapAlloc/HeapFree only.
+    expect(externMayCollect("pickle_raw_alloc")).toBe(false)
+    expect(externMayCollect("pickle_raw_free")).toBe(false)
+    // String -> string builders allocate, but strings are never registered in
+    // the sweepability registry, so none of them can reach the trigger.
+    expect(externMayCollect("pickle_str_concat")).toBe(false)
+    expect(externMayCollect("pickle_str_append_owned")).toBe(false)
+    expect(externMayCollect("pickle_str_from_i64")).toBe(false)
+    expect(externMayCollect("pickle_str_from_bytes")).toBe(false)
+    expect(externMayCollect("pickle_str_substring")).toBe(false)
+    expect(externMayCollect("pickle_str_trim")).toBe(false)
+    expect(externMayCollect("pickle_str_repeat")).toBe(false)
+    // Allocating or callback-bearing entry points can reach the collector.
+    expect(externMayCollect("pickle_box_i64")).toBe(true)
+    expect(externMayCollect("pickle_map_set")).toBe(true)
+    expect(externMayCollect("pickle_list_push")).toBe(true)
+    expect(externMayCollect("pickle_map_keys")).toBe(true)
+    // These build lists, and `abiListNew` registers through the engine.
+    expect(externMayCollect("pickle_str_split_whitespace")).toBe(true)
+    expect(externMayCollect("pickle_str_chars")).toBe(true)
+    expect(externMayCollect("abiEngineRegister")).toBe(true)
+    expect(externMayCollect("some_unknown_extern")).toBe(true)
+}
+
+/// A managed slot only needs a shadow frame when a callee can collect. A CRT
+/// `memcpy` cannot, so a function that keeps a `Str` slot live across the call
+/// must emit the call with no `pickle_shadow_push`/`pop` relocations at all.
+test fn memcpy_call_does_not_shadow_managed_slot() {
+    let e = IrExtern("__imp_memcpy", [IrTy.Ptr, IrTy.Ptr, IrTy.Int], IrTy.Unit)
+    let f = mkFuncParams("f", "pkl_f", [IrParam("s", IrTy.Str)], IrTy.Str, [IrTy.Str], oneBlockTerm(
+        IrTerm.Return(0),
+        [IrInstr.LoadSlot(0, 0),
+         IrInstr.Const(1, IrConst.Int(0)),
+         IrInstr.Const(2, IrConst.Int(0)),
+         IrInstr.Call(none, Callee.Extern(0), [0, 1, 2])]))
+    let xf = lowerFExt(f, e)
+    expect(xf.ncells).toBe(2)
+    expect(len(xf.relocs)).toBe(1)
+    expect(xf.relocs[0].sym).toBe("__imp_memcpy")
+}
+
+// ------------------------------------------------ in-place append selection
+
+fn hasRelocSym(xf: X64Func, sym: string) -> bool {
+    var i = 0
+    while (i < len(xf.relocs)) {
+        if (xf.relocs[i].sym == sym) {
+            return true
+        }
+        i = i + 1
+    }
+    false
+}
+
+fn appendExtern() -> IrExtern {
+    IrExtern("pickle_str_concat", [IrTy.Str, IrTy.Str], IrTy.Str)
+}
+
+/// Build the langbench-like shape: the string slot is assigned a literal on two
+/// different paths, so the optimizer cannot forward the literal into the load
+/// that feeds the concat chain. Slot 1 is the string; slot 0 is a bool parameter
+/// used only to select the entry path.
+fn appendBody(appendInstrs: List<IrInstr>, tail: List<IrBlock>) -> IrFunc {
+    var bs: List<IrBlock> = []
+    bs.push(IrBlock(0, [IrInstr.LoadSlot(0, 0)], IrTerm.BranchIf(0, 1, 2)))
+    bs.push(IrBlock(1, [
+        IrInstr.Const(1, IrConst.Str(0)),
+        IrInstr.StoreSlot(1, 1)
+    ], IrTerm.Branch(3)))
+    bs.push(IrBlock(2, [
+        IrInstr.Const(2, IrConst.Str(0)),
+        IrInstr.StoreSlot(1, 2)
+    ], IrTerm.Branch(3)))
+    bs.push(IrBlock(3, appendInstrs, IrTerm.Branch(4)))
+    for (b in tail) {
+        bs.push(b)
+    }
+    mkFuncParams("f", "pkl_f", [IrParam("c", IrTy.Bool)], IrTy.Str, [IrTy.Bool, IrTy.Str, IrTy.Str], bs)
+}
+
+fn appendTail() -> List<IrBlock> {
+    var l: List<IrBlock> = []
+    l.push(IrBlock(4, [IrInstr.LoadSlot(60, 1)], IrTerm.Return(60)))
+    l
+}
+
+/// The canonical owned pattern: the slot holds a literal, then a concat's only
+/// reader is the store back to that same slot, and the later read cannot reach
+/// the append again. The call must lower to `pickle_str_append_owned` while the
+/// IR declaration stays `pickle_str_concat`.
+test fn append_owned_lowering_reuses_the_private_chain() {
+    let f = appendBody([
+        IrInstr.LoadSlot(10, 1),
+        IrInstr.Const(11, IrConst.Str(1)),
+        IrInstr.Call(12, Callee.Extern(0), [10, 11]),
+        IrInstr.StoreSlot(1, 12)
+    ], appendTail())
+    let xf = lowerFExt(f, appendExtern())
+    expect(hasRelocSym(xf, "pickle_str_append_owned")).toBe(true)
+    expect(hasRelocSym(xf, "pickle_str_concat")).toBe(false)
+}
+
+/// The `line = line + term + " "` shape from langbench: two concats, the first
+/// result read only as the second call's argument, then one store back to the
+/// slot. The backend must emit one fused `pickle_str_append_two` call instead
+/// of the two sequential appends, while the IR declarations stay untouched.
+test fn append_owned_lowering_handles_a_two_concat_chain() {
+    let f = appendBody([
+        IrInstr.LoadSlot(10, 1),
+        IrInstr.Const(11, IrConst.Str(1)),
+        IrInstr.Call(12, Callee.Extern(0), [10, 11]),
+        IrInstr.Const(13, IrConst.Str(2)),
+        IrInstr.Call(14, Callee.Extern(0), [12, 13]),
+        IrInstr.StoreSlot(1, 14)
+    ], appendTail())
+    let xf = lowerFExt(f, appendExtern())
+    expect(hasRelocSym(xf, "pickle_str_append_two")).toBe(true)
+    expect(hasRelocSym(xf, "pickle_str_append_owned")).toBe(false)
+    expect(hasRelocSym(xf, "pickle_str_concat")).toBe(false)
+}
+
+/// Three links stay on the proven sequential path. Fusion is only defined for
+/// exactly two links, and skipping the middle call without a fused third
+/// operand would lose it.
+test fn append_owned_lowering_keeps_a_three_concat_chain_sequential() {
+    let f = appendBody([
+        IrInstr.LoadSlot(10, 1),
+        IrInstr.Const(11, IrConst.Str(1)),
+        IrInstr.Call(12, Callee.Extern(0), [10, 11]),
+        IrInstr.Const(13, IrConst.Str(2)),
+        IrInstr.Call(14, Callee.Extern(0), [12, 13]),
+        IrInstr.Const(15, IrConst.Str(2)),
+        IrInstr.Call(16, Callee.Extern(0), [14, 15]),
+        IrInstr.StoreSlot(1, 16)
+    ], appendTail())
+    let xf = lowerFExt(f, appendExtern())
+    expect(hasRelocSym(xf, "pickle_str_append_two")).toBe(false)
+    expect(hasRelocSym(xf, "pickle_str_append_owned")).toBe(true)
+    expect(hasRelocSym(xf, "pickle_str_concat")).toBe(false)
+}
+
+/// A read of the slot between the root load and the store observes the buffer
+/// mid-append, so the proof must reject the whole chain. The read is stored in a
+/// second slot so the optimizer cannot delete it as dead.
+test fn append_owned_lowering_rejects_an_interleaved_slot_read() {
+    let f = appendBody([
+        IrInstr.LoadSlot(10, 1),
+        IrInstr.LoadSlot(15, 1),
+        IrInstr.Const(11, IrConst.Str(1)),
+        IrInstr.Call(12, Callee.Extern(0), [10, 11]),
+        IrInstr.StoreSlot(1, 12),
+        IrInstr.StoreSlot(2, 15)
+    ], appendTail())
+    let xf = lowerFExt(f, appendExtern())
+    expect(hasRelocSym(xf, "pickle_str_append_owned")).toBe(false)
+    expect(hasRelocSym(xf, "pickle_str_concat")).toBe(true)
+}
+
+/// An escaped read that can reach the concat again (a loop back edge) makes the
+/// buffer observable, even though the immediate store looks linear.
+test fn append_owned_lowering_rejects_a_read_that_reaches_the_append() {
+    var tail: List<IrBlock> = []
+    tail.push(IrBlock(4, [
+        IrInstr.LoadSlot(60, 1),
+        IrInstr.Const(61, IrConst.Int(0)),
+        IrInstr.BinOp(62, IrBinOp.Ne, 60, 61)
+    ], IrTerm.BranchIf(62, 3, 5)))
+    tail.push(IrBlock(5, [IrInstr.Const(63, IrConst.Str(0))], IrTerm.Return(63)))
+    let f = appendBody([
+        IrInstr.LoadSlot(10, 1),
+        IrInstr.Const(11, IrConst.Str(1)),
+        IrInstr.Call(12, Callee.Extern(0), [10, 11]),
+        IrInstr.StoreSlot(1, 12)
+    ], tail)
+    let xf = lowerFExt(f, appendExtern())
+    expect(hasRelocSym(xf, "pickle_str_append_owned")).toBe(false)
+    expect(hasRelocSym(xf, "pickle_str_concat")).toBe(true)
+}
+
+/// A concat result with a second reader is not private, so its buffer must be
+/// copied rather than mutated in place. The copy is stored in a second slot so
+/// the extra reader survives optimization.
+test fn append_owned_lowering_rejects_a_shared_concat_result() {
+    let f = appendBody([
+        IrInstr.LoadSlot(10, 1),
+        IrInstr.Const(11, IrConst.Str(1)),
+        IrInstr.Call(12, Callee.Extern(0), [10, 11]),
+        IrInstr.Copy(13, 12),
+        IrInstr.StoreSlot(1, 12),
+        IrInstr.StoreSlot(2, 13)
+    ], appendTail())
+    let xf = lowerFExt(f, appendExtern())
+    expect(hasRelocSym(xf, "pickle_str_append_owned")).toBe(false)
+    expect(hasRelocSym(xf, "pickle_str_concat")).toBe(true)
+}
+
+

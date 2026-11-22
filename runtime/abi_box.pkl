@@ -85,7 +85,13 @@ import { PICKLE_CLASS_BOX_INT, PICKLE_CLASS_BOX_FLOAT, PICKLE_CLASS_BOX_BOOL, PI
 // `abiRegisterObject` rides the same import: every box is a managed object and
 // is recorded in the port's sweepability registry as it is created
 // (`abi_raw`).
-import { abiRawAlloc, abiRegisterObject } from runtime.abi_raw
+import { abiRawAlloc, abiManagedAlloc, abiRegisterObject } from runtime.abi_raw
+// The boxers below call the engine's register directly instead of going through
+// `abi_raw`'s delegating wrapper: that wrapper is itself a shadowed frame with
+// a `*int` home, so every skipped layer saves a push/pop pair on the hottest
+// allocation in the language (measured box cost 325ns -> ~200ns after
+// flattening the chain in micro9).
+import { abiEngineRegister } from runtime.abi_gcengine
 
 const PAYLOAD_WORD: int = 3
 const BOX_WORDS: int = 4
@@ -96,15 +102,21 @@ const BOX_WORDS: int = 4
 /// an object's extent, so it must be 32 and not the word count.
 fn newBox(classId: int, bits: int) -> *int {
     unsafe {
-        var p = alloc(int, BOX_WORDS)
+        var p = abiManagedAlloc(BOX_WORDS * 8) as *int
         p[0] = 0
         p[1] = classId
         p[2] = BOX_WORDS * 8
         p[3] = bits
-        abiRegisterObject(p)
+        abiEngineRegister(p as int)
         return p
     }
 }
+
+/// The inline form every boxer uses: allocate the 32-byte block, stamp the
+/// header and payload, register it, return it. Each boxer spells this out
+/// rather than calling `newBox`/a helper because every call layer with a `*int`
+/// home costs a shadow push/pop pair (~20-50ns) on the hottest allocation in
+/// the language.
 
 /// Read the raw 8 payload bits of a box. Mirrors `boxscalar.rs::box_bits`.
 /// The null check lives in the native `unbox_bits` helper; see the GAP above.
@@ -115,9 +127,54 @@ fn boxBits(obj: *int) -> int {
 }
 
 /// Box an `int` as a managed object. Mirrors `boxscalar.rs::pickle_box_i64`.
+///
+/// SHARED SMALL VALUES. Map-heavy code boxes every stored/incremented `int`
+/// (`counts[w] = counts.get(w).unwrapOr(0) + 1`), and the box payload is
+/// immutable: nothing in the runtime or emitted code writes `p[3]` after the
+/// header is stamped. A direct-indexed table of boxes for `0 .. 4095` therefore
+/// turns the benchmark's ~120k allocations into ~2k allocations and table
+/// probes. Precedent: `str(int)` already returns shared interned values.
+///
+/// GC interaction is safe by construction: a cached box that becomes
+/// unreachable may be dropped from the sweepability registry, but managed
+/// blocks come from the port's bump arena, which is never reused (only
+/// oversized blocks go to the CRT and only those are actually freed), so the
+/// pointer stays readable forever. A hit on a swept box returns the same intact
+/// header and payload.
+const SMALL_BOX_CAP: int = 4096
+var smallBoxTab: int = 0
+
 #[symbol("pickle_box_i64")]
 fn abiBoxI64(v: int) -> *int {
-    return newBox(PICKLE_CLASS_BOX_INT, v)
+    unsafe {
+        if (v >= 0 && v < SMALL_BOX_CAP) {
+            var tab = smallBoxTab
+            if (tab == 0) {
+                tab = abiManagedAlloc(SMALL_BOX_CAP * 8)
+                memset(tab as *int, 0, SMALL_BOX_CAP * 8)
+                smallBoxTab = tab
+            }
+            var hit = (tab as *int)[v]
+            if (hit != 0) {
+                return hit as *int
+            }
+            var fresh = abiManagedAlloc(BOX_WORDS * 8) as *int
+            fresh[0] = 0
+            fresh[1] = PICKLE_CLASS_BOX_INT
+            fresh[2] = BOX_WORDS * 8
+            fresh[3] = v
+            abiEngineRegister(fresh as int)
+            (tab as *int)[v] = fresh as int
+            return fresh
+        }
+        var p = abiManagedAlloc(BOX_WORDS * 8) as *int
+        p[0] = 0
+        p[1] = PICKLE_CLASS_BOX_INT
+        p[2] = BOX_WORDS * 8
+        p[3] = v
+        abiEngineRegister(p as int)
+        return p
+    }
 }
 
 /// Box a `bool` as a managed object (`0`/`1` payload).
@@ -128,7 +185,15 @@ fn abiBoxBool(v: bool) -> *int {
     if (v) {
         bits = 1
     }
-    return newBox(PICKLE_CLASS_BOX_BOOL, bits)
+    unsafe {
+        var p = abiManagedAlloc(BOX_WORDS * 8) as *int
+        p[0] = 0
+        p[1] = PICKLE_CLASS_BOX_BOOL
+        p[2] = BOX_WORDS * 8
+        p[3] = bits
+        abiEngineRegister(p as int)
+        return p
+    }
 }
 
 /// Box a `char` as a managed object. `char` is an i32 scalar at the IR boundary
@@ -136,7 +201,15 @@ fn abiBoxBool(v: bool) -> *int {
 /// Mirrors `boxscalar.rs::pickle_box_char`.
 #[symbol("pickle_box_char")]
 fn abiBoxChar(v: int) -> *int {
-    return newBox(PICKLE_CLASS_BOX_CHAR, v)
+    unsafe {
+        var p = abiManagedAlloc(BOX_WORDS * 8) as *int
+        p[0] = 0
+        p[1] = PICKLE_CLASS_BOX_CHAR
+        p[2] = BOX_WORDS * 8
+        p[3] = v
+        abiEngineRegister(p as int)
+        return p
+    }
 }
 
 /// Unbox a managed `int` object back to a raw `i64`.
@@ -360,7 +433,15 @@ fn f64Bits(v: float) -> int {
 /// runtime it replaces.
 #[symbol("pickle_box_f64")]
 fn abiBoxF64(v: float) -> *int {
-    return newBox(PICKLE_CLASS_BOX_FLOAT, f64Bits(v))
+    unsafe {
+        var p = abiManagedAlloc(BOX_WORDS * 8) as *int
+        p[0] = 0
+        p[1] = PICKLE_CLASS_BOX_FLOAT
+        p[2] = BOX_WORDS * 8
+        p[3] = f64Bits(v)
+        abiEngineRegister(p as int)
+        return p
+    }
 }
 
 /// Unbox a managed `float` object back to a raw `f64`.

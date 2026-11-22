@@ -1,8 +1,9 @@
 module runtime.abi_string_test
 
-import { wordsFor, abiStrLen, abiStrConcat, abiStrCmp, abiStrGet, abiStrSet, abiStrFromBool, abiStrFromByte, abiStrFromChar, abiStrToBytes, abiStrFromList, abiStrStartsWith, abiStrEndsWith, abiStrStripPrefix, abiStrStripSuffix, abiStrIndexOf, abiStrLastIndexOf, abiStrCount, abiStrTrim, abiStrTrimStart, abiStrTrimEnd, abiStrSplitLines, abiStrSplitWhitespace, abiStrToUpper, abiStrToLower, abiStrSubstring, abiStrSplit, abiStrReplace, abiStrReplaceFirst, abiStrChars, abiStrRepeat, abiStrPadStart, abiStrPadEnd, abiStrFormat, abiListJoin, isScalar, utf8Len, leadByte } from runtime.abi_string
+import { wordsFor, abiStrLen, abiStrConcat, abiStrCmp, abiStrGet, abiStrSet, abiStrFromBool, abiStrFromByte, abiStrFromChar, abiStrToBytes, abiStrFromList, abiStrStartsWith, abiStrEndsWith, abiStrStripPrefix, abiStrStripSuffix, abiStrIndexOf, abiStrLastIndexOf, abiStrCount, abiStrTrim, abiStrTrimStart, abiStrTrimEnd, abiStrSplitLines, abiStrSplitWhitespace, abiStrToUpper, abiStrToLower, abiStrSubstring, abiStrSplit, abiStrReplace, abiStrReplaceFirst, abiStrChars, abiStrRepeat, abiStrPadStart, abiStrPadEnd, abiStrFormat, abiListJoin, isScalar, utf8Len, leadByte, abiStrFromI64, newStr, newStrCap, maskStrTail, byteInto, abiStrAppendOwned, abiStrAppendTwo, strSubFast, shortInternWord } from runtime.abi_string
 import { abiListNew, abiListLen, abiListGet, abiListPush } from runtime.abi_list
 import { abiBoxI64, abiUnboxI64 } from runtime.abi_box
+import { keyHash } from runtime.abi_map
 
 /// WHY THE TESTS BUILD STRINGS INSTEAD OF WRITING THEM.
 ///
@@ -451,6 +452,185 @@ test fn str_substring_uses_byte_offsets() {
     let tail = abiStrSubstring(x, 1, 3)
     expect(abiStrLen(tail)).toBe(2)
     expect(abiStrCmp(tail, bytes2(195, 169))).toBe(0)
+}
+
+/// A cross-word span whose source word has the sign bit set used to OR the
+/// arithmetic shift's sign fill over the tail bytes. This is the byte-level
+/// shape: six ASCII bytes, a separator, then C3 A9 starting at byte 7.
+fn crossWordProbe() -> *int {
+    let s = newStr(10)
+    var i = 0
+    while (i < 6) {
+        byteInto(s, i, 97)
+        i = i + 1
+    }
+    byteInto(s, 6, 32)
+    byteInto(s, 7, 195)
+    byteInto(s, 8, 169)
+    byteInto(s, 9, 32)
+    return s
+}
+
+test fn str_sub_fast_cross_word_span_keeps_high_bytes() {
+    let s = crossWordProbe()
+    let p = strSubFast(s, 7, 9)
+    expect(abiStrLen(p)).toBe(2)
+    expect(abiStrGet(p, 0)).toBe(195)
+    expect(abiStrGet(p, 1)).toBe(169)
+}
+
+test fn split_whitespace_cross_word_field_keeps_high_bytes() {
+    let ws = abiStrSplitWhitespace(crossWordProbe())
+    expect(abiListLen(ws)).toBe(2)
+    let w1 = abiListGet(ws, 1)
+    expect(abiStrLen(w1)).toBe(2)
+    expect(abiStrGet(w1, 0)).toBe(195)
+    expect(abiStrGet(w1, 1)).toBe(169)
+    // Two bytes is inside the interned range, so the high bytes must survive
+    // the payload packing and a second split must return the same object.
+    let ws2 = abiStrSplitWhitespace(crossWordProbe())
+    expect(w1 as int).toBe(abiListGet(ws2, 1) as int)
+    expect(abiStrGet(abiListGet(ws2, 1), 0)).toBe(195)
+    expect(abiStrGet(abiListGet(ws2, 1), 1)).toBe(169)
+}
+
+// ---------------------------------------------------------------------------
+// Short-string interning
+// ---------------------------------------------------------------------------
+//
+// `abiStrSplitWhitespace` and the one-byte-prefix `abiStrConcat` shape share one
+// table: the benchmark's generated text is `"w" + str(id)`, so a query term and
+// the document field it is looked up against are now the same object. These
+// tests pin the observable contract that makes that safe - equal text has equal
+// bytes and equal hashes, identity is only reused for equal text, longer fields
+// and unshared operands keep the fresh path, and the mutating helpers copy.
+
+test fn short_split_fields_are_interned_across_calls() {
+    // "w1 w2"
+    let s = abiStrConcat(bytes3(119, 49, 32), bytes2(119, 50))
+    let a = abiStrSplitWhitespace(s)
+    let b = abiStrSplitWhitespace(s)
+    expect(abiListLen(a)).toBe(2)
+    let w1 = abiListGet(a, 0)
+    let w2 = abiListGet(a, 1)
+    // Equal text yields the same object on every split.
+    expect(w1 as int).toBe(abiListGet(b, 0) as int)
+    expect(w2 as int).toBe(abiListGet(b, 1) as int)
+    // Different text still yields different objects, with the right bytes.
+    expect((w1 as int) != (w2 as int)).toBe(true)
+    expect(abiStrLen(w1)).toBe(2)
+    expect(abiStrGet(w1, 0)).toBe(119)
+    expect(abiStrGet(w1, 1)).toBe(49)
+    expect(abiStrGet(w2, 1)).toBe(50)
+}
+
+test fn whitespace_runs_still_produce_interned_fields() {
+    // "w1\tw2\nw3\r\nw4"
+    let s = abiStrConcat(abiStrConcat(bytes3(119, 49, 9), bytes3(119, 50, 10)),
+                         abiStrConcat(bytes4(119, 51, 13, 10), bytes2(119, 52)))
+    let ws = abiStrSplitWhitespace(s)
+    expect(abiListLen(ws)).toBe(4)
+    var i = 0
+    while (i < 4) {
+        let w = abiListGet(ws, i)
+        expect(abiStrLen(w)).toBe(2)
+        expect(abiStrGet(w, 0)).toBe(119)
+        expect(abiStrGet(w, 1)).toBe(49 + i)
+        i = i + 1
+    }
+    let again = abiStrSplitWhitespace(s)
+    i = 0
+    while (i < 4) {
+        expect(abiListGet(ws, i) as int).toBe(abiListGet(again, i) as int)
+        i = i + 1
+    }
+}
+
+test fn an_interned_split_field_hashes_like_fresh_equal_text() {
+    let ws = abiStrSplitWhitespace(bytes3(119, 52, 50)) // "w42"
+    let interned = abiListGet(ws, 0)
+    // Built through the general path: the pieces are unshared, so no interning.
+    let fresh = abiStrConcat(bytes2(119, 52), bytes1(50))
+    expect((interned as int) != (fresh as int)).toBe(true)
+    expect(abiStrCmp(interned, fresh)).toBe(0)
+    // The cached hash must equal the reference FNV walk over the same bytes;
+    // otherwise a map probe using this key would look in the wrong chain.
+    expect(keyHash(interned)).toBe(keyHash(fresh))
+}
+
+test fn a_prefixed_small_integer_concat_is_interned_with_the_split_field() {
+    let name = abiStrConcat(bytes1(119), abiStrFromI64(42))
+    let again = abiStrConcat(bytes1(119), abiStrFromI64(42))
+    let ws = abiStrSplitWhitespace(bytes3(119, 52, 50)) // "w42"
+    expect(abiStrLen(name)).toBe(3)
+    // Repeated builds agree...
+    expect(name as int).toBe(again as int)
+    // ...and agree with a split field of the same text, which is what turns
+    // the benchmark's document-map lookups into identity hits.
+    expect(name as int).toBe(abiListGet(ws, 0) as int)
+}
+
+test fn a_prefixed_negative_integer_concat_is_interned() {
+    let name = abiStrConcat(bytes1(119), abiStrFromI64(0 - 7))
+    let ws = abiStrSplitWhitespace(abiStrConcat(bytes2(119, 45), bytes1(55))) // "w-7"
+    expect(abiStrLen(name)).toBe(3)
+    expect(name as int).toBe(abiListGet(ws, 0) as int)
+    expect(abiStrGet(name, 1)).toBe(45)
+    expect(abiStrGet(name, 2)).toBe(55)
+}
+
+test fn a_concat_with_a_fresh_short_operand_stays_fresh() {
+    // "ab" comes from the general concat path and is not shared, so "w" + "ab"
+    // must not be interned. Interning is only safe for operands whose
+    // immutability is already proven.
+    let tail = abiStrConcat(bytes1(97), bytes1(98))
+    let joined = abiStrConcat(bytes1(119), tail)
+    let ws = abiStrSplitWhitespace(bytes3(119, 97, 98)) // "wab"
+    expect(abiStrLen(joined)).toBe(3)
+    expect(abiStrCmp(joined, abiListGet(ws, 0))).toBe(0)
+    expect((joined as int) != (abiListGet(ws, 0) as int)).toBe(true)
+}
+
+test fn a_two_byte_prefix_concat_stays_fresh() {
+    let joined = abiStrConcat(bytes2(97, 98), abiStrFromI64(7)) // "ab7"
+    let ws = abiStrSplitWhitespace(bytes3(97, 98, 55))
+    expect(abiStrLen(joined)).toBe(3)
+    expect(abiStrCmp(joined, abiListGet(ws, 0))).toBe(0)
+    expect((joined as int) != (abiListGet(ws, 0) as int)).toBe(true)
+}
+
+test fn a_five_thousand_concat_stays_fresh() {
+    // `str(int)` only interns -999..999. "5000" is a normal heap string, so the
+    // prefix interning path must fall through rather than trust it.
+    let tail = abiStrFromI64(5000)
+    let joined = abiStrConcat(bytes1(119), tail) // "w5000"
+    let ws = abiStrSplitWhitespace(abiStrConcat(bytes3(119, 53, 48), bytes2(48, 48)))
+    expect(abiStrLen(joined)).toBe(5)
+    expect(abiStrCmp(joined, abiListGet(ws, 0))).toBe(0)
+    expect((joined as int) != (abiListGet(ws, 0) as int)).toBe(true)
+}
+
+test fn long_split_fields_are_not_interned() {
+    // Nine bytes is one past the interned range; every split allocates.
+    let nine = abiStrRepeat(bytes1(97), 9)
+    let a = abiStrSplitWhitespace(nine)
+    let b = abiStrSplitWhitespace(nine)
+    expect(abiStrLen(abiListGet(a, 0))).toBe(9)
+    expect((abiListGet(a, 0) as int) != (abiListGet(b, 0) as int)).toBe(true)
+}
+
+test fn appending_to_an_interned_split_field_does_not_mutate_it() {
+    let ws = abiStrSplitWhitespace(bytes2(119, 49)) // "w1"
+    let w = abiListGet(ws, 0)
+    let longer = abiStrAppendOwned(w, bytes1(33))
+    expect(abiStrLen(longer)).toBe(3)
+    expect(abiStrGet(longer, 2)).toBe(33)
+    // The shared interned object keeps its original length and bytes, so a
+    // later split of "w1" still sees "w1".
+    expect(abiStrLen(w)).toBe(2)
+    let ws2 = abiStrSplitWhitespace(bytes2(119, 49))
+    expect(abiStrLen(abiListGet(ws2, 0))).toBe(2)
+    expect(abiStrGet(abiListGet(ws2, 0), 1)).toBe(49)
 }
 
 fn strList(items: List<*int>) -> *int {
@@ -924,4 +1104,546 @@ test fn str_replace_first_empty_needle_is_a_fresh_copy() {
     let s = bytes2(97, 98)
     let r = abiStrReplaceFirst(s, abiStrRepeat(bytes1(0), 0), bytes1(122))
     expect(abiStrCmp(r, s)).toBe(0)
+}
+// ------------------------------------------------- short-concat differential
+// Build an `n`-byte heap string with a deterministic, non-repeating byte
+// pattern, so an off-by-one in the word/shift merge changes the bytes.
+fn mkPattern(n: int, seed: int) -> *int {
+    let p = newStr(n)
+    var i = 0
+    while (i < n) {
+        byteInto(p, i, (seed + i * 37) & 255)
+        i = i + 1
+    }
+    return p
+}
+
+/// Independent concatenation: one byte at a time through the public getter.
+/// Deliberately does not share code with `abiStrConcat`, so the comparison is a
+/// reference implementation rather than the implementation agreeing with itself.
+fn refConcat(a: *int, b: *int) -> *int {
+    let la = abiStrLen(a)
+    let lb = abiStrLen(b)
+    let p = newStr(la + lb)
+    var i = 0
+    while (i < la) {
+        byteInto(p, i, abiStrGet(a, i))
+        i = i + 1
+    }
+    i = 0
+    while (i < lb) {
+        byteInto(p, la + i, abiStrGet(b, i))
+        i = i + 1
+    }
+    return p
+}
+
+test fn concat_short_word_path_matches_byte_reference() {
+    // Every length pair through the 32-byte word path, plus a few just past the
+    // cutoff where the memcpy path takes over. This covers start offsets 0-7,
+    // carry words, empty operands and the final-word mask.
+    var la = 0
+    while (la <= 40) {
+        var lb = 0
+        while (lb <= 40) {
+            if (la + lb <= 48) {
+                let a = mkPattern(la, la * 7 + 3)
+                let b = mkPattern(lb, lb * 11 + 5)
+                let got = abiStrConcat(a, b)
+                let want = refConcat(a, b)
+                expect(abiStrLen(got)).toBe(la + lb)
+                var i = 0
+                while (i < la + lb) {
+                    expect(abiStrGet(got, i)).toBe(abiStrGet(want, i))
+                    i = i + 1
+                }
+            }
+            lb = lb + 1
+        }
+        la = la + 1
+    }
+}
+
+test fn concat_does_not_share_the_destination_with_an_operand() {
+    let a = mkPattern(12, 1)
+    let b = mkPattern(9, 2)
+    let got = abiStrConcat(a, b)
+    expect((got as int) == (a as int)).toBe(false)
+    expect((got as int) == (b as int)).toBe(false)
+    // Mutating the result through the copy-on-write setter must not touch the
+    // operands, because the append path is allowed to reuse a private buffer.
+    let t = abiStrSet(got, 0, 90)
+    expect(abiStrGet(a, 0)).toBe(1)
+    expect(abiStrGet(got, 0)).toBe(1)
+    expect(abiStrGet(t, 0)).toBe(90)
+}
+
+// ------------------------------------------------------ str(int) interning
+test fn str_from_i64_interns_small_values_safely() {
+    let a = abiStrFromI64(123)
+    let b = abiStrFromI64(123)
+    expect((a as int) == (b as int)).toBe(true)
+    expect(abiStrCmp(a, bytes3(49, 50, 51))).toBe(0)
+    unsafe {
+        expect((a[2] & 4) != 0).toBe(true)
+    }
+    let n = abiStrFromI64(0 - 9)
+    expect((n as int) == (abiStrFromI64(0 - 9) as int)).toBe(true)
+    expect(abiStrCmp(n, bytes2(45, 57))).toBe(0)
+    // Out of range: every call allocates a fresh string.
+    let big1 = abiStrFromI64(1000)
+    let big2 = abiStrFromI64(1000)
+    expect((big1 as int) == (big2 as int)).toBe(false)
+    expect(abiStrLen(big1)).toBe(4)
+    expect(abiStrCmp(big1, bytes4(49, 48, 48, 48))).toBe(0)
+}
+
+test fn str_set_does_not_mutate_an_interned_value() {
+    let s = abiStrFromI64(7)
+    let t = abiStrSet(s, 0, 56)
+    expect(abiStrGet(s, 0)).toBe(55)
+    expect(abiStrGet(t, 0)).toBe(56)
+    // The intern table still hands out the original text.
+    expect(abiStrGet(abiStrFromI64(7), 0)).toBe(55)
+}
+
+// ------------------------------------------------ in-place append contract
+
+/// Deterministic byte pattern: seed + i*37 truncated to a byte, so lengths and
+/// offsets are distinguishable without relying on string literals.
+fn makeCapString(n: int, seed: int, cap: int) -> *int {
+    let s = newStrCap(n, cap)
+    var i = 0
+    while (i < n) {
+        byteInto(s, i, (seed + i * 37) & 255)
+        i = i + 1
+    }
+    maskStrTail(s, n)
+    s
+}
+
+fn expectSameBytes(a: *int, b: *int) {
+    expect(abiStrLen(a)).toBe(abiStrLen(b))
+    var i = 0
+    while (i < abiStrLen(a)) {
+        expect(abiStrGet(a, i)).toBe(abiStrGet(b, i))
+        i = i + 1
+    }
+}
+
+/// Differential against `abiStrConcat`: every length 0..8 in both directions,
+/// once with no spare capacity (copy branch) and once with spare capacity
+/// (in-place branch). The in-place branch must also return the same pointer.
+test fn append_owned_matches_concat_across_lengths_and_capacities() {
+    var la = 0
+    while (la <= 8) {
+        var lb = 0
+        while (lb <= 8) {
+            let b = makeCapString(lb, 31, lb)
+            let tight = makeCapString(la, 7, la)
+            let spare = makeCapString(la, 7, la + 8)
+            let refa = makeCapString(la, 7, la)
+            let want = abiStrConcat(refa, b)
+            let gotTight = abiStrAppendOwned(tight, b)
+            let gotSpare = abiStrAppendOwned(spare, b)
+            expectSameBytes(gotTight, want)
+            expectSameBytes(gotSpare, want)
+            expect((gotSpare as int) == (spare as int)).toBe(true)
+            lb = lb + 1
+        }
+        la = la + 1
+    }
+}
+
+/// `s = s + s` must duplicate, not smear: the runtime uses memmove for the
+/// in-place copy. The final word is masked so no stale padding leaks into
+/// equality or hashing.
+test fn append_owned_handles_self_append_and_masks_the_tail() {
+    let n = 5
+    let a = makeCapString(n, 3, 64)
+    let refa = makeCapString(n, 3, n)
+    let r = abiStrAppendOwned(a, a)
+    expect((r as int) == (a as int)).toBe(true)
+    expect(abiStrLen(r)).toBe(n + n)
+    var i = 0
+    while (i < n) {
+        expect(abiStrGet(r, i)).toBe(abiStrGet(refa, i))
+        expect(abiStrGet(r, n + i)).toBe(abiStrGet(refa, i))
+        i = i + 1
+    }
+    // 10 bytes occupy one full word plus 2 bytes. The upper 48 bits of the
+    // final word must be zero after masking.
+    let tailWord = (abiStrGet(r, 8) as int) | ((abiStrGet(r, 9) as int) << 8)
+    unsafe {
+        expect(r[4 + 1]).toBe(tailWord)
+    }
+}
+
+/// A tight buffer must grow geometrically, and the grown buffer must then be
+/// reusable in place.
+test fn append_owned_grows_and_then_reuses_the_new_capacity() {
+    let a = makeCapString(8, 1, 8)
+    let b = makeCapString(2, 80, 2)
+    let want = abiStrConcat(makeCapString(8, 1, 8), b)
+    let r = abiStrAppendOwned(a, b)
+    expect((r as int) == (a as int)).toBe(false)
+    expectSameBytes(r, want)
+    unsafe {
+        // Heap bit set, cached-hash and shared bits clear.
+        expect((r[2] & 7)).toBe(1)
+    }
+    let r2 = abiStrAppendOwned(r, bytes1(33))
+    expect((r2 as int) == (r as int)).toBe(true)
+    expect(abiStrLen(r2)).toBe(11)
+    expect(abiStrGet(r2, 10)).toBe(33)
+}
+
+/// Shared (interned) and non-heap (static descriptor style) strings must be
+/// copied, never mutated. The original contents and the intern table survive.
+test fn append_owned_copies_shared_and_static_style_strings() {
+    let interned = abiStrFromI64(7)
+    unsafe {
+        expect((interned[2] & 4) != 0).toBe(true)
+    }
+    let r = abiStrAppendOwned(interned, bytes1(56))
+    expect((r as int) == (interned as int)).toBe(false)
+    expect(abiStrLen(r)).toBe(2)
+    expect(abiStrGet(r, 0)).toBe(55)
+    expect(abiStrGet(r, 1)).toBe(56)
+    expect(abiStrGet(abiStrFromI64(7), 0)).toBe(55)
+    expect(abiStrLen(abiStrFromI64(7))).toBe(1)
+
+    // Clear FLAG_HEAP to mimic a `.rdata` descriptor.
+    let stat = bytes1(65)
+    unsafe {
+        stat[2] = stat[2] & (0 - 2)
+    }
+    let r2 = abiStrAppendOwned(stat, bytes1(66))
+    expect((r2 as int) == (stat as int)).toBe(false)
+    expect(abiStrLen(r2)).toBe(2)
+    expect(abiStrGet(r2, 0)).toBe(65)
+    expect(abiStrGet(r2, 1)).toBe(66)
+    expect(abiStrLen(stat)).toBe(1)
+    expect(abiStrGet(stat, 0)).toBe(65)
+}
+
+/// Appending must invalidate the cached FNV-1a hash. Compute the hash first (so
+/// FLAG_HASH is set), append, then compare against an independently built
+/// reference; a stale cache would return the old hash and fail.
+test fn append_owned_invalidates_the_cached_hash() {
+    let a = makeCapString(2, 9, 64)
+    let h0 = keyHash(a)
+    unsafe {
+        expect((a[2] & 2) != 0).toBe(true)
+    }
+    let r = abiStrAppendOwned(a, bytes1(90))
+    expect((r as int) == (a as int)).toBe(true)
+    unsafe {
+        expect((r[2] & 2)).toBe(0)
+    }
+    let want = abiStrConcat(makeCapString(2, 9, 2), bytes1(90))
+    expect(keyHash(r)).toBe(keyHash(want))
+    expect(keyHash(r) != h0).toBe(true)
+}
+
+// ---------------------------------------------------------------------------
+// Fused two-piece append
+// ---------------------------------------------------------------------------
+//
+// The backend rewrites `a + b + c` into one `pickle_str_append_two` call. That
+// is only sound if the helper is byte-for-byte the two sequential appends, so
+// these tests are differential: for every length combination and both capacity
+// shapes, compare against `abiStrAppendOwned(abiStrAppendOwned(...))`.
+
+/// Every short length combination, once forced to copy (tight) and once with
+/// room for both pieces (in place). The in-place result must reuse `a`.
+test fn append_two_matches_two_appends_across_lengths() {
+    var la = 0
+    while (la <= 8) {
+        var lb = 0
+        while (lb <= 8) {
+            var lc = 0
+            while (lc <= 8) {
+                let b = makeCapString(lb, 41, lb)
+                let c = makeCapString(lc, 83, lc)
+                let tight = makeCapString(la, 7, la)
+                let spare = makeCapString(la, 7, la + 16)
+                let refa = makeCapString(la, 7, la)
+                let want = abiStrAppendOwned(abiStrAppendOwned(refa, b), c)
+                let gotTight = abiStrAppendTwo(tight, b, c)
+                let gotSpare = abiStrAppendTwo(spare, b, c)
+                expectSameBytes(gotTight, want)
+                expectSameBytes(gotSpare, want)
+                expect((gotSpare as int) == (spare as int)).toBe(true)
+                lc = lc + 1
+            }
+            lb = lb + 1
+        }
+        la = la + 1
+    }
+}
+
+/// An operand that aliases `a` must reproduce the intermediate buffer the two
+/// sequential calls expose, not read source bytes that the first store already
+/// overwrote.
+test fn append_two_preserves_alias_semantics() {
+    // a == b: `s = s + s + tail`.
+    let a = makeCapString(5, 3, 64)
+    let tail = bytes1(33)
+    let want = abiStrAppendOwned(abiStrAppendOwned(makeCapString(5, 3, 5), makeCapString(5, 3, 5)), tail)
+    let got = abiStrAppendTwo(a, a, tail)
+    expectSameBytes(got, want)
+    expect(abiStrLen(got)).toBe(11)
+
+    // a == c: the second append sees the buffer after the first append. With a
+    // private buffer that is the mutated `a` itself.
+    let own = makeCapString(3, 9, 64)
+    let mid = bytes1(33)
+    let want2 = abiStrAppendOwned(abiStrAppendOwned(makeCapString(3, 9, 3), mid),
+                                  abiStrAppendOwned(makeCapString(3, 9, 3), mid))
+    let got2 = abiStrAppendTwo(own, mid, own)
+    expectSameBytes(got2, want2)
+}
+
+/// A shared (interned) first argument must be copied; a shared second or third
+/// argument is a source only. The interned object keeps its old bytes.
+test fn append_two_copies_a_shared_first() {
+    let shared = abiStrFromI64(42)
+    let r = abiStrAppendTwo(shared, bytes1(33), bytes1(63))
+    expect((r as int) == (shared as int)).toBe(false)
+    expect(abiStrLen(r)).toBe(4)
+    expect(abiStrGet(r, 0)).toBe(52)
+    expect(abiStrGet(r, 1)).toBe(50)
+    expect(abiStrGet(r, 2)).toBe(33)
+    expect(abiStrGet(r, 3)).toBe(63)
+    // The source is untouched and still say "42".
+    expect(abiStrLen(abiStrFromI64(42))).toBe(2)
+    expect(abiStrGet(shared, 0)).toBe(52)
+
+    // Shared operands as pieces are fine: source bytes never change.
+    let own = makeCapString(2, 5, 64)
+    let r2 = abiStrAppendTwo(own, shared, shared)
+    expect(abiStrLen(r2)).toBe(6)
+    expect(abiStrGet(r2, 2)).toBe(52)
+    expect(abiStrGet(r2, 3)).toBe(50)
+    expect(abiStrGet(r2, 4)).toBe(52)
+    expect(abiStrGet(r2, 5)).toBe(50)
+}
+
+/// After the copy path the new buffer must be reusable in place, and the second
+/// fused append must not need another allocation.
+test fn append_two_grows_then_reuses_the_new_capacity() {
+    let a = makeCapString(8, 1, 8)
+    let b = makeCapString(2, 80, 2)
+    let c = bytes1(33)
+    let want = abiStrAppendOwned(abiStrAppendOwned(makeCapString(8, 1, 8), b), c)
+    let r = abiStrAppendTwo(a, b, c)
+    expect((r as int) == (a as int)).toBe(false)
+    expectSameBytes(r, want)
+    let r2 = abiStrAppendTwo(r, bytes1(63), bytes1(33))
+    expect((r2 as int) == (r as int)).toBe(true)
+    expect(abiStrLen(r2)).toBe(13)
+    expect(abiStrGet(r2, 11)).toBe(63)
+    expect(abiStrGet(r2, 12)).toBe(33)
+}
+
+/// The splitter is differential-tested against an independent per-byte
+/// scanner rather than against itself: `byteAt`-style `abiStrGet` walks the
+/// same bytes and builds the expected field boundaries directly. The corpus
+/// cycles every length through 0..=80 (so every start/end offset modulo 8 is
+/// covered), mixes the four whitespace bytes with runs, near-whitespace bytes,
+/// NUL, high bytes, and long non-space runs. This is what catches a word-mask
+/// lane that flags a neighbour or a partial-last-word overrun.
+fn isSplitSpace(c: int) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 13
+}
+
+fn nextSplitByte(state: *int) -> int {
+    unsafe {
+        state[0] = (state[0] * 1664525 + 1013904223) % 2147483648
+        return (state[0] / 65536) & 255
+    }
+}
+
+test fn split_whitespace_matches_naive_scanner_on_random_bytes() {
+    unsafe {
+        let state = alloc(int, 1)
+        state[0] = 246813579
+        var caseIndex = 0
+        while (caseIndex < 520) {
+            let length = caseIndex % 81
+            let bytes = abiListNew(0)
+            var i = 0
+            while (i < length) {
+                var b = 97
+                let shape = caseIndex % 8
+                if (shape == 0) {
+                    // Long non-space run: exercises whole-word skipping.
+                    b = 97 + (i % 26)
+                } else if (shape == 1) {
+                    // Whitespace run: one separator, never empty fields.
+                    b = 32
+                } else if (shape == 2) {
+                    // Alternating field/separator: every offset alignment.
+                    if (i % 2 == 0) {
+                        b = 97 + (i % 26)
+                    } else {
+                        b = 32
+                    }
+                } else {
+                    let pick = nextSplitByte(state)
+                    if (pick < 18) {
+                        b = 32
+                    } else if (pick < 26) {
+                        b = 9
+                    } else if (pick < 34) {
+                        b = 10
+                    } else if (pick < 42) {
+                        b = 13
+                    } else if (pick < 50) {
+                        // Bytes adjacent to the whitespace values, plus NUL
+                        // and the high-bit lane, must never be separators.
+                        b = pick
+                    } else {
+                        b = nextSplitByte(state)
+                    }
+                }
+                abiListPush(bytes, abiBoxI64(b))
+                i = i + 1
+            }
+            let s = abiStrFromList(bytes)
+            let fields = abiStrSplitWhitespace(s)
+
+            var expectedCount = 0
+            var pos = 0
+            while (pos < length) {
+                while (pos < length && isSplitSpace(abiStrGet(s, pos))) {
+                    pos = pos + 1
+                }
+                if (pos >= length) {
+                    break
+                }
+                let start = pos
+                while (pos < length && !isSplitSpace(abiStrGet(s, pos))) {
+                    pos = pos + 1
+                }
+                if (expectedCount >= abiListLen(fields)) {
+                    expect(expectedCount + 1).toBe(abiListLen(fields))
+                }
+                let field = abiListGet(fields, expectedCount)
+                expect(abiStrLen(field)).toBe(pos - start)
+                var q = 0
+                while (q < pos - start) {
+                    expect(abiStrGet(field, q)).toBe(abiStrGet(s, start + q))
+                    q = q + 1
+                }
+                expectedCount = expectedCount + 1
+            }
+            expect(abiListLen(fields)).toBe(expectedCount)
+            caseIndex = caseIndex + 1
+        }
+    }
+}
+
+/// A piece wider than one word delegates to the sequential bodies; the result
+/// must still be exact.
+test fn append_two_handles_wide_pieces() {
+    let a = makeCapString(3, 1, 64)
+    let wide = makeCapString(11, 17, 11)
+    let c = bytes1(33)
+    let want = abiStrAppendOwned(abiStrAppendOwned(makeCapString(3, 1, 3), wide), c)
+    let got = abiStrAppendTwo(a, wide, c)
+    expectSameBytes(got, want)
+    expect(abiStrLen(got)).toBe(15)
+}
+
+/// The header update is shared with append: capacity bits survive, the heap bit
+/// is set, and the cached hash is cleared.
+test fn append_two_invalidates_the_cached_hash() {
+    let a = makeCapString(2, 9, 64)
+    let h0 = keyHash(a)
+    let r = abiStrAppendTwo(a, bytes1(90), bytes1(33))
+    unsafe {
+        expect((r[2] & 7)).toBe(1)
+    }
+    let want = abiStrConcat(abiStrConcat(makeCapString(2, 9, 2), bytes1(90)), bytes1(33))
+    expect(abiStrLen(r)).toBe(4)
+    expect(keyHash(r)).toBe(keyHash(want))
+    expect(keyHash(r) != h0).toBe(true)
+}
+
+
+/// The intern helper is the one place where a backend inline reimplements a
+/// payload-placement mix: `(payload ^ (len * K1)) * K2`, arithmetic shift right
+/// by 33, mask to capacity. Every magic constant there is a 64-bit wrapping
+/// value, so a transcription error would still return *a* string and only show
+/// up as a missed slot (duplicate object, or a stale pointer after growth).
+/// These two tests exercise the observable contract instead of the spelling:
+/// padding above the payload never changes the identity, a returned object
+/// always carries exactly the low `len` bytes, and 1,300 distinct 8-byte
+/// payloads survive a table growth and still return their original pointers.
+test fn intern_word_masks_padding_bits_and_is_idempotent() {
+    unsafe {
+        var ln = 1
+        while (ln <= 8) {
+            var sample = 0
+            while (sample < 32) {
+                var low = 0
+                var k = 0
+                while (k < ln) {
+                    low = low | (((sample * 37 + k * 53 + 11) & 255) << (k * 8))
+                    k = k + 1
+                }
+                // Junk in every lane above the payload must be ignored. The
+                // mask keeps only bits at or above `ln * 8`; for ln == 8 there
+                // are none and the shift is skipped (a shift by 64 is not a
+                // valid way to build that mask).
+                var junk = 0
+                if (ln < 8) {
+                    let highMask = 0 - (1 << (ln * 8))
+                    junk = (sample * 2654435761 + 97) & highMask
+                }
+                let padded = low | junk
+                let first = shortInternWord(padded, ln)
+                let second = shortInternWord(low, ln)
+                expect(first as int).toBe(second as int)
+                expect(abiStrLen(first)).toBe(ln)
+                var q = 0
+                while (q < ln) {
+                    expect(abiStrGet(first, q)).toBe((low >> (q * 8)) & 255)
+                    q = q + 1
+                }
+                sample = sample + 1
+            }
+            ln = ln + 1
+        }
+    }
+}
+
+test fn intern_word_stays_consistent_across_table_growth() {
+    unsafe {
+        let count = 1300
+        let stored = alloc(int, count)
+        var i = 0
+        // Each value packs `i` into four 16-bit fields, so all 1,300 payloads
+        // are distinct 8-byte words and the table crosses its 0.7 load factor.
+        while (i < count) {
+            let v = i | (i << 16) | (i << 32) | (i << 48)
+            stored[i] = shortInternWord(v, 8) as int
+            i = i + 1
+        }
+        i = 0
+        while (i < count) {
+            let v = i | (i << 16) | (i << 32) | (i << 48)
+            let again = shortInternWord(v, 8)
+            expect(again as int).toBe(stored[i])
+            expect(abiStrLen(again)).toBe(8)
+            var q = 0
+            while (q < 8) {
+                expect(abiStrGet(again, q)).toBe((v >> (q * 8)) & 255)
+                q = q + 1
+            }
+            i = i + 1
+        }
+    }
 }

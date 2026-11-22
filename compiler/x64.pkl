@@ -2,6 +2,7 @@ module compiler.x64
 
 import { Diagnostic, DiagnosticSink, Span } from compiler.diag
 import { Callee, IrBlock, IrFunc, IrModule, IrTy, IrConst, IrUnOp, IrBinOp, IrInstr, IrTerm, irTyStr } from compiler.ir
+import { optimizeModule } from compiler.irop
 import { sliceRange } from std.text.format
 
 const SHADOW_HEADER_BYTES: int = 16
@@ -88,6 +89,82 @@ fn isCmp(op: IrBinOp) -> bool {
         case IrBinOp.Gt -> true
         case IrBinOp.Ge -> true
         case _ -> false
+    }
+}
+
+/// Commutative integer operators: safe to swap operands so a constant lands on
+/// the right-hand side and folds into the immediate field.
+fn binOpCommutes(op: IrBinOp) -> bool {
+    match (op) {
+        case IrBinOp.Add -> true
+        case IrBinOp.Mul -> true
+        case IrBinOp.BitAnd -> true
+        case IrBinOp.BitOr -> true
+        case IrBinOp.BitXor -> true
+        case IrBinOp.Eq -> true
+        case IrBinOp.Ne -> true
+        case _ -> false
+    }
+}
+
+/// Signed strength reduction for `x / c` and `x % c` when `c` is a positive
+/// non-power-of-two divisor in `(1, 2^31)`. Returns `[M, s]`, or `none`.
+///
+/// `M = floor(2^(64+s)/c) + 1` with the smallest `s` whose error
+/// `e = M*c - 2^(64+s)` satisfies `0 < e < 2^(s+1)`. For `u = |x|` (which is
+/// `2^63` at `INT64_MIN`) that strict bound makes `floor(u*M / 2^(64+s))`
+/// equal `floor(u/c)`; allowing `e == 2^(s+1)` is off by one at exactly
+/// `u == 2^63`. `0 < e` is also required: the `+ 1` overshoots when `c`
+/// divides `2^(64+s)`.
+///
+/// The loop is long division over the single set bit of `2^(64+s)`: `r` stays
+/// below `c <= 2^31`, so `r*2` cannot overflow, and quotient bits at or above
+/// 64 are rejected instead of silently wrapping. The emitted quotient is
+/// `mulhi(u, M) >> s`; `M*c` wraps mod 2^64 to `e` because `s <= 30`.
+fn magicDivConst(c: int) -> List<int>? {
+    var s = 0
+    while (s <= 30) {
+        var q = 0
+        var r = 0
+        var wide = false
+        var i = 64 + s
+        while (i >= 0) {
+            r = r * 2
+            if (i == 64 + s) {
+                r = r + 1
+            }
+            if (r >= c) {
+                r = r - c
+                if (i >= 64) {
+                    wide = true
+                } else {
+                    q = q | (1 << i)
+                }
+            }
+            i = i - 1
+        }
+        if (!wide) {
+            let m = q + 1
+            let e = m * c
+            if (e > 0 && e < (1 << (s + 1))) {
+                return [m, s]
+            }
+        }
+        s = s + 1
+    }
+    none
+}
+
+/// Opcode of the `rAX, imm32` form of an integer ALU op:
+/// `add 05`, `sub 2D`, `and 25`, `or 0D`, `xor 35`.
+fn immGroupOpcode(op: IrBinOp) -> int {
+    match (op) {
+        case IrBinOp.Add -> 0x05
+        case IrBinOp.Sub -> 0x2D
+        case IrBinOp.BitAnd -> 0x25
+        case IrBinOp.BitOr -> 0x0D
+        case IrBinOp.BitXor -> 0x35
+        case _ -> 0x05
     }
 }
 
@@ -252,8 +329,7 @@ class CB {
     }
 
     fn rbpMem(reg: int, k: int) -> List<int> {
-        let d = [0]
-        d.pop()
+        let d: List<int> = []
         if (k <= 128) {
             d.push(0x45 | ((reg & 7) << 3))
             d.push((0 - k) & 0xFF)
@@ -391,6 +467,65 @@ class CB {
         }
     }
 
+    /// `movq xmm, r11`: load a 64-bit bit pattern from r11 into the low half of
+    /// `reg` (66 REX.W(+R/B) 0F 6E /r). r11 is scratch in every lowering, so a
+    /// rematerialised constant can reach an SSE operand without touching rax or
+    /// any argument register that has already been loaded.
+    fn movqXmmR11(reg: int) {
+        this.u8(0x66)
+        if (reg >= 8) {
+            this.u8(0x4D)
+        } else {
+            this.u8(0x49)
+        }
+        this.u8(0x0F)
+        this.u8(0x6E)
+        this.u8(0xC3 | ((reg & 7) << 3))
+    }
+
+    /// `movq xmm, rax`: load the 64-bit bit pattern already in rax into the low
+    /// half of `reg` (66 REX.W(+R) 0F 6E /r). `loadTmpFloat` uses this when a
+    /// float consumer reads a temp whose home write `putRes` deferred.
+    fn movqXmmRax(reg: int) {
+        this.u8(0x66)
+        if (reg >= 8) {
+            this.u8(0x4C)
+        } else {
+            this.u8(0x48)
+        }
+        this.u8(0x0F)
+        this.u8(0x6E)
+        this.u8(0xC0 | ((reg & 7) << 3))
+    }
+
+    /// `movsd dst, src` between two XMM registers (F2 0F 10 /r with mod=11).
+    /// Used to copy a pinned float slot or a tracked temp between scratch
+    /// registers without a memory round trip.
+    fn movsdRR(dst: int, src: int) {
+        this.u8(0xF2)
+        this.u8(0x0F)
+        this.u8(0x10)
+        this.u8(0xC0 | ((dst & 7) << 3) | (src & 7))
+    }
+
+    /// `movq r64, xmm`: move the low 64 bits of an XMM register into a GPR
+    /// (66 REX.W 0F 7E /r). The exact inverse of `movqXmmR11`, needed when a
+    /// pinned float slot's bits are consumed as an integer (Copy, bitcast).
+    fn movqXmmToR(reg: int, xr: int) {
+        this.u8(0x66)
+        var rex = 0x48
+        if (reg >= 8) {
+            rex = rex | 0x04
+        }
+        if (xr >= 8) {
+            rex = rex | 0x01
+        }
+        this.u8(rex)
+        this.u8(0x0F)
+        this.u8(0x7E)
+        this.u8(0xC0 | ((reg & 7) << 3) | (xr & 7))
+    }
+
     fn movabsImm(reg: int, imm: int) {
         var ext = 0x08
         if (reg >= 8) {
@@ -399,6 +534,27 @@ class CB {
         this.u8(0x40 | ext)
         this.u8(0xB8 + (reg & 7))
         this.u64le(imm)
+    }
+
+    /// `mov dst, src` between two general-purpose registers. Used by slot
+    /// pinning, which keeps hot scalar locals in callee-saved registers instead
+    /// of re-reading them from their stack home at every use.
+    fn movRR(dst: int, src: int, w: int) {
+        var ext = 0
+        if (w == 64) {
+            ext = ext | 0x08
+        }
+        if (src >= 8) {
+            ext = ext | 0x04
+        }
+        if (dst >= 8) {
+            ext = ext | 0x01
+        }
+        if (ext != 0) {
+            this.u8(0x40 | ext)
+        }
+        this.u8(0x89)
+        this.u8(0xC0 | ((src & 7) << 3) | (dst & 7))
     }
 
     fn movabsReloc(reg: int, sym: string) {
@@ -583,6 +739,28 @@ class FnPlan {
     var tempCell: Map<int, int>
     var tempK: Map<int, int>
     var types: Map<int, IrTy>
+    /// Scalar constants that never need a stack home: the emitter materialises
+    /// them at the use site (or folds them into the instruction's immediate
+    /// field). Keys are temps, values the 64-bit bit pattern.
+    var constVals: Map<int, int>
+    /// Hot unmanaged scalar slots kept in a callee-saved register for the whole
+    /// body. Slot -> register number.
+    var slotReg: Map<int, int>
+    /// Hot float slots kept in an XMM register for the whole body. Slot -> XMM
+    /// register number. Only populated for functions that emit no call: every
+    /// XMM register is volatile under Win64, so a call would destroy the pin.
+    /// These slots therefore get no stack home at all - the register *is* the
+    /// home, exactly like `slotReg`.
+    var floatSlotReg: Map<int, int>
+    /// Registers pinned by this function, in save order. Empty for most
+    /// functions (the selection is use-count driven).
+    var pinRegs: List<int>
+    /// K of each pin's save slot, parallel to `pinRegs`.
+    var pinK: List<int>
+    /// How many times each temp is read, instructions and terminators
+    /// included. A comparison read exactly once by its block's `BranchIf` is
+    /// fused into the branch instead of materialising a 0/1 bool.
+    var tempUses: Map<int, int>
 
     constructor(
         ncells: int,
@@ -593,7 +771,12 @@ class FnPlan {
         slotK: List<int>,
         tempCell: Map<int, int>,
         tempK: Map<int, int>,
-        types: Map<int, IrTy>
+        types: Map<int, IrTy>,
+        constVals: Map<int, int>,
+        slotReg: Map<int, int>,
+        pinRegs: List<int>,
+        pinK: List<int>,
+        tempUses: Map<int, int>
     ) {
         this.ncells = ncells
         this.shadowBytes = shadowBytes
@@ -604,16 +787,23 @@ class FnPlan {
         this.tempCell = tempCell
         this.tempK = tempK
         this.types = types
+        this.constVals = constVals
+        this.slotReg = slotReg
+        this.pinRegs = pinRegs
+        this.pinK = pinK
+        this.tempUses = tempUses
     }
 
     fn slotHome(s: int) -> int? {
-        if (s < len(this.slotCell) && this.slotCell[s] >= 0) {
+        if (this.slotReg.has(s) || this.floatSlotReg.has(s)) {
+            none
+        } else if (s < len(this.slotCell) && this.slotCell[s] >= 0) {
             return this.shadowBytes - SHADOW_HEADER_BYTES - CELL_BYTES * this.slotCell[s]
-        }
-        if (s < len(this.slotK) && this.slotK[s] >= 1) {
+        } else if (s < len(this.slotK) && this.slotK[s] >= 1) {
             return this.slotK[s]
+        } else {
+            none
         }
-        none
     }
 
     fn tempHome(t: int) -> int? {
@@ -635,6 +825,162 @@ fn defTy(types: Map<int, IrTy>, v: int) -> IrTy {
     }
 }
 
+/// Registers eligible for slot pinning, in preference order. All of them are
+/// callee-saved under the Win64 ABI, so a pinned value survives every call the
+/// emitter emits (including into the runtime, which follows the same ABI). The
+/// emitter itself never touches these, so no allocator bookkeeping is needed.
+const PIN_REG_0: int = 3
+const PIN_REG_1: int = 6
+const PIN_REG_2: int = 7
+const PIN_REG_3: int = 12
+const PIN_REG_4: int = 13
+const PIN_REG_5: int = 14
+const MAX_PINS: int = 6
+/// Float pins use xmm2..xmm5. All four are volatile under Win64, which is fine
+/// because the selection only ever fires for functions whose body emits no
+/// call; xmm0/xmm1 stay the emitter's scratch pair, so a pinned register is
+/// never implicitly clobbered by a lowering sequence.
+const MAX_FLOAT_PINS: int = 4
+fn floatPinRegAt(j: int) -> int {
+    return 2 + j
+}
+/// A slot has to be touched at least this many times before the prologue save
+/// and the one-instruction restore at the return are worth the register. Two
+/// uses already break even, but three keeps short leaf helpers untouched.
+const PIN_MIN_USES: int = 3
+
+fn pinRegAt(j: int) -> int {
+    match (j) {
+        case 0 -> PIN_REG_0
+        case 1 -> PIN_REG_1
+        case 2 -> PIN_REG_2
+        case 3 -> PIN_REG_3
+        case 4 -> PIN_REG_4
+        case 5 -> PIN_REG_5
+        case _ -> 15
+    }
+}
+
+fn slotUseCount(uses: Map<int, int>, s: int) -> int {
+    if (uses.has(s)) {
+        uses[s]
+    } else {
+        0
+    }
+}
+
+fn tempUseCount(uses: Map<int, int>, t: int) -> int {
+    if (uses.has(t)) {
+        uses[t]
+    } else {
+        0
+    }
+}
+
+fn bumpTempUses(uses: Map<int, int>, t: int) {
+    uses[t] = tempUseCount(uses, t) + 1
+}
+
+/// Count every temp read by one instruction. Definitions are not uses; the
+/// only consumers of this map are the fusion and forwarding decisions, which
+/// care whether a value is read after it is produced.
+fn countInstrUses(uses: Map<int, int>, ins: IrInstr) {
+    match (ins) {
+        case IrInstr.Const(d, cst) -> {}
+        case IrInstr.UnOp(d, op, v) -> bumpTempUses(uses, v)
+        case IrInstr.BinOp(d, op, a, b) -> {
+            bumpTempUses(uses, a)
+            bumpTempUses(uses, b)
+        }
+        case IrInstr.Copy(d, v) -> bumpTempUses(uses, v)
+        case IrInstr.Itof(d, v) -> bumpTempUses(uses, v)
+        case IrInstr.Ftoi(d, v) -> bumpTempUses(uses, v)
+        case IrInstr.Chartoi(d, v) -> bumpTempUses(uses, v)
+        case IrInstr.Itochar(d, v) -> bumpTempUses(uses, v)
+        case IrInstr.LoadSlot(d, s) -> {}
+        case IrInstr.StoreSlot(s, v) -> bumpTempUses(uses, v)
+        case IrInstr.LocalAddr(d, s) -> {}
+        case IrInstr.LoadRaw(d, addr, ty) -> bumpTempUses(uses, addr)
+        case IrInstr.StoreRaw(addr, v, ty) -> {
+            bumpTempUses(uses, addr)
+            bumpTempUses(uses, v)
+        }
+        case IrInstr.GlobalAddr(d, id) -> {}
+        case IrInstr.LoadGlobal(d, id, ty) -> {}
+        case IrInstr.StoreGlobal(id, v, ty) -> bumpTempUses(uses, v)
+        case IrInstr.Call(d, callee, args) -> {
+            for (a in args) {
+                bumpTempUses(uses, a)
+            }
+        }
+        case IrInstr.CallInd(d, fnAddr, params, ret, args) -> {
+            bumpTempUses(uses, fnAddr)
+            for (a in args) {
+                bumpTempUses(uses, a)
+            }
+        }
+    }
+}
+
+/// True when `ins` reads `t`. The alias flush needs the predicate form: a
+/// `LoadSlot` result only lives in its pin register inside the block that
+/// loaded it, so a read from any other block forces a store to its home.
+fn instrReadsTmp(ins: IrInstr, t: int) -> bool {
+    var hit = false
+    match (ins) {
+        case IrInstr.Const(d, cst) -> {}
+        case IrInstr.UnOp(d, op, v) -> {
+            if (v == t) { hit = true }
+        }
+        case IrInstr.BinOp(d, op, a, b) -> {
+            if (a == t || b == t) { hit = true }
+        }
+        case IrInstr.Copy(d, v) -> {
+            if (v == t) { hit = true }
+        }
+        case IrInstr.Itof(d, v) -> {
+            if (v == t) { hit = true }
+        }
+        case IrInstr.Ftoi(d, v) -> {
+            if (v == t) { hit = true }
+        }
+        case IrInstr.Chartoi(d, v) -> {
+            if (v == t) { hit = true }
+        }
+        case IrInstr.Itochar(d, v) -> {
+            if (v == t) { hit = true }
+        }
+        case IrInstr.LoadSlot(d, s) -> {}
+        case IrInstr.StoreSlot(s, v) -> {
+            if (v == t) { hit = true }
+        }
+        case IrInstr.LocalAddr(d, s) -> {}
+        case IrInstr.LoadRaw(d, addr, ty) -> {
+            if (addr == t) { hit = true }
+        }
+        case IrInstr.StoreRaw(addr, v, ty) -> {
+            if (addr == t || v == t) { hit = true }
+        }
+        case IrInstr.GlobalAddr(d, id) -> {}
+        case IrInstr.LoadGlobal(d, id, ty) -> {}
+        case IrInstr.StoreGlobal(id, v, ty) -> {
+            if (v == t) { hit = true }
+        }
+        case IrInstr.Call(d, callee, args) -> {
+            for (a in args) {
+                if (a == t) { hit = true }
+            }
+        }
+        case IrInstr.CallInd(d, fnAddr, params, ret, args) -> {
+            if (fnAddr == t) { hit = true }
+            for (a in args) {
+                if (a == t) { hit = true }
+            }
+        }
+    }
+    hit
+}
+
 // ---------------------------------------------------------------------------
 // Which functions can actually trigger a collection?
 //
@@ -653,6 +999,73 @@ fn defTy(types: Map<int, IrTy>, v: int) -> IrTy {
 // Conservatism: an indirect call (`CallInd`) is treated as collecting, since
 // the target is unknown, and an extern whose symbol names the engine trigger is
 // treated the same way.
+/// Whether a call to this extern symbol can reach a collection. The compiler
+/// emits `pickle_*` calls for every runtime operation, and only the allocating
+/// ones can collect. Whitelisting the read-only/arithmetic entry points is what
+/// lets hot lookups (`pickle_map_get`, `pickle_list_get`, `pickle_unbox_i64`, ...)
+/// drop their shadow frame entirely, in user programs as well as the runtime.
+/// Everything not listed stays conservative: a wrong "cannot collect" would
+/// leave live locals invisible while the GC runs.
+fn externMayCollect(sym: string) -> bool {
+    if (sym == "pickle_map_get" || sym == "pickle_map_get_boxed"
+        || sym == "pickle_map_has" || sym == "pickle_map_len"
+        || sym == "pickle_list_get" || sym == "pickle_list_len"
+        || sym == "pickle_str_len" || sym == "pickle_str_cmp"
+        || sym == "pickle_str_get" || sym == "pickle_str_contains"
+        || sym == "pickle_str_starts_with" || sym == "pickle_str_ends_with"
+        || sym == "pickle_str_index_of" || sym == "pickle_str_last_index_of"
+        || sym == "pickle_str_count"
+        || sym == "pickle_unbox_i64" || sym == "pickle_unbox_char"
+        || sym == "pickle_unbox_bool" || sym == "pickle_unbox_f64"
+        || sym == "pickle_fmod"
+        || sym == "pickle_obj_slot_get" || sym == "pickle_tuple_field"
+        || sym == "pickle_enum_eq" || sym == "pickle_union_eq"
+        || sym == "pickle_class_is" || sym == "pickle_int_pow"
+        // Win32/CRT primitives: the heap, TLS, memory-copy and process-exit
+        // entry points are OS calls; they can never re-enter PickleScript code,
+        // so they cannot reach the collection trigger. `__imp_ExitProcess` is
+        // listed because the allocator's failure path calls it: leaving it out
+        // made every allocating helper transitively may-GC, which put a shadow
+        // push/pop around every string/map/list operation. The same applies to
+        // `memcpy`/`memset`, which every string builder calls.
+        || sym == "__imp_HeapAlloc" || sym == "__imp_HeapFree"
+        || sym == "__imp_GetProcessHeap" || sym == "__imp_ExitProcess"
+        || sym == "__imp_TlsAlloc" || sym == "__imp_TlsGetValue"
+        || sym == "__imp_TlsSetValue"
+        || sym == "__imp_memcpy" || sym == "__imp_memmove"
+        || sym == "__imp_memset" || sym == "__imp_memcmp"
+        // Raw heap allocation/free: `pickle_raw_alloc` is the `alloc(int, n)`
+        // builtin's HeapAlloc wrapper (with `pickle_raw_free` its HeapFree
+        // pair). Neither registers a managed object nor reaches
+        // `abiEngineRegister`, so a caller holding only its own homes across
+        // one can never observe a collection. Leaving these out marked every
+        // function that touches `alloc` may-GC - including `str(int)`'s
+        // intern-table init, which put a 17-cell shadow frame on the hottest
+        // string helper in the benchmark.
+        || sym == "pickle_raw_alloc" || sym == "pickle_raw_free"
+        // Pure string -> string builders. `abi_string`'s newStr/builders
+        // deliberately do NOT register their blocks (see that module's header):
+        // strings allocate from the managed arena and never enter the
+        // sweepability registry, so no path below reaches the collection
+        // trigger. Only string-to-string entries are listed; the split/chars
+        // family creates lists through `abiListNew`, which does register, and
+        // stays conservative.
+        || sym == "pickle_str_concat" || sym == "pickle_str_append_owned"
+        || sym == "pickle_str_from_i64" || sym == "pickle_str_from_bytes"
+        || sym == "pickle_str_from_bool" || sym == "pickle_str_from_byte"
+        || sym == "pickle_str_from_char" || sym == "pickle_str_substring"
+        || sym == "pickle_str_set" || sym == "pickle_str_repeat"
+        || sym == "pickle_str_replace" || sym == "pickle_str_replace_first"
+        || sym == "pickle_str_to_lower" || sym == "pickle_str_to_upper"
+        || sym == "pickle_str_trim" || sym == "pickle_str_trim_start"
+        || sym == "pickle_str_trim_end"
+        || sym == "pickle_str_pad_start" || sym == "pickle_str_pad_end"
+        || sym == "pickle_str_strip_prefix" || sym == "pickle_str_strip_suffix") {
+        return false
+    }
+    true
+}
+
 fn computeMayGC(m: IrModule) -> Map<string, bool> {
     var mgc: Map<string, bool> = {"": false}
     mgc.remove("")
@@ -669,10 +1082,13 @@ fn computeMayGC(m: IrModule) -> Map<string, bool> {
                         match (callee) {
                             case Callee.Func(id) -> {}
                             case Callee.Extern(id) -> {
-                                // The runtime is linked as extern symbols, so the
-                                // compiler cannot see which of them allocate. Any
-                                // extern call is treated as able to collect.
-                                mgc[f.name] = true
+                                // Only allocating runtime entry points can
+                                // collect. OS/CRT calls cannot re-enter the
+                                // runtime, and the read-only pickle_* helpers
+                                // are listed in `externMayCollect`.
+                                if (externMayCollect(m.externs[id].symbol)) {
+                                    mgc[f.name] = true
+                                }
                             }
                         }
                     }
@@ -717,11 +1133,393 @@ fn computeMayGC(m: IrModule) -> Map<string, bool> {
     mgc
 }
 
+/// True when the callee is the global `pickle_str_concat` entry point. Runtime
+/// modules call `abiStrConcat` directly (`Callee.Func`), which is deliberately
+/// excluded: only the user-facing ABI call has the assignment shape.
+fn isExternConcat(m: IrModule, callee: Callee) -> bool {
+    match (callee) {
+        case Callee.Extern(id) -> m.externs[id].symbol == "pickle_str_concat"
+        case Callee.Func(id) -> false
+    }
+}
+
+fn instrTouchesSlot(ins: IrInstr, s: int) -> bool {
+    match (ins) {
+        case IrInstr.LoadSlot(d, s2) -> s2 == s
+        case IrInstr.StoreSlot(s2, v) -> s2 == s
+        case IrInstr.LocalAddr(d, s2) -> s2 == s
+        case _ -> false
+    }
+}
+
+fn blockStoresTo(fun: IrFunc, id: int, s: int) -> bool {
+    let blk = fun.blocks[id]
+    var hit = false
+    for (ins in blk.instrs) {
+        match (ins) {
+            case IrInstr.StoreSlot(s2, v) -> {
+                if (s2 == s) {
+                    hit = true
+                }
+            }
+            case _ -> {}
+        }
+    }
+    hit
+}
+
+/// True when this block contains a `pickle_str_concat` whose first argument
+/// comes from a load of `s`. This is a *possible* mutation point; using a
+/// superset here is safe because a false positive only makes the ownership
+/// proof more conservative.
+fn blockHasConcatOnSlot(m: IrModule, fun: IrFunc, id: int, s: int, loadSlotOf: Map<int, int>) -> bool {
+    let blk = fun.blocks[id]
+    var hit = false
+    for (ins in blk.instrs) {
+        match (ins) {
+            case IrInstr.Call(d, callee, args) -> {
+                if (isExternConcat(m, callee) && len(args) >= 1) {
+                    let a0 = args[0]
+                    if (loadSlotOf.has(a0) && loadSlotOf[a0] == s) {
+                        hit = true
+                    }
+                }
+            }
+            case _ -> {}
+        }
+    }
+    hit
+}
+
+fn termSucc(term: IrTerm) -> List<int> {
+    var out: List<int> = []
+    match (term) {
+        case IrTerm.Branch(t) -> { out.push(t) }
+        case IrTerm.BranchIf(c, tn, el) -> {
+            out.push(tn)
+            out.push(el)
+        }
+        case IrTerm.Return(v) -> {}
+        case IrTerm.Unreachable -> {}
+    }
+    out
+}
+
+/// Can a read of the slot reach an append block without a store to the slot in
+/// between? A store replaces the value the read saw, so paths through one are
+/// harmless. Anything else means the read value can still be the object an
+/// append would mutate - reject.
+fn reachesAppendBlock(m: IrModule, fun: IrFunc, start: int, s: int, loadSlotOf: Map<int, int>) -> bool {
+    var seen = {0: false}
+    seen.remove(0)
+    var q: List<int> = []
+    q.push(start)
+    var qi = 0
+    while (qi < len(q)) {
+        let id = q[qi]
+        qi = qi + 1
+        if (!(seen.has(id) && seen[id])) {
+            seen[id] = true
+            if (blockHasConcatOnSlot(m, fun, id, s, loadSlotOf)) {
+                return true
+            }
+            if (!blockStoresTo(fun, id, s)) {
+                for (nx in termSucc(fun.blocks[id].term)) {
+                    if (!(seen.has(nx) && seen[nx])) {
+                        q.push(nx)
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Follow a concat result through single-use concat consumers until it is
+/// stored. The chain is only accepted when it stays in one block and stores
+/// back to `s`, with no other access to `s` between the root load and the
+/// store. Returns every concat call in the chain, or an empty list.
+fn appendChain(
+    m: IrModule,
+    fun: IrFunc,
+    concatBlock: Map<int, int>,
+    concatArg0: Map<int, int>,
+    loadBlock: Map<int, int>,
+    first: int,
+    s: int,
+    tempUses: Map<int, int>
+) -> List<int> {
+    var chain: List<int> = []
+    let bi = concatBlock[first]
+    let root = concatArg0[first]
+    if (!loadBlock.has(root) || loadBlock[root] != bi) {
+        return chain
+    }
+    var rootIdx = 0 - 1
+    var ii = 0
+    for (ins in fun.blocks[bi].instrs) {
+        match (ins) {
+            case IrInstr.LoadSlot(d, s2) -> {
+                if (d == root && s2 == s) {
+                    rootIdx = ii
+                }
+            }
+            case _ -> {}
+        }
+        ii = ii + 1
+    }
+    if (rootIdx < 0) {
+        return chain
+    }
+    var cur = first
+    chain.push(first)
+    var storeIdx = 0 - 1
+    var steps = 0
+    var ok = true
+    while (ok && storeIdx < 0) {
+        steps = steps + 1
+        if (steps > 64 || tempUseCount(tempUses, cur) != 1) {
+            ok = false
+        } else {
+            var consumer = 0 - 1
+            var count = 0
+            ii = 0
+            for (ins in fun.blocks[bi].instrs) {
+                if (instrReadsTmp(ins, cur)) {
+                    consumer = ii
+                    count = count + 1
+                }
+                ii = ii + 1
+            }
+            if (count != 1) {
+                ok = false
+            } else {
+                match (fun.blocks[bi].instrs[consumer]) {
+                    case IrInstr.StoreSlot(s2, v) -> {
+                        ok = s2 == s
+                        if (ok) {
+                            storeIdx = consumer
+                        }
+                    }
+                    case IrInstr.Call(d2, callee, args) -> {
+                        var next = false
+                        if (isExternConcat(m, callee) && len(args) == 2 && args[0] == cur) {
+                            match (d2) {
+                                case some(dd) -> {
+                                    if (concatBlock.has(dd) && concatBlock[dd] == bi) {
+                                        chain.push(dd)
+                                        cur = dd
+                                        next = true
+                                    }
+                                }
+                                case none -> {}
+                            }
+                        }
+                        if (!next) {
+                            ok = false
+                        }
+                    }
+                    case _ -> { ok = false }
+                }
+            }
+        }
+    }
+    if (!ok || storeIdx < 0) {
+        return [0]
+    }
+    // Nothing may read the slot between the chain's root load and final store:
+    // a read there would observe the half-appended buffer.
+    ii = rootIdx + 1
+    while (ii < storeIdx) {
+        if (instrTouchesSlot(fun.blocks[bi].instrs[ii], s)) {
+            return [0]
+        }
+        ii = ii + 1
+    }
+    chain
+}
+
+/// Result of the append-owned proof: which concat destinations may lower to
+/// `pickle_str_append_owned`, plus the two-link chains that may lower to one
+/// fused `pickle_str_append_two`. `fuse` maps the *first* concat's destination
+/// to `[root, piece]`; the emitter skips that call and emits the fused call at
+/// the second link.
+class AppendPlan {
+    var owned: Map<int, bool>
+    var fuse: Map<int, List<int>>
+
+    constructor(owned: Map<int, bool>, fuse: Map<int, List<int>>) {
+        this.owned = owned
+        this.fuse = fuse
+    }
+}
+
+/// Backend-only proof that lets `pickle_str_concat` lower to
+/// `pickle_str_append_owned`. See the runtime body for the second line of
+/// defence (static/shared strings are always copied). The proof is deliberately
+/// whole-function: a single escaped read of the slot that can reach an append
+/// without an intervening store disqualifies the slot, even if the immediate
+/// instruction sequence looks linear.
+fn analyzeAppendOwned(m: IrModule, fun: IrFunc, types: Map<int, IrTy>, tempUses: Map<int, int>) -> AppendPlan {
+    var owned = {0: false}
+    owned.remove(0)
+    var fuse = {0: [0]}
+    fuse.remove(0)
+    // The schedules below address blocks by id. The emitter allocates ids in
+    // order; refuse anything else instead of guessing.
+    var bi = 0
+    while (bi < len(fun.blocks)) {
+        if (fun.blocks[bi].id != bi) {
+            return AppendPlan(owned, fuse)
+        }
+        bi = bi + 1
+    }
+    var loadSlotOf = {0: 0}
+    loadSlotOf.remove(0)
+    var loadBlock = {0: 0}
+    loadBlock.remove(0)
+    var concatArg0 = {0: 0}
+    concatArg0.remove(0)
+    var concatArg1 = {0: 0}
+    concatArg1.remove(0)
+    var concatBlock = {0: 0}
+    concatBlock.remove(0)
+    var arg0Set = {0: false}
+    arg0Set.remove(0)
+    var constStr = {0: false}
+    constStr.remove(0)
+    var any = false
+    for (blk in fun.blocks) {
+        for (ins in blk.instrs) {
+            match (ins) {
+                case IrInstr.LoadSlot(d, s) -> {
+                    loadSlotOf[d] = s
+                    loadBlock[d] = blk.id
+                    // Unit tail: the arms below are value-typed and all arms of
+                    // a match must agree.
+                    {}
+                }
+                case IrInstr.StoreSlot(s, v) -> {}
+                case IrInstr.LocalAddr(d, s) -> {}
+                case IrInstr.Const(d, cst) -> {
+                    match (cst) {
+                        case IrConst.Str(id) -> { constStr[d] = true }
+                        case _ -> {}
+                    }
+                }
+                case IrInstr.Call(d, callee, args) -> {
+                    if (isExternConcat(m, callee) && len(args) == 2) {
+                        any = true
+                        match (d) {
+                            case some(dd) -> {
+                                concatArg0[dd] = args[0]
+                                concatArg1[dd] = args[1]
+                                concatBlock[dd] = blk.id
+                                arg0Set[args[0]] = true
+                            }
+                            case none -> {}
+                        }
+                    }
+                }
+                case _ -> {}
+            }
+        }
+    }
+    if (!any) {
+        return AppendPlan(owned, fuse)
+    }
+    // Rule 1: a concat result used exactly once as another concat's first
+    // argument is private by construction, regardless of where it came from.
+    for (dd in concatArg0.keys()) {
+        let a0 = concatArg0[dd]
+        if (concatArg0.has(a0) && tempUseCount(tempUses, a0) == 1) {
+            owned[dd] = true
+        }
+    }
+    // Rule 2: a linear string slot. Every stored value must be a literal or a
+    // single-use concat result; every read that is not the chain's root must be
+    // unable to reach an append without crossing a store.
+    var si = 0
+    while (si < len(fun.slots)) {
+        let s = si
+        if (fun.slots[s] == IrTy.Str) {
+            var hasAddr = false
+            var badStore = false
+            var hasStore = false
+            var roots = 0
+            var otherLoads: List<int> = []
+            for (blk in fun.blocks) {
+                for (ins in blk.instrs) {
+                    match (ins) {
+                        case IrInstr.LocalAddr(d, s2) -> {
+                            if (s2 == s) {
+                                hasAddr = true
+                            }
+                        }
+                        case IrInstr.StoreSlot(s2, v) -> {
+                            if (s2 == s) {
+                                hasStore = true
+                                var good = constStr.has(v)
+                                if (!good && concatArg0.has(v) && tempUseCount(tempUses, v) == 1) {
+                                    good = true
+                                }
+                                if (!good) {
+                                    badStore = true
+                                }
+                            }
+                        }
+                        case IrInstr.LoadSlot(d, s2) -> {
+                            if (s2 == s) {
+                                if (arg0Set.has(d) && tempUseCount(tempUses, d) == 1) {
+                                    roots = roots + 1
+                                } else {
+                                    otherLoads.push(d)
+                                }
+                            }
+                        }
+                        case _ -> {}
+                    }
+                }
+            }
+            if (!hasAddr && !badStore && hasStore && roots > 0) {
+                var safe = true
+                for (l2 in otherLoads) {
+                    if (safe) {
+                        let lb = loadBlock[l2]
+                        if (blockStoresTo(fun, lb, s)) {
+                            safe = false
+                        }
+                        if (safe && reachesAppendBlock(m, fun, lb, s, loadSlotOf)) {
+                            safe = false
+                        }
+                    }
+                }
+                if (safe) {
+                    for (dd in concatArg0.keys()) {
+                        let a0 = concatArg0[dd]
+                        if (loadSlotOf.has(a0) && loadSlotOf[a0] == s && tempUseCount(tempUses, a0) == 1) {
+                            let ch = appendChain(m, fun, concatBlock, concatArg0, loadBlock, dd, s, tempUses)
+                            if (len(ch) > 0) {
+                                for (ct in ch) {
+                                    owned[ct] = true
+                                }
+                                if (len(ch) == 2 && concatArg1.has(ch[0])) {
+                                    fuse[ch[0]] = [concatArg0[ch[0]], concatArg1[ch[0]]]
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        si = si + 1
+    }
+    AppendPlan(owned, fuse)
+}
+
 fn analyze(m: IrModule, fun: IrFunc, mayGC: Map<string, bool>) -> FnPlan {
-    var slotCell = [0]
-    slotCell.pop()
-    var slotK = [0]
-    slotK.pop()
+    var slotCell: List<int> = []
+    var slotK: List<int> = []
     var i = 0
     while (i < len(fun.slots)) {
         slotCell.push(-1)
@@ -730,13 +1528,72 @@ fn analyze(m: IrModule, fun: IrFunc, mayGC: Map<string, bool>) -> FnPlan {
     }
     var types = {0: IrTy.Unit}
     types.remove(0)
-    var allTemps = [0]
-    allTemps.pop()
-    for (b in fun.blocks) {
-        for (ins in b.instrs) {
+    var constVals = {0: 0}
+    constVals.remove(0)
+    var tempUses = {0: 0}
+    tempUses.remove(0)
+    var allTemps: List<int> = []
+    // Slot pinning inputs: a slot whose address is taken must keep its stack
+    // home (the address has to stay valid for the whole body), and the use
+    // count decides which remaining slots are hot enough to be worth a
+    // callee-saved register.
+    var addressTaken = {0: false}
+    addressTaken.remove(0)
+    var slotUses = {0: 0}
+    slotUses.remove(0)
+    // Mark blocks that lie inside a loop: a backward branch target plus every
+    // block up to the branching block. Uses there are weighted, so loop-carried
+    // locals (the map hash's `h`, `v`, `n`) outrank locals that merely appear
+    // often in straight-line code when the six pins are handed out.
+    var loopBlock = {0: false}
+    loopBlock.remove(0)
+    for (pb in fun.blocks) {
+        loopBlock[pb.id] = false
+    }
+    for (pb in fun.blocks) {
+        var back = 0 - 1
+        match (pb.term) {
+            case IrTerm.Branch(t) -> {
+                if (t <= pb.id) { back = t }
+            }
+            case IrTerm.BranchIf(c, tn, el) -> {
+                if (tn <= pb.id) { back = tn }
+                if (el <= pb.id) { back = el }
+            }
+            case _ -> {}
+        }
+        if (back >= 0) {
+            var lk = back
+            while (lk <= pb.id) {
+                loopBlock[lk] = true
+                lk = lk + 1
+            }
+        }
+    }
+    var bi = 0
+    while (bi < len(fun.blocks)) {
+        let cur = fun.blocks[bi]
+        let wgt = if (loopBlock.has(cur.id) && loopBlock[cur.id]) { 8 } else { 1 }
+        for (ins in cur.instrs) {
             match (ins) {
                 case IrInstr.Const(d, cst) -> {
                     types[d] = constTy(cst)
+                    if (let IrConst.Int(v) = cst) {
+                        constVals[d] = v
+                    }
+                    if (let IrConst.Bool(bv) = cst) {
+                        if (bv) {
+                            constVals[d] = 1
+                        } else {
+                            constVals[d] = 0
+                        }
+                    }
+                    if (let IrConst.Char(cv) = cst) {
+                        constVals[d] = cv as int
+                    }
+                    if (IrConst.Null == cst) {
+                        constVals[d] = 0
+                    }
                     allTemps.push(d)
                 }
                 case IrInstr.UnOp(d, op, v) -> {
@@ -777,11 +1634,15 @@ fn analyze(m: IrModule, fun: IrFunc, mayGC: Map<string, bool>) -> FnPlan {
                 }
                 case IrInstr.LoadSlot(d, s) -> {
                     types[d] = fun.slots[s]
+                    slotUses[s] = slotUseCount(slotUses, s) + wgt
                     allTemps.push(d)
                 }
-                case IrInstr.StoreSlot(s, v) -> {}
+                case IrInstr.StoreSlot(s, v) -> {
+                    slotUses[s] = slotUseCount(slotUses, s) + wgt
+                }
                 case IrInstr.LocalAddr(d, s) -> {
                     types[d] = IrTy.Int
+                    addressTaken[s] = true
                     allTemps.push(d)
                 }
                 case IrInstr.LoadRaw(d, addr, ty) -> {
@@ -818,10 +1679,28 @@ fn analyze(m: IrModule, fun: IrFunc, mayGC: Map<string, bool>) -> FnPlan {
                 }
             }
         }
+        bi = bi + 1
     }
     var ncells = 0
     var tempCell = {0: 0}
     tempCell.remove(0)
+    // Count reads after types are known: the fusion check below needs the
+    // BranchIf operand's total use count, terminators included.
+    for (blk in fun.blocks) {
+        for (ins in blk.instrs) {
+            countInstrUses(tempUses, ins)
+        }
+        match (blk.term) {
+            case IrTerm.BranchIf(c, tn, el) -> bumpTempUses(tempUses, c)
+            case IrTerm.Return(v) -> {
+                match (v) {
+                    case some(tv) -> bumpTempUses(tempUses, tv)
+                    case none -> {}
+                }
+            }
+            case _ -> {}
+        }
+    }
     var tempK = {0: 0}
     tempK.remove(0)
     i = 0
@@ -833,12 +1712,136 @@ fn analyze(m: IrModule, fun: IrFunc, mayGC: Map<string, bool>) -> FnPlan {
         i = i + 1
     }
     for (t in allTemps) {
-        if (isManaged(types[t])) {
+        if (!constVals.has(t) && isManaged(types[t])) {
             tempCell[t] = ncells
             ncells = ncells + 1
         }
     }
     let shadowBytes = SHADOW_HEADER_BYTES + CELL_BYTES * ncells
+    // Pick the hot scalar slots to keep in registers. Int and Char only: both
+    // are 4/8-byte values every candidate register can encode directly, while a
+    // `bool` slot is one byte and byte registers 4..7 need a REX prefix to mean
+    // sil/dil rather than ah/bh. Float would need an XMM register. Ties break on
+    // the lower slot index so the choice is deterministic.
+    var cand: List<int> = []
+    i = 0
+    while (i < len(fun.slots)) {
+        let ty = fun.slots[i]
+        if (!addressTaken.has(i) && (ty == IrTy.Int || ty == IrTy.Char)
+            && slotUseCount(slotUses, i) >= PIN_MIN_USES) {
+            cand.push(i)
+        }
+        i = i + 1
+    }
+    var slotReg = {0: 0}
+    slotReg.remove(0)
+    var pinRegs: List<int> = []
+    var pinSet: List<bool> = []
+    i = 0
+    while (i < len(cand)) {
+        pinSet.push(false)
+        i = i + 1
+    }
+    var picking = true
+    while (picking && len(pinRegs) < MAX_PINS) {
+        var best = 0 - 1
+        var bestUses = 0
+        var j = 0
+        while (j < len(cand)) {
+            if (!pinSet[j]) {
+                let u = slotUseCount(slotUses, cand[j])
+                if (best < 0 || u > bestUses) {
+                    best = j
+                    bestUses = u
+                }
+            }
+            j = j + 1
+        }
+        if (best < 0) {
+            picking = false
+        } else {
+            pinSet[best] = true
+            let rg = pinRegAt(len(pinRegs))
+            slotReg[cand[best]] = rg
+            pinRegs.push(rg)
+        }
+    }
+    // Float pins: only when the body cannot emit a call. `exp`, the benchmark's
+    // hot Taylor loop, reads and writes nothing but float locals, and keeping
+    // them in XMM registers removes the memory round trip that otherwise sits
+    // on the `mulsd`/`divsd` dependency chain on every iteration.
+    var emitsCall = fun.symbol == ENTRY_SYMBOL
+    if (ncells > 0 && mayGC.has(fun.name) && !isShadowApiFn(fun.name, fun.symbol)) {
+        // The prologue/return shadow push calls clobber every volatile XMM
+        // register, so a float pin could not survive them either.
+        emitsCall = true
+    }
+    for (blk in fun.blocks) {
+        for (ins in blk.instrs) {
+            match (ins) {
+                case IrInstr.Call(_, _, _) -> emitsCall = true
+                case IrInstr.CallInd(_, _, _, _, _) -> emitsCall = true
+                case IrInstr.BinOp(_, op, a, _) -> {
+                    // Float modulo lowers to a call to `pickle_fmod`.
+                    if (op == IrBinOp.Mod && isFloatTy(defTy(types, a))) {
+                        emitsCall = true
+                    }
+                }
+                case _ -> {}
+            }
+        }
+    }
+    // Seeding more than one float parameter would let an earlier pin overwrite
+    // an incoming xmm2/xmm3 argument before `seedParams` has spilled it. A
+    // single float parameter is safe: its own move either is a no-op or happens
+    // before any other pin is seeded.
+    var floatParams = 0
+    for (p in fun.params) {
+        if (isFloatTy(p.ty)) {
+            floatParams = floatParams + 1
+        }
+    }
+    var floatSlotReg = {0: 0}
+    floatSlotReg.remove(0)
+    if (!emitsCall && floatParams <= 1) {
+        var fcand: List<int> = []
+        i = 0
+        while (i < len(fun.slots)) {
+            if (!(addressTaken.has(i) && addressTaken[i]) && isFloatTy(fun.slots[i])
+                && slotUseCount(slotUses, i) >= PIN_MIN_USES) {
+                fcand.push(i)
+            }
+            i = i + 1
+        }
+        var fpinSet: List<bool> = []
+        for (f in fcand) {
+            fpinSet.push(false)
+        }
+        var fpicking = true
+        var fpins = 0
+        while (fpicking && fpins < MAX_FLOAT_PINS) {
+            var fbest = 0 - 1
+            var fbestUses = 0
+            var fk = 0
+            while (fk < len(fcand)) {
+                if (!fpinSet[fk]) {
+                    let u = slotUseCount(slotUses, fcand[fk])
+                    if (fbest < 0 || u > fbestUses) {
+                        fbest = fk
+                        fbestUses = u
+                    }
+                }
+                fk = fk + 1
+            }
+            if (fbest < 0) {
+                fpicking = false
+            } else {
+                fpinSet[fbest] = true
+                floatSlotReg[fcand[fbest]] = floatPinRegAt(fpins)
+                fpins = fpins + 1
+            }
+        }
+    }
     // The shadow frame occupies K in [0, shadowBytes]: `prev` sits at exactly
     // shadowBytes, so unmanaged slots/temps must start strictly past it. Starting
     // at shadowBytes would let an alloc whose K is already a multiple of its
@@ -854,7 +1857,7 @@ fn analyze(m: IrModule, fun: IrFunc, mayGC: Map<string, bool>) -> FnPlan {
     var firstK = true
     i = 0
     while (i < len(fun.slots)) {
-        if (!isManaged(fun.slots[i])) {
+        if (!isManaged(fun.slots[i]) && !slotReg.has(i) && !floatSlotReg.has(i)) {
             let k = alignK(used + (if (firstK) { 0 } else { tyBytes(fun.slots[i]) }), tyBytes(fun.slots[i]))
             slotK[i] = k
             used = k
@@ -863,16 +1866,35 @@ fn analyze(m: IrModule, fun: IrFunc, mayGC: Map<string, bool>) -> FnPlan {
         i = i + 1
     }
     for (t in allTemps) {
-        if (!isManaged(types[t])) {
+        if (!constVals.has(t) && !isManaged(types[t])) {
             let k = alignK(used + (if (firstK) { 0 } else { tyBytes(types[t]) }), tyBytes(types[t]))
             tempK[t] = k
             used = k
             firstK = false
         }
     }
-    let totalK = alignK(used, 16)
+    // Save area for the pinned registers, at the bottom of the frame. Each save
+    // slot is a full 8 bytes, and the lowest one has to clear the last home, so
+    // the reservation starts one slot deeper than `used`.
+    let pinBytes = 8 * len(pinRegs)
+    var pinK: List<int> = []
+    var totalK = 0
+    if (pinBytes > 0) {
+        used = used + pinBytes + 8
+    }
+    totalK = alignK(used, 16)
+    var j0 = 0
+    while (j0 < len(pinRegs)) {
+        pinK.push(totalK - 8 * (j0 + 1))
+        j0 = j0 + 1
+    }
     let shadowed = ncells > 0 && mayGC.has(fun.name) && !isShadowApiFn(fun.name, fun.symbol)
-    FnPlan(ncells, shadowBytes, totalK, shadowed, slotCell, slotK, tempCell, tempK, types)
+    var plan = FnPlan(ncells, shadowBytes, totalK, shadowed, slotCell, slotK, tempCell, tempK, types, constVals, slotReg, pinRegs, pinK, tempUses)
+    // Assigned after construction: the seed-built backend drops the 15th
+    // constructor argument, leaving a null map behind. `floatSlotReg` is a
+    // plain field, so a post-hoc store is equivalent.
+    plan.floatSlotReg = floatSlotReg
+    plan
 }
 
 class X64Emitter {
@@ -885,6 +1907,68 @@ class X64Emitter {
     var cb: CB
     var fixes: List<BranchFix>
     var starts: Map<int, int>
+    /// Temp whose value is currently in rax, and the width that value is valid
+    /// at (-1 / 0 when nothing is known). See `loadTmp`/`noteRax`.
+    var raxT: int
+    var raxW: int
+    /// Same, for rcx. The two registers are the emitter's operand pair, so a
+    /// value left in one can reach the other with a register move instead of a
+    /// reload. Both entries are cleared at every instruction boundary unless
+    /// the arm proved what it left behind.
+    var rcxT: int
+    var rcxW: int
+    /// Deferred home write. `pendT` is a temp whose value is in rax but not yet
+    /// stored to its home, because it has exactly one use and that use can take
+    /// it straight out of rax. `pendK` is the home the write was skipped for.
+    /// Anything that touches rax before the consumer must `flushPend` first;
+    /// `lowerInstr`/`lowerTerm` decide that from the instruction shape.
+    var pendT: int
+    var pendK: int
+    var pendW: int
+    /// Compare/branch fusion for the current block: when `fuseCc >= 0`, the
+    /// block's trailing comparison `fuseA op fuseB` is emitted as `cmp`+`jcc`
+    /// inside `lowerTerm` instead of a setcc/store. `fuseImm` says the right
+    /// operand is the constant `fuseImmV`.
+    var fuseCc: int
+    var fuseA: int
+    var fuseB: int
+    var fuseW: int
+    var fuseImm: bool
+    var fuseImmV: int
+    /// Counter for the negative pseudo-block ids used by backend-only inline
+    /// sequences that need a local join/slow label. Real block ids are
+    /// non-negative, so `-1 - n` can never collide with one in `starts`.
+    var inlineLab: int
+    /// Pinned-slot aliases. A `LoadSlot` of a register-pinned slot needs no
+    /// copy: the value already lives in the pin register until the next store
+    /// to that slot. `aliasReg` maps the loaded temp to that register,
+    /// `aliasSlot` records which slot it came from (so a store invalidates it),
+    /// and `aliasW` is the width the register is valid at. The alias is
+    /// materialised to the temp's home only when a store clobbers the register
+    /// or a use wants a different width.
+    var aliasReg: Map<int, int>
+    var aliasSlot: Map<int, int>
+    var aliasW: Map<int, int>
+    /// Float-pinned-slot aliases, the XMM counterpart of `aliasReg`: a
+    /// `LoadSlot` of a `floatSlotReg` slot names the pin directly and consumers
+    /// read it without a copy.
+    var aliasXmm: Map<int, int>
+    var aliasXSlot: Map<int, int>
+    /// Temp ids whose value a float-producing instruction left in xmm0/xmm1, or
+    /// -1. Like `raxT`/`rcxT` this is a redundant copy: every float result is
+    /// still written to its home, so a miss (or a cleared entry) just reloads.
+    /// It exists to keep `mulsd` -> `divsd` chains out of memory.
+    var fx0: int
+    var fx1: int
+    /// `pickle_str_concat` results whose first argument the backend may pass to
+    /// `pickle_str_append_owned` instead. Keyed by the call's destination temp;
+    /// `analyzeAppendOwned` only lists calls where the function provably owns
+    /// the buffer, and the runtime re-checks the string header regardless.
+    var appendOwned: Map<int, bool>
+    /// First link of a proven two-concat chain, mapped to `[root, piece]`.
+    /// Emitting that call is skipped; the second link becomes one
+    /// `pickle_str_append_two` call with both pieces.
+    var appendFuse: Map<int, List<int>>
 
     constructor(m: IrModule, fun: IrFunc, diags: DiagnosticSink, mayGC: Map<string, bool>) {
         this.m = m
@@ -893,11 +1977,40 @@ class X64Emitter {
         this.failed = false
         this.mayGC = mayGC
         this.plan = analyze(m, fun, mayGC)
+        let ap = analyzeAppendOwned(m, fun, this.plan.types, this.plan.tempUses)
+        this.appendOwned = ap.owned
+        this.appendFuse = ap.fuse
         this.cb = CB()
         this.fixes = [BranchFix(0, 0)]
         this.fixes.pop()
         this.starts = {0: 0}
         this.starts.remove(0)
+        this.raxT = 0 - 1
+        this.raxW = 0
+        this.rcxT = 0 - 1
+        this.rcxW = 0
+        this.pendT = 0 - 1
+        this.pendK = 0
+        this.pendW = 0
+        this.fuseCc = 0 - 1
+        this.fuseA = 0
+        this.fuseB = 0
+        this.fuseW = 64
+        this.fuseImm = false
+        this.fuseImmV = 0
+        this.inlineLab = 0
+        this.aliasReg = {0: 0}
+        this.aliasReg.remove(0)
+        this.aliasSlot = {0: 0}
+        this.aliasSlot.remove(0)
+        this.aliasW = {0: 0}
+        this.aliasW.remove(0)
+        this.aliasXmm = {0: 0}
+        this.aliasXmm.remove(0)
+        this.aliasXSlot = {0: 0}
+        this.aliasXSlot.remove(0)
+        this.fx0 = 0 - 1
+        this.fx1 = 0 - 1
     }
 
     fn fail(msg: string) {
@@ -943,23 +2056,772 @@ class X64Emitter {
         }
     }
 
+    /// Load a source temp into `reg`. Scalar constants have no stack home (and
+    /// no shadow cell), so they are rematerialised here. This is what removes
+    /// the `movabs`+store+reload sequence a literal used to cost.
+    ///
+    /// `reg == 0` also consults the rax forwarding cache: when the previous
+    /// instruction left this very temp in rax, the reload is dropped. `raxT`
+    /// and `raxW` are only ever set where the emitter knows rax's final
+    /// contents, so a hit is always exact.
+    fn loadTmp(reg: int, w: int, t: int) {
+        // The deferred result lives only in rax. Serving the consumer from it
+        // is the reason the home write was skipped; a width mismatch means rax
+        // cannot be used as-is, so materialise the home and reload normally.
+        if (t == this.pendT) {
+            if (w == this.pendW) {
+                this.pendT = 0 - 1
+                if (reg == 0) {
+                    this.raxT = t
+                    this.raxW = w
+                    return
+                }
+                this.cb.movRR(reg, 0, w)
+                if (reg == 1) {
+                    this.rcxT = t
+                    this.rcxW = w
+                }
+                return
+            }
+            this.cb.st(0, this.pendW, this.pendK)
+            this.pendT = 0 - 1
+        }
+        if (reg == 0 && this.raxT == t && this.raxW == w) {
+            return
+        }
+        if (reg == 1 && this.rcxT == t && this.rcxW == w) {
+            return
+        }
+        if (this.plan.constVals.has(t)) {
+            this.cb.movabsImm(reg, this.plan.constVals[t])
+            if (reg == 0) {
+                this.raxT = t
+                this.raxW = w
+            } else if (reg == 1) {
+                this.rcxT = t
+                this.rcxW = w
+            }
+            return
+        }
+        // A float temp loaded straight from a pinned slot is not in its home.
+        // A consumer that wants the raw bits (a copy or an int-typed alias)
+        // gets them from the pin register; the XMM copy stays valid.
+        if (this.aliasXmm.has(t)) {
+            if (w == 64) {
+                this.cb.movqXmmToR(reg, this.aliasXmm[t])
+                if (reg == 0) {
+                    this.raxT = t
+                    this.raxW = w
+                } else if (reg == 1) {
+                    this.rcxT = t
+                    this.rcxW = w
+                }
+                return
+            }
+            this.cb.stsd(this.aliasXmm[t], this.kOfTemp(t))
+            this.dropXAlias(t)
+        }
+        // A register-to-register move is ~1 cycle against ~5 for a reload that
+        // forwards through the store it follows.
+        if (reg == 0 && this.rcxT == t && this.rcxW == w) {
+            this.cb.movRR(0, 1, w)
+            this.raxT = t
+            this.raxW = w
+            return
+        }
+        if (reg == 1 && this.raxT == t && this.raxW == w) {
+            this.cb.movRR(1, 0, w)
+            this.rcxT = t
+            this.rcxW = w
+            return
+        }
+        // A pinned-slot load left the value in its callee-saved register; serve
+        // the use from there instead of a home that was never written.
+        if (this.aliasReg.has(t)) {
+            if (this.aliasW[t] == w) {
+                let ar = this.aliasReg[t]
+                if (ar != reg) {
+                    this.cb.movRR(reg, ar, w)
+                }
+                if (reg == 0) {
+                    this.raxT = t
+                    this.raxW = w
+                } else if (reg == 1) {
+                    this.rcxT = t
+                    this.rcxW = w
+                }
+                return
+            }
+            // Reused at a different width (e.g. char -> int): give the home its
+            // one write, then load normally.
+            this.flushAlias(t)
+        }
+        this.cb.ld(reg, w, this.kOfTemp(t))
+        if (reg == 0) {
+            this.raxT = t
+            this.raxW = w
+        } else if (reg == 1) {
+            this.rcxT = t
+            this.rcxW = w
+        }
+    }
+
+    /// Load a float operand into an SSE register. A float constant keeps an
+    /// ordinary home, but an Int/Bool/Char constant can appear where a float is
+    /// expected: the front end's implicit "return zero" tail emits `const 0`
+    /// even in a float function. Scalar constants have no home (`noEmitConst`),
+    /// so reproduce what a home-based backend's 8-byte load would see: the
+    /// constant's 64-bit pattern reinterpreted as a double. r11 carries the
+    /// bits, so neither rax (possibly an already-loaded argument) nor any other
+    /// argument register is disturbed.
+    fn loadTmpFloat(reg: int, t: int) {
+        // `putRes` can leave a float load's bits in rax with its home never
+        // written: unpinned float slots load through the integer `ld` path, and
+        // a single-use temp defers the store. Consume that value here, exactly
+        // as `loadTmp` does for integer consumers. rax stays valid, so the
+        // deferred home write is still safe to drop or flush later.
+        if (t == this.pendT) {
+            if (this.pendW == 64) {
+                this.cb.movqXmmRax(reg)
+                if (reg < 2) {
+                    this.setFx(reg, t)
+                }
+                return
+            }
+            this.cb.st(0, this.pendW, this.pendK)
+            this.pendT = 0 - 1
+        }
+        // A pinned float slot has no stack home: its value lives in the pin
+        // register for the whole body. Copying from there is the only load.
+        if (this.aliasXmm.has(t)) {
+            let ar = this.aliasXmm[t]
+            if (ar != reg) {
+                if (reg < 2) {
+                    this.dropFxReg(reg)
+                }
+                this.cb.movsdRR(reg, ar)
+            }
+            if (reg < 2) {
+                this.setFx(reg, t)
+            }
+            return
+        }
+        if (reg >= 2) {
+            // A pin destination reads the producer's result straight out of the
+            // scratch register that still holds it. Without this, every float
+            // pin store reloads the home the producer just wrote, putting a
+            // store-to-load-forwarding round trip on the loop's critical path
+            // (the `exp` Taylor loop measured ~25 cycles/iteration instead of
+            // the ~19 the arithmetic allows).
+            if (this.fx0 == t) {
+                this.cb.movsdRR(reg, 0)
+                return
+            }
+            if (this.fx1 == t) {
+                this.cb.movsdRR(reg, 1)
+                return
+            }
+        }
+        if (reg < 2) {
+            if (this.fxOf(reg) == t) {
+                return
+            }
+            // Serve the other scratch register before touching memory: a
+            // `mulsd` result feeding a `divsd` whose divisor was already
+            // converted stays entirely in registers.
+            let other = 1 - reg
+            if (this.fxOf(other) == t) {
+                this.dropFxReg(reg)
+                this.cb.movsdRR(reg, other)
+                this.setFx(reg, t)
+                return
+            }
+            // An unrelated tracked value is only a copy; the home is current.
+            this.dropFxReg(reg)
+        }
+        if (this.plan.constVals.has(t)) {
+            this.cb.movabsImm(11, this.plan.constVals[t])
+            this.cb.movqXmmR11(reg)
+        } else {
+            this.cb.ldsd(reg, this.kOfTemp(t))
+        }
+        if (reg < 2) {
+            this.setFx(reg, t)
+        }
+    }
+
+    /// Write the value in rax to `d`'s home - or, when `d` has exactly one use,
+    /// leave it in rax and remember the skipped write. The consumer takes it
+    /// from rax (`loadTmp`), so a chain of single-use temps lowers to one
+    /// instruction per node with no store at all. `flushPend` covers every case
+    /// where something else needs rax first.
+    fn putRes(d: int, w: int, kd: int) {
+        if (this.pendT < 0 && tempUseCount(this.plan.tempUses, d) == 1) {
+            this.pendT = d
+            this.pendK = kd
+            this.pendW = w
+        } else {
+            this.cb.st(0, w, kd)
+        }
+    }
+
+    /// Emit the deferred home write, if any. Always safe: it does not change
+    /// rax, so the forwarding entry stays valid.
+    fn flushPend() {
+        if (this.pendT >= 0) {
+            this.cb.st(0, this.pendW, this.pendK)
+            this.pendT = 0 - 1
+        }
+    }
+
+    fn dropAlias(t: int) {
+        if (this.aliasReg.has(t)) {
+            this.aliasReg.remove(t)
+            this.aliasSlot.remove(t)
+            this.aliasW.remove(t)
+        }
+    }
+
+    /// Materialise an aliased temp into its home and forget the alias. Required
+    /// before the pin register it names is overwritten.
+    fn flushAlias(t: int) {
+        if (this.aliasReg.has(t)) {
+            this.cb.st(this.aliasReg[t], this.aliasW[t], this.kOfTemp(t))
+            this.dropAlias(t)
+        }
+    }
+
+    /// Spill every live alias of `s` except `keep` (the value about to be
+    /// written to the slot's register).
+    fn flushSlotAliases(s: int, keep: int) {
+        let ts = this.aliasSlot.keys()
+        for (t in ts) {
+            if (t != keep && this.aliasSlot.has(t) && this.aliasSlot[t] == s) {
+                this.flushAlias(t)
+            }
+        }
+    }
+
+    /// Forget what an XMM register holds. The producing instruction already
+    /// wrote the temp's home, so dropping is always safe - it only costs the
+    /// next consumer a reload.
+    fn dropFxReg(reg: int) {
+        if (reg == 0) {
+            this.fx0 = 0 - 1
+        } else {
+            this.fx1 = 0 - 1
+        }
+    }
+
+    fn dropFx() {
+        this.fx0 = 0 - 1
+        this.fx1 = 0 - 1
+    }
+
+    fn fxOf(reg: int) -> int {
+        if (reg == 0) {
+            this.fx0
+        } else {
+            this.fx1
+        }
+    }
+
+    fn setFx(reg: int, t: int) {
+        if (reg == 0) {
+            this.fx0 = t
+        } else {
+            this.fx1 = t
+        }
+    }
+
+    /// Materialise every live float alias of `s` into its temp's home before a
+    /// store overwrites the pin register that currently backs it.
+    fn flushXSlotAliases(s: int) {
+        let ts = this.aliasXmm.keys()
+        for (t in ts) {
+            if (this.aliasXmm.has(t) && this.aliasXSlot[t] == s) {
+                this.cb.stsd(this.aliasXmm[t], this.kOfTemp(t))
+                this.aliasXmm.remove(t)
+                this.aliasXSlot.remove(t)
+            }
+        }
+    }
+
+    fn dropXAlias(t: int) {
+        if (this.aliasXmm.has(t)) {
+            this.aliasXmm.remove(t)
+            this.aliasXSlot.remove(t)
+        }
+    }
+
+    /// True when `t`, a `LoadSlot` result defined in block `bi`, is read from
+    /// any other block. Aliases only live in their pin register inside the
+    /// block that loaded them, so exactly these reads force a store to the
+    /// home before that block's terminator.
+    fn tempReadOutside(t: int, bi: int) -> bool {
+        var j = 0
+        while (j < len(this.fun.blocks)) {
+            if (j != bi) {
+                let blk = this.fun.blocks[j]
+                for (ins in blk.instrs) {
+                    if (instrReadsTmp(ins, t)) {
+                        return true
+                    }
+                }
+                match (blk.term) {
+                    case IrTerm.BranchIf(c, tn, el) -> {
+                        if (c == t) {
+                            return true
+                        }
+                    }
+                    case IrTerm.Return(v) -> {
+                        match (v) {
+                            case some(tv) -> {
+                                if (tv == t) {
+                                    return true
+                                }
+                            }
+                            case none -> {}
+                        }
+                    }
+                    case _ -> {}
+                }
+            }
+            j = j + 1
+        }
+        false
+    }
+
+    /// Materialise the aliases read outside the current block. Every path out
+    /// of a block runs through its terminator, so this is the exit state later
+    /// blocks can rely on. Aliases read only by the terminator itself stay live
+    /// for `loadTmp` to consume straight from the pin.
+    fn flushLiveOutAliases(bi: int) {
+        let ts = this.aliasSlot.keys()
+        for (t in ts) {
+            if (this.aliasSlot.has(t) && this.tempReadOutside(t, bi)) {
+                this.flushAlias(t)
+            }
+        }
+        let xs = this.aliasXmm.keys()
+        for (t in xs) {
+            if (this.aliasXmm.has(t) && this.tempReadOutside(t, bi)) {
+                this.cb.stsd(this.aliasXmm[t], this.kOfTemp(t))
+                this.dropXAlias(t)
+            }
+        }
+    }
+
+    /// Forget every alias at block exit. The pin register may be reused on a
+    /// path that never executed the load, so a later block must never see it.
+    fn clearAliases() {
+        let ts = this.aliasSlot.keys()
+        for (t in ts) {
+            this.dropAlias(t)
+        }
+        let xs = this.aliasXmm.keys()
+        for (t in xs) {
+            this.dropXAlias(t)
+        }
+        this.dropFx()
+    }
+
+    /// True for a scalar `Const` instruction: `emitConst` rematerialises those
+    /// at each use, so the instruction emits no code and leaves rax untouched.
+    /// The IR interleaves one before almost every operand, so treating it as a
+    /// barrier would flush the deferred value into its home and reload it
+    /// immediately - exactly the store/reload pair this cache exists to avoid.
+    fn noEmitConst(ins: IrInstr) -> bool {
+        match (ins) {
+            case IrInstr.Const(d, c) -> {
+                return this.plan.constVals.has(d)
+            }
+            case _ -> {
+                return false
+            }
+        }
+    }
+
+    /// Whether lowering `ins` will read the deferred temp out of rax as its
+    /// first action. Mirrors the operand normalisation in `emitBinOp` and the
+    /// load order of the other arms exactly; anything unrecognised answers
+    /// false, which costs a store but can never lose the value.
+    fn pendingConsumedBy(ins: IrInstr) -> bool {
+        let t = this.pendT
+        if (t < 0) {
+            return false
+        }
+        // A rematerialised constant emits nothing, so the pending value keeps
+        // its home in rax across it.
+        if (this.noEmitConst(ins)) {
+            return true
+        }
+        let w = this.pendW
+        match (ins) {
+            case IrInstr.StoreGlobal(id, v, ty) -> {
+                return v == t && tyWidth(ty) == w
+            }
+            case IrInstr.BinOp(d, op, a, b) -> {
+                if (isFloatTy(this.typeOfT(a))) {
+                    return false
+                }
+                var aa = a
+                var bb = b
+                if (!this.plan.constVals.has(bb) && this.plan.constVals.has(aa) && binOpCommutes(op)) {
+                    aa = b
+                    bb = a
+                }
+                return (aa == t || bb == t) && tyWidth(this.typeOfT(a)) == w
+            }
+            case IrInstr.UnOp(d, op, v) -> {
+                if (op == IrUnOp.Neg && isFloatTy(this.typeOfT(v))) {
+                    return false
+                }
+                var ww = tyWidth(this.typeOfT(v))
+                if (op == IrUnOp.Not) {
+                    ww = 8
+                }
+                return v == t && ww == w
+            }
+            case IrInstr.Copy(d, v) -> {
+                return v == t && tyWidth(this.typeOfT(v)) == w
+            }
+            case IrInstr.LoadRaw(d, addr, ty) -> {
+                return addr == t && w == 64
+            }
+            case IrInstr.StoreRaw(addr, v, ty) -> {
+                if (isFloatTy(ty)) {
+                    return false
+                }
+                if (addr == t && w == 64) {
+                    return true
+                }
+                return v == t && tyWidth(ty) == w
+            }
+            case IrInstr.StoreSlot(s, v) -> {
+                return v == t && tyWidth(this.fun.slots[s]) == w
+            }
+            case IrInstr.LoadSlot(d, s) -> {
+                // A pinned-slot load emits no code (the temp aliases the pin
+                // register), so a deferred rax value survives it unharmed.
+                return this.plan.slotReg.has(s)
+            }
+            case IrInstr.Chartoi(d, v) -> {
+                return v == t && w == 32
+            }
+            case IrInstr.Itochar(d, v) -> {
+                return v == t && w == 64
+            }
+            case _ -> {
+                return false
+            }
+        }
+    }
+
+    /// True when `ins` may leave the XMM copy cache (`fx0`/`fx1`) valid. Only a
+    /// `call` can clobber xmm0/xmm1 behind the cache's back: every other
+    /// lowering either touches GPRs only (integer loads, constants, copies,
+    /// stores) or re-stamps the entry for the register it writes. That is what
+    /// keeps `term * x` live across the `load i` / `itof i` pair in `exp`'s
+    /// loop; dropping it there forced a reload of the numerator and a
+    /// scratch-register reshuffle on every iteration.
+    fn floatConsumedBy(ins: IrInstr) -> bool {
+        match (ins) {
+            // Integer binops use GPRs only. Float arithmetic writes xmm0 (and
+            // operands via `loadTmpFloat`, which invalidates the register it
+            // overwrites) and re-stamps fx0 with its result; the float modulo
+            // path calls out and drops the cache explicitly.
+            case IrInstr.BinOp(_, _, _, _) -> true
+            // Float `Neg` writes xmm0 and drops fx1 itself; `Not`/`BitNot`
+            // are GPR-only.
+            case IrInstr.UnOp(_, _, _) -> true
+            // Reads xmm0, writes xmm1 and rax; fx0 stays valid.
+            case IrInstr.Ftoi(_, _) -> true
+            // Writes a scratch xmm register and stamps it.
+            case IrInstr.Itof(_, _) -> true
+            // A float load drops fx0 before overwriting it; an integer load is
+            // GPR-only.
+            case IrInstr.LoadRaw(_, _, _) -> true
+            // A float store routes through `loadTmpFloat(0, ...)`, which keeps
+            // fx0 honest; an integer store is GPR-only.
+            case IrInstr.StoreRaw(_, _, _) -> true
+            // Unpinned float slots load their bits through the integer `ld`
+            // path; pinned ones only link an alias. Neither writes xmm0/xmm1.
+            case IrInstr.LoadSlot(_, _) -> true
+            // A float constant drops fx0 before materialising itself and
+            // re-stamps it; a rematerialised one emits nothing at all.
+            case IrInstr.Const(_, _) -> true
+            case IrInstr.Copy(_, _) -> true
+            // Float pin stores forward from the cache; unpinned float stores
+            // go through `loadTmpFloat(0, ...)`; integer stores are GPR-only.
+            case IrInstr.StoreSlot(_, _) -> true
+            case IrInstr.Chartoi(_, _) -> true
+            case IrInstr.Itochar(_, _) -> true
+            case IrInstr.LocalAddr(_, _) -> true
+            case IrInstr.GlobalAddr(_, _) -> true
+            case IrInstr.LoadGlobal(_, _, _) -> true
+            case IrInstr.StoreGlobal(_, _, _) -> true
+            // Calls may use every XMM register as scratch.
+            case _ -> false
+        }
+    }
+
+    /// Same decision for the block terminator, which is lowered after the
+    /// instructions and can be the deferred temp's single consumer.
+    fn termConsumes(t: IrTerm) -> bool {
+        if (this.pendT < 0) {
+            return false
+        }
+        match (t) {
+            case IrTerm.BranchIf(c, tn, el) -> {
+                if (this.fuseCc >= 0) {
+                    return this.fuseA == this.pendT && this.fuseW == this.pendW
+                }
+                return c == this.pendT && this.pendW == 8
+            }
+            case IrTerm.Return(v) -> {
+                // The escaped-exception check and shadow pop that `lowerTerm`
+                // runs first are no-ops off the entry point and in a frame-free
+                // function, so rax still holds the deferred value there.
+                //
+                // Float returns are the exception to the rax path: the return
+                // arm moves xmm0 from the value's home with `ldsd`, so a float
+                // temp left deferred would be read from an unwritten slot.
+                if (this.plan.shadowed || this.fun.symbol == ENTRY_SYMBOL || isFloatTy(this.fun.ret)) {
+                    return false
+                }
+                match (v) {
+                    case some(ti) -> {
+                        return ti == this.pendT && tyWidth(this.fun.ret) == this.pendW
+                    }
+                    case none -> {
+                        return false
+                    }
+                }
+            }
+            case _ -> {
+                return false
+            }
+        }
+    }
+
+    /// A call may destroy rcx (Win64 volatile register). Nothing may forward a
+    /// temp through it once a `call` has been emitted; the rax return value is
+    /// reconstructed separately by `putRes`/`noteRax`.
+    fn clobberRcx() {
+        this.rcxT = 0 - 1
+        this.rcxW = 0
+    }
+
+    /// Record the temp whose value `ins` left in rax (or forget it). Every arm
+    /// here mirrors an emitter arm that ends with rax holding the result, or
+    /// leaves rax untouched. Anything else clears the cache, which is always
+    /// safe - a miss just reloads from the home.
+    fn noteRax(ins: IrInstr) {
+        // No-emit scalars leave rax exactly as the previous instruction did.
+        if (this.noEmitConst(ins)) {
+            return
+        }
+        this.raxT = 0 - 1
+        this.raxW = 0
+        match (ins) {
+            case IrInstr.UnOp(d, op, v) -> {
+                if (!isFloatTy(this.typeOfT(v))) {
+                    this.raxT = d
+                    if (op == IrUnOp.Not) {
+                        this.raxW = 8
+                    } else {
+                        this.raxW = tyWidth(this.typeOfT(d))
+                    }
+                }
+            }
+            case IrInstr.BinOp(d, op, a, b) -> {
+                if (!isFloatTy(this.typeOfT(a))) {
+                    this.raxT = d
+                    if (isCmp(op)) {
+                        this.raxW = 8
+                    } else {
+                        this.raxW = tyWidth(this.typeOfT(d))
+                    }
+                }
+            }
+            case IrInstr.Copy(d, v) -> {
+                this.raxT = d
+                this.raxW = tyWidth(this.typeOfT(v))
+            }
+            case IrInstr.Ftoi(d, v) -> {
+                this.raxT = d
+                this.raxW = 64
+            }
+            case IrInstr.Chartoi(d, v) -> {
+                this.raxT = d
+                this.raxW = 64
+            }
+            case IrInstr.Itochar(d, v) -> {
+                this.raxT = d
+                this.raxW = 32
+            }
+            case IrInstr.LoadSlot(d, s) -> {
+                if (!this.plan.slotReg.has(s)) {
+                    this.raxT = d
+                    this.raxW = tyWidth(this.fun.slots[s])
+                }
+            }
+            case IrInstr.StoreSlot(s, v) -> {
+                // A pinned slot is written with a register move, which leaves
+                // the value in rax alone only when the source was not loaded
+                // there; the deflection below covers the common case.
+                if (!this.plan.slotReg.has(s)) {
+                    this.raxT = v
+                    this.raxW = tyWidth(this.fun.slots[s])
+                }
+            }
+            case IrInstr.LocalAddr(d, s) -> {
+                this.raxT = d
+                this.raxW = 64
+            }
+            case IrInstr.LoadRaw(d, addr, ty) -> {
+                if (!isFloatTy(ty)) {
+                    this.raxT = d
+                    this.raxW = tyWidth(ty)
+                }
+            }
+            case IrInstr.GlobalAddr(d, id) -> {
+                this.raxT = d
+                this.raxW = 64
+            }
+            case IrInstr.LoadGlobal(d, id, ty) -> {
+                if (!isFloatTy(ty)) {
+                    this.raxT = d
+                    this.raxW = tyWidth(ty)
+                }
+            }
+            case IrInstr.Call(d, callee, args) -> {
+                // The call itself clobbers rcx.
+                this.rcxT = 0 - 1
+                this.rcxW = 0
+                match (d) {
+                    case some(dd) -> {
+                        let rt = callRet(this.m, callee)
+                        if (!isFloatTy(rt)) {
+                            this.raxT = dd
+                            this.raxW = tyWidth(rt)
+                        }
+                    }
+                    case none -> {}
+                }
+            }
+            case IrInstr.CallInd(d, fnAddr, params, ret, args) -> {
+                this.rcxT = 0 - 1
+                this.rcxW = 0
+                match (d) {
+                    case some(dd) -> {
+                        if (!isFloatTy(ret)) {
+                            this.raxT = dd
+                            this.raxW = tyWidth(ret)
+                        }
+                    }
+                    case none -> {}
+                }
+            }
+            case _ -> {}
+        }
+    }
+
+    /// True when a constant temp's value is a sign-extended 32-bit immediate.
+    /// Everything wider has to go through `movabs`, which is still one
+    /// instruction but needs a register instead of the immediate field.
+    fn constFits32(t: int) -> bool {
+        if (!this.plan.constVals.has(t)) {
+            return false
+        }
+        let v = this.plan.constVals[t]
+        v >= 0 - 2147483648 && v <= 2147483647
+    }
+
+    /// True when the body can emit a machine `call`. Four-or-fewer-argument
+    /// calls emit no `sub rsp` of their own (the args fit the registers), so
+    /// only the prologue can reserve the Win64 shadow space they need.
+    fn makesCalls() -> bool {
+        if (this.plan.shadowed || this.fun.symbol == ENTRY_SYMBOL) {
+            return true
+        }
+        var found = false
+        for (blk in this.fun.blocks) {
+            for (ins in blk.instrs) {
+                match (ins) {
+                    case IrInstr.Call(_, _, _) -> {
+                        found = true
+                    }
+                    case IrInstr.CallInd(_, _, _, _, _) -> {
+                        found = true
+                    }
+                    case IrInstr.BinOp(_, op, a, _) -> {
+                        // Float modulo is a call to the `pickle_fmod` helper.
+                        if (op == IrBinOp.Mod && isFloatTy(this.typeOfT(a))) {
+                            found = true
+                        }
+                    }
+                    case _ -> {}
+                }
+            }
+        }
+        found
+    }
+
     fn prologue() {
         this.cb.u8(0x55)
         this.cb.u8(0x48)
         this.cb.u8(0x89)
         this.cb.u8(0xE5)
-        if (this.plan.totalK > 0) {
-            this.cb.subRsp(this.plan.totalK)
+        var frameK = this.plan.totalK
+        if (this.makesCalls()) {
+            // Win64 reserves 32 bytes below every call for the callee's spill
+            // area. Calls with at most four arguments emit no per-call `sub
+            // rsp`, so the frame itself has to provide that scratch space;
+            // otherwise the callee writes over the bottom of the caller's
+            // frame - exactly where the pin saves live. `totalK` is 16-byte
+            // aligned, so adding 32 keeps the call sites 16-byte aligned.
+            frameK = frameK + CALL_SHADOW_BYTES
+        }
+        if (frameK > 0) {
+            this.cb.subRsp(frameK)
+        }
+        // Slot pinning: stash the caller's callee-saved registers in the frame
+        // before the body can touch them. `pinK` was laid out below every home.
+        var p = 0
+        while (p < len(this.plan.pinRegs)) {
+            this.cb.st(this.plan.pinRegs[p], 64, this.plan.pinK[p])
+            p = p + 1
         }
         if (this.plan.shadowed) {
-            this.cb.u8(0x48)
-            this.cb.u8(0x31)
-            this.cb.u8(0xC0)
+            // Zero the cells two at a time with a 16-byte SSE store. Cells are
+            // 8 bytes apart and `k` is the offset of the cell's *lowest* byte,
+            // so cell `c` occupies [k, k+7] and cell `c+1` occupies
+            // [k-8, k-1]: one `movdqu [rbp-k]` covers both. avx is avoided,
+            // SSE2 is baseline.
+            //
+            // The register must NOT be xmm0..3: `seedParams` runs after this
+            // and spills the incoming float arguments out of exactly those
+            // registers, so zeroing xmm0 here would replace the first float
+            // parameter with 0.0. xmm4 is volatile and unused by the emitter.
+            this.cb.u8(0x0F)
+            this.cb.u8(0x57)
+            this.cb.u8(0xE4)
             var c = 0
-            while (c < this.plan.ncells) {
+            while (c + 1 < this.plan.ncells) {
                 let k = this.plan.shadowBytes - SHADOW_HEADER_BYTES - CELL_BYTES * c
-                this.cb.st(0, 64, k)
-                c = c + 1
+                this.cb.u8(0xF3)
+                this.cb.u8(0x0F)
+                this.cb.u8(0x7F)
+                for (b in this.cb.rbpMem(4, k)) {
+                    this.cb.u8(b)
+                }
+                c = c + 2
+            }
+            if (c < this.plan.ncells) {
+                let k = this.plan.shadowBytes - SHADOW_HEADER_BYTES - CELL_BYTES * c
+                this.cb.stImm(0, 64, k, 0)
             }
             let packed = (SHADOW_FRAME_TAG << SHADOW_TAG_SHIFT) | (this.plan.totalK << 32) | this.plan.ncells
             this.cb.stImm(0, 64, this.plan.shadowBytes - 8, packed)
@@ -1019,23 +2881,59 @@ class X64Emitter {
         var i = 0
         while (i < len(this.fun.params)) {
             let t = this.fun.params[i].ty
-            let k = this.kOfSlot(i)
-            if (i < 4) {
-                if (isFloatTy(t)) {
-                    this.cb.stsd(i, k)
+            if (isFloatTy(t)) {
+                if (this.plan.floatSlotReg.has(i)) {
+                    // The parameter's home is an XMM register for the whole
+                    // body; move the incoming argument straight into the pin.
+                    let xr = this.plan.floatSlotReg[i]
+                    if (i < 4) {
+                        if (xr != i) {
+                            this.cb.movsdRR(xr, i)
+                        }
+                    } else {
+                        let disp = 48 + 8 * (i - 4)
+                        this.cb.ld(11, 64, 0 - disp)
+                        this.cb.movqXmmR11(xr)
+                    }
                 } else {
-                    this.cb.st(intArgReg(i), tyWidth(t), k)
+                    let k = this.kOfSlot(i)
+                    if (i < 4) {
+                        this.cb.stsd(i, k)
+                    } else {
+                        let disp = 48 + 8 * (i - 4)
+                        this.cb.ld(0, 64, 0 - disp)
+                        this.cb.st(0, 64, k)
+                    }
+                }
+            } else if (this.plan.slotReg.has(i)) {
+                // The parameter's home is a pinned register for the whole body.
+                let rg = this.plan.slotReg[i]
+                if (i < 4) {
+                    this.cb.movRR(rg, intArgReg(i), tyWidth(t))
+                } else {
+                    let disp = 48 + 8 * (i - 4)
+                    this.cb.ld(rg, 64, 0 - disp)
                 }
             } else {
-                let disp = 48 + 8 * (i - 4)
-                this.cb.ld(0, 64, 0 - disp)
-                this.cb.st(0, tyWidth(t), k)
+                let k = this.kOfSlot(i)
+                if (i < 4) {
+                    this.cb.st(intArgReg(i), tyWidth(t), k)
+                } else {
+                    let disp = 48 + 8 * (i - 4)
+                    this.cb.ld(0, 64, 0 - disp)
+                    this.cb.st(0, tyWidth(t), k)
+                }
             }
             i = i + 1
         }
     }
 
     fn emitConst(d: int, c: IrConst) {
+        // Scalar constants are rematerialised at each use, so they define
+        // nothing and take no space in the frame.
+        if (this.plan.constVals.has(d)) {
+            return
+        }
         let k = this.kOfTemp(d)
         match (c) {
             case IrConst.Int(v) -> {
@@ -1043,6 +2941,7 @@ class X64Emitter {
                 this.cb.st(0, 64, k)
             }
             case IrConst.Float(v) -> {
+                this.dropFxReg(0)
                 this.cb.movabsImm(0, f64ToBits(v))
                 this.cb.u8(0x66)
                 this.cb.u8(0x48)
@@ -1050,6 +2949,7 @@ class X64Emitter {
                 this.cb.u8(0x6E)
                 this.cb.u8(0xC0)
                 this.cb.stsd(0, k)
+                this.setFx(0, d)
             }
             case IrConst.Bool(b) -> {
                 var v = 0
@@ -1066,12 +2966,11 @@ class X64Emitter {
                 this.cb.st(0, 64, k)
             }
             case IrConst.Str(id) -> {
-                this.cb.movabsReloc(1, "pkl_strdata_" + str(id))
-                this.cb.movabsImm(2, len(this.m.strings[id]))
-                this.cb.movabsReloc(10, "pickle_str_from_bytes")
-                this.cb.u8(0x41)
-                this.cb.u8(0xFF)
-                this.cb.u8(0xD2)
+                // Static descriptor emitted into `.rdata` by compiler/coff.pkl:
+                // header + bytes with the same layout `newStr` produces, so a
+                // literal costs one address load instead of an allocation and a
+                // copy. Literals are immutable; `pickle_str_set` copies.
+                this.cb.movabsReloc(0, "pkl_strdesc_" + str(id))
                 this.cb.st(0, 64, k)
             }
             case IrConst.StrAddr(id) -> {
@@ -1090,7 +2989,8 @@ class X64Emitter {
         match (op) {
             case IrUnOp.Neg -> {
                 if (isFloatTy(this.typeOfT(v))) {
-                    this.cb.ldsd(0, this.kOfTemp(v))
+                    this.loadTmpFloat(0, v)
+                    this.dropFxReg(1)
                     this.cb.movabsImm(0, i64MinBits())
                     this.cb.u8(0x66)
                     this.cb.u8(0x48)
@@ -1102,27 +3002,28 @@ class X64Emitter {
                     this.cb.u8(0x57)
                     this.cb.u8(0xC1)
                     this.cb.stsd(0, kd)
+                    this.setFx(0, d)
                 } else {
                     let w = tyWidth(this.typeOfT(v))
-                    this.cb.ld(0, w, this.kOfTemp(v))
+                    this.loadTmp(0, w, v)
                     if (w == 64) {
                         this.cb.u8(0x48)
                     }
                     this.cb.u8(0xF7)
                     this.cb.u8(0xD8)
-                    this.cb.st(0, w, kd)
+                    this.putRes(d, w, kd)
                 }
             }
             case IrUnOp.Not -> {
-                this.cb.ld(0, 8, this.kOfTemp(v))
+                this.loadTmp(0, 8, v)
                 this.cb.u8(0x84)
                 this.cb.u8(0xC0)
                 this.cb.setcc(0x04)
-                this.cb.st(0, 8, kd)
+                this.putRes(d, 8, kd)
             }
             case IrUnOp.BitNot -> {
                 let w = tyWidth(this.typeOfT(v))
-                this.cb.ld(0, w, this.kOfTemp(v))
+                this.loadTmp(0, w, v)
                 if (w == 64) {
                     this.cb.u8(0x48)
                     this.cb.u8(0xF7)
@@ -1134,12 +3035,14 @@ class X64Emitter {
                     this.cb.u8(0xF6)
                     this.cb.u8(0xD0)
                 }
-                this.cb.st(0, w, kd)
+                this.putRes(d, w, kd)
             }
         }
     }
 
     fn floatCmpSeq(op: IrBinOp) {
+        this.rcxT = 0 - 1
+        this.rcxW = 0
         this.cb.u8(0x66)
         this.cb.u8(0x0F)
         this.cb.u8(0x2E)
@@ -1201,18 +3104,39 @@ class X64Emitter {
         let ta = this.typeOfT(a)
         let kd = this.kOfTemp(d)
         if (isFloatTy(ta)) {
-            this.cb.ldsd(0, this.kOfTemp(a))
-            this.cb.ldsd(1, this.kOfTemp(b))
             if (op == IrBinOp.Mod) {
+                // `pickle_fmod` is a call: it may read every XMM register as
+                // scratch, so drop the copy cache before loading the operands.
+                this.dropFx()
+                this.loadTmpFloat(0, a)
+                this.loadTmpFloat(1, b)
                 this.cb.movabsReloc(10, "pickle_fmod")
                 this.cb.u8(0x41)
                 this.cb.u8(0xFF)
                 this.cb.u8(0xD2)
+                this.clobberRcx()
+                // The call clobbers rcx: drop the forwarding cache so a later
+                // consumer cannot read the result through a dead register.
+                this.dropFx()
                 this.cb.stsd(0, kd)
+                this.setFx(0, d)
             } else if (isCmp(op)) {
+                this.loadTmpFloat(0, a)
+                this.loadTmpFloat(1, b)
                 this.floatCmpSeq(op)
-                this.cb.st(0, 8, kd)
+                this.putRes(d, 8, kd)
             } else {
+                // `b` may already be the tracked value in xmm0 (the divisor
+                // `itof` just produced, for instance). Park it in xmm1 before
+                // `a` claims xmm0; overwriting xmm1 is safe because its home is
+                // always current.
+                if (b != a && this.fx0 == b) {
+                    this.cb.movsdRR(1, 0)
+                    this.fx1 = b
+                    this.fx0 = 0 - 1
+                }
+                this.loadTmpFloat(0, a)
+                this.loadTmpFloat(1, b)
                 match (op) {
                     case IrBinOp.Add -> {
                         this.cb.u8(0xF2)
@@ -1241,103 +3165,298 @@ class X64Emitter {
                     case _ -> this.fail("bad float binop")
                 }
                 this.cb.stsd(0, kd)
+                this.setFx(0, d)
             }
         } else {
             let w = tyWidth(ta)
-            this.cb.ld(0, w, this.kOfTemp(a))
-            this.cb.ld(1, w, this.kOfTemp(b))
-            if (isCmp(op)) {
-                if (w == 8) {
-                    this.cb.u8(0x38)
-                    this.cb.u8(0xC8)
-                } else if (w == 32) {
-                    this.cb.u8(0x39)
-                    this.cb.u8(0xC8)
-                } else {
-                    this.cb.u8(0x48)
-                    this.cb.u8(0x39)
-                    this.cb.u8(0xC8)
-                }
-                this.intSetcc(this.intCmpCc(op))
-                this.cb.st(0, 8, kd)
-            } else if (op == IrBinOp.Div || op == IrBinOp.Mod) {
-                this.cb.u8(0x48)
-                this.cb.u8(0x99)
-                this.cb.u8(0x48)
-                this.cb.u8(0xF7)
-                this.cb.u8(0xF9)
-                if (op == IrBinOp.Mod) {
-                    this.cb.u8(0x48)
-                    this.cb.u8(0x89)
-                    this.cb.u8(0xD0)
-                }
-                this.cb.st(0, 64, kd)
-            } else if (op == IrBinOp.Shl || op == IrBinOp.Shr) {
-                if (w == 64) {
-                    this.cb.u8(0x48)
-                }
-                this.cb.u8(0xD3)
-                if (op == IrBinOp.Shl) {
-                    this.cb.u8(0xE0)
-                } else {
-                    this.cb.u8(0xF8)
-                }
-                this.cb.st(0, 64, kd)
-            } else {
-                match (op) {
-                    case IrBinOp.Add -> {
-                        if (w == 64) {
-                            this.cb.u8(0x48)
+            // Put a constant on the right so it can fold into the immediate
+            // field. Only commutative operators may be reordered.
+            var aa = a
+            var bb = b
+            if (!this.plan.constVals.has(bb) && this.plan.constVals.has(aa) && binOpCommutes(op)) {
+                aa = b
+                bb = a
+            }
+            // A deferred operand-b is still in rax. Park it in rcx before the
+            // next load overwrites rax; `loadTmp(1, ..., bb)` then serves the
+            // value straight from rcx instead of its stack home. Keeping rax's
+            // forwarding entry also covers `aa == bb`.
+            if (this.pendT == bb && this.pendW == w) {
+                this.cb.movRR(1, 0, w)
+                this.rcxT = bb
+                this.rcxW = w
+                this.raxT = bb
+                this.raxW = w
+                this.pendT = 0 - 1
+            }
+            // Signed `x / c` and `x % c` for a power-of-two `c`: hardware
+            // `idiv` costs 20-40 cycles, while the correction below is 4-5 ALU
+            // ops. `shr rdx, 64-k` turns the sign fill (-1/0) into the `c-1`
+            // bias truncating division needs for negatives. `c == 1` is not
+            // expressible this way (a 64-bit shift count masks to 0), so it is
+            // peeled off first.
+            if ((op == IrBinOp.Div || op == IrBinOp.Mod) && w == 64 && this.plan.constVals.has(bb)) {
+                let cv = this.plan.constVals[bb]
+                if (cv > 0 && cv <= 2147483648 && (cv & (cv - 1)) == 0) {
+                    if (cv == 1) {
+                        if (op == IrBinOp.Div) {
+                            this.loadTmp(0, 64, aa)
+                        } else {
+                            this.cb.movabsImm(0, 0)
                         }
-                        this.cb.u8(0x01)
-                        this.cb.u8(0xC8)
-                    }
-                    case IrBinOp.Sub -> {
-                        if (w == 64) {
-                            this.cb.u8(0x48)
+                    } else {
+                        var k = 0
+                        var p = 1
+                        while (p < cv) {
+                            p = p * 2
+                            k = k + 1
                         }
-                        this.cb.u8(0x29)
-                        this.cb.u8(0xC8)
-                    }
-                    case IrBinOp.Mul -> {
-                        if (w == 64) {
-                            this.cb.u8(0x48)
-                        }
-                        this.cb.u8(0x0F)
-                        this.cb.u8(0xAF)
+                        this.loadTmp(0, 64, aa)
+                        // rdx = x < 0 ? (c - 1) : 0
+                        this.cb.u8(0x48)
+                        this.cb.u8(0x89)
+                        this.cb.u8(0xC2)
+                        this.cb.u8(0x48)
                         this.cb.u8(0xC1)
-                    }
-                    case IrBinOp.BitAnd -> {
-                        if (w == 64) {
+                        this.cb.u8(0xFA)
+                        this.cb.u8(63)
+                        this.cb.u8(0x48)
+                        this.cb.u8(0xC1)
+                        this.cb.u8(0xEA)
+                        this.cb.u8(64 - k)
+                        this.cb.u8(0x48)
+                        this.cb.u8(0x01)
+                        this.cb.u8(0xD0)
+                        if (op == IrBinOp.Mod) {
                             this.cb.u8(0x48)
-                        }
-                        this.cb.u8(0x21)
-                        this.cb.u8(0xC8)
-                    }
-                    case IrBinOp.BitOr -> {
-                        if (w == 64) {
+                            this.cb.u8(0x25)
+                            this.cb.u32le(cv - 1)
                             this.cb.u8(0x48)
-                        }
-                        this.cb.u8(0x09)
-                        this.cb.u8(0xC8)
-                    }
-                    case IrBinOp.BitXor -> {
-                        if (w == 64) {
+                            this.cb.u8(0x29)
+                            this.cb.u8(0xD0)
+                        } else {
                             this.cb.u8(0x48)
+                            this.cb.u8(0xC1)
+                            this.cb.u8(0xF8)
+                            this.cb.u8(k)
                         }
-                        this.cb.u8(0x31)
-                        this.cb.u8(0xC8)
                     }
-                    case _ -> this.fail("bad int binop")
+                    this.putRes(d, 64, kd)
+                    return
                 }
-                this.cb.st(0, w, kd)
+                // Non-power-of-two positive divisors: signed magic-number
+                // multiply. `u = |x|` is unsigned (2^63 at INT64_MIN), the
+                // quotient is `mulhi(u, M) >> s`, and division reapplies the
+                // sign while modulo recomputes `u - q*c`. This replaces a
+                // 20-40 cycle `idiv` with a multiply and a few ALU ops.
+                if (cv > 1 && cv <= 2147483647) {
+                    match (magicDivConst(cv)) {
+                        case some(ms) -> {
+                            let mag = ms[0]
+                            let sh = ms[1]
+                            this.loadTmp(0, 64, aa)
+                            // r9 = x < 0 ? -1 : 0
+                            this.cb.movRR(9, 0, 64)
+                            this.cb.u8(0x49)
+                            this.cb.u8(0xC1)
+                            this.cb.u8(0xF9)
+                            this.cb.u8(63)
+                            // rax = u = |x|
+                            this.cb.u8(0x4C)
+                            this.cb.u8(0x31)
+                            this.cb.u8(0xC8)
+                            this.cb.u8(0x4C)
+                            this.cb.u8(0x29)
+                            this.cb.u8(0xC8)
+                            // r10 keeps u for the modulo's `u - q*c`
+                            this.cb.movRR(10, 0, 64)
+                            // rdx = mulhi(u, M)
+                            this.cb.movabsImm(11, mag)
+                            this.cb.u8(0x49)
+                            this.cb.u8(0xF7)
+                            this.cb.u8(0xE3)
+                            if (sh > 0) {
+                                this.cb.u8(0x48)
+                                this.cb.u8(0xC1)
+                                this.cb.u8(0xEA)
+                                this.cb.u8(sh)
+                            }
+                            if (op == IrBinOp.Div) {
+                                // rdx = sign ? -q : q
+                                this.cb.u8(0x4C)
+                                this.cb.u8(0x31)
+                                this.cb.u8(0xCA)
+                                this.cb.u8(0x4C)
+                                this.cb.u8(0x29)
+                                this.cb.u8(0xCA)
+                                this.cb.movRR(0, 2, 64)
+                            } else {
+                                // rax = u - q*c, then reapply the sign
+                                this.cb.u8(0x4C)
+                                this.cb.u8(0x69)
+                                this.cb.u8(0xDA)
+                                this.cb.u32le(cv)
+                                this.cb.movRR(0, 10, 64)
+                                this.cb.u8(0x4C)
+                                this.cb.u8(0x29)
+                                this.cb.u8(0xD8)
+                                this.cb.u8(0x4C)
+                                this.cb.u8(0x31)
+                                this.cb.u8(0xC8)
+                                this.cb.u8(0x4C)
+                                this.cb.u8(0x29)
+                                this.cb.u8(0xC8)
+                            }
+                            this.putRes(d, 64, kd)
+                            return
+                        }
+                        case none -> { }
+                    }
+                }
+            }
+            let immOp = this.constFits32(bb) && (w == 32 || w == 64)
+                && !(op == IrBinOp.Div || op == IrBinOp.Mod)
+            if (immOp) {
+                let cv = this.plan.constVals[bb]
+                this.loadTmp(0, w, aa)
+                if (isCmp(op)) {
+                    if (w == 64) {
+                        this.cb.u8(0x48)
+                    }
+                    this.cb.u8(0x3D)
+                    this.cb.u32le(cv & 0xFFFFFFFF)
+                    this.intSetcc(this.intCmpCc(op))
+                    this.putRes(d, 8, kd)
+                } else if (op == IrBinOp.Shl || op == IrBinOp.Shr) {
+                    if (w == 64) {
+                        this.cb.u8(0x48)
+                    }
+                    this.cb.u8(0xC1)
+                    if (op == IrBinOp.Shl) {
+                        this.cb.u8(0xE0)
+                    } else {
+                        this.cb.u8(0xF8)
+                    }
+                    this.cb.u8(cv & 0xFF)
+                    this.putRes(d, 64, kd)
+                } else if (op == IrBinOp.Mul) {
+                    if (w == 64) {
+                        this.cb.u8(0x48)
+                    }
+                    this.cb.u8(0x69)
+                    this.cb.u8(0xC0)
+                    this.cb.u32le(cv & 0xFFFFFFFF)
+                    this.putRes(d, w, kd)
+                } else if (op == IrBinOp.Add || op == IrBinOp.Sub || op == IrBinOp.BitAnd
+                    || op == IrBinOp.BitOr || op == IrBinOp.BitXor) {
+                    // `add/sub/and/or/xor rax, imm32`
+                    if (w == 64) {
+                        this.cb.u8(0x48)
+                    }
+                    this.cb.u8(immGroupOpcode(op))
+                    this.cb.u32le(cv & 0xFFFFFFFF)
+                    this.putRes(d, w, kd)
+                } else {
+                    this.fail("bad int immediate binop")
+                }
+            } else {
+                this.loadTmp(0, w, aa)
+                this.loadTmp(1, w, bb)
+                if (isCmp(op)) {
+                    if (w == 8) {
+                        this.cb.u8(0x38)
+                        this.cb.u8(0xC8)
+                    } else if (w == 32) {
+                        this.cb.u8(0x39)
+                        this.cb.u8(0xC8)
+                    } else {
+                        this.cb.u8(0x48)
+                        this.cb.u8(0x39)
+                        this.cb.u8(0xC8)
+                    }
+                    this.intSetcc(this.intCmpCc(op))
+                    this.putRes(d, 8, kd)
+                } else if (op == IrBinOp.Div || op == IrBinOp.Mod) {
+                    this.cb.u8(0x48)
+                    this.cb.u8(0x99)
+                    this.cb.u8(0x48)
+                    this.cb.u8(0xF7)
+                    this.cb.u8(0xF9)
+                    if (op == IrBinOp.Mod) {
+                        this.cb.u8(0x48)
+                        this.cb.u8(0x89)
+                        this.cb.u8(0xD0)
+                    }
+                    this.putRes(d, 64, kd)
+                } else if (op == IrBinOp.Shl || op == IrBinOp.Shr) {
+                    if (w == 64) {
+                        this.cb.u8(0x48)
+                    }
+                    this.cb.u8(0xD3)
+                    if (op == IrBinOp.Shl) {
+                        this.cb.u8(0xE0)
+                    } else {
+                        this.cb.u8(0xF8)
+                    }
+                    this.putRes(d, 64, kd)
+                } else {
+                    match (op) {
+                        case IrBinOp.Add -> {
+                            if (w == 64) {
+                                this.cb.u8(0x48)
+                            }
+                            this.cb.u8(0x01)
+                            this.cb.u8(0xC8)
+                        }
+                        case IrBinOp.Sub -> {
+                            if (w == 64) {
+                                this.cb.u8(0x48)
+                            }
+                            this.cb.u8(0x29)
+                            this.cb.u8(0xC8)
+                        }
+                        case IrBinOp.Mul -> {
+                            if (w == 64) {
+                                this.cb.u8(0x48)
+                            }
+                            this.cb.u8(0x0F)
+                            this.cb.u8(0xAF)
+                            this.cb.u8(0xC1)
+                        }
+                        case IrBinOp.BitAnd -> {
+                            if (w == 64) {
+                                this.cb.u8(0x48)
+                            }
+                            this.cb.u8(0x21)
+                            this.cb.u8(0xC8)
+                        }
+                        case IrBinOp.BitOr -> {
+                            if (w == 64) {
+                                this.cb.u8(0x48)
+                            }
+                            this.cb.u8(0x09)
+                            this.cb.u8(0xC8)
+                        }
+                        case IrBinOp.BitXor -> {
+                            if (w == 64) {
+                                this.cb.u8(0x48)
+                            }
+                            this.cb.u8(0x31)
+                            this.cb.u8(0xC8)
+                        }
+                        case _ -> this.fail("bad int binop")
+                    }
+                    this.putRes(d, w, kd)
+                }
             }
         }
     }
 
     fn emitFtoi(d: int, v: int) {
         let kd = this.kOfTemp(d)
-        this.cb.ldsd(0, this.kOfTemp(v))
+        this.loadTmpFloat(0, v)
+        // The overflow branches materialise their constants in xmm1..xmm2.
+        this.dropFxReg(1)
         this.cb.u8(0x66)
         this.cb.u8(0x0F)
         this.cb.u8(0x2E)
@@ -1345,6 +3464,8 @@ class X64Emitter {
         var fnan = this.cb.size()
         this.cb.u8(0x7A)
         this.cb.u8(0x00)
+        this.rcxT = 0 - 1
+        this.rcxW = 0
         this.cb.movabsImm(1, 0x43E0000000000000)
         this.cb.u8(0x66)
         this.cb.u8(0x48)
@@ -1359,15 +3480,18 @@ class X64Emitter {
         this.cb.u8(0x73)
         this.cb.u8(0x00)
         this.cb.movabsImm(1, negTwo63Bits())
+        // Reuse xmm1, the same scratch the 2^63 constant used. xmm2..xmm5
+        // may hold live float pins, and this is not a call that justifies
+        // clobbering one.
         this.cb.u8(0x66)
         this.cb.u8(0x48)
         this.cb.u8(0x0F)
         this.cb.u8(0x6E)
-        this.cb.u8(0xD1)
+        this.cb.u8(0xC9)
         this.cb.u8(0x66)
         this.cb.u8(0x0F)
         this.cb.u8(0x2E)
-        this.cb.u8(0xC2)
+        this.cb.u8(0xC1)
         var fsmall = this.cb.size()
         this.cb.u8(0x72)
         this.cb.u8(0x00)
@@ -1400,36 +3524,66 @@ class X64Emitter {
         this.cb.bytes[fdj + 1] = (offDone - (fdj + 2)) & 0xFF
         this.cb.bytes[fnj + 1] = (offDone - (fnj + 2)) & 0xFF
         this.cb.bytes[fbj + 1] = (offDone - (fbj + 2)) & 0xFF
-        this.cb.st(0, 64, kd)
+        this.putRes(d, 64, kd)
     }
 
     fn emitMem(op: IrInstr) {
         match (op) {
             case IrInstr.LoadSlot(d, s) -> {
                 let w = tyWidth(this.fun.slots[s])
-                let kd = this.kOfTemp(d)
-                this.cb.ld(0, w, this.kOfSlot(s))
-                this.cb.st(0, w, kd)
+                if (this.plan.floatSlotReg.has(s)) {
+                    // Same no-copy rule as an int pin: consumers read the XMM
+                    // pin until a store to the slot overwrites it.
+                    this.aliasXmm[d] = this.plan.floatSlotReg[s]
+                    this.aliasXSlot[d] = s
+                } else if (this.plan.slotReg.has(s)) {
+                    // No copy: consumers read the pin register until a store to
+                    // the slot invalidates the alias.
+                    this.aliasReg[d] = this.plan.slotReg[s]
+                    this.aliasSlot[d] = s
+                    this.aliasW[d] = w
+                } else {
+                    this.cb.ld(0, w, this.kOfSlot(s))
+                    this.putRes(d, w, this.kOfTemp(d))
+                }
             }
             case IrInstr.StoreSlot(s, v) -> {
                 let w = tyWidth(this.fun.slots[s])
-                let kh = this.kOfSlot(s)
-                this.cb.ld(0, w, this.kOfTemp(v))
-                this.cb.st(0, w, kh)
+                if (this.plan.floatSlotReg.has(s)) {
+                    // Spill aliases of the old value before the pin changes,
+                    // then move the new value into the pin.
+                    this.flushXSlotAliases(s)
+                    this.loadTmpFloat(this.plan.floatSlotReg[s], v)
+                } else if (this.plan.slotReg.has(s)) {
+                    // Writing the register invalidates every alias of the old
+                    // value; spill them before the move lands.
+                    this.flushSlotAliases(s, v)
+                    this.loadTmp(this.plan.slotReg[s], w, v)
+                } else if (isFloatTy(this.fun.slots[s]) && isFloatTy(this.typeOfT(v))) {
+                    // A float slot is 8 bytes: one SSE store, no GPR round trip.
+                    this.loadTmpFloat(0, v)
+                    this.cb.stsd(0, this.kOfSlot(s))
+                } else {
+                    let kh = this.kOfSlot(s)
+                    this.loadTmp(0, w, v)
+                    this.cb.st(0, w, kh)
+                }
             }
             case IrInstr.LocalAddr(d, s) -> {
                 this.cb.leaRbp(0, this.kOfSlot(s))
-                this.cb.st(0, 64, this.kOfTemp(d))
+                this.putRes(d, 64, this.kOfTemp(d))
             }
             case IrInstr.LoadRaw(d, addr, ty) -> {
-                this.cb.ld(0, 64, this.kOfTemp(addr))
+                this.loadTmp(0, 64, addr)
                 let kd = this.kOfTemp(d)
                 if (isFloatTy(ty)) {
+                    this.dropFxReg(0)
                     this.cb.u8(0xF2)
                     this.cb.u8(0x0F)
                     this.cb.u8(0x10)
                     this.cb.u8(0x00)
                     this.cb.stsd(0, kd)
+                    this.setFx(0, d)
                 } else {
                     let w = tyWidth(ty)
                     if (w == 64) {
@@ -1441,20 +3595,20 @@ class X64Emitter {
                         this.cb.u8(0x8B)
                     }
                     this.cb.u8(0x00)
-                    this.cb.st(0, w, kd)
+                    this.putRes(d, w, kd)
                 }
             }
             case IrInstr.StoreRaw(addr, v, ty) -> {
-                this.cb.ld(1, 64, this.kOfTemp(addr))
+                this.loadTmp(1, 64, addr)
                 if (isFloatTy(ty)) {
-                    this.cb.ldsd(0, this.kOfTemp(v))
+                    this.loadTmpFloat(0, v)
                     this.cb.u8(0xF2)
                     this.cb.u8(0x0F)
                     this.cb.u8(0x11)
                     this.cb.u8(0x01)
                 } else {
                     let w = tyWidth(ty)
-                    this.cb.ld(0, w, this.kOfTemp(v))
+                    this.loadTmp(0, w, v)
                     if (w == 64) {
                         this.cb.u8(0x48)
                     }
@@ -1470,15 +3624,1096 @@ class X64Emitter {
         }
     }
 
+    /// `pickle_list_get(list, index)` inlined: signed bounds check, then the
+    /// element load. Mirrors `abiListGet` exactly - including a negative index
+    /// reading below `data`, which the compiler's static bounds checks make
+    /// unreachable but the runtime body would do.
+    fn emitInlineListGet(d: int, listT: int, indexT: int) {
+        this.loadTmp(1, 64, listT)
+        this.loadTmp(2, 64, indexT)
+        // rax = list[LEN_WORD] (24); if (index >= len) -> null.
+        this.cb.u8(0x48)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x41)
+        this.cb.u8(24)
+        this.cb.u8(0x48)
+        this.cb.u8(0x39)
+        this.cb.u8(0xC2)
+        this.cb.u8(0x7D)
+        this.cb.u8(0x0A)
+        // rax = ((*int) list[DATA_WORD])[index]
+        this.cb.u8(0x48)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x41)
+        this.cb.u8(40)
+        this.cb.u8(0x48)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x04)
+        this.cb.u8(0xD0)
+        this.cb.u8(0xEB)
+        this.cb.u8(0x02)
+        // null:
+        this.cb.u8(0x31)
+        this.cb.u8(0xC0)
+        this.putRes(d, 64, this.kOfTemp(d))
+    }
+
+    /// `pickle_list_len` / `pickle_str_len` / `pickle_map_len` inlined: each
+    /// reads its object's `len` word at offset 24 (`LEN_WORD` is 3 everywhere).
+    fn emitInlineObjLen(d: int, objT: int) {
+        this.loadTmp(1, 64, objT)
+        this.cb.u8(0x48)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x41)
+        this.cb.u8(24)
+        this.putRes(d, 64, this.kOfTemp(d))
+    }
+
+    /// `pickle_unbox_i64` / `pickle_unbox_char` inlined: the payload is word 3
+    /// of the box, a single unchecked load at offset 24. Both runtime bodies are
+    /// exactly that read (`abi_box`'s `boxBits`), so a null pointer faults the
+    /// same way the call did.
+    fn emitInlineUnbox(d: int, objT: int) {
+        this.loadTmp(1, 64, objT)
+        this.cb.u8(0x48)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x41)
+        this.cb.u8(24)
+        this.putRes(d, 64, this.kOfTemp(d))
+    }
+
+    /// `pickle_unbox_f64` inlined: word 3 of a float box is the exact IEEE-754
+    /// word `abiBoxF64` stored (`f64Bits(v)`), so loading it as a double is the
+    /// same reinterpretation `abiUnboxF64` performs. The runtime body rebuilds
+    /// the value field-by-field through `f64FromBits` (sign, exponent, `pow2`
+    /// loops); that is bit-exact but costs a call and dozens of instructions per
+    /// unbox, and the benchmark's inner loop unboxes `idfs[k]` 288k times.
+    ///
+    /// The two forms differ only on a NaN payload: `f64FromBits` answers the
+    /// canonical quiet NaN, while the load reproduces whatever word was stored.
+    /// Every float box is produced by `pickle_box_f64`, which stores the
+    /// canonical quiet NaN for any NaN, so the loaded word *is* that canonical
+    /// NaN. Even if another word reached the payload, Pickle cannot read a
+    /// float's bits (`f64Bits` canonicalises NaN), `==` is false for every NaN,
+    /// and the formatter writes `NaN` - so the difference is unobservable.
+    fn emitInlineUnboxF64(d: int, objT: int) {
+        this.loadTmp(1, 64, objT)
+        this.cb.u8(0xF2)
+        this.cb.u8(0x0F)
+        this.cb.u8(0x10)
+        this.cb.u8(0x41)
+        this.cb.u8(24)
+        this.cb.stsd(0, this.kOfTemp(d))
+    }
+
+    /// `pickle_box_i64`'s shared-small-value cache, inlined. The benchmark's
+    /// map updates box `0..48` on every `m[k] = m[k] + 1`, and `abiBoxI64`
+    /// answers those from `smallBoxTab` without allocating. Reaching that
+    /// answer through the extern still costs a call plus the shadow frame the
+    /// function needs for its allocating paths, so probe the cache here and
+    /// fall back to the real call for a miss, a cold table, or an out-of-range
+    /// value. The table and its `0` sentinel are exactly what `abi_box` reads;
+    /// hits are immutable boxes whose pointers the arena never reuses.
+    fn emitInlineBoxI64(d: int, arg: int) {
+        this.loadTmp(1, 64, arg)
+        let slow = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        let done = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        // rax = smallBoxTab; test tab != 0.
+        this.cb.movabsReloc(0, "pkl_global_smallBoxTab")
+        this.cb.u8(0x48)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x00)
+        this.cb.u8(0x48)
+        this.cb.u8(0x85)
+        this.cb.u8(0xC0)
+        this.emitJcc(0x04, slow)
+        // Unsigned compare folds the `v < 0` and `v >= SMALL_BOX_CAP` tests
+        // into one branch: a negative value is huge as unsigned.
+        this.cb.u8(0x48)
+        this.cb.u8(0x81)
+        this.cb.u8(0xF9)
+        this.cb.u32le(4096)
+        this.emitJcc(0x03, slow)
+        // rax = tab[v]; a zero entry is a miss.
+        this.cb.u8(0x48)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x04)
+        this.cb.u8(0xC8)
+        this.cb.u8(0x48)
+        this.cb.u8(0x85)
+        this.cb.u8(0xC0)
+        this.emitJcc(0x04, slow)
+        this.emitJmp(done)
+        this.starts[slow] = this.cb.size()
+        this.cb.movabsReloc(10, "pickle_box_i64")
+        this.cb.u8(0x41)
+        this.cb.u8(0xFF)
+        this.cb.u8(0xD2)
+        this.starts[done] = this.cb.size()
+        this.clobberRcx()
+        this.putRes(d, 64, this.kOfTemp(d))
+    }
+
+    /// `pickle_str_from_i64`'s small-integer intern cache, inlined. Every
+    /// generated name in the benchmark is `"w" + str(t)` with `t` in 0..255, so
+    /// the runtime answers from a 2000-slot table (`-999..999`) and never
+    /// builds digits. Those entries are `FLAG_SHARED` and never freed, so a hit
+    /// is immutable and pointer-identical to the split text the map probe
+    /// compares against. A cold table, an out-of-range value or an unfilled
+    /// slot falls back to the real entry point with rcx untouched.
+    fn emitInlineStrFromI64(d: int, arg: int) {
+        this.loadTmp(1, 64, arg)
+        let slow = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        let done = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        // rax = pkl_global_internTab; test tab != 0.
+        this.cb.movabsReloc(0, "pkl_global_internTab")
+        this.cb.u8(0x48)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x00)
+        this.cb.u8(0x48)
+        this.cb.u8(0x85)
+        this.cb.u8(0xC0)
+        this.emitJcc(0x04, slow)
+        // r11 = v + 1000. The unsigned compare folds `v < -999` and `v > 999`
+        // into one branch: a negative value is huge as unsigned.
+        this.cb.u8(0x4C)
+        this.cb.u8(0x8D)
+        this.cb.u8(0x99)
+        this.cb.u32le(1000)
+        this.cb.u8(0x49)
+        this.cb.u8(0x81)
+        this.cb.u8(0xFB)
+        this.cb.u32le(2000)
+        this.emitJcc(0x03, slow)
+        // rax = tab[v + 1000]; a zero entry is a miss.
+        this.cb.u8(0x4A)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x04)
+        this.cb.u8(0xD8)
+        this.cb.u8(0x48)
+        this.cb.u8(0x85)
+        this.cb.u8(0xC0)
+        this.emitJcc(0x04, slow)
+        this.emitJmp(done)
+        this.starts[slow] = this.cb.size()
+        this.cb.movabsReloc(11, "pickle_str_from_i64")
+        this.cb.u8(0x41)
+        this.cb.u8(0xFF)
+        this.cb.u8(0xD3)
+        this.starts[done] = this.cb.size()
+        this.clobberRcx()
+        this.putRes(d, 64, this.kOfTemp(d))
+    }
+
+    /// `pkl_shortInternWord` inlined: the intern probe is the single most
+    /// frequent runtime entry in the benchmark (once per generated name and
+    /// once per split field), and its generic body spends most of its ~155
+    /// instructions spilling sub-expressions to the frame. The hot path here
+    /// keeps the payload, table, capacity mask and slot index in registers;
+    /// every miss - an empty slot, a grown table, a cold table - falls back to
+    /// the real entry point, so insertion, growth and FNV hashing stay in one
+    /// implementation.
+    ///
+    /// The placement mix is copied exactly: `(vv ^ (ln * K1)) * K2`, arithmetic
+    /// shift right by 33, then `& (cap - 1)`. K1 is the negated 64-bit golden
+    /// ratio constant and K2 is the 64-bit mix multiplier; both are emitted as
+    /// 64-bit immediates because the operation is wrapping i64 arithmetic. The
+    /// shift is `sar`, not `shr`: the runtime's `>>` is signed, so a negative
+    /// product must sign-extend before the mask.
+    ///
+    /// The fallback passes `r11`, which is the raw input before masking and the
+    /// masked payload afterwards. `shortInternWord` masks its argument again
+    /// with the same length, so the masked form is an equivalent input; this
+    /// avoids reloading a value whose home may have been elided by pending-rax
+    /// forwarding.
+    fn emitInlineShortInternWord(d: int, vT: int, lnT: int) {
+        this.loadTmp(1, 64, vT)
+        this.loadTmp(2, 64, lnT)
+        let cold = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        let masked = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        let probe = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        let nextSlot = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        let hit = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        let done = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        // r11 = v; r8 = table; a null table takes the cold path (init/insert).
+        this.cb.u8(0x4C)
+        this.cb.u8(0x8B)
+        this.cb.u8(0xD9)
+        this.cb.movabsReloc(0, "pkl_global_shortInternTab")
+        this.cb.u8(0x4C)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x00)
+        this.cb.u8(0x4D)
+        this.cb.u8(0x85)
+        this.cb.u8(0xC0)
+        this.emitJcc(0x04, cold)
+        // msk = -1; if (ln < 8) msk = (1 << (ln * 8)) - 1. The signed compare
+        // matches the runtime's `ln < 8`; the shift count only uses `cl`.
+        this.cb.u8(0x49)
+        this.cb.u8(0xC7)
+        this.cb.u8(0xC1)
+        this.cb.u32le(0 - 1)
+        this.cb.u8(0x48)
+        this.cb.u8(0x83)
+        this.cb.u8(0xFA)
+        this.cb.u8(0x08)
+        this.emitJcc(0x0D, masked)
+        this.cb.u8(0x89)
+        this.cb.u8(0xD1)
+        this.cb.u8(0xC1)
+        this.cb.u8(0xE1)
+        this.cb.u8(0x03)
+        this.cb.u8(0x49)
+        this.cb.u8(0xC7)
+        this.cb.u8(0xC1)
+        this.cb.u32le(1)
+        this.cb.u8(0x49)
+        this.cb.u8(0xD3)
+        this.cb.u8(0xE1)
+        this.cb.u8(0x49)
+        this.cb.u8(0x83)
+        this.cb.u8(0xE9)
+        this.cb.u8(0x01)
+        this.starts[masked] = this.cb.size()
+        // r11 = vv; r9 = capacity mask.
+        this.cb.u8(0x4D)
+        this.cb.u8(0x21)
+        this.cb.u8(0xCB)
+        this.cb.movabsReloc(0, "pkl_global_shortInternCap")
+        this.cb.u8(0x4C)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x08)
+        this.cb.u8(0x49)
+        this.cb.u8(0x83)
+        this.cb.u8(0xE9)
+        this.cb.u8(0x01)
+        // rax = (((vv ^ (ln * K1)) * K2) >> 33) & mask.
+        this.cb.u8(0x48)
+        this.cb.u8(0x8B)
+        this.cb.u8(0xC2)
+        this.cb.u8(0x49)
+        this.cb.u8(0xBA)
+        this.cb.u64le(0 - 0x61C8864680B583EB)
+        this.cb.u8(0x49)
+        this.cb.u8(0x0F)
+        this.cb.u8(0xAF)
+        this.cb.u8(0xC2)
+        this.cb.u8(0x4C)
+        this.cb.u8(0x31)
+        this.cb.u8(0xD8)
+        this.cb.u8(0x49)
+        this.cb.u8(0xBA)
+        this.cb.u64le(0x7FB5D329728EA185)
+        this.cb.u8(0x49)
+        this.cb.u8(0x0F)
+        this.cb.u8(0xAF)
+        this.cb.u8(0xC2)
+        this.cb.u8(0x48)
+        this.cb.u8(0xC1)
+        this.cb.u8(0xF8)
+        this.cb.u8(33)
+        this.cb.u8(0x4C)
+        this.cb.u8(0x21)
+        this.cb.u8(0xC8)
+        this.starts[probe] = this.cb.size()
+        // p = tab[idx]; an empty slot needs insertion.
+        this.cb.u8(0x4D)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x14)
+        this.cb.u8(0xC0)
+        this.cb.u8(0x4D)
+        this.cb.u8(0x85)
+        this.cb.u8(0xD2)
+        this.emitJcc(0x04, cold)
+        // A hit needs both the length and the masked payload to match.
+        this.cb.u8(0x49)
+        this.cb.u8(0x39)
+        this.cb.u8(0x52)
+        this.cb.u8(0x18)
+        this.emitJcc(0x05, nextSlot)
+        this.cb.u8(0x4D)
+        this.cb.u8(0x39)
+        this.cb.u8(0x5A)
+        this.cb.u8(0x20)
+        this.emitJcc(0x04, hit)
+        this.starts[nextSlot] = this.cb.size()
+        this.cb.u8(0x48)
+        this.cb.u8(0xFF)
+        this.cb.u8(0xC0)
+        this.cb.u8(0x4C)
+        this.cb.u8(0x21)
+        this.cb.u8(0xC8)
+        this.emitJmp(probe)
+        this.starts[hit] = this.cb.size()
+        this.cb.u8(0x4C)
+        this.cb.u8(0x89)
+        this.cb.u8(0xD0)
+        this.emitJmp(done)
+        this.starts[cold] = this.cb.size()
+        // rcx = r11 (raw v, or vv for the same ln); rdx still holds ln.
+        this.cb.u8(0x49)
+        this.cb.u8(0x8B)
+        this.cb.u8(0xCB)
+        this.cb.movabsReloc(10, "pkl_shortInternWord")
+        this.cb.u8(0x41)
+        this.cb.u8(0xFF)
+        this.cb.u8(0xD2)
+        this.starts[done] = this.cb.size()
+        this.clobberRcx()
+        this.putRes(d, 64, this.kOfTemp(d))
+    }
+
+    /// `pickle_str_append_two`'s fast path, inlined. The backend already fuses
+    /// `line + piece + " "` into this symbol, and the benchmark reaches it once
+    /// per generated token. The runtime body is correct but pays a full call
+    /// frame, argument spills and a stack home for every sub-expression; the
+    /// whole fast path is a handful of masked word stores, so it is emitted
+    /// here with the operands in the argument registers.
+    ///
+    /// Exactly the runtime conditions gate the fast path: no operand aliases
+    /// `a`, `a` is an owned heap buffer, not shared, both appended lengths fit
+    /// one payload word, and the result fits the allocation. Everything else -
+    /// including a destination that must grow - jumps to the real entry point
+    /// with rcx/rdx/r8 untouched, so capacity growth, copying and interning stay
+    /// in one implementation. The store rule is the source's: keep the
+    /// destination's low `pos & 7` bytes, shift the piece in, spill the overflow
+    /// byte into the next word, then publish the new length and the cleared
+    /// cached-hash flag. The tail word is masked last so the payload stays
+    /// canonical past `n`.
+    ///
+    /// Register plan (all caller-saved): rcx/rdx/r8 are the arguments, r9 keeps
+    /// `a`, r10 the word base or scratch, r11 the payload word, rax the new
+    /// length, and rcx doubles as the shift count between the stores. Byte
+    /// offsets are `32 + (pos & ~7)`: the payload's fifth word is `a[4]` at byte
+    /// 32, so the word containing payload offset `pos` starts there.
+    fn emitInlineAppendTwo(d: int, aT: int, bT: int, cT: int) {
+        this.loadTmp(1, 64, aT)
+        this.loadTmp(2, 64, bT)
+        this.loadTmp(8, 64, cT)
+        let slow = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        let cross1 = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        let aligned1 = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        let done1 = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        let cross2 = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        let aligned2 = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        let done2 = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        let tailed = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        let done = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        // `a == b` and `a == c` must fall back: the sequential bodies expose
+        // the intermediate buffer, so writing over live source bytes is wrong.
+        this.cb.u8(0x48)
+        this.cb.u8(0x39)
+        this.cb.u8(0xD1)
+        this.emitJcc(0x04, slow)
+        this.cb.u8(0x4C)
+        this.cb.u8(0x39)
+        this.cb.u8(0xC1)
+        this.emitJcc(0x04, slow)
+        // rax = flags. Owned (bit 0) and not shared (bit 2) are required.
+        this.cb.u8(0x48)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x41)
+        this.cb.u8(0x10)
+        this.cb.u8(0xA8)
+        this.cb.u8(0x01)
+        this.emitJcc(0x04, slow)
+        this.cb.u8(0xA8)
+        this.cb.u8(0x04)
+        this.emitJcc(0x05, slow)
+        // r9 = byte capacity, r10 = len(a), r11 = len(b), rax = len(c).
+        this.cb.movRR(9, 0, 64)
+        this.cb.u8(0x49)
+        this.cb.u8(0x83)
+        this.cb.u8(0xE1)
+        this.cb.u8(0xF8)
+        this.cb.u8(0x4C)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x51)
+        this.cb.u8(0x18)
+        this.cb.u8(0x4C)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x5A)
+        this.cb.u8(0x18)
+        this.cb.u8(0x49)
+        this.cb.u8(0x83)
+        this.cb.u8(0xFB)
+        this.cb.u8(0x08)
+        this.emitJcc(0x0F, slow)
+        this.cb.u8(0x49)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x40)
+        this.cb.u8(0x18)
+        this.cb.u8(0x48)
+        this.cb.u8(0x83)
+        this.cb.u8(0xF8)
+        this.cb.u8(0x08)
+        this.emitJcc(0x0F, slow)
+        // Signed compare, exactly `n > capBytes - 4 * 8`.
+        this.cb.u8(0x49)
+        this.cb.u8(0x83)
+        this.cb.u8(0xE9)
+        this.cb.u8(0x20)
+        this.cb.u8(0x4C)
+        this.cb.u8(0x01)
+        this.cb.u8(0xD0)
+        this.cb.u8(0x4C)
+        this.cb.u8(0x01)
+        this.cb.u8(0xD8)
+        this.cb.u8(0x4C)
+        this.cb.u8(0x39)
+        this.cb.u8(0xC8)
+        this.emitJcc(0x0F, slow)
+        // r9 = a, r10 = word base, r11 = pos & 7.
+        this.cb.movRR(9, 1, 64)
+        this.cb.movRR(11, 10, 64)
+        this.cb.u8(0x41)
+        this.cb.u8(0x83)
+        this.cb.u8(0xE3)
+        this.cb.u8(0x07)
+        this.emitJcc(0x04, aligned1)
+        this.cb.u8(0x49)
+        this.cb.u8(0x83)
+        this.cb.u8(0xE2)
+        this.cb.u8(0xF8)
+        // Cross test: `r + len(b) > 8` needs the spill store.
+        this.cb.u8(0x48)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x4A)
+        this.cb.u8(0x18)
+        this.cb.u8(0x4C)
+        this.cb.u8(0x01)
+        this.cb.u8(0xD9)
+        this.cb.u8(0x48)
+        this.cb.u8(0x83)
+        this.cb.u8(0xF9)
+        this.cb.u8(0x08)
+        this.emitJcc(0x0F, cross1)
+        // No spill: write the shifted word under the position mask.
+        this.cb.u8(0x44)
+        this.cb.u8(0x89)
+        this.cb.u8(0xD9)
+        this.cb.u8(0xC1)
+        this.cb.u8(0xE1)
+        this.cb.u8(0x03)
+        this.cb.u8(0x4C)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x5A)
+        this.cb.u8(0x20)
+        this.cb.u8(0x49)
+        this.cb.u8(0xD3)
+        this.cb.u8(0xE3)
+        this.cb.u8(0x48)
+        this.cb.u8(0xC7)
+        this.cb.u8(0xC2)
+        this.cb.u32le(1)
+        this.cb.u8(0x48)
+        this.cb.u8(0xD3)
+        this.cb.u8(0xE2)
+        this.cb.u8(0x48)
+        this.cb.u8(0xFF)
+        this.cb.u8(0xCA)
+        this.cb.u8(0x4B)
+        this.cb.u8(0x21)
+        this.cb.u8(0x54)
+        this.cb.u8(0x11)
+        this.cb.u8(0x20)
+        this.cb.u8(0x4F)
+        this.cb.u8(0x09)
+        this.cb.u8(0x5C)
+        this.cb.u8(0x11)
+        this.cb.u8(0x20)
+        this.emitJmp(done1)
+        this.starts[aligned1] = this.cb.size()
+        this.cb.u8(0x4C)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x5A)
+        this.cb.u8(0x20)
+        this.cb.u8(0x4F)
+        this.cb.u8(0x89)
+        this.cb.u8(0x5C)
+        this.cb.u8(0x11)
+        this.cb.u8(0x20)
+        this.emitJmp(done1)
+        this.starts[cross1] = this.cb.size()
+        // Spill first, then the masked base store; the source's order inside
+        // one buffer is unobservable until the header is published.
+        this.cb.u8(0x44)
+        this.cb.u8(0x89)
+        this.cb.u8(0xD9)
+        this.cb.u8(0xC1)
+        this.cb.u8(0xE1)
+        this.cb.u8(0x03)
+        this.cb.u8(0x4C)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x5A)
+        this.cb.u8(0x20)
+        this.cb.u8(0xF7)
+        this.cb.u8(0xD9)
+        this.cb.u8(0x4C)
+        this.cb.u8(0x89)
+        this.cb.u8(0xDA)
+        this.cb.u8(0x48)
+        this.cb.u8(0xD3)
+        this.cb.u8(0xEA)
+        this.cb.u8(0x4B)
+        this.cb.u8(0x89)
+        this.cb.u8(0x54)
+        this.cb.u8(0x11)
+        this.cb.u8(0x28)
+        this.cb.u8(0xF7)
+        this.cb.u8(0xD9)
+        this.cb.u8(0x48)
+        this.cb.u8(0xC7)
+        this.cb.u8(0xC2)
+        this.cb.u32le(1)
+        this.cb.u8(0x48)
+        this.cb.u8(0xD3)
+        this.cb.u8(0xE2)
+        this.cb.u8(0x48)
+        this.cb.u8(0xFF)
+        this.cb.u8(0xCA)
+        this.cb.u8(0x49)
+        this.cb.u8(0xD3)
+        this.cb.u8(0xE3)
+        this.cb.u8(0x4B)
+        this.cb.u8(0x21)
+        this.cb.u8(0x54)
+        this.cb.u8(0x11)
+        this.cb.u8(0x20)
+        this.cb.u8(0x4F)
+        this.cb.u8(0x09)
+        this.cb.u8(0x5C)
+        this.cb.u8(0x11)
+        this.cb.u8(0x20)
+        this.starts[done1] = this.cb.size()
+        // Second piece: pos = n - len(c), r2 = pos & 7.
+        this.cb.movRR(1, 0, 64)
+        this.cb.u8(0x4D)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x50)
+        this.cb.u8(0x18)
+        this.cb.u8(0x4C)
+        this.cb.u8(0x29)
+        this.cb.u8(0xD1)
+        this.cb.movRR(10, 1, 64)
+        this.cb.u8(0x41)
+        this.cb.u8(0x83)
+        this.cb.u8(0xE2)
+        this.cb.u8(0x07)
+        this.emitJcc(0x04, aligned2)
+        this.cb.u8(0x4D)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x58)
+        this.cb.u8(0x18)
+        // Cross test without losing r2: rdx = (pos & 7) + len(c). rdx held the
+        // source pointer for the first piece and is dead here.
+        this.cb.u8(0x4C)
+        this.cb.u8(0x89)
+        this.cb.u8(0xD2)
+        this.cb.u8(0x4C)
+        this.cb.u8(0x01)
+        this.cb.u8(0xDA)
+        this.cb.u8(0x48)
+        this.cb.u8(0x83)
+        this.cb.u8(0xFA)
+        this.cb.u8(0x08)
+        this.emitJcc(0x0F, cross2)
+        this.cb.movRR(2, 1, 64)
+        this.cb.u8(0x48)
+        this.cb.u8(0x83)
+        this.cb.u8(0xE2)
+        this.cb.u8(0xF8)
+        this.cb.u8(0x44)
+        this.cb.u8(0x89)
+        this.cb.u8(0xD1)
+        this.cb.u8(0xC1)
+        this.cb.u8(0xE1)
+        this.cb.u8(0x03)
+        this.cb.u8(0x4D)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x58)
+        this.cb.u8(0x20)
+        this.cb.u8(0x49)
+        this.cb.u8(0xD3)
+        this.cb.u8(0xE3)
+        this.cb.u8(0x49)
+        this.cb.u8(0xC7)
+        this.cb.u8(0xC2)
+        this.cb.u32le(1)
+        this.cb.u8(0x49)
+        this.cb.u8(0xD3)
+        this.cb.u8(0xE2)
+        this.cb.u8(0x49)
+        this.cb.u8(0xFF)
+        this.cb.u8(0xCA)
+        this.cb.u8(0x4D)
+        this.cb.u8(0x21)
+        this.cb.u8(0x54)
+        this.cb.u8(0x11)
+        this.cb.u8(0x20)
+        this.cb.u8(0x4D)
+        this.cb.u8(0x09)
+        this.cb.u8(0x5C)
+        this.cb.u8(0x11)
+        this.cb.u8(0x20)
+        this.emitJmp(done2)
+        this.starts[aligned2] = this.cb.size()
+        this.cb.u8(0x4D)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x58)
+        this.cb.u8(0x20)
+        this.cb.u8(0x48)
+        this.cb.u8(0x83)
+        this.cb.u8(0xE1)
+        this.cb.u8(0xF8)
+        this.cb.u8(0x4D)
+        this.cb.u8(0x89)
+        this.cb.u8(0x5C)
+        this.cb.u8(0x09)
+        this.cb.u8(0x20)
+        this.emitJmp(done2)
+        this.starts[cross2] = this.cb.size()
+        this.cb.movRR(2, 1, 64)
+        this.cb.u8(0x48)
+        this.cb.u8(0x83)
+        this.cb.u8(0xE2)
+        this.cb.u8(0xF8)
+        this.cb.u8(0x44)
+        this.cb.u8(0x89)
+        this.cb.u8(0xD1)
+        this.cb.u8(0xC1)
+        this.cb.u8(0xE1)
+        this.cb.u8(0x03)
+        this.cb.u8(0x4D)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x58)
+        this.cb.u8(0x20)
+        this.cb.u8(0xF7)
+        this.cb.u8(0xD9)
+        this.cb.movRR(10, 11, 64)
+        this.cb.u8(0x49)
+        this.cb.u8(0xD3)
+        this.cb.u8(0xEA)
+        this.cb.u8(0x4D)
+        this.cb.u8(0x89)
+        this.cb.u8(0x54)
+        this.cb.u8(0x11)
+        this.cb.u8(0x28)
+        this.cb.u8(0xF7)
+        this.cb.u8(0xD9)
+        this.cb.u8(0x49)
+        this.cb.u8(0xC7)
+        this.cb.u8(0xC2)
+        this.cb.u32le(1)
+        this.cb.u8(0x49)
+        this.cb.u8(0xD3)
+        this.cb.u8(0xE2)
+        this.cb.u8(0x49)
+        this.cb.u8(0xFF)
+        this.cb.u8(0xCA)
+        this.cb.u8(0x49)
+        this.cb.u8(0xD3)
+        this.cb.u8(0xE3)
+        this.cb.u8(0x4D)
+        this.cb.u8(0x21)
+        this.cb.u8(0x54)
+        this.cb.u8(0x11)
+        this.cb.u8(0x20)
+        this.cb.u8(0x4D)
+        this.cb.u8(0x09)
+        this.cb.u8(0x5C)
+        this.cb.u8(0x11)
+        this.cb.u8(0x20)
+        this.starts[done2] = this.cb.size()
+        // Publish the length and drop the cached hash in one header store, then
+        // clear the unused high bytes of the final partial word.
+        this.cb.u8(0x49)
+        this.cb.u8(0x89)
+        this.cb.u8(0x41)
+        this.cb.u8(0x18)
+        this.cb.u8(0x49)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x51)
+        this.cb.u8(0x10)
+        this.cb.u8(0x48)
+        this.cb.u8(0x83)
+        this.cb.u8(0xE2)
+        this.cb.u8(0xF8)
+        this.cb.u8(0x48)
+        this.cb.u8(0x83)
+        this.cb.u8(0xCA)
+        this.cb.u8(0x01)
+        this.cb.u8(0x49)
+        this.cb.u8(0x89)
+        this.cb.u8(0x51)
+        this.cb.u8(0x10)
+        this.cb.u8(0x89)
+        this.cb.u8(0xC1)
+        this.cb.u8(0x83)
+        this.cb.u8(0xE1)
+        this.cb.u8(0x07)
+        this.emitJcc(0x04, tailed)
+        this.cb.u8(0xC1)
+        this.cb.u8(0xE1)
+        this.cb.u8(0x03)
+        this.cb.u8(0x48)
+        this.cb.u8(0xC7)
+        this.cb.u8(0xC2)
+        this.cb.u32le(1)
+        this.cb.u8(0x48)
+        this.cb.u8(0xD3)
+        this.cb.u8(0xE2)
+        this.cb.u8(0x48)
+        this.cb.u8(0xFF)
+        this.cb.u8(0xCA)
+        this.cb.movRR(10, 0, 64)
+        this.cb.u8(0x49)
+        this.cb.u8(0x83)
+        this.cb.u8(0xE2)
+        this.cb.u8(0xF8)
+        this.cb.u8(0x4B)
+        this.cb.u8(0x21)
+        this.cb.u8(0x54)
+        this.cb.u8(0x11)
+        this.cb.u8(0x20)
+        this.starts[tailed] = this.cb.size()
+        this.cb.movRR(0, 9, 64)
+        this.emitJmp(done)
+        this.starts[slow] = this.cb.size()
+        // Arguments are still in rcx/rdx/r8; only r9/r10/r11/rax were touched.
+        this.cb.movabsReloc(10, "pickle_str_append_two")
+        this.cb.u8(0x41)
+        this.cb.u8(0xFF)
+        this.cb.u8(0xD2)
+        this.starts[done] = this.cb.size()
+        this.clobberRcx()
+        this.putRes(d, 64, this.kOfTemp(d))
+    }
+
+    /// `pkl_wsMaskWord` inlined: a pure leaf that the generic call path wraps
+    /// in a frame plus a stack write and read for every sub-expression.
+    /// `abiStrSplitWhitespace` asks for the mask once per eight input bytes,
+    /// so the benchmark's 240-byte lines reach it about thirty times each and
+    /// that frame overhead was a measurable part of the split phase.
+    ///
+    /// The arithmetic is exactly the runtime body: each target byte produces
+    /// `((xorWord & 0x7F..) + 0x7F..) | xorWord`, whose byte lane has bit 7
+    /// clear precisely when the lane equals the target. AND-ing the four
+    /// reduced words leaves bit 7 set only when no target matched, so the
+    /// final complement isolates the `0x80` lane flags. Keeping the operation
+    /// exact (rather than the shorter subtract-based `haszero`) matters: this
+    /// mask locates field boundaries, and a false lane would truncate a field.
+    /// The randomized differential in `abi_string_test` compares the produced
+    /// fields against an independent per-byte scanner and covers it.
+    fn emitInlineWsMaskWord(d: int, arg: int) {
+        this.loadTmp(1, 64, arg)
+        // r11 = input word, r10 = the per-lane low-bit mask.
+        this.cb.u8(0x4C)
+        this.cb.u8(0x8B)
+        this.cb.u8(0xD9)
+        this.cb.u8(0x49)
+        this.cb.u8(0xBA)
+        this.cb.u64le(0x7F7F7F7F7F7F7F7F)
+        // First target (space) seeds the accumulator; the rest fold into it.
+        this.emitWsMaskTarget(0x2020202020202020, 0)
+        this.emitWsMaskTarget(0x0909090909090909, 1)
+        this.emitWsMaskTarget(0x0A0A0A0A0A0A0A0A, 1)
+        this.emitWsMaskTarget(0x0D0D0D0D0D0D0D0D, 1)
+        // rax = ~accumulator & 0x80-per-lane.
+        this.cb.u8(0x48)
+        this.cb.u8(0xF7)
+        this.cb.u8(0xD0)
+        this.cb.u8(0x49)
+        this.cb.u8(0xB8)
+        this.cb.u64le(0x0101010101010101 * 128)
+        this.cb.u8(0x4C)
+        this.cb.u8(0x21)
+        this.cb.u8(0xC0)
+        this.clobberRcx()
+        this.putRes(d, 64, this.kOfTemp(d))
+    }
+
+    /// One whitespace target inside `emitInlineWsMaskWord`. `fold == 0` seeds
+    /// rax with the reduced word; `fold == 1` ANDs it into rax. Registers:
+    /// r11 holds the input word, r10 the `0x7F` lane mask, rax the accumulator,
+    /// rdx the reduced word, r8 the target constant, r9 a copy of it.
+    fn emitWsMaskTarget(target: int, fold: int) {
+        this.cb.u8(0x49)
+        this.cb.u8(0x8B)
+        this.cb.u8(0xD3)
+        this.cb.u8(0x49)
+        this.cb.u8(0xB8)
+        this.cb.u64le(target)
+        this.cb.u8(0x4C)
+        this.cb.u8(0x31)
+        this.cb.u8(0xC2)
+        // r9 = rdx (copy of the reduced word), so the OR below can still see it.
+        this.cb.u8(0x4C)
+        this.cb.u8(0x8B)
+        this.cb.u8(0xCA)
+        this.cb.u8(0x4C)
+        this.cb.u8(0x21)
+        this.cb.u8(0xD2)
+        this.cb.u8(0x4C)
+        this.cb.u8(0x01)
+        this.cb.u8(0xD2)
+        this.cb.u8(0x4C)
+        this.cb.u8(0x09)
+        this.cb.u8(0xCA)
+        if (fold == 0) {
+            this.cb.u8(0x48)
+            this.cb.u8(0x8B)
+            this.cb.u8(0xC2)
+        } else {
+            this.cb.u8(0x48)
+            this.cb.u8(0x21)
+            this.cb.u8(0xD0)
+        }
+    }
+
+    /// `pickle_map_get`'s bloom-filter rejection, inlined. The query loop asks
+    /// `docs[i].get(term)` with a 256-term vocabulary against 48-term
+    /// documents, so most lookups are absent and the map's two-bit bloom
+    /// filter answers them without probing. Reaching that answer through the
+    /// extern costs a call and the entry prologue; the filter is conservative
+    /// (bits are only ever set, never cleared, and removal keeps them), so a
+    /// clear filter is a sound "absent". Every other shape - a key whose hash
+    /// is not cached yet, a non-string key, a bloom hit - falls back to the
+    /// real entry point with the argument registers untouched.
+    fn emitInlineMapGet(d: int, mapT: int, keyT: int) {
+        this.loadTmp(1, 64, mapT)
+        this.loadTmp(2, 64, keyT)
+        let slow = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        let miss = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        let done = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        // 0/1/2 are the map's empty/tombstone/none sentinels, not pointers.
+        this.cb.u8(0x48)
+        this.cb.u8(0x83)
+        this.cb.u8(0xFA)
+        this.cb.u8(0x02)
+        this.emitJcc(0x06, slow)
+        // Word 1 is the class id; only string keys may be answered here.
+        this.cb.u8(0x48)
+        this.cb.u8(0x83)
+        this.cb.u8(0x7A)
+        this.cb.u8(0x08)
+        this.cb.u8(0x00)
+        this.emitJcc(0x05, slow)
+        // Word 2 carries the flags; without FLAG_HASH the filter index is
+        // unknown, so let the runtime hash and cache it.
+        this.cb.u8(0x48)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x42)
+        this.cb.u8(0x10)
+        this.cb.u8(0x48)
+        this.cb.u8(0xA8)
+        this.cb.u8(0x02)
+        this.emitJcc(0x04, slow)
+        // rax = cached FNV hash; r8 = entry table (word 6, byte 48).
+        this.cb.u8(0x48)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x02)
+        this.cb.u8(0x4C)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x41)
+        this.cb.u8(0x30)
+        this.cb.u8(0x4D)
+        this.cb.u8(0x85)
+        this.cb.u8(0xC0)
+        this.emitJcc(0x04, slow)
+        // First filter bit: word (h >> 6) & 3, bit h & 63.
+        this.cb.u8(0x49)
+        this.cb.u8(0x89)
+        this.cb.u8(0xC3)
+        this.cb.u8(0x49)
+        this.cb.u8(0xC1)
+        this.cb.u8(0xEB)
+        this.cb.u8(0x06)
+        this.cb.u8(0x49)
+        this.cb.u8(0x83)
+        this.cb.u8(0xE3)
+        this.cb.u8(0x03)
+        this.cb.u8(0x4F)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x4C)
+        this.cb.u8(0xD8)
+        this.cb.u8(0xE0)
+        this.cb.u8(0x49)
+        this.cb.u8(0x89)
+        this.cb.u8(0xC3)
+        this.cb.u8(0x4D)
+        this.cb.u8(0x0F)
+        this.cb.u8(0xA3)
+        this.cb.u8(0xD9)
+        this.emitJcc(0x03, miss)
+        // Second filter bit: word (h >> 14) & 3, bit (h >> 8) & 63.
+        this.cb.u8(0x49)
+        this.cb.u8(0x89)
+        this.cb.u8(0xC3)
+        this.cb.u8(0x49)
+        this.cb.u8(0xC1)
+        this.cb.u8(0xEB)
+        this.cb.u8(0x0E)
+        this.cb.u8(0x49)
+        this.cb.u8(0x83)
+        this.cb.u8(0xE3)
+        this.cb.u8(0x03)
+        this.cb.u8(0x4F)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x4C)
+        this.cb.u8(0xD8)
+        this.cb.u8(0xE0)
+        this.cb.u8(0x49)
+        this.cb.u8(0x89)
+        this.cb.u8(0xC3)
+        this.cb.u8(0x49)
+        this.cb.u8(0xC1)
+        this.cb.u8(0xEB)
+        this.cb.u8(0x08)
+        this.cb.u8(0x4D)
+        this.cb.u8(0x0F)
+        this.cb.u8(0xA3)
+        this.cb.u8(0xD9)
+        this.emitJcc(0x03, miss)
+        this.emitJmp(slow)
+        this.starts[miss] = this.cb.size()
+        this.cb.u8(0x31)
+        this.cb.u8(0xC0)
+        this.emitJmp(done)
+        this.starts[slow] = this.cb.size()
+        this.cb.movabsReloc(10, "pickle_map_get")
+        this.cb.u8(0x41)
+        this.cb.u8(0xFF)
+        this.cb.u8(0xD2)
+        this.starts[done] = this.cb.size()
+        this.clobberRcx()
+        this.putRes(d, 64, this.kOfTemp(d))
+    }
+
     fn emitCall(sum: string, ptys: List<IrTy>, ret: IrTy, d: int?, args: List<int>) {
+        // Backend-only inlining of the hottest leaf helpers. Each is a single
+        // bounds-tested load, so the call frame cost more than the body. The
+        // emitted IR is unchanged; only the x64 spelling differs.
+        if (sum == "pickle_box_i64" && len(args) == 1) {
+            match (d) {
+                case some(dd) -> {
+                    this.emitInlineBoxI64(dd, args[0])
+                    return
+                }
+                case none -> {}
+            }
+        }
+        if (sum == "pickle_str_append_two" && len(args) == 3) {
+            match (d) {
+                case some(dd) -> {
+                    this.emitInlineAppendTwo(dd, args[0], args[1], args[2])
+                    return
+                }
+                case none -> {}
+            }
+        }
+        if (sum == "pkl_shortInternWord" && len(args) == 2) {
+            match (d) {
+                case some(dd) -> {
+                    this.emitInlineShortInternWord(dd, args[0], args[1])
+                    return
+                }
+                case none -> {}
+            }
+        }
+        if (sum == "pkl_wsMaskWord" && len(args) == 1) {
+            match (d) {
+                case some(dd) -> {
+                    this.emitInlineWsMaskWord(dd, args[0])
+                    return
+                }
+                case none -> {}
+            }
+        }
+        if (sum == "pickle_map_get" && len(args) == 2) {
+            match (d) {
+                case some(dd) -> {
+                    this.emitInlineMapGet(dd, args[0], args[1])
+                    return
+                }
+                case none -> {}
+            }
+        }
+        if (sum == "pickle_str_from_i64" && len(args) == 1) {
+            match (d) {
+                case some(dd) -> {
+                    this.emitInlineStrFromI64(dd, args[0])
+                    return
+                }
+                case none -> {}
+            }
+        }
+        if (sum == "pickle_list_get" && len(args) == 2) {
+            match (d) {
+                case some(dd) -> {
+                    this.emitInlineListGet(dd, args[0], args[1])
+                    return
+                }
+                case none -> {}
+            }
+        }
+        if ((sum == "pickle_list_len" || sum == "pickle_str_len" || sum == "pickle_map_len") && len(args) == 1) {
+            match (d) {
+                case some(dd) -> {
+                    this.emitInlineObjLen(dd, args[0])
+                    return
+                }
+                case none -> {}
+            }
+        }
+        if ((sum == "pickle_unbox_i64" || sum == "pickle_unbox_char") && len(args) == 1) {
+            match (d) {
+                case some(dd) -> {
+                    this.emitInlineUnbox(dd, args[0])
+                    return
+                }
+                case none -> {}
+            }
+        }
+        if (sum == "pickle_unbox_f64" && len(args) == 1) {
+            match (d) {
+                case some(dd) -> {
+                    this.emitInlineUnboxF64(dd, args[0])
+                    return
+                }
+                case none -> {}
+            }
+        }
         let n = len(args)
         var i = 0
         while (i < n && i < 4) {
             let t = ptys[i]
             if (isFloatTy(t)) {
-                this.cb.ldsd(i, this.kOfTemp(args[i]))
+                this.loadTmpFloat(i, args[i])
             } else {
-                this.cb.ld(intArgReg(i), tyWidth(t), this.kOfTemp(args[i]))
+                this.loadTmp(intArgReg(i), tyWidth(t), args[i])
             }
             i = i + 1
         }
@@ -1496,15 +4731,18 @@ class X64Emitter {
                 let t = ptys[i]
                 let disp = CALL_SHADOW_BYTES + 8 * j
                 if (isFloatTy(t)) {
-                    this.cb.ldsd(4, this.kOfTemp(args[i]))
+                    this.loadTmpFloat(4, args[i])
                     this.cb.stsdRsp(4, disp)
                 } else {
-                    this.cb.ld(0, tyWidth(t), this.kOfTemp(args[i]))
+                    this.loadTmp(0, tyWidth(t), args[i])
                     this.cb.stRsp(0, tyWidth(t), disp)
                 }
                 i = i + 1
             }
         }
+        // The call may clobber every volatile XMM register, so the copy cache
+        // cannot survive it. The homes are current either way.
+        this.dropFx()
         this.cb.movabsReloc(10, sum)
         if (isImpSlotCall(sum)) {
             // The reloc above resolved to the IAT slot, which stores the entry
@@ -1521,12 +4759,14 @@ class X64Emitter {
         if (ns > 0) {
             this.cb.addRsp(R)
         }
+        this.clobberRcx()
         match (d) {
             case some(dd) -> {
                 if (isFloatTy(ret)) {
                     this.cb.stsd(0, this.kOfTemp(dd))
+                    this.setFx(0, dd)
                 } else {
-                    this.cb.st(0, tyWidth(ret), this.kOfTemp(dd))
+                    this.putRes(dd, tyWidth(ret), this.kOfTemp(dd))
                 }
             }
             case none -> {}
@@ -1537,34 +4777,61 @@ class X64Emitter {
         if (this.failed) {
             return
         }
+        // A deferred result is only in rax. When this instruction cannot take it
+        // from there as its first move, materialise the home now - before the
+        // instruction has a chance to clobber rax.
+        if (!this.pendingConsumedBy(ins)) {
+            this.flushPend()
+        }
+        if (!this.floatConsumedBy(ins)) {
+            this.dropFx()
+        }
         match (ins) {
             case IrInstr.Const(d, cst) -> this.emitConst(d, cst)
             case IrInstr.UnOp(d, op, v) -> this.emitUnOp(d, op, v)
             case IrInstr.BinOp(d, op, a, b) -> this.emitBinOp(d, op, a, b)
             case IrInstr.Copy(d, v) -> {
                 let w = tyWidth(this.typeOfT(v))
-                this.cb.ld(0, w, this.kOfTemp(v))
-                this.cb.st(0, w, this.kOfTemp(d))
+                this.loadTmp(0, w, v)
+                this.putRes(d, w, this.kOfTemp(d))
             }
             case IrInstr.Itof(d, v) -> {
-                this.cb.ld(0, 64, this.kOfTemp(v))
-                this.cb.u8(0xF2)
-                this.cb.u8(0x48)
-                this.cb.u8(0x0F)
-                this.cb.u8(0x2A)
-                this.cb.u8(0xC0)
-                this.cb.stsd(0, this.kOfTemp(d))
+                // Convert into whichever scratch register is free. In the
+                // `term * x / (i as float)` chain xmm0 still holds the pending
+                // numerator, so the divisor lands in xmm1 and `divsd` reads
+                // both operands without a store/reload.
+                let kd = this.kOfTemp(d)
+                this.loadTmp(0, 64, v)
+                if (this.fx0 >= 0) {
+                    this.dropFxReg(1)
+                    this.cb.u8(0xF2)
+                    this.cb.u8(0x48)
+                    this.cb.u8(0x0F)
+                    this.cb.u8(0x2A)
+                    this.cb.u8(0xC8)
+                    this.cb.stsd(1, kd)
+                    this.setFx(1, d)
+                } else {
+                    this.dropFxReg(0)
+                    this.cb.u8(0xF2)
+                    this.cb.u8(0x48)
+                    this.cb.u8(0x0F)
+                    this.cb.u8(0x2A)
+                    this.cb.u8(0xC0)
+                    this.cb.stsd(0, kd)
+                    this.setFx(0, d)
+                }
             }
             case IrInstr.Ftoi(d, v) -> this.emitFtoi(d, v)
             case IrInstr.Chartoi(d, v) -> {
-                this.cb.ld(0, 32, this.kOfTemp(v))
-                this.cb.st(0, 64, this.kOfTemp(d))
+                this.loadTmp(0, 32, v)
+                this.putRes(d, 64, this.kOfTemp(d))
             }
             case IrInstr.Itochar(d, v) -> {
-                this.cb.ld(0, 64, this.kOfTemp(v))
+                this.loadTmp(0, 64, v)
                 this.cb.u8(0x89)
                 this.cb.u8(0xC0)
-                this.cb.st(0, 32, this.kOfTemp(d))
+                this.putRes(d, 32, this.kOfTemp(d))
             }
             case IrInstr.LoadSlot(d, s) -> this.emitMem(IrInstr.LoadSlot(d, s))
             case IrInstr.StoreSlot(s, v) -> this.emitMem(IrInstr.StoreSlot(s, v))
@@ -1573,7 +4840,7 @@ class X64Emitter {
             case IrInstr.StoreRaw(addr, v, ty) -> this.emitMem(IrInstr.StoreRaw(addr, v, ty))
             case IrInstr.GlobalAddr(d, id) -> {
                 this.cb.movabsReloc(0, this.globalSym(id))
-                this.cb.st(0, 64, this.kOfTemp(d))
+                this.putRes(d, 64, this.kOfTemp(d))
             }
             case IrInstr.LoadGlobal(d, id, ty) -> {
                 if (!this.globalTyOk(ty)) {
@@ -1582,14 +4849,14 @@ class X64Emitter {
                 }
                 this.cb.movabsReloc(0, this.globalSym(id))
                 this.cb.ldMemR0(0, tyWidth(ty))
-                this.cb.st(0, tyWidth(ty), this.kOfTemp(d))
+                this.putRes(d, tyWidth(ty), this.kOfTemp(d))
             }
             case IrInstr.StoreGlobal(id, v, ty) -> {
                 if (!this.globalTyOk(ty)) {
                     this.fail("storeglobal of `" + irTyStr(ty) + "` is not lowered yet")
                     return
                 }
-                this.cb.ld(1, tyWidth(ty), this.kOfTemp(v))
+                this.loadTmp(1, tyWidth(ty), v)
                 this.cb.movabsReloc(0, this.globalSym(id))
                 this.cb.stMemR0(1, tyWidth(ty))
             }
@@ -1610,7 +4877,43 @@ class X64Emitter {
                         let e = this.m.externs[id]
                         sym = e.symbol
                         ptys = e.params
-                        this.emitCall(sym, ptys, e.ret, d, args)
+                        var skip = false
+                        // Backend-only swap: the IR and its declaration stay
+                        // `pickle_str_concat`; only the emitted symbol changes.
+                        // A proven two-link chain emits one fused call at the
+                        // second link and skips the first, because no code can
+                        // observe the intermediate buffer (see
+                        // `analyzeAppendOwned`).
+                        if (sym == "pickle_str_concat" && len(args) == 2) {
+                            match (d) {
+                                case some(dd) -> {
+                                    if (this.appendFuse.has(dd)) {
+                                        skip = true
+                                    } else if (this.appendFuse.has(args[0])) {
+                                        let parts = this.appendFuse[args[0]]
+                                        let fargs: List<int> = [parts[0], parts[1], args[1]]
+                                        let ftys: List<IrTy> = [ptys[0], ptys[1], ptys[1]]
+                                        this.emitCall("pickle_str_append_two", ftys, e.ret, d, fargs)
+                                        skip = true
+                                    } else if (this.appendOwned.has(dd) && this.appendOwned[dd]) {
+                                        sym = "pickle_str_append_owned"
+                                    }
+                                }
+                                case none -> {}
+                            }
+                        } else {
+                            match (d) {
+                                case some(dd) -> {
+                                    if (this.appendOwned.has(dd) && this.appendOwned[dd]) {
+                                        sym = "pickle_str_append_owned"
+                                    }
+                                }
+                                case none -> {}
+                            }
+                        }
+                        if (!skip) {
+                            this.emitCall(sym, ptys, e.ret, d, args)
+                        }
                     }
                 }
             }
@@ -1621,9 +4924,9 @@ class X64Emitter {
                 while (i < n && i < 4) {
                     let t = ptys[i]
                     if (isFloatTy(t)) {
-                        this.cb.ldsd(i, this.kOfTemp(args[i]))
+                        this.loadTmpFloat(i, args[i])
                     } else {
-                        this.cb.ld(intArgReg(i), tyWidth(t), this.kOfTemp(args[i]))
+                        this.loadTmp(intArgReg(i), tyWidth(t), args[i])
                     }
                     i = i + 1
                 }
@@ -1641,34 +4944,38 @@ class X64Emitter {
                         let t = ptys[i]
                         let disp = CALL_SHADOW_BYTES + 8 * j
                         if (isFloatTy(t)) {
-                            this.cb.ldsd(4, this.kOfTemp(args[i]))
+                            this.loadTmpFloat(4, args[i])
                             this.cb.stsdRsp(4, disp)
                         } else {
-                            this.cb.ld(0, tyWidth(t), this.kOfTemp(args[i]))
+                            this.loadTmp(0, tyWidth(t), args[i])
                             this.cb.stRsp(0, tyWidth(t), disp)
                         }
                         i = i + 1
                     }
                 }
-                this.cb.ld(10, 64, this.kOfTemp(fnAddr))
+                this.loadTmp(10, 64, fnAddr)
+                this.dropFx()
                 this.cb.u8(0x41)
                 this.cb.u8(0xFF)
                 this.cb.u8(0xD2)
                 if (ns > 0) {
                     this.cb.addRsp(R)
                 }
+                this.clobberRcx()
                 match (d) {
                     case some(dd) -> {
                         if (isFloatTy(ret)) {
                             this.cb.stsd(0, this.kOfTemp(dd))
+                            this.setFx(0, dd)
                         } else {
-                            this.cb.st(0, tyWidth(ret), this.kOfTemp(dd))
+                            this.putRes(dd, tyWidth(ret), this.kOfTemp(dd))
                         }
                     }
                     case none -> {}
                 }
             }
         }
+        this.noteRax(ins)
     }
 
     fn emitJmp(target: int) {
@@ -1687,16 +4994,60 @@ class X64Emitter {
     }
 
     fn lowerTerm(t: IrTerm) {
+        if (!this.termConsumes(t)) {
+            this.flushPend()
+        }
         match (t) {
             case IrTerm.Branch(target) -> this.emitJmp(target)
             case IrTerm.BranchIf(c, tn, el) -> {
-                this.cb.ld(0, 8, this.kOfTemp(c))
-                this.cb.u8(0x84)
-                this.cb.u8(0xC0)
-                this.emitJcc(0x05, tn)
-                this.emitJmp(el)
+                if (this.fuseCc >= 0) {
+                    // Fused `cmp` + `jcc`: the comparison's 0/1 result was only
+                    // ever consumed by this branch, so materialising it in a
+                    // byte register and testing it again is pure overhead.
+                    this.loadTmp(0, this.fuseW, this.fuseA)
+                    if (this.fuseImm) {
+                        if (this.fuseW == 64) {
+                            this.cb.u8(0x48)
+                        }
+                        this.cb.u8(0x3D)
+                        this.cb.u32le(this.fuseImmV & 0xFFFFFFFF)
+                    } else {
+                        this.loadTmp(1, this.fuseW, this.fuseB)
+                        if (this.fuseW == 8) {
+                            this.cb.u8(0x38)
+                            this.cb.u8(0xC8)
+                        } else if (this.fuseW == 32) {
+                            this.cb.u8(0x39)
+                            this.cb.u8(0xC8)
+                        } else {
+                            this.cb.u8(0x48)
+                            this.cb.u8(0x39)
+                            this.cb.u8(0xC8)
+                        }
+                    }
+                    this.emitJcc(this.fuseCc, tn)
+                    this.emitJmp(el)
+                } else {
+                    this.loadTmp(0, 8, c)
+                    this.cb.u8(0x84)
+                    this.cb.u8(0xC0)
+                    this.emitJcc(0x05, tn)
+                    this.emitJmp(el)
+                }
             }
             case IrTerm.Return(v) -> {
+                // `emitEscapedCheck`/`popShadow` are calls: whatever the last
+                // instruction left in rax/rcx is gone, so drop the forwarding
+                // caches before the return value is loaded. A call clobbers
+                // both, and a stale rcx hit here would load a garbage return.
+                this.raxT = 0 - 1
+                this.raxW = 0
+                this.clobberRcx()
+                if (this.fun.symbol == ENTRY_SYMBOL || this.plan.shadowed) {
+                    // These two helpers can emit a runtime call, which
+                    // destroys xmm0/xmm1 along with the GPR caches above.
+                    this.dropFx()
+                }
                 this.emitEscapedCheck()
                 if (this.plan.shadowed) {
                     this.popShadow()
@@ -1705,13 +5056,18 @@ class X64Emitter {
                     case some(ti) -> {
                         if (!(this.fun.ret == IrTy.Unit)) {
                             if (isFloatTy(this.fun.ret)) {
-                                this.cb.ldsd(0, this.kOfTemp(ti))
+                                this.loadTmpFloat(0, ti)
                             } else {
-                                this.cb.ld(0, tyWidth(this.fun.ret), this.kOfTemp(ti))
+                                this.loadTmp(0, tyWidth(this.fun.ret), ti)
                             }
                         }
                     }
                     case none -> {}
+                }
+                var p = 0
+                while (p < len(this.plan.pinRegs)) {
+                    this.cb.ld(this.plan.pinRegs[p], 64, this.plan.pinK[p])
+                    p = p + 1
                 }
                 this.cb.u8(0x48)
                 this.cb.u8(0x89)
@@ -1745,12 +5101,33 @@ class X64Emitter {
         this.prologue()
         this.seedParams()
         this.pushShadow()
-        for (b in this.fun.blocks) {
-            this.starts[b.id] = this.cb.size()
-            for (ins in b.instrs) {
-                this.lowerInstr(ins)
+        for (blk in this.fun.blocks) {
+            this.starts[blk.id] = this.cb.size()
+            // Control flow joins here from arbitrary predecessors, so nothing
+            // is known about rax.
+            this.raxT = 0 - 1
+            this.raxW = 0
+            this.rcxT = 0 - 1
+            this.rcxW = 0
+            this.pendT = 0 - 1
+            this.fuseCc = 0 - 1
+            let n = len(blk.instrs)
+            if (n > 0 && this.planFuse(blk.instrs[n - 1], blk.term)) {
+                // The trailing comparison feeds only this `BranchIf`; its
+                // `cmp` is emitted by `lowerTerm` right before the branch.
+                var fi = 0
+                while (fi < n - 1) {
+                    this.lowerInstr(blk.instrs[fi])
+                    fi = fi + 1
+                }
+            } else {
+                for (ins in blk.instrs) {
+                    this.lowerInstr(ins)
+                }
             }
-            this.lowerTerm(b.term)
+            this.flushLiveOutAliases(blk.id)
+            this.lowerTerm(blk.term)
+            this.clearAliases()
         }
         if (this.failed) {
             return none
@@ -1761,14 +5138,56 @@ class X64Emitter {
         }
         X64Func(this.fun.symbol, this.cb.bytes, this.cb.relocs, this.plan.ncells, this.plan.totalK)
     }
+
+    /// Decide whether `last` is a comparison used only by the `BranchIf` term.
+    /// The operands are normalised here exactly like `emitBinOp` does, so the
+    /// fused emission can share its immediate/register logic.
+    fn planFuse(last: IrInstr, term: IrTerm) -> bool {
+        match (term) {
+            case IrTerm.BranchIf(c, tn, el) -> {
+                match (last) {
+                    case IrInstr.BinOp(d, op, a, b) -> {
+                        if (d != c || !isCmp(op) || isFloatTy(this.typeOfT(a))
+                            || tempUseCount(this.plan.tempUses, c) != 1) {
+                            return false
+                        }
+                        let w = tyWidth(this.typeOfT(a))
+                        var aa = a
+                        var bb = b
+                        if (!this.plan.constVals.has(bb) && this.plan.constVals.has(aa)
+                            && binOpCommutes(op)) {
+                            aa = b
+                            bb = a
+                        }
+                        this.fuseCc = this.intCmpCc(op)
+                        this.fuseA = aa
+                        this.fuseB = bb
+                        this.fuseW = w
+                        this.fuseImm = this.constFits32(bb) && (w == 32 || w == 64)
+                        this.fuseImmV = 0
+                        if (this.fuseImm) {
+                            this.fuseImmV = this.plan.constVals[bb]
+                        }
+                        true
+                    }
+                    case _ -> false
+                }
+            }
+            case _ -> false
+        }
+    }
 }
 
 fn x64LowerModule(m: IrModule, diags: DiagnosticSink) -> X64Out? {
+    // Constant folding, load CSE, copy propagation and DCE first: the emitter
+    // lowers every instruction literally, so removing the redundant ones here
+    // is what keeps the generated code compact.
+    let om = optimizeModule(m)
     var funcs = List<X64Func>()
-    let mayGC = computeMayGC(m)
+    let mayGC = computeMayGC(om)
     var i = 0
-    while (i < len(m.funcs)) {
-        let e = X64Emitter(m, m.funcs[i], diags, mayGC)
+    while (i < len(om.funcs)) {
+        let e = X64Emitter(om, om.funcs[i], diags, mayGC)
         let f = e.emitFunc()
         var failed = false
         match (f) {

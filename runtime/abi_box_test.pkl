@@ -1,8 +1,12 @@
 module runtime.abi_box_test
 
-import { abiBoxI64, abiUnboxI64, abiBoxBool, abiUnboxBool, abiBoxChar, abiUnboxChar, abiBoxF64, abiUnboxF64, newBox, boxBits } from runtime.abi_box
+import { abiBoxI64, abiUnboxI64, abiBoxBool, abiUnboxBool, abiBoxChar, abiUnboxChar, abiBoxF64, abiUnboxF64, newBox, boxBits, f64Bits } from runtime.abi_box
 import { PICKLE_CLASS_BOX_INT, PICKLE_CLASS_BOX_FLOAT, PICKLE_CLASS_BOX_BOOL, PICKLE_CLASS_BOX_CHAR } from runtime.object
 import { abiRegisteredCount, abiRegisteredBytes } from runtime.abi_raw
+import { abiGcCollect } from runtime.abi_gc
+
+/// Held briefly so a cached box can be made unreachable before a collection.
+var boxProbe: int = 0
 
 /// A float box, built by hand. `pickle_box_f64` IS ported now, so the tests
 /// below use `abiBoxF64` where they are checking the box half and this helper
@@ -83,6 +87,43 @@ test fn unbox_f64_preserves_the_smallest_subnormal() {
 test fn unbox_f64_propagates_nan_rather_than_panicking() {
     var f = abiUnboxF64(floatBox(9221120237041090560))
     expect(f == f).toBe(false)
+}
+
+/// The backend lowers `pickle_unbox_f64` to a raw payload load
+/// (`compiler/x64.pkl::emitInlineUnboxF64`). This differential runs the
+/// language-level path - a `List<float>` store then read-back - against the
+/// runtime reference `abiUnboxF64` over the shapes where a reinterpretation
+/// could diverge: signed zero, subnormals, the normal-range boundaries, both
+/// infinities and NaN. `f64Bits` compares the words, so `-0.0` cannot pass by
+/// value-level equality and a NaN is compared in the one form the language can
+/// observe.
+test fn list_float_unbox_matches_the_runtime_reference() {
+    let vals = List<float>()
+    vals.push(0.0)
+    vals.push(0.0 * (0.0 - 1.0))
+    vals.push(1.0)
+    vals.push(0.0 - 1.0)
+    vals.push(1.5)
+    vals.push(0.0 - 2.5)
+    vals.push(5e-324)
+    vals.push(2.2250738585072014e-308)
+    vals.push(1.7976931348623157e308)
+    vals.push(0.0 - 1.7976931348623157e308)
+    vals.push(1.0 / 0.0)
+    vals.push(0.0 - (1.0 / 0.0))
+    vals.push((1.0 / 0.0) - (1.0 / 0.0))
+    vals.push(0.1)
+    vals.push(0.0 - 0.1)
+    var i = 0
+    while (i < len(vals)) {
+        let got = vals[i] as float
+        let want = abiUnboxF64(abiBoxF64(vals[i]))
+        expect(f64Bits(got)).toBe(f64Bits(want))
+        i = i + 1
+    }
+    let tiny = vals[6]
+    expect(tiny > 0.0).toBe(true)
+    expect(f64Bits(tiny * 2.0)).toBe(2)
 }
 
 test fn f64_from_bits_reconstructs_the_four_shape_boundaries() {
@@ -208,7 +249,9 @@ test fn boxes_register_in_the_sweepability_registry() {
     // exact. Boxes are 32 bytes regardless of payload (BOX_WORDS * 8).
     var beforeC = abiRegisteredCount()
     var beforeB = abiRegisteredBytes()
-    var b = abiBoxI64(123)
+    // Outside the maker's shared small-int range, so this call is guaranteed to
+    // allocate and register a fresh box rather than hitting the cache.
+    var b = abiBoxI64(5000)
     expect((b as int) != 0).toBe(true)
     expect(abiRegisteredCount()).toBe(beforeC + 1)
     expect(abiRegisteredBytes()).toBe(beforeB + 32)
@@ -216,4 +259,33 @@ test fn boxes_register_in_the_sweepability_registry() {
     expect((f as int) != 0).toBe(true)
     expect(abiRegisteredCount()).toBe(beforeC + 2)
     expect(abiRegisteredBytes()).toBe(beforeB + 64)
+}
+
+test fn small_int_boxes_are_shared_and_value_exact() {
+    // The maker canonicalises `0 .. 4095`; the payload is immutable, so sharing
+    // is unobservable through the value API and saves one allocation per
+    // increment in map-heavy code.
+    let a = abiBoxI64(300)
+    let b = abiBoxI64(300)
+    expect((a as int) == (b as int)).toBe(true)
+    expect(abiUnboxI64(a)).toBe(300)
+    expect(abiUnboxI64(b)).toBe(300)
+    // Outside the cached range every call still allocates a fresh box.
+    let c = abiBoxI64(5000)
+    let d = abiBoxI64(5000)
+    expect((c as int) == (d as int)).toBe(false)
+    expect(abiUnboxI64(c)).toBe(5000)
+    expect(abiUnboxI64(d)).toBe(5000)
+}
+
+test fn cached_small_int_box_stays_readable_after_a_collection() {
+    // The cache is not a root. Make the cached 777 box unreachable, force a
+    // collection (a sweep may drop it from the registry), then hit the cache
+    // again. Managed blocks live in the never-reused bump arena, so the header
+    // and payload must still read back exactly.
+    boxProbe = abiBoxI64(777) as int
+    boxProbe = 0
+    abiGcCollect(true)
+    let again = abiBoxI64(777)
+    expect(abiUnboxI64(again)).toBe(777)
 }
