@@ -121,6 +121,45 @@ fn floatCmpBytes(op: IrBinOp) -> List<int> {
     lowerF(f).bytes
 }
 
+/// Calls between functions emitted in one module are known to land in the
+/// final image's `.text`, so they use `E8 disp32` and REL32 rather than an
+/// absolute address load followed by an indirect call. Extern calls retain the
+/// latter form because imports and archive-selected runtime symbols are not
+/// eligible for this relocation.
+test fn internal_calls_use_rel32() {
+    let callee = mkFunc("callee", "pkl_callee", IrTy.Int, List<IrTy>(), oneBlockTerm(
+        IrTerm.Return(0), [IrInstr.Const(0, IrConst.Int(7))]))
+    let caller = mkFunc("caller", "pkl_caller", IrTy.Int, List<IrTy>(), oneBlockTerm(
+        IrTerm.Return(0), [IrInstr.Call(0, Callee.Func(0), List<int>())]))
+    let fs = [callee, caller]
+    let m = IrModule(fs, List<IrExtern>(), {"::seed::": 0}, List<List<int>>(), List<IrGlobal>())
+    let d = DiagnosticSink()
+    match (x64LowerModule(m, d)) {
+        case some(out) -> {
+            let xf = out.funcs[1]
+            expect(containsSeq(xf.bytes, [0xE8, 0, 0, 0, 0])).toBe(true)
+            expect(len(xf.relocs)).toBe(1)
+            expect(xf.relocs[0].sym).toBe("pkl_callee")
+            expect(xf.relocs[0].type).toBe(4)
+        }
+        case none -> expect(false).toBe(true)
+    }
+}
+
+/// Runtime ABI externs are archive-selected but become normal code in the
+/// final merged image, so their direct calls are also REL32. Non-runtime
+/// externs keep the import/indirect path.
+test fn runtime_extern_calls_use_rel32() {
+    let e = IrExtern("pickle_runtime_leaf", List<IrTy>(), IrTy.Int)
+    let f = mkFunc("caller", "pkl_caller", IrTy.Int, List<IrTy>(), oneBlockTerm(
+        IrTerm.Return(0), [IrInstr.Call(0, Callee.Extern(0), List<int>())]))
+    let xf = lowerFExt(f, e)
+    expect(containsSeq(xf.bytes, [0xE8, 0, 0, 0, 0])).toBe(true)
+    expect(len(xf.relocs)).toBe(1)
+    expect(xf.relocs[0].sym).toBe("pickle_runtime_leaf")
+    expect(xf.relocs[0].type).toBe(4)
+}
+
 // Regression: float Eq/Ne/Lt/Le emitted `setcc` twice with ModRM 0xC0, which
 // is always AL, so the second clobbered the first and the trailing `20 C8` /
 // `08 C8` combined against an undefined CL. `0x20 0xC8` reads like
@@ -431,10 +470,11 @@ test fn extern_float_mod_call() {
          IrInstr.Const(1, IrConst.Float(2.0)),
          IrInstr.Call(2, Callee.Extern(0), [0, 1])]))
     let xf = lowerFExt(f, e)
-    assertBytes(xf, "554889e54881ec5000000048b8000000000000144066480f6ec0f20f1145e848b8000000000000004066480f6ec0f20f1145e0f20f1045e8f20f104de049ba000000000000000041ffd2f20f1145d84889ec5dc3")
+    assertBytes(xf, "554889e54881ec5000000048b8000000000000144066480f6ec0f20f1145e848b8000000000000004066480f6ec0f20f1145e0f20f1045e8f20f104de0e800000000f20f1145d84889ec5dc3")
     expect(len(xf.relocs)).toBe(1)
-    expect(xf.relocs[0].off).toBe(63)
+    expect(xf.relocs[0].off).toBe(62)
     expect(xf.relocs[0].sym).toBe("pickle_fmod")
+    expect(xf.relocs[0].type).toBe(4)
 }
 
 /// Win64 reserves 32 bytes of shadow space below the return address of every
@@ -656,6 +696,27 @@ test fn inline_list_get_lowering() {
     expect(len(xf.relocs)).toBe(0)
 }
 
+test fn inline_list_set_lowering() {
+    let e = IrExtern("pickle_list_set", [IrTy.Ptr, IrTy.Int, IrTy.Ptr], IrTy.Unit)
+    let f = mkFuncParams("f", "pkl_f", [IrParam("xs", IrTy.Ptr), IrParam("v", IrTy.Ptr)], IrTy.Unit, [IrTy.Ptr, IrTy.Ptr], oneBlockTerm(
+        IrTerm.Return(none),
+        [IrInstr.LoadSlot(0, 0),
+         IrInstr.Const(1, IrConst.Int(0)),
+         IrInstr.LoadSlot(2, 1),
+         IrInstr.Call(none, Callee.Extern(0), [0, 1, 2])]))
+    let xf = lowerFExt(f, e)
+    // cmp rdx, rax; jge done; mov rax, [rcx+40]; mov [rax+rdx*8], r8.
+    expect(containsSeq(xf.bytes, [0x48, 0x39, 0xC2, 0x7D, 0x08, 0x48, 0x8B, 0x41, 0x28, 0x4C, 0x89, 0x04, 0xD0])).toBe(true)
+    var calls = 0
+    for (r in xf.relocs) {
+        if (r.sym == "pickle_list_set") { calls = calls + 1 }
+    }
+    // The function still has its conservative shadow-frame pair because call
+    // classification happens before backend inlining. No relocation may target
+    // the runtime list setter.
+    expect(calls).toBe(0)
+}
+
 test fn inline_list_len_lowering() {
     let e = IrExtern("pickle_list_len", [IrTy.Ptr], IrTy.Int)
     let f = mkFuncParams("f", "pkl_f", [IrParam("xs", IrTy.Ptr)], IrTy.Int, [IrTy.Ptr], oneBlockTerm(
@@ -718,16 +779,19 @@ test fn inline_box_i64_lowering() {
         IrTerm.Return(1),
         [IrInstr.LoadSlot(0, 0), IrInstr.Call(1, Callee.Extern(0), [0])]))
     let xf = lowerFExt(f, e)
-    assertBytes(xf, "554889e54881ec500000000f57e448b80000000000000000488945f848b8010000003000005a488945f048894de0488d4de849ba000000000000000041ffd2488b45e04889c148b80000000000000000488b004885c00f841f0000004881f9001000000f8312000000488b04c84885c00f8405000000e90d00000049ba000000000000000041ffd2488945f8488d4de849ba000000000000000041ffd2488b45f84889ec5dc3")
-    expect(len(xf.relocs)).toBe(4)
-    expect(xf.relocs[0].off).toBe(52)
-    expect(xf.relocs[0].sym).toBe("pickle_shadow_push")
-    expect(xf.relocs[1].off).toBe(72)
-    expect(xf.relocs[1].sym).toBe("pkl_global_smallBoxTab")
-    expect(xf.relocs[2].off).toBe(125)
-    expect(xf.relocs[2].sym).toBe("pickle_box_i64")
-    expect(xf.relocs[3].off).toBe(146)
-    expect(xf.relocs[3].sym).toBe("pickle_shadow_pop")
+    assertBytes(xf, "554889e54881ec500000000f57e448b80000000000000000488945f848b8010000003000005a488945f048894de0488d4de849ba000000000000000041ffd2488b45e04889c148894dd848b80000000000000000488b004885c00f84f10200004881f9001000000f8383010000488b04c84885c00f85e4020000b9200000004889c8ba080000004883f808480f4cc24883c0074883e0f8483d000004000f8f4c00000049ba0000000000000000498b1249bb00000000000000004d8b034c8d0c024d39c10f8f2500000049bb00000000000000004d8b1b4901d349ba00000000000000004d890a4c89d8e90d00000049ba000000000000000041ffd248c7000000000048c740080300000048c7401020000000488b55d848895018488945f84889c14885c90f84a700000048b80000000000000000488338000f848600000048b80000000000000000488338000f8472000000488b511048b800000000000000004c8b0048b800000000000000004c3b000f834e00000048b80000000000000000488b004a890cc048b800000000000000004d8d50014c891048b8000000000000000048011048b8000000000000000048ff0048b80000000000000000480110e90d00000049ba000000000000000041ffd2488b45f849b800000000000000004d8b00488b55d8498904d0e96e010000b9200000004889c8ba080000004883f808480f4cc24883c0074883e0f8483d000004000f8f4c00000049ba0000000000000000498b1249bb00000000000000004d8b034c8d0c024d39c10f8f2500000049bb00000000000000004d8b1b4901d349ba00000000000000004d890a4c89d8e90d00000049ba000000000000000041ffd248c7000000000048c740080300000048c7401020000000488b55d848895018488945f84889c14885c90f84a700000048b80000000000000000488338000f848600000048b80000000000000000488338000f8472000000488b511048b800000000000000004c8b0048b800000000000000004c3b000f834e00000048b80000000000000000488b004a890cc048b800000000000000004d8d50014c891048b8000000000000000048011048b8000000000000000048ff0048b80000000000000000480110e90d00000049ba000000000000000041ffd2488b45f8e90d00000049ba000000000000000041ffd2488945f8488d4de849ba000000000000000041ffd2488b45f84889ec5dc3")
+    // The inline is the 0..4095 cache probe, the allocating small-value miss
+    // (alloc + stamp + register + table insert), the out-of-cache allocating
+    // tail (same, without the insert) and the cold-table fallback. Both
+    // allocating tails are only reachable after the table sentinel proves the
+    // cache exists, and both rejoin the fallback's `done` label.
+    let want: List<string> = ["pickle_shadow_push", "pkl_global_smallBoxTab", "pkl_global_managedArenaUsed", "pkl_global_managedArenaCap", "pkl_global_managedArenaBase", "pkl_global_managedArenaUsed", "pkl_abiManagedAlloc", "pkl_global_envInited", "pkl_global_noAutoGc", "pkl_global_regCount", "pkl_global_regCap", "pkl_global_regBase", "pkl_global_regCount", "pkl_global_regBytes", "pkl_global_rawAllocCount", "pkl_global_rawAllocBytes", "pkl_abiEngineRegister", "pkl_global_smallBoxTab", "pkl_global_managedArenaUsed", "pkl_global_managedArenaCap", "pkl_global_managedArenaBase", "pkl_global_managedArenaUsed", "pkl_abiManagedAlloc", "pkl_global_envInited", "pkl_global_noAutoGc", "pkl_global_regCount", "pkl_global_regCap", "pkl_global_regBase", "pkl_global_regCount", "pkl_global_regBytes", "pkl_global_rawAllocCount", "pkl_global_rawAllocBytes", "pkl_abiEngineRegister", "pickle_box_i64", "pickle_shadow_pop"]
+    expect(len(xf.relocs)).toBe(len(want))
+    var i = 0
+    while (i < len(want)) {
+        expect(xf.relocs[i].sym).toBe(want[i])
+        i = i + 1
+    }
 }
 
 test fn inline_map_len_lowering() {

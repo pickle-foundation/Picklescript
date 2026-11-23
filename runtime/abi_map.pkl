@@ -1099,14 +1099,13 @@ fn mapRemove(map: *int, key: *int) -> *int {
 fn mapSnapshot(map: *int, wantKeys: bool) -> *int {
     unsafe {
         var cap = map[CAP_WORD]
+        let count = map[LEN_WORD]
         var entries = map[ENTRIES_WORD] as *int
-        // A snapshot holds at most `cap` live entries, so allocate that
-        // capacity up front and fill the data span directly. `abiListPush`
-        // grew geometrically and copied the buffer three times for the
-        // benchmark's 48-key document maps (8 -> 16 -> 32 -> 64). No
-        // allocation happens between `abiListNew` and the length store below,
-        // so no collection can run and `data` cannot move.
-        var l = abiListNew(cap)
+        // A snapshot has exactly one element per live entry. Preallocate the
+        // known final length so sparse maps do not retain capacity-sized list
+        // storage. No allocation happens between `abiListNew` and the length
+        // store below, so `data` cannot move.
+        var l = abiListNew(count)
         var data = l[LIST_DATA_WORD] as *int
         var n = 0
         var i = 0
@@ -1570,10 +1569,23 @@ fn abiMapGetBoxed(map: *int, key: *int, default: *int) -> *int {
             }
         }
         if (!bloom) { return default }
+        var firstTomb = -1
         while (probes < cap) {
             var slot = idx * 2
             var sk = entries[slot]
-            if (sk == KEY_EMPTY) { return default }
+            if (sk == KEY_EMPTY) {
+                // Compound map assignments lower to get_boxed followed by set
+                // with this same key object. Preserve the probe result so that
+                // set can update/insert without re-hashing or re-probing.
+                var tgt = slot
+                if (firstTomb >= 0) { tgt = firstTomb }
+                llVer = mapVer
+                llMap = map as int
+                llKey = k
+                llSlot = tgt
+                llHash = h
+                return default
+            }
             if (sk != KEY_TOMBSTONE) {
                 var same = false
                 if (sk == k) {
@@ -1606,7 +1618,14 @@ fn abiMapGetBoxed(map: *int, key: *int, default: *int) -> *int {
                 } else {
                     same = keyEq(sk as *int, kp)
                 }
-                if (same) { return entries[slot + 1] as *int }
+                if (same) {
+                    llVer = mapVer
+                    llMap = map as int
+                    llKey = k
+                    llSlot = slot
+                    llHash = h
+                    return entries[slot + 1] as *int
+                }
             }
             idx = (idx + 1) & mask
             probes = probes + 1

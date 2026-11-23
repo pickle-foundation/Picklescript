@@ -95,23 +95,17 @@ class SymRec {
     }
 }
 
-fn pushSym(recs: List<SymRec>, name: string, section: int, value: int, cls: int) {
+fn pushSym(recs: List<SymRec>, indexes: Map<string, int>, name: string, section: int, value: int, cls: int) {
+    // Preserve `symIndex`'s old first-match semantics even if a caller emits
+    // duplicate records: relocations must keep resolving to the first record.
+    if (!indexes.has(name)) {
+        indexes[name] = len(recs)
+    }
     recs.push(SymRec(name, section, value, cls))
 }
 
-fn symIndex(recs: List<SymRec>, name: string) -> int {
-    var i = 0
-    while (i < len(recs)) {
-        if (recs[i].name == name) {
-            return i
-        }
-        i = i + 1
-    }
-    -1
-}
-
-fn hasSym(recs: List<SymRec>, name: string) -> bool {
-    symIndex(recs, name) >= 0
+fn hasSym(indexes: Map<string, int>, name: string) -> bool {
+    indexes.has(name)
 }
 
 fn buildStrTbl(recs: List<SymRec>, longOffs: List<int>) -> List<int> {
@@ -214,7 +208,7 @@ fn coffObjFor(m: IrModule, out: X64Out) -> List<int> {
     text.pop()
     var funcStart = [0]
     funcStart.pop()
-    var relocs = [Reloc(0, "x")]
+    var relocs = [Reloc(0, "x", 1)]
     relocs.pop()
     var rdata = [0]
     rdata.pop()
@@ -237,7 +231,7 @@ fn coffObjFor(m: IrModule, out: X64Out) -> List<int> {
         pad16(text)
         var r = 0
         while (r < len(f.relocs)) {
-            relocs.push(Reloc(funcStart[len(funcStart) - 1] + f.relocs[r].off, f.relocs[r].sym))
+            relocs.push(Reloc(funcStart[len(funcStart) - 1] + f.relocs[r].off, f.relocs[r].sym, f.relocs[r].type))
             r = r + 1
         }
         i = i + 1
@@ -260,21 +254,22 @@ fn coffObjFor(m: IrModule, out: X64Out) -> List<int> {
     }
 
     var recs = List<SymRec>()
-    pushSym(recs, ".text", 1, 0, 3)
+    let indexes = Map<string, int>()
+    pushSym(recs, indexes, ".text", 1, 0, 3)
     if (len(m.strings) > 0) {
-        pushSym(recs, ".rdata", 2, 0, 3)
+        pushSym(recs, indexes, ".rdata", 2, 0, 3)
     }
     if (len(m.globals) > 0) {
-        pushSym(recs, ".data", 3, 0, 3)
+        pushSym(recs, indexes, ".data", 3, 0, 3)
     }
     var fi = 0
     while (fi < len(out.funcs)) {
-        if (!hasSym(recs, out.funcs[fi].symbol)) {
-            pushSym(recs, out.funcs[fi].symbol, 1, funcStart[fi], 2)
+        if (!hasSym(indexes, out.funcs[fi].symbol)) {
+            pushSym(recs, indexes, out.funcs[fi].symbol, 1, funcStart[fi], 2)
         }
         fi = fi + 1
     }
-    pushSym(recs, "pickle_fmod", 1, funcStart[len(out.funcs)], 2)
+    pushSym(recs, indexes, "pickle_fmod", 1, funcStart[len(out.funcs)], 2)
     var gi = 0
     while (gi < len(m.globals)) {
         let g = m.globals[gi]
@@ -288,19 +283,19 @@ fn coffObjFor(m: IrModule, out: X64Out) -> List<int> {
             data.push(bytes[q])
             q = q + 1
         }
-        pushSym(recs, g.symbol, 3, globStart[gi], 2)
+        pushSym(recs, indexes, g.symbol, 3, globStart[gi], 2)
         gi = gi + 1
     }
     var si = 0
     while (si < len(m.strings)) {
-        pushSym(recs, "pkl_strdesc_" + str(si), 2, strStart[si], 2)
-        pushSym(recs, "pkl_strdata_" + str(si), 2, strStart[si] + 32, 2)
+        pushSym(recs, indexes, "pkl_strdesc_" + str(si), 2, strStart[si], 2)
+        pushSym(recs, indexes, "pkl_strdata_" + str(si), 2, strStart[si] + 32, 2)
         si = si + 1
     }
     var ri = 0
     while (ri < len(relocs)) {
-        if (!hasSym(recs, relocs[ri].sym)) {
-            pushSym(recs, relocs[ri].sym, 0, 0, 2)
+        if (!hasSym(indexes, relocs[ri].sym)) {
+            pushSym(recs, indexes, relocs[ri].sym, 0, 0, 2)
         }
         ri = ri + 1
     }
@@ -376,9 +371,9 @@ fn coffObjFor(m: IrModule, out: X64Out) -> List<int> {
     while (rl < len(relocs)) {
         let base = textRelocOff + 10 * rl
         u32wBlob(blob, base, relocs[rl].off)
-        let si = symIndex(recs, relocs[rl].sym)
+        let si = indexes[relocs[rl].sym]
         u32wBlob(blob, base + 4, si)
-        u16Blob(blob, base + 8, 0x0001)
+        u16Blob(blob, base + 8, relocs[rl].type)
         rl = rl + 1
     }
     var ys = 0

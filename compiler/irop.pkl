@@ -738,12 +738,44 @@ fn oIsPureDef(ins: IrInstr) -> bool {
     }
 }
 
-/// One DCE round; returns whether anything was dropped. Callers iterate to the
-/// fixed point so chains of dead definitions collapse too.
+/// Mark only values that escape through an effect or a terminator, then trace
+/// their pure definitions backwards. The former implementation first marked
+/// every instruction input, including inputs of dead pure definitions, and
+/// consequently needed one whole-module scan per link in a dead chain.
 fn oDceRound(f: IrFunc) -> bool {
     var used = Map<int, bool>()
     for (b in f.blocks) {
-        oMarkUses(b.instrs, b.term, used)
+        for (ins in b.instrs) {
+            if (!oIsPureDef(ins)) {
+                oMarkUses([ins], IrTerm.Unreachable, used)
+            }
+        }
+        oMarkUses([], b.term, used)
+    }
+    // Definitions normally precede their users, so visiting in reverse makes
+    // a straight dead/live chain settle in one scan. Repeat only for unusual
+    // cross-block ordering rather than rebuilding use information per link.
+    var grew = true
+    while (grew) {
+        grew = false
+        var bi = len(f.blocks) - 1
+        while (bi >= 0) {
+            let b = f.blocks[bi]
+            var ii = len(b.instrs) - 1
+            while (ii >= 0) {
+                let ins = b.instrs[ii]
+                let d = oDstOf(ins)
+                if (d >= 0 && oIsPureDef(ins) && used.has(d)) {
+                    let before = len(used)
+                    oMarkUses([ins], IrTerm.Unreachable, used)
+                    if (len(used) != before) {
+                        grew = true
+                    }
+                }
+                ii = ii - 1
+            }
+            bi = bi - 1
+        }
     }
     var changed = false
     for (b in f.blocks) {
@@ -770,12 +802,9 @@ fn optimizeFunc(m: IrModule, f: IrFunc) {
         f.blocks[i] = oRewriteBlock(f, types, addrs, uses.foreign, f.blocks[i])
         i = i + 1
     }
-    var rounds = 0
-    var changed = true
-    while (changed && rounds < 8) {
-        changed = oDceRound(f)
-        rounds = rounds + 1
-    }
+    // `oDceRound` computes the complete backwards use closure before deleting
+    // any definition, so one invocation removes every dead pure definition.
+    oDceRound(f)
 }
 
 fn optimizeModule(m: IrModule) -> IrModule {

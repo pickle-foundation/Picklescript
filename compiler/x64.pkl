@@ -248,13 +248,32 @@ fn isImpSlotCall(sym: string) -> bool {
     return !isCrtThunkImp(sliceRange(sym, 6, len(sym)))
 }
 
+/// Runtime ABI symbols are resolved from the static runtime archive and merged
+/// into the final executable's `.text`, so an extern call to one has the same
+/// REL32 contract as a call to a function in the current IR module. Imports,
+/// CRT calls, and indirect function-pointer calls do not qualify: they either
+/// resolve through the IAT/thunk machinery or have no link-time target.
+fn isDirectRuntimeCall(sym: string) -> bool {
+    if (len(sym) >= 7 && sliceRange(sym, 0, 7) == "pickle_") {
+        return true
+    }
+    if (len(sym) >= 4 && sliceRange(sym, 0, 4) == "pkl_") {
+        return true
+    }
+    false
+}
+
 class Reloc {
     var off: int
     var sym: string
+    /// COFF relocation kind: ADDR64 (1) for absolute addresses, REL32 (4)
+    /// for direct internal calls.
+    var type: int
 
-    constructor(off: int, sym: string) {
+    constructor(off: int, sym: string, type: int) {
         this.off = off
         this.sym = sym
+        this.type = type
     }
 }
 
@@ -325,7 +344,17 @@ class CB {
     fn relocAbs(sym: string) {
         let off = this.size()
         this.u64le(0)
-        this.relocs.push(Reloc(off, sym))
+        this.relocs.push(Reloc(off, sym, 1))
+    }
+
+    /// Emit a four-byte IMAGE_REL_AMD64_REL32 relocation. The linker resolves
+    /// it as `symbol - (field address + 4)`, exactly the displacement `E8`
+    /// needs. This is valid only for symbols emitted in the same image.
+    fn callRel32(sym: string) {
+        this.u8(0xE8)
+        let off = this.size()
+        this.u32le(0)
+        this.relocs.push(Reloc(off, sym, 4))
     }
 
     fn rbpMem(reg: int, k: int) -> List<int> {
@@ -3706,6 +3735,100 @@ class X64Emitter {
         this.putRes(d, 64, this.kOfTemp(d))
     }
 
+    /// `pickle_list_set(list, index, value)` inlined. The runtime only rejects
+    /// indexes at or above the list length; retain its signed comparison so a
+    /// negative index has the same compiler-guarded behavior as the ABI call.
+    /// The store cannot allocate or collect, so publishing the already-rooted
+    /// value directly into the existing element span is safe.
+    fn emitInlineListSet(listT: int, indexT: int, valT: int) {
+        this.loadTmp(1, 64, listT)
+        this.loadTmp(2, 64, indexT)
+        this.loadTmp(8, 64, valT)
+        // rax = list[LEN_WORD] (24); if (index >= len), return.
+        this.cb.u8(0x48)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x41)
+        this.cb.u8(24)
+        this.cb.u8(0x48)
+        this.cb.u8(0x39)
+        this.cb.u8(0xC2)
+        this.cb.u8(0x7D)
+        this.cb.u8(0x08)
+        // rax = list[DATA_WORD] (40); data[index] = value.
+        this.cb.u8(0x48)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x41)
+        this.cb.u8(40)
+        this.cb.u8(0x4C)
+        this.cb.u8(0x89)
+        this.cb.u8(0x04)
+        this.cb.u8(0xD0)
+    }
+
+    /// `pickle_list_push(list, value)`'s append fast path, inlined. The runtime
+    /// body is two calls deep (`abiListPush` -> `requireCapacity`, each with
+    /// its own GC shadow frame), and a pipeline's output list is usually
+    /// preallocated to the receiver's length, so that frame cost is paid per
+    /// element to do one store and one increment.
+    ///
+    /// The fast path is the whole runtime body when `len < cap`: read the
+    /// element span, store, bump `len`. A full list falls back to the real
+    /// entry point with both arguments still in rcx/rdx, so growth, the
+    /// capacity floor, and the raw-span allocation stay in one place.
+    ///
+    /// No collection can run between the load of `len` and the store, so the
+    /// list and the value are as rooted as they were at the call site, and the
+    /// element is published before `len` makes it visible to the tracer. The
+    /// receiver and value are already managed homes (or freshly registered
+    /// boxes), exactly as the call's arguments were.
+    fn emitInlineListPush(listT: int, valT: int) {
+        this.loadTmp(1, 64, listT)
+        this.loadTmp(2, 64, valT)
+        let slow = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        let done = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        // rax = list[LEN_WORD] (24); r8 = list[CAP_WORD] (32).
+        this.cb.u8(0x48)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x41)
+        this.cb.u8(24)
+        this.cb.u8(0x4C)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x41)
+        this.cb.u8(32)
+        // cmp rax, r8; jae slow - unsigned, so a full list takes the growth
+        // path and no other value can pass.
+        this.cb.u8(0x4C)
+        this.cb.u8(0x39)
+        this.cb.u8(0xC0)
+        this.emitJcc(0x03, slow)
+        // r9 = list[DATA_WORD] (40); data[len] = value; len = len + 1.
+        this.cb.u8(0x4C)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x49)
+        this.cb.u8(40)
+        this.cb.u8(0x49)
+        this.cb.u8(0x89)
+        this.cb.u8(0x14)
+        this.cb.u8(0xC1)
+        this.cb.u8(0x48)
+        this.cb.u8(0xFF)
+        this.cb.u8(0xC0)
+        this.cb.u8(0x48)
+        this.cb.u8(0x89)
+        this.cb.u8(0x41)
+        this.cb.u8(24)
+        this.emitJmp(done)
+        this.starts[slow] = this.cb.size()
+        this.cb.movabsReloc(10, "pickle_list_push")
+        this.cb.u8(0x41)
+        this.cb.u8(0xFF)
+        this.cb.u8(0xD2)
+        this.starts[done] = this.cb.size()
+        this.clobberRcx()
+    }
+
     /// `pickle_obj_slot_get(obj, slot)` inlined for a constant, non-negative
     /// slot. Mirrors `abiObjSlotGet`: a null object answers null, and the bound
     /// is `(size - 32) / 8` derived from the object's own stored size. The
@@ -4096,21 +4219,43 @@ class X64Emitter {
         this.putRes(d, 64, this.kOfTemp(d))
     }
 
-    /// `pickle_box_i64`'s shared-small-value cache, inlined. The benchmark's
-    /// map updates box `0..48` on every `m[k] = m[k] + 1`, and `abiBoxI64`
-    /// answers those from `smallBoxTab` without allocating. Reaching that
-    /// answer through the extern still costs a call plus the shadow frame the
-    /// function needs for its allocating paths, so probe the cache here and
-    /// fall back to the real call for a miss, a cold table, or an out-of-range
-    /// value. The table and its `0` sentinel are exactly what `abi_box` reads;
-    /// hits are immutable boxes whose pointers the arena never reuses.
+    /// `pickle_box_i64`'s shared-small-value cache, inlined, with the allocating
+    /// tail inlined too. The benchmark's map updates box `0..48` on every
+    /// `m[k] = m[k] + 1`, and `abiBoxI64` answers those from `smallBoxTab`
+    /// without allocating. Everything else allocates a fresh 32-byte box:
+    /// `abiManagedAlloc(32)`, the four-word header/payload stamp, and
+    /// `abiEngineRegister`. Both halves are already independent inlines
+    /// (`emitInlineManagedAlloc`, `emitInlineEngineRegister`) whose fast paths
+    /// need no calls, so the extern call and its prologue are pure overhead.
+    ///
+    /// Cache hits, fresh boxes, and the cold-table case must stay observably
+    /// identical to `abiBoxI64`:
+    ///   - a small value is inserted into the table, so two calls share one
+    ///     box (`sameObject` and `abi_box_test` pin this);
+    ///   - a cold table falls back to the real entry point, which builds and
+    ///     zeroes the table and owns that path;
+    ///   - values outside `0..4095` are never looked up or inserted.
+    ///
+    /// Registration can collect; the box is fully stamped and its address sits
+    /// in the destination temp's home before that call, exactly as in the
+    /// runtime body. The table is not a root, but the value is also reachable
+    /// from the destination, so inserting after registration is safe.
     fn emitInlineBoxI64(d: int, arg: int) {
         this.loadTmp(1, 64, arg)
-        let slow = 0 - 1 - this.inlineLab
+        // The allocating tail and the registration inline clobber rcx/rax/rdx,
+        // and `loadTmp` can only rematerialise a *constant* once its forwarding
+        // entry is gone. Give a real temp's home its value now, so every later
+        // reload of `arg` (stamp payload, table index) is a plain memory read.
+        if (!this.plan.constVals.has(arg)) {
+            this.cb.st(1, 64, this.kOfTemp(arg))
+        }
+        let cold = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        let big = 0 - 1 - this.inlineLab
         this.inlineLab = this.inlineLab + 1
         let done = 0 - 1 - this.inlineLab
         this.inlineLab = this.inlineLab + 1
-        // rax = smallBoxTab; test tab != 0.
+        // rax = smallBoxTab; a zero table is the cold path.
         this.cb.movabsReloc(0, "pkl_global_smallBoxTab")
         this.cb.u8(0x48)
         this.cb.u8(0x8B)
@@ -4118,7 +4263,7 @@ class X64Emitter {
         this.cb.u8(0x48)
         this.cb.u8(0x85)
         this.cb.u8(0xC0)
-        this.emitJcc(0x04, slow)
+        this.emitJcc(0x04, cold)
         // Unsigned compare folds the `v < 0` and `v >= SMALL_BOX_CAP` tests
         // into one branch: a negative value is huge as unsigned. The bound is
         // `runtime.abi_box`'s `SMALL_BOX_CAP`; keep the two in step.
@@ -4126,8 +4271,9 @@ class X64Emitter {
         this.cb.u8(0x81)
         this.cb.u8(0xF9)
         this.cb.u32le(4096)
-        this.emitJcc(0x03, slow)
-        // rax = tab[v]; a zero entry is a miss.
+        this.emitJcc(0x03, big)
+        // rax = tab[v]. A non-zero entry is a canonical hit; a zero entry is
+        // a small-value miss and falls through to the allocating tail.
         this.cb.u8(0x48)
         this.cb.u8(0x8B)
         this.cb.u8(0x04)
@@ -4135,9 +4281,36 @@ class X64Emitter {
         this.cb.u8(0x48)
         this.cb.u8(0x85)
         this.cb.u8(0xC0)
-        this.emitJcc(0x04, slow)
+        this.emitJcc(0x05, done)
+        // Small-value miss: allocate, stamp, register, then publish into the
+        // table so later calls canonicalise to the same box.
+        this.emitInlineManagedAllocConst(d, 32)
+        this.loadTmp(0, 64, d)
+        this.emitStampIntBox(arg)
+        this.cb.st(0, 64, this.kOfTemp(d))
+        this.emitInlineEngineRegister(none, d)
+        this.cb.ld(0, 64, this.kOfTemp(d))
+        this.cb.movabsReloc(8, "pkl_global_smallBoxTab")
+        this.cb.u8(0x4D)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x00)
+        this.loadTmp(2, 64, arg)
+        this.cb.u8(0x49)
+        this.cb.u8(0x89)
+        this.cb.u8(0x04)
+        this.cb.u8(0xD0)
         this.emitJmp(done)
-        this.starts[slow] = this.cb.size()
+        // Values outside the cache: allocate, stamp, register, no table entry.
+        this.starts[big] = this.cb.size()
+        this.emitInlineManagedAllocConst(d, 32)
+        this.loadTmp(0, 64, d)
+        this.emitStampIntBox(arg)
+        this.cb.st(0, 64, this.kOfTemp(d))
+        this.emitInlineEngineRegister(none, d)
+        this.cb.ld(0, 64, this.kOfTemp(d))
+        this.emitJmp(done)
+        // Cold table: the runtime builds it, and its path owns the insert.
+        this.starts[cold] = this.cb.size()
         this.cb.movabsReloc(10, "pickle_box_i64")
         this.cb.u8(0x41)
         this.cb.u8(0xFF)
@@ -4145,6 +4318,32 @@ class X64Emitter {
         this.starts[done] = this.cb.size()
         this.clobberRcx()
         this.putRes(d, 64, this.kOfTemp(d))
+    }
+
+    /// Stamp a 32-byte int box at the address already in rax: `next` 0, class
+    /// `PICKLE_CLASS_BOX_INT` (3), byte size 32, payload word 3. Same four
+    /// stores `abiBoxI64` performs; `arg` is reloaded into rdx because the
+    /// allocator used rcx and the register inline clobbers the scratch pair.
+    fn emitStampIntBox(arg: int) {
+        this.cb.u8(0x48)
+        this.cb.u8(0xC7)
+        this.cb.u8(0x00)
+        this.cb.u32le(0)
+        this.cb.u8(0x48)
+        this.cb.u8(0xC7)
+        this.cb.u8(0x40)
+        this.cb.u8(8)
+        this.cb.u32le(3)
+        this.cb.u8(0x48)
+        this.cb.u8(0xC7)
+        this.cb.u8(0x40)
+        this.cb.u8(16)
+        this.cb.u32le(32)
+        this.loadTmp(2, 64, arg)
+        this.cb.u8(0x48)
+        this.cb.u8(0x89)
+        this.cb.u8(0x50)
+        this.cb.u8(24)
     }
 
     /// `abiManagedAlloc(size)`'s bump-pointer path, inlined. Every managed
@@ -4165,6 +4364,22 @@ class X64Emitter {
     /// that calls this helper embeds the closure that defines them.
     fn emitInlineManagedAlloc(d: int, sizeT: int) {
         this.loadTmp(1, 64, sizeT)
+        this.emitInlineManagedAllocBody(d)
+    }
+
+    /// Constant-size form of `emitInlineManagedAlloc`: the size goes straight
+    /// into rcx, which is where the body and its slow-path fallback expect it.
+    fn emitInlineManagedAllocConst(d: int, size: int) {
+        // `mov ecx, imm32` zero-extends into rcx; every caller passes a small
+        // positive byte size.
+        this.cb.u8(0xB9)
+        this.cb.u32le(size)
+        this.clobberRcx()
+        this.emitInlineManagedAllocBody(d)
+    }
+
+    /// The allocator body, entered with the requested size in rcx.
+    fn emitInlineManagedAllocBody(d: int) {
         let slow = 0 - 1 - this.inlineLab
         this.inlineLab = this.inlineLab + 1
         let done = 0 - 1 - this.inlineLab
@@ -5200,7 +5415,7 @@ class X64Emitter {
         this.putRes(d, 64, this.kOfTemp(d))
     }
 
-    fn emitCall(sum: string, ptys: List<IrTy>, ret: IrTy, d: int?, args: List<int>) {
+    fn emitCall(sum: string, ptys: List<IrTy>, ret: IrTy, d: int?, args: List<int>, direct: bool) {
         // Backend-only inlining of the hottest leaf helpers. Each is a single
         // bounds-tested load, so the call frame cost more than the body. The
         // emitted IR is unchanged; only the x64 spelling differs.
@@ -5278,6 +5493,19 @@ class X64Emitter {
                     return
                 }
                 case none -> {}
+            }
+        }
+        if (sum == "pickle_list_set" && len(args) == 3) {
+            this.emitInlineListSet(args[0], args[1], args[2])
+            return
+        }
+        if (sum == "pickle_list_push" && len(args) == 2 && ret == IrTy.Unit) {
+            match (d) {
+                case none -> {
+                    this.emitInlineListPush(args[0], args[1])
+                    return
+                }
+                case some(_) -> {}
             }
         }
         if ((sum == "pickle_list_len" || sum == "pickle_str_len" || sum == "pickle_map_len") && len(args) == 1) {
@@ -5448,19 +5676,28 @@ class X64Emitter {
         // The call may clobber every volatile XMM register, so the copy cache
         // cannot survive it. The homes are current either way.
         this.dropFx()
-        this.cb.movabsReloc(10, sum)
-        if (isImpSlotCall(sum)) {
-            // The reloc above resolved to the IAT slot, which stores the entry
-            // point rather than being one: `mov r10, [r10]` turns the slot
-            // address into the address of the imported function. CRT imports
-            // skip this because their reloc already names a jump thunk.
-            this.cb.u8(0x4D)
-            this.cb.u8(0x8B)
-            this.cb.u8(0x12)
+        // Calls to functions in this IR module resolve into the merged program
+        // `.text` section, so `E8 rel32` is position independent and removes
+        // the 10-byte address materialisation plus an indirect branch. Externs
+        // must remain indirect: imports resolve to IAT slots and archive
+        // selection/linking may bind them outside this object.
+        if (direct) {
+            this.cb.callRel32(sum)
+        } else {
+            this.cb.movabsReloc(10, sum)
+            if (isImpSlotCall(sum)) {
+                // The reloc above resolved to the IAT slot, which stores the entry
+                // point rather than being one: `mov r10, [r10]` turns the slot
+                // address into the address of the imported function. CRT imports
+                // skip this because their reloc already names a jump thunk.
+                this.cb.u8(0x4D)
+                this.cb.u8(0x8B)
+                this.cb.u8(0x12)
+            }
+            this.cb.u8(0x41)
+            this.cb.u8(0xFF)
+            this.cb.u8(0xD2)
         }
-        this.cb.u8(0x41)
-        this.cb.u8(0xFF)
-        this.cb.u8(0xD2)
         if (ns > 0) {
             this.cb.addRsp(R)
         }
@@ -5576,7 +5813,7 @@ class X64Emitter {
                         for (p in f.params) {
                             ptys.push(p.ty)
                         }
-                        this.emitCall(sym, ptys, f.ret, d, args)
+                        this.emitCall(sym, ptys, f.ret, d, args, true)
                     }
                     case Callee.Extern(id) -> {
                         let e = this.m.externs[id]
@@ -5598,7 +5835,7 @@ class X64Emitter {
                                         let parts = this.appendFuse[args[0]]
                                         let fargs: List<int> = [parts[0], parts[1], args[1]]
                                         let ftys: List<IrTy> = [ptys[0], ptys[1], ptys[1]]
-                                        this.emitCall("pickle_str_append_two", ftys, e.ret, d, fargs)
+                                        this.emitCall("pickle_str_append_two", ftys, e.ret, d, fargs, false)
                                         skip = true
                                     } else if (this.appendOwned.has(dd) && this.appendOwned[dd]) {
                                         sym = "pickle_str_append_owned"
@@ -5617,7 +5854,7 @@ class X64Emitter {
                             }
                         }
                         if (!skip) {
-                            this.emitCall(sym, ptys, e.ret, d, args)
+                            this.emitCall(sym, ptys, e.ret, d, args, isDirectRuntimeCall(sym))
                         }
                     }
                 }
