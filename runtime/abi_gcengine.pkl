@@ -54,6 +54,7 @@ module runtime.abi_gcengine
 import { shadowRegistryLockAcquire, shadowRegistryLockRelease, abiShadowRegistryHead } from runtime.abi_shadow
 import { abiClassOwnedMaskOf, abiClassFinalizerOf } from runtime.abi_classwords
 import { abiManagedRelease } from runtime.abi_raw
+import { MAP_BLOOM_OFF } from runtime.layout
 
 /// Managed class ids on object words (mirror of `runtime/object` labels).
 /// Word 1 carries the id; string's id is 0 (see `abi_raw`'s note on word 0's
@@ -882,7 +883,13 @@ fn geMarkFromRoots() {
 }
 
 /// Free an object's out-of-line backing span, if any: a list's element block or
-/// a map's entry table (both at word 5).
+/// a map's entry table (both at word 5/6). A map stores an INTERIOR pointer -
+/// its table starts `MAP_BLOOM_OFF` bytes into the block - so the block base is
+/// recovered before the release. That matters as soon as the span is too large
+/// for the managed arena: `abiManagedRelease` can only free a raw block at its
+/// base, and handing it `base + MAP_BLOOM_OFF` is a `HeapFree` of an interior
+/// pointer (heap corruption). Arena spans would tolerate either address, which
+/// is why this only surfaced for maps whose capacity crossed the bump limit.
 fn geReleaseOutOfLine(object: int) {
     unsafe {
         var header = object as *int
@@ -892,6 +899,9 @@ fn geReleaseOutOfLine(object: int) {
             span = header[WO_LIST_DATA]
         } else if (classId == CLA_MAP) {
             span = header[WO_MAP_ENTRIES]
+            if (span != 0) {
+                span = span - MAP_BLOOM_OFF
+            }
         }
         if (span != 0) {
             abiManagedRelease(span)

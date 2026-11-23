@@ -1366,3 +1366,40 @@ test fn string_hash_cache_matches_the_reference_and_is_writable_only() {
         expect((ro[2] & 2) != 0).toBe(false)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Collector span release
+// ---------------------------------------------------------------------------
+
+/// Fill a map with enough keys that its table outgrows the managed bump arena:
+/// `needsGrow` doubles the capacity to 16384, and a cap-16384 table is
+/// `(4 + 2*16384) * 8` = 262,176 bytes, just over `MANAGED_MAX_BUMP` (262,144),
+/// so `abiManagedAlloc` hands it straight to the heap. The map is dropped when
+/// this helper returns.
+fn buildAFreedOversizedMap() {
+    let m = abiMapNew(0)
+    var i = 0
+    while (i < 9000) {
+        abiMapSet(m, abiBoxI64(i), abiBoxI64(i))
+        i = i + 1
+    }
+    expect(abiMapLen(m)).toBe(9000)
+}
+
+/// Regression (2026-11-23): `mapTableNew` returns a pointer `MAP_BLOOM_OFF`
+/// bytes into the table block (the bloom filter precedes the entries in the
+/// same allocation). Sweeping used to release that interior pointer, which is
+/// harmless for an arena-backed table but is a `HeapFree(base + 32)` for an
+/// oversized raw table and corrupts the process heap on the next heap call.
+/// The explicit collection below sweeps the dead oversized map; before the
+/// base adjustment this test died with STATUS_HEAP_CORRUPTION.
+test fn sweeping_an_oversized_map_releases_the_block_base() {
+    buildAFreedOversizedMap()
+    gcCollect(true)
+    // The heap is still usable and a map still works after the sweep.
+    let m = abiMapNew(0)
+    abiMapSet(m, abiBoxI64(7), abiBoxI64(11))
+    expect(abiMapLen(m)).toBe(1)
+    expect(abiUnboxI64(abiMapGet(m, abiBoxI64(7)))).toBe(11)
+    expect(abiMapHas(m, abiBoxI64(8))).toBe(false)
+}

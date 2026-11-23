@@ -58,9 +58,13 @@ fn make_registered_list() -> int {
 fn make_registered_map() -> int {
     var addr = 0
     unsafe {
-        var entries = alloc(int, 8)
+        // A real map's entry table is preceded by the 32-byte negative-membership
+        // bloom filter in the same block (`mapTableNew`), and the sweep recovers
+        // the block base with `MAP_BLOOM_OFF`. Hand-built maps must follow that
+        // layout: cap 8 -> 4 filter words + 16 entry words.
+        var entries = alloc(int, 20)
         var k = 0
-        while (k < 8) {
+        while (k < 20) {
             entries[k] = 0
             k = k + 1
         }
@@ -71,7 +75,7 @@ fn make_registered_map() -> int {
         map[3] = 0
         map[4] = 8
         map[5] = 0
-        map[6] = entries as int
+        map[6] = (entries as int) + 32
         abiRegisterObject(map as int)
         addr = map as int
     }
@@ -497,19 +501,20 @@ test fn map_entries_are_traced_and_markers_skipped() {
         child[2] = 32
         child[3] = 0
         abiRegisterObject(child as int)
-        // Entry table with a tombstone marker in a key slot (1): the marker is
-        // a trivial integer, never an object address - the walk must skip it
-        // rather than dereference it, while still tracing the live child keys
-        // and values.
-        var entries = alloc(int, 8)
-        entries[0] = 1
-        entries[1] = child as int
-        entries[2] = child as int
-        entries[3] = 0
-        entries[4] = 0
-        entries[5] = 0
-        entries[6] = 0
-        entries[7] = 0
+        // Entry block with the 32-byte bloom filter in words 0..3 (the table
+        // starts at the block + 32, as `mapTableNew` lays it out). Table slot 0
+        // holds a tombstone marker in a key slot (1): the marker is a trivial
+        // integer, never an object address - the walk must skip it rather than
+        // dereference it, while still tracing the live child keys and values.
+        var entries = alloc(int, 12)
+        var k = 0
+        while (k < 12) {
+            entries[k] = 0
+            k = k + 1
+        }
+        entries[4] = 1
+        entries[5] = child as int
+        entries[6] = child as int
         var map = alloc(int, 7)
         map[0] = 0
         map[1] = 2
@@ -517,7 +522,7 @@ test fn map_entries_are_traced_and_markers_skipped() {
         map[3] = 2
         map[4] = 4
         map[5] = 2
-        map[6] = entries as int
+        map[6] = (entries as int) + 32
         abiRegisterObject(map as int)
         abiManualAdopt(map)
     }
