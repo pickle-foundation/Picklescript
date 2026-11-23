@@ -3815,6 +3815,102 @@ class X64Emitter {
         this.putRes(d, 64, this.kOfTemp(d))
     }
 
+    /// `pickle_enum_new(tag, count)` inlined for a constant, small field count.
+    /// Variant construction is the whole cost of an enum benchmark: the object
+    /// is five words, and the two runtime layers (`abiEnumNew` ->
+    /// `enumNewAddr`) plus their frames cost more than the allocation they
+    /// wrap. The layout is the one `abi_enum.pkl` stamps - `next` 0, class 7
+    /// (`PICKLE_CLASS_ENUM`), the byte size, the tag at word 3, then `count`
+    /// zeroed payload words at word 4 - and a fresh chunk, an oversized
+    /// request or a count this inline does not cover falls back to the real
+    /// entry point with both arguments still in place.
+    ///
+    /// Stamping happens before registration, exactly as in the runtime body:
+    /// nothing between the allocation and the register can collect, and the
+    /// register itself is the engine's own entry point.
+    fn emitInlineEnumNew(d: int, tagT: int, countT: int) {
+        let count = this.plan.constVals[countT]
+        let size = 32 + 8 * count
+        let kd = this.kOfTemp(d)
+        let slow = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        let done = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        this.loadTmp(1, 64, tagT)
+        // rdx = used, r8 = cap; r9 = used + size.
+        this.cb.movabsReloc(10, "pkl_global_managedArenaUsed")
+        this.cb.u8(0x49)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x12)
+        this.cb.movabsReloc(11, "pkl_global_managedArenaCap")
+        this.cb.u8(0x4D)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x03)
+        this.cb.u8(0x4C)
+        this.cb.u8(0x8D)
+        this.cb.u8(0x4A)
+        this.cb.u8(size)
+        this.cb.u8(0x4D)
+        this.cb.u8(0x39)
+        this.cb.u8(0xC1)
+        this.emitJcc(0x0F, slow)
+        // rax = base + used; used = used + size.
+        this.cb.movabsReloc(10, "pkl_global_managedArenaBase")
+        this.cb.u8(0x49)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x02)
+        this.cb.u8(0x48)
+        this.cb.u8(0x01)
+        this.cb.u8(0xD0)
+        this.cb.movabsReloc(10, "pkl_global_managedArenaUsed")
+        this.cb.u8(0x4D)
+        this.cb.u8(0x89)
+        this.cb.u8(0x0A)
+        // Header: next, class, byte size, tag.
+        this.cb.u8(0x48)
+        this.cb.u8(0xC7)
+        this.cb.u8(0x00)
+        this.cb.u32le(0)
+        this.cb.u8(0x48)
+        this.cb.u8(0xC7)
+        this.cb.u8(0x40)
+        this.cb.u8(8)
+        this.cb.u32le(7)
+        this.cb.u8(0x48)
+        this.cb.u8(0xC7)
+        this.cb.u8(0x40)
+        this.cb.u8(16)
+        this.cb.u32le(size)
+        this.cb.u8(0x48)
+        this.cb.u8(0x89)
+        this.cb.u8(0x48)
+        this.cb.u8(24)
+        // Payload fields start null so an unset slot is never traced.
+        var i = 0
+        while (i < count) {
+            this.cb.u8(0x48)
+            this.cb.u8(0xC7)
+            this.cb.u8(0x40)
+            this.cb.u8(32 + 8 * i)
+            this.cb.u32le(0)
+            i = i + 1
+        }
+        this.cb.st(0, 64, kd)
+        this.emitInlineEngineRegister(none, d)
+        this.cb.ld(0, 64, kd)
+        this.emitJmp(done)
+        this.starts[slow] = this.cb.size()
+        this.cb.u8(0xBA)
+        this.cb.u32le(count)
+        this.cb.movabsReloc(10, "pickle_enum_new")
+        this.cb.u8(0x41)
+        this.cb.u8(0xFF)
+        this.cb.u8(0xD2)
+        this.clobberRcx()
+        this.starts[done] = this.cb.size()
+        this.putRes(d, 64, kd)
+    }
+
     /// `pickle_enum_field(obj, index)` inlined for a constant, non-negative
     /// index. Mirrors `abiEnumField`: the count is `(size - 32) / 8` with a
     /// saturating subtract, an index equal to the count is out of range, and
@@ -4024,7 +4120,8 @@ class X64Emitter {
         this.cb.u8(0xC0)
         this.emitJcc(0x04, slow)
         // Unsigned compare folds the `v < 0` and `v >= SMALL_BOX_CAP` tests
-        // into one branch: a negative value is huge as unsigned.
+        // into one branch: a negative value is huge as unsigned. The bound is
+        // `runtime.abi_box`'s `SMALL_BOX_CAP`; keep the two in step.
         this.cb.u8(0x48)
         this.cb.u8(0x81)
         this.cb.u8(0xF9)
@@ -4048,6 +4145,203 @@ class X64Emitter {
         this.starts[done] = this.cb.size()
         this.clobberRcx()
         this.putRes(d, 64, this.kOfTemp(d))
+    }
+
+    /// `abiManagedAlloc(size)`'s bump-pointer path, inlined. Every managed
+    /// object - box, enum, class instance, list, map, string - reaches this
+    /// helper, and the entry prologue the backend gives it (a home for every
+    /// temp plus the callee-saved spill pair) costs more than the five
+    /// instructions the common path actually needs.
+    ///
+    /// The fast path is the whole body for a small request: clamp to 8 bytes,
+    /// round up, and take the next slice of the current chunk. Anything that
+    /// needs a fresh chunk, an oversized request that bypasses the arena, or a
+    /// request whose rounded size does not fit falls back to the real entry
+    /// point with rcx still holding the original size. `abiManagedAlloc` is a
+    /// leaf that never calls into Pickle code, so the inline adds no
+    /// collection point the caller did not already have.
+    ///
+    /// The globals are the ones the runtime body reads; every archive member
+    /// that calls this helper embeds the closure that defines them.
+    fn emitInlineManagedAlloc(d: int, sizeT: int) {
+        this.loadTmp(1, 64, sizeT)
+        let slow = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        let done = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        // rax = max(size, 8), rounded up to a multiple of 8. The clamp is a
+        // cmov so the tiny-size case costs no branch of its own.
+        this.cb.u8(0x48)
+        this.cb.u8(0x89)
+        this.cb.u8(0xC8)
+        this.cb.u8(0xBA)
+        this.cb.u32le(8)
+        this.cb.u8(0x48)
+        this.cb.u8(0x83)
+        this.cb.u8(0xF8)
+        this.cb.u8(8)
+        this.cb.u8(0x48)
+        this.cb.u8(0x0F)
+        this.cb.u8(0x4C)
+        this.cb.u8(0xC2)
+        this.cb.u8(0x48)
+        this.cb.u8(0x83)
+        this.cb.u8(0xC0)
+        this.cb.u8(7)
+        this.cb.u8(0x48)
+        this.cb.u8(0x83)
+        this.cb.u8(0xE0)
+        this.cb.u8(0xF8)
+        // An oversized request goes straight to the heap in the runtime.
+        this.cb.u8(0x48)
+        this.cb.u8(0x3D)
+        this.cb.u32le(262144)
+        this.emitJcc(0x0F, slow)
+        // rdx = used, r8 = cap; r9 = used + n.
+        this.cb.movabsReloc(10, "pkl_global_managedArenaUsed")
+        this.cb.u8(0x49)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x12)
+        this.cb.movabsReloc(11, "pkl_global_managedArenaCap")
+        this.cb.u8(0x4D)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x03)
+        this.cb.u8(0x4C)
+        this.cb.u8(0x8D)
+        this.cb.u8(0x0C)
+        this.cb.u8(0x02)
+        this.cb.u8(0x4D)
+        this.cb.u8(0x39)
+        this.cb.u8(0xC1)
+        this.emitJcc(0x0F, slow)
+        // r11 = base + used; used = used + n; rax = the new address.
+        this.cb.movabsReloc(11, "pkl_global_managedArenaBase")
+        this.cb.u8(0x4D)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x1B)
+        this.cb.u8(0x49)
+        this.cb.u8(0x01)
+        this.cb.u8(0xD3)
+        this.cb.movabsReloc(10, "pkl_global_managedArenaUsed")
+        this.cb.u8(0x4D)
+        this.cb.u8(0x89)
+        this.cb.u8(0x0A)
+        this.cb.u8(0x4C)
+        this.cb.u8(0x89)
+        this.cb.u8(0xD8)
+        this.emitJmp(done)
+        this.starts[slow] = this.cb.size()
+        this.cb.movabsReloc(10, "pkl_abiManagedAlloc")
+        this.cb.u8(0x41)
+        this.cb.u8(0xFF)
+        this.cb.u8(0xD2)
+        this.starts[done] = this.cb.size()
+        this.clobberRcx()
+        this.putRes(d, 64, this.kOfTemp(d))
+    }
+
+    /// `abiEngineRegister(objAddr)`'s no-collection path, inlined. Registration
+    /// is on every managed allocation, and under `PKL_NO_AUTO_GC` the whole
+    /// reachable body is "record the address, bump the counters": no pin, no
+    /// threshold trigger. Reaching that through the extern pays the entry
+    /// prologue and a `geRegObjSize` call for eight instructions of work.
+    ///
+    /// The fast path requires the environment to be read (so `noAutoGc` is
+    /// final) and no automatic collection to be armed. A cold environment, a
+    /// live auto-collector (which needs the pin and the trigger) and a
+    /// geometric registry growth all fall back to the real entry point with
+    /// rcx still holding the object address. The size word is read directly
+    /// (word 2, byte 16), exactly as `geRegObjSize` does.
+    fn emitInlineEngineRegister(d: int?, objT: int) {
+        this.loadTmp(1, 64, objT)
+        let slow = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        let done = 0 - 1 - this.inlineLab
+        this.inlineLab = this.inlineLab + 1
+        // Null is a no-op, like the runtime's first branch.
+        this.cb.u8(0x48)
+        this.cb.u8(0x85)
+        this.cb.u8(0xC9)
+        this.emitJcc(0x04, done)
+        // `envInited` must be non-zero and `noAutoGc` must be set.
+        this.cb.movabsReloc(0, "pkl_global_envInited")
+        this.cb.u8(0x48)
+        this.cb.u8(0x83)
+        this.cb.u8(0x38)
+        this.cb.u8(0)
+        this.emitJcc(0x04, slow)
+        this.cb.movabsReloc(0, "pkl_global_noAutoGc")
+        this.cb.u8(0x48)
+        this.cb.u8(0x83)
+        this.cb.u8(0x38)
+        this.cb.u8(0)
+        this.emitJcc(0x04, slow)
+        // rdx = object byte size (word 2).
+        this.cb.u8(0x48)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x51)
+        this.cb.u8(16)
+        // r8 = regCount; a full registry grows through the real entry point.
+        this.cb.movabsReloc(0, "pkl_global_regCount")
+        this.cb.u8(0x4C)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x00)
+        this.cb.movabsReloc(0, "pkl_global_regCap")
+        this.cb.u8(0x4C)
+        this.cb.u8(0x3B)
+        this.cb.u8(0x00)
+        this.emitJcc(0x03, slow)
+        // regBase[count] = obj.
+        this.cb.movabsReloc(0, "pkl_global_regBase")
+        this.cb.u8(0x48)
+        this.cb.u8(0x8B)
+        this.cb.u8(0x00)
+        this.cb.u8(0x4A)
+        this.cb.u8(0x89)
+        this.cb.u8(0x0C)
+        this.cb.u8(0xC0)
+        // regCount = count + 1.
+        this.cb.movabsReloc(0, "pkl_global_regCount")
+        this.cb.u8(0x4D)
+        this.cb.u8(0x8D)
+        this.cb.u8(0x50)
+        this.cb.u8(1)
+        this.cb.u8(0x4C)
+        this.cb.u8(0x89)
+        this.cb.u8(0x10)
+        // regBytes += size; rawAllocCount += 1; rawAllocBytes += size.
+        this.cb.movabsReloc(0, "pkl_global_regBytes")
+        this.cb.u8(0x48)
+        this.cb.u8(0x01)
+        this.cb.u8(0x10)
+        this.cb.movabsReloc(0, "pkl_global_rawAllocCount")
+        this.cb.u8(0x48)
+        this.cb.u8(0xFF)
+        this.cb.u8(0x00)
+        this.cb.movabsReloc(0, "pkl_global_rawAllocBytes")
+        this.cb.u8(0x48)
+        this.cb.u8(0x01)
+        this.cb.u8(0x10)
+        this.emitJmp(done)
+        this.starts[slow] = this.cb.size()
+        this.cb.movabsReloc(10, "pkl_abiEngineRegister")
+        this.cb.u8(0x41)
+        this.cb.u8(0xFF)
+        this.cb.u8(0xD2)
+        this.starts[done] = this.cb.size()
+        this.clobberRcx()
+        // A unit return still carries an IR destination temp in some lowering
+        // paths (a runtime module's statement call allocates one), and the
+        // generic path stores rax there. Nothing ever reads a unit temp, but
+        // leave a defined value in case something later does.
+        match (d) {
+            case some(dd) -> {
+                this.cb.u8(0x31)
+                this.cb.u8(0xC0)
+                this.putRes(dd, 64, this.kOfTemp(dd))
+            }
+            case none -> {}
+        }
     }
 
     /// `pickle_str_from_i64`'s small-integer intern cache, inlined. Every
@@ -4910,6 +5204,19 @@ class X64Emitter {
         // Backend-only inlining of the hottest leaf helpers. Each is a single
         // bounds-tested load, so the call frame cost more than the body. The
         // emitted IR is unchanged; only the x64 spelling differs.
+        if (sum == "pkl_abiManagedAlloc" && len(args) == 1) {
+            match (d) {
+                case some(dd) -> {
+                    this.emitInlineManagedAlloc(dd, args[0])
+                    return
+                }
+                case none -> {}
+            }
+        }
+        if (sum == "pkl_abiEngineRegister" && len(args) == 1 && ret == IrTy.Unit) {
+            this.emitInlineEngineRegister(d, args[0])
+            return
+        }
         if (sum == "pickle_box_i64" && len(args) == 1) {
             match (d) {
                 case some(dd) -> {
@@ -5069,6 +5376,20 @@ class X64Emitter {
                         let s = this.plan.constVals[args[1]]
                         if (s >= 0 && s <= 268435449) {
                             this.emitInlineEnumField(dd, args[0], s)
+                            return
+                        }
+                    }
+                }
+                case none -> {}
+            }
+        }
+        if (sum == "pickle_enum_new" && len(args) == 2) {
+            match (d) {
+                case some(dd) -> {
+                    if (this.plan.constVals.has(args[1])) {
+                        let c = this.plan.constVals[args[1]]
+                        if (c >= 0 && c <= 8) {
+                            this.emitInlineEnumNew(dd, args[0], args[1])
                             return
                         }
                     }
