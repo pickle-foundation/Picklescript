@@ -31,6 +31,14 @@ param(
     [switch]$SkipRuntime
 )
 
+# Same contract as battery_full.ps1: this lane runs UNPINNED. An inherited
+# PKL_NO_AUTO_GC from a benchmark shell would otherwise apply to the driver
+# compiles below as well, and a compiler with no collector grows without bound
+# on a large source tree (observed: 6.9 GB before the build was killed).
+# (The variable remains available for debugging a single run.)
+Remove-Item Env:PKL_NO_AUTO_GC -ErrorAction SilentlyContinue
+Remove-Item Env:AUTO_GC -ErrorAction SilentlyContinue
+
 . (Join-Path $PSScriptRoot "battery_common.ps1")
 
 function Abs([string]$p) { (Resolve-Path -LiteralPath $p).Path }

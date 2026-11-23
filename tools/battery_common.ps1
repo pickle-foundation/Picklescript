@@ -167,7 +167,12 @@ function Get-GoldenKey([string]$path) {
 function Invoke-BuildDriver([string]$src, [string]$out) {
     $stamp = "$out.hash"
     if (Test-SelfHostSeed) {
+        # The seed links the driver against the runtime archive, so its bytes are
+        # an input too: a runtime edit changes the archive without touching any
+        # `$batteryDriverDirs` source, and omitting it here pinned drivers built
+        # against the previous runtime.
         $want = (Get-DriverHash) + "|selfhost:" + (Get-FileHash -LiteralPath $selfhostSeed -Algorithm SHA256).Hash
+        $want = $want + "|rtlib:" + (Get-FileHash -LiteralPath $selfhostArchive -Algorithm SHA256).Hash
     } else {
         $provider = ""
         if (Test-Path -LiteralPath $batteryCommonCli) { $provider = "|rust:" + (Get-FileHash -LiteralPath $batteryCommonCli -Algorithm SHA256).Hash }
@@ -244,11 +249,16 @@ function Get-RtlibArchive() {
         return $rtlibArchive
     }
     Write-Host "RTLIB-ARCHIVE: rebuilding $rtlibArchive ($($rtlibDriver) $rtlibRuntimeDir)"
-    $null = Invoke-NativeQuiet $rtlibDriver @($rtlibRuntimeDir, $rtlibArchive)
-    if (Test-Path -LiteralPath $rtlibArchive) {
+    # Delete the previous archive first. The driver can die before writing
+    # anything (a stale driver whose embedded runtime cannot sweep does exactly
+    # that), and leaving the old file in place used to stamp it as current and
+    # hide the failed build from every later gate.
+    if (Test-Path -LiteralPath $rtlibArchive) { Remove-Item -LiteralPath $rtlibArchive -Force }
+    $code = Invoke-NativeQuiet $rtlibDriver @($rtlibRuntimeDir, $rtlibArchive)
+    if ($code -eq 0 -and (Test-Path -LiteralPath $rtlibArchive)) {
         Set-Content -LiteralPath $stamp -Value $want -NoNewline
         return $rtlibArchive
     }
-    Write-Host "RTLIB-ARCHIVE: write failed"
+    Write-Host "RTLIB-ARCHIVE: write failed (exit $code)"
     return $null
 }
