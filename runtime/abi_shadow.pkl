@@ -107,6 +107,12 @@ module runtime.abi_shadow
 /// mechanical correctness at small volumes but must not be pushed past the GC
 /// threshold. Byte-parity probes therefore run against the selflink.
 
+// Lock cells are taken through the platform lock backend rather than naming a
+// Win32 primitive here: `abi_world` is the portable contract, `abi_world_win`
+// the Win32 implementation. A POSIX shadow backend swaps this import for the
+// POSIX backend and keeps the same call sites.
+import { winLockAcquire, winLockRelease } from runtime.abi_world_win
+
 /// The Win32 TLS index holding this thread's `GcThread` node pointer, or
 /// `-1` (`TLS_OUT_OF_INDEXES`) before the first push/registration.
 var shadowTlsSlot: int = -1
@@ -124,19 +130,23 @@ var shadowNextId: int = 1
 /// exclusive lock, 0 = unlocked.
 var shadowLock: int = 0
 
-/// Take the registry lock. Bounded spin between `win_sleep(0)` retries - the
-/// Sleep(0) yields the time slice, so a future contended image cannot starve;
-/// in the qualified single-thread contract the loop never runs twice.
+/// Take the registry lock. A zero-initialized `SRWLOCK` is the Win32 unlocked
+/// state, and a spawned task's first shadow push is a real second caller, so
+/// the owner word must be taken atomically. The SRW pair is the linkable
+/// primitive (`InterlockedCompareExchange64` is a compiler intrinsic, not an
+/// export); it parks a waiter rather than spinning, and a failed raw-node
+/// allocation exits without leaving the lock held.
 fn shadowRegistryLockAcquire() {
-    while (shadowLock == 1) {
-        win_sleep(0)
+    unsafe {
+        winLockAcquire((&shadowLock) as int)
     }
-    shadowLock = 1
 }
 
 /// Release the registry lock.
 fn shadowRegistryLockRelease() {
-    shadowLock = 0
+    unsafe {
+        winLockRelease((&shadowLock) as int)
+    }
 }
 
 /// Ensure this thread is registered, assuming the lock is held (native
@@ -186,10 +196,8 @@ fn shadowEnsureRegisteredLocked() -> int {
 #[symbol("pickle_shadow_push")]
 fn abiShadowPush(frame: *int) {
     unsafe {
-        while (shadowLock == 1) {
-            win_sleep(0)
-        }
-        shadowLock = 1
+        let lockAddr = (&shadowLock) as int
+        winLockAcquire(lockAddr)
         if (shadowTlsSlot == -1) {
             shadowTlsSlot = win_tls_alloc()
         }
@@ -198,7 +206,7 @@ fn abiShadowPush(frame: *int) {
             var heap = win_get_process_heap()
             node = win_heap_alloc(heap, 0, 24)
             if (node == 0) {
-                shadowLock = 0
+                winLockRelease(lockAddr)
                 win_exit(1)
             }
             (node as *int)[0] = 0
@@ -210,7 +218,7 @@ fn abiShadowPush(frame: *int) {
         }
         frame[0] = (node as *int)[0]
         (node as *int)[0] = frame as int
-        shadowLock = 0
+        winLockRelease(lockAddr)
     }
 }
 
@@ -226,16 +234,14 @@ fn abiShadowPush(frame: *int) {
 fn abiShadowPop(frame: *int) {
     unsafe {
         if (shadowTlsSlot != -1) {
-            while (shadowLock == 1) {
-                win_sleep(0)
-            }
-            shadowLock = 1
+            let lockAddr = (&shadowLock) as int
+            winLockAcquire(lockAddr)
             var node = win_tls_get(shadowTlsSlot)
             if (node == 0) {
                 var heap = win_get_process_heap()
                 node = win_heap_alloc(heap, 0, 24)
                 if (node == 0) {
-                    shadowLock = 0
+                    winLockRelease(lockAddr)
                     win_exit(1)
                 }
                 (node as *int)[0] = 0
@@ -246,12 +252,12 @@ fn abiShadowPop(frame: *int) {
                 let _ = win_tls_set(shadowTlsSlot, node)
             }
             if ((node as *int)[0] != (frame as int)) {
-                shadowLock = 0
+                winLockRelease(lockAddr)
                 win_exit(1)
             }
             (node as *int)[0] = frame[0]
             frame[0] = 0
-            shadowLock = 0
+            winLockRelease(lockAddr)
         }
     }
 }

@@ -26,6 +26,7 @@ module runtime.abi_runtime
 /// marker string per call, so the flag is also a realism guard.
 
 import { seedBuiltins } from runtime.abi_class_extra
+import { worldAcquire } from runtime.abi_world
 
 /// Set once the builtin class names are seeded; image data, valid from entry.
 var runtimeInited: int = 0
@@ -35,6 +36,12 @@ fn abiRuntimeInit() -> int {
     if (runtimeInited == 1) {
         return 0
     }
+    // Take the world lock before anything else runs. Every other OS thread the
+    // program starts is parked on it, and the blocking operations in the
+    // network/thread layers release it around their OS call. Doing this before
+    // `seedBuiltins` means the very first managed allocation in the process
+    // already happens under the lock.
+    worldAcquire()
     seedBuiltins()
     runtimeInited = 1
     return 0

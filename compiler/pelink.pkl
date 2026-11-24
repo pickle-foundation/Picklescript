@@ -243,6 +243,43 @@ fn isWs2Imp(nm: string) -> bool {
         case "ntohl" -> true
         case "ioctlsocket" -> true
         case "select" -> true
+        case "WSAPoll" -> true
+        case _ -> false
+    }
+}
+
+/// SSPI / Schannel entry points (TLS). Explicit list, like `isWs2Imp`.
+fn isSecurImp(nm: string) -> bool {
+    match (nm) {
+        case "AcquireCredentialsHandleW" -> true
+        case "InitializeSecurityContextW" -> true
+        case "AcceptSecurityContext" -> true
+        case "DeleteSecurityContext" -> true
+        case "FreeCredentialsHandle" -> true
+        case "FreeContextBuffer" -> true
+        case "QueryContextAttributesW" -> true
+        case "EncryptMessage" -> true
+        case "DecryptMessage" -> true
+        case "ApplyControlToken" -> true
+        case _ -> false
+    }
+}
+
+/// CryptoAPI certificate store / chain verification entry points (TLS).
+fn isCryptImp(nm: string) -> bool {
+    match (nm) {
+        case "PFXImportCertStore" -> true
+        case "CertFindCertificateInStore" -> true
+        case "CertFreeCertificateContext" -> true
+        case "CertCloseStore" -> true
+        case "CertOpenStore" -> true
+        case "CertCreateCertificateContext" -> true
+        case "CertAddCertificateContextToStore" -> true
+        case "CertCreateCertificateChainEngine" -> true
+        case "CertFreeCertificateChainEngine" -> true
+        case "CertGetCertificateChain" -> true
+        case "CertFreeCertificateChain" -> true
+        case "CertVerifyCertificateChainPolicy" -> true
         case _ -> false
     }
 }
@@ -256,6 +293,15 @@ fn dllForImp(nm: string) -> string {
     }
     if (isWs2Imp(nm)) {
         return "WS2_32.dll"
+    }
+    if (isSecurImp(nm)) {
+        return "SECUR32.dll"
+    }
+    if (isCryptImp(nm)) {
+        return "CRYPT32.dll"
+    }
+    if (nm == "BCryptGenRandom") {
+        return "BCRYPT.dll"
     }
     "KERNEL32.dll"
 }
@@ -434,42 +480,39 @@ fn buildExe(ob: CoffObj, mainName: string, fb: FailBox) -> List<int>? {
     }
     let importCount = len(imports)
 
-    var kernNames = [""]
-    kernNames.pop()
-    var crtNames = [""]
-    crtNames.pop()
-    var shellNames = [""]
-    shellNames.pop()
-    var ws2Names = [""]
-    ws2Names.pop()
+    // Group imports by DLL in a fixed, deterministic order. KERNEL32 first
+    // (ExitProcess lives there), the CRT last, matching the historical layout.
+    let dllOrder: List<string> = ["KERNEL32.dll", "SHELL32.dll", "WS2_32.dll", "SECUR32.dll", "CRYPT32.dll", "BCRYPT.dll", "VCRUNTIME140.dll"]
+    var groups = List<List<string>>()
+    var gi0 = 0
+    while (gi0 < len(dllOrder)) {
+        groups.push(List<string>())
+        gi0 = gi0 + 1
+    }
     var im = 0
     while (im < importCount) {
         let n2 = imports[im]
         let dll = dllForImp(n2)
-        if (dll == "VCRUNTIME140.dll") {
-            crtNames.push(n2)
-        } else if (dll == "SHELL32.dll") {
-            shellNames.push(n2)
-        } else if (dll == "WS2_32.dll") {
-            ws2Names.push(n2)
-        } else {
-            kernNames.push(n2)
+        var gk = 0
+        while (gk < len(dllOrder)) {
+            if (dllOrder[gk] == dll) {
+                groups[gk].push(n2)
+                break
+            }
+            gk = gk + 1
         }
         im = im + 1
     }
     var dlls = [""]
     dlls.pop()
-    if (len(kernNames) > 0) {
-        dlls.push("KERNEL32.dll")
-    }
-    if (len(shellNames) > 0) {
-        dlls.push("SHELL32.dll")
-    }
-    if (len(ws2Names) > 0) {
-        dlls.push("WS2_32.dll")
-    }
-    if (len(crtNames) > 0) {
-        dlls.push("VCRUNTIME140.dll")
+    var used = List<List<string>>()
+    var gu = 0
+    while (gu < len(dllOrder)) {
+        if (len(groups[gu]) > 0) {
+            dlls.push(dllOrder[gu])
+            used.push(groups[gu])
+        }
+        gu = gu + 1
     }
     let dllCount = len(dlls)
 
@@ -485,33 +528,7 @@ fn buildExe(ob: CoffObj, mainName: string, fb: FailBox) -> List<int>? {
     let dllIatBase = OrderedMap<string, int>("", 0)
     var di = 0
     while (di < dllCount) {
-        var grp = [""]
-        grp.pop()
-        if (dlls[di] == "KERNEL32.dll") {
-            var g0 = 0
-            while (g0 < len(kernNames)) {
-                grp.push(kernNames[g0])
-                g0 = g0 + 1
-            }
-        } else if (dlls[di] == "SHELL32.dll") {
-            var gs0 = 0
-            while (gs0 < len(shellNames)) {
-                grp.push(shellNames[gs0])
-                gs0 = gs0 + 1
-            }
-        } else if (dlls[di] == "WS2_32.dll") {
-            var gw0 = 0
-            while (gw0 < len(ws2Names)) {
-                grp.push(ws2Names[gw0])
-                gw0 = gw0 + 1
-            }
-        } else {
-            var g1 = 0
-            while (g1 < len(crtNames)) {
-                grp.push(crtNames[g1])
-                g1 = g1 + 1
-            }
-        }
+        let grp = used[di]
         var h2 = 0
         while (h2 < len(grp)) {
             let nm = grp[h2]
@@ -544,45 +561,19 @@ fn buildExe(ob: CoffObj, mainName: string, fb: FailBox) -> List<int>? {
         dn = dn + 1
     }
     let importsSize = len(idata)
-    var pv = 0
-    while (pv < len(kernNames)) {
-        let nm2 = kernNames[pv]
-        if (let some(sl) = iatSlot.get(nm2)) {
-            if (let some(hr) = hintRva.get(nm2)) {
-                write64(idata, sl, importsRva + hr)
+    var ug = 0
+    while (ug < len(used)) {
+        var pv = 0
+        while (pv < len(used[ug])) {
+            let nm2 = used[ug][pv]
+            if (let some(sl) = iatSlot.get(nm2)) {
+                if (let some(hr) = hintRva.get(nm2)) {
+                    write64(idata, sl, importsRva + hr)
+                }
             }
+            pv = pv + 1
         }
-        pv = pv + 1
-    }
-    pv = 0
-    while (pv < len(shellNames)) {
-        let nm2 = shellNames[pv]
-        if (let some(sl) = iatSlot.get(nm2)) {
-            if (let some(hr) = hintRva.get(nm2)) {
-                write64(idata, sl, importsRva + hr)
-            }
-        }
-        pv = pv + 1
-    }
-    pv = 0
-    while (pv < len(ws2Names)) {
-        let nm2 = ws2Names[pv]
-        if (let some(sl) = iatSlot.get(nm2)) {
-            if (let some(hr) = hintRva.get(nm2)) {
-                write64(idata, sl, importsRva + hr)
-            }
-        }
-        pv = pv + 1
-    }
-    pv = 0
-    while (pv < len(crtNames)) {
-        let nm2 = crtNames[pv]
-        if (let some(sl) = iatSlot.get(nm2)) {
-            if (let some(hr) = hintRva.get(nm2)) {
-                write64(idata, sl, importsRva + hr)
-            }
-        }
-        pv = pv + 1
+        ug = ug + 1
     }
     var dzi = 0
     while (dzi < dllCount) {

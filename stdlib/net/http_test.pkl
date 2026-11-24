@@ -1,0 +1,863 @@
+module std.net.http_test
+
+// Coverage for std.net.http. The first half drives the parser/serializer over
+// an in-memory `Conn`, so framing rules (chunked, keep-alive, HEAD, limits) are
+// tested without sockets and without timing. The second half runs real clients
+// and servers on an ephemeral loopback port, including one HTTPS exchange over
+// the self-signed PKCS#12 fixture.
+
+import { Conn, NetError, TcpListener, TcpStream, ERR_NONE, ERR_PROTOCOL, ERR_TOO_LARGE } from std.net
+import { HttpHeaders, HttpRequest, HttpResponse, HttpConn, HttpClient, HttpServer, serializeRequest, serializeResponse } from std.net.http
+import { TlsStream } from std.tls
+import { spawn, Task, AtomicInt, Semaphore } from std.thread
+import { File } from std.fs
+
+// ---------------------------------------------------------------------------
+// In-memory transport
+// ---------------------------------------------------------------------------
+
+/// A `Conn` over a fixed byte list: reads consume the list, writes append to
+/// `output`. An exhausted list is a clean EOF (an empty read).
+class MemoryConn implements Conn {
+    var input: List<byte>
+    var pos: int
+    var output: List<byte>
+    var closed: bool
+    var err: NetError
+
+    constructor(input: List<byte>) {
+        this.input = input
+        this.pos = 0
+        this.output = bytes("")
+        this.closed = false
+        this.err = NetError()
+    }
+
+    fn readSome(max: int) -> List<byte>? {
+        if (this.pos >= len(this.input)) {
+            return bytes("")
+        }
+        var want = max
+        if (want < 0) {
+            want = 0
+        }
+        let left = len(this.input) - this.pos
+        if (want > left) {
+            want = left
+        }
+        var out = bytes("")
+        var i = 0
+        while (i < want) {
+            out.push(this.input[this.pos + i])
+            i = i + 1
+        }
+        this.pos = this.pos + want
+        out
+    }
+
+    fn writeAll(data: List<byte>) -> bool {
+        if (this.closed) {
+            return false
+        }
+        for (b in data) {
+            this.output.push(b)
+        }
+        true
+    }
+
+    fn setRecvTimeoutMs(ms: int) -> bool {
+        true
+    }
+
+    fn lastError() -> NetError {
+        this.err
+    }
+
+    fn close() {
+        this.closed = true
+    }
+}
+
+fn mem(text: string) -> MemoryConn {
+    MemoryConn(bytes(text))
+}
+
+fn bytesContain(hay: List<byte>, needle: List<byte>) -> bool {
+    let n = len(hay)
+    let m = len(needle)
+    if (m == 0) {
+        return true
+    }
+    if (m > n) {
+        return false
+    }
+    var i = 0
+    while (i <= n - m) {
+        var ok = true
+        var j = 0
+        while (j < m) {
+            if ((hay[i + j] as int) != (needle[j] as int)) {
+                ok = false
+                break
+            }
+            j = j + 1
+        }
+        if (ok) {
+            return true
+        }
+        i = i + 1
+    }
+    false
+}
+
+fn sameBytes(a: List<byte>, b: List<byte>) -> bool {
+    if (len(a) != len(b)) {
+        return false
+    }
+    var i = 0
+    while (i < len(a)) {
+        if ((a[i] as int) != (b[i] as int)) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+fn pattern(n: int, seed: int) -> List<byte> {
+    var out = bytes("")
+    var i = 0
+    while (i < n) {
+        out.push(((i * 31 + seed) & 255) as byte)
+        i = i + 1
+    }
+    out
+}
+
+fn mustRequestBytes(req: HttpRequest) -> List<byte> {
+    match (serializeRequest(req)) {
+        case some(b) -> b
+        case none -> {
+            assert(false, "serializeRequest returned none")
+            bytes("")
+        }
+    }
+}
+
+fn mustResponseBytes(res: HttpResponse) -> List<byte> {
+    match (serializeResponse(res)) {
+        case some(b) -> b
+        case none -> {
+            assert(false, "serializeResponse returned none")
+            bytes("")
+        }
+    }
+}
+
+fn mustReadRequest(hc: HttpConn) -> HttpRequest {
+    match (hc.readRequest()) {
+        case some(r) -> r
+        case none -> {
+            assert(false, "readRequest failed: " + hc.lastError().toString())
+            HttpRequest("GET", "/")
+        }
+    }
+}
+
+fn mustReadResponse(hc: HttpConn, method: string) -> HttpResponse {
+    match (hc.readResponse(method)) {
+        case some(r) -> r
+        case none -> {
+            assert(false, "readResponse failed: " + hc.lastError().toString())
+            HttpResponse(0)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit: headers and serialization
+// ---------------------------------------------------------------------------
+
+test fn headers_are_case_insensitive_and_ordered() {
+    let h = HttpHeaders()
+    h.set("Content-Type", "text/plain")
+    h.add("Set-Cookie", "a=1")
+    h.add("set-cookie", "b=2")
+    expect(h.lenHeaders()).toBe(3)
+    expect(h.countOf("SET-COOKIE")).toBe(2)
+    expect(h.getOr("content-type", "")).toBe("text/plain")
+    expect(h.has("Content-TYPE")).toBe(true)
+
+    h.set("content-TYPE", "text/html")
+    expect(h.lenHeaders()).toBe(3)
+    expect(h.getOr("Content-Type", "")).toBe("text/html")
+
+    let all = h.getAll("Set-Cookie")
+    expect(len(all)).toBe(2)
+    expect(all[0]).toBe("a=1")
+    expect(all[1]).toBe("b=2")
+
+    h.remove("set-cookie")
+    expect(h.has("Set-Cookie")).toBe(false)
+    expect(h.lenHeaders()).toBe(1)
+}
+
+test fn request_roundtrip_preserves_binary_body() {
+    let req = HttpRequest("POST", "/echo")
+    req.setHeader("X-Test", "yes")
+    req.body = pattern(256, 0)
+    let wire = mustRequestBytes(req)
+    expect(bytesContain(wire, bytes("POST /echo HTTP/1.1\r\n"))).toBe(true)
+    expect(bytesContain(wire, bytes("Content-Length: 256\r\n"))).toBe(true)
+
+    let hc = HttpConn(MemoryConn(wire))
+    let got = mustReadRequest(hc)
+    expect(got.method).toBe("POST")
+    expect(got.target).toBe("/echo")
+    expect(got.version).toBe("HTTP/1.1")
+    expect(got.headers.getOr("x-test", "")).toBe("yes")
+    expect(len(got.body)).toBe(256)
+    expect(sameBytes(got.body, req.body)).toBe(true)
+    expect(got.closeAfter).toBe(false)
+}
+
+test fn response_roundtrip_uses_reason_for_status() {
+    let res = HttpResponse(404)
+    res.setBodyText("gone")
+    let wire = mustResponseBytes(res)
+    expect(bytesContain(wire, bytes("HTTP/1.1 404 Not Found\r\n"))).toBe(true)
+    expect(bytesContain(wire, bytes("Content-Length: 4\r\n"))).toBe(true)
+
+    let hc = HttpConn(MemoryConn(wire))
+    let got = mustReadResponse(hc, "")
+    expect(got.status).toBe(404)
+    expect(got.reason).toBe("Not Found")
+    expect(got.ok()).toBe(false)
+    expect(got.bodyText()).toBe("gone")
+    expect(got.closeAfter).toBe(false)
+}
+
+test fn status_204_writes_no_body_and_no_length() {
+    let res = HttpResponse(204)
+    let wire = mustResponseBytes(res)
+    expect(bytesContain(wire, bytes("204 No Content\r\n"))).toBe(true)
+    expect(bytesContain(wire, bytes("Content-Length"))).toBe(false)
+
+    let got = mustReadResponse(HttpConn(MemoryConn(wire)), "")
+    expect(got.status).toBe(204)
+    expect(len(got.body)).toBe(0)
+}
+
+// ---------------------------------------------------------------------------
+// Unit: framing
+// ---------------------------------------------------------------------------
+
+test fn chunked_response_decodes_and_records_trailers() {
+    let raw = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" +
+        "5;ext=yes\r\nhello\r\n" +
+        "6\r\n world\r\n" +
+        "0\r\nX-Trailer: done\r\n\r\n"
+    let hc = HttpConn(mem(raw))
+    let res = mustReadResponse(hc, "")
+    expect(res.status).toBe(200)
+    expect(res.bodyText()).toBe("hello world")
+    expect(res.headers.getOr("transfer-encoding", "")).toBe("chunked")
+    expect(res.trailers.getOr("X-Trailer", "")).toBe("done")
+    expect(res.closeAfter).toBe(false)
+    expect(hc.lastError().kind).toBe(ERR_NONE)
+}
+
+test fn chunked_request_decodes() {
+    let raw = "POST /upload HTTP/1.1\r\nHost: example\r\nTransfer-Encoding: chunked\r\n\r\n" +
+        "3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n"
+    let req = mustReadRequest(HttpConn(mem(raw)))
+    expect(req.method).toBe("POST")
+    expect(req.bodyText()).toBe("abcde")
+    expect(req.closeAfter).toBe(false)
+}
+
+test fn chunked_serialization_uses_hex_sizes() {
+    // 16 bytes must be written as 0x10, not decimal 16.
+    let req = HttpRequest("POST", "/x")
+    req.setHeader("Transfer-Encoding", "chunked")
+    req.setBodyText("0123456789abcdef")
+    let raw = str(mustRequestBytes(req))
+    expect(raw.contains("\r\n10\r\n0123456789abcdef\r\n0\r\n\r\n")).toBe(true)
+
+    let res = HttpResponse(200)
+    res.setHeader("Transfer-Encoding", "chunked")
+    res.setBodyText("0123456789abcdef")
+    let rawRes = str(mustResponseBytes(res))
+    expect(rawRes.contains("\r\n10\r\n0123456789abcdef\r\n0\r\n\r\n")).toBe(true)
+}
+
+test fn keep_alive_reads_two_responses_from_one_buffer() {
+    let raw = "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\na" +
+        "HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\nbc"
+    let hc = HttpConn(mem(raw))
+    let first = mustReadResponse(hc, "")
+    expect(first.status).toBe(200)
+    expect(first.bodyText()).toBe("a")
+    expect(first.closeAfter).toBe(false)
+    let second = mustReadResponse(hc, "")
+    expect(second.status).toBe(201)
+    expect(second.bodyText()).toBe("bc")
+    expect(second.closeAfter).toBe(false)
+    expect(hc.lastError().kind).toBe(ERR_NONE)
+    expect(hc.readResponse() as? HttpResponse).toBe(none)
+    expect(hc.lastError().kind).toBe(ERR_NONE)
+}
+
+test fn connection_close_marks_the_message() {
+    let raw = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+    let res = mustReadResponse(HttpConn(mem(raw)), "")
+    expect(res.bodyText()).toBe("ok")
+    expect(res.closeAfter).toBe(true)
+
+    let raw10 = "HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok"
+    let res10 = mustReadResponse(HttpConn(mem(raw10)), "")
+    expect(res10.closeAfter).toBe(true)
+
+    let raw10ka = "HTTP/1.0 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok"
+    let res10ka = mustReadResponse(HttpConn(mem(raw10ka)), "")
+    expect(res10ka.closeAfter).toBe(false)
+}
+
+test fn close_delimited_response_runs_to_eof() {
+    let hc = HttpConn(mem("HTTP/1.1 200 OK\r\n\r\nclose-body"))
+    let res = mustReadResponse(hc, "")
+    expect(res.bodyText()).toBe("close-body")
+    expect(res.closeAfter).toBe(true)
+}
+
+test fn head_skips_a_body_and_keeps_alignment() {
+    // The HEAD response advertises five bytes but sends none; the 204 follows
+    // immediately. A method-blind parser would consume "HTTP/" as the body.
+    let raw = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n" +
+        "HTTP/1.1 204 No Content\r\n\r\n"
+    let hc = HttpConn(mem(raw))
+    let head = mustReadResponse(hc, "HEAD")
+    expect(head.status).toBe(200)
+    expect(head.headers.getOr("content-length", "")).toBe("5")
+    expect(len(head.body)).toBe(0)
+    let next = mustReadResponse(hc, "")
+    expect(next.status).toBe(204)
+    expect(len(next.body)).toBe(0)
+}
+
+test fn invalid_content_length_is_rejected() {
+    let hc = HttpConn(mem("HTTP/1.1 200 OK\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\nabc"))
+    expect(hc.readResponse() as? HttpResponse).toBe(none)
+    expect(hc.lastError().kind).toBe(ERR_PROTOCOL)
+
+    let hc2 = HttpConn(mem("HTTP/1.1 200 OK\r\nContent-Length: nope\r\n\r\nabc"))
+    expect(hc2.readResponse() as? HttpResponse).toBe(none)
+    expect(hc2.lastError().kind).toBe(ERR_PROTOCOL)
+}
+
+test fn oversized_header_block_is_rejected() {
+    let hc = HttpConn(mem("HTTP/1.1 200 OK\r\nX-Long: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n\r\n"), 32)
+    expect(hc.readResponse() as? HttpResponse).toBe(none)
+    expect(hc.lastError().kind).toBe(ERR_TOO_LARGE)
+}
+
+test fn malformed_header_field_is_rejected() {
+    let hc = HttpConn(mem("HTTP/1.1 200 OK\r\nBad Header: x\r\n\r\n"))
+    expect(hc.readResponse() as? HttpResponse).toBe(none)
+    expect(hc.lastError().kind).toBe(ERR_PROTOCOL)
+}
+
+test fn chunked_body_limit_is_enforced() {
+    let hc = HttpConn(mem("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nabcde\r\n0\r\n\r\n"), 65536, 4)
+    expect(hc.readResponse() as? HttpResponse).toBe(none)
+    expect(hc.lastError().kind).toBe(ERR_TOO_LARGE)
+}
+
+test fn request_with_both_framing_headers_is_rejected() {
+    let raw = "POST /x HTTP/1.1\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n"
+    let hc = HttpConn(mem(raw))
+    expect(hc.readRequest() as? HttpRequest).toBe(none)
+    expect(hc.lastError().kind).toBe(ERR_PROTOCOL)
+}
+
+// ---------------------------------------------------------------------------
+// Loopback integration
+// ---------------------------------------------------------------------------
+
+fn runServeOnce(srv: HttpServer) {
+    let _ = srv.serveOnceTimeout(5000)
+}
+
+fn serveAsync(srv: HttpServer) -> Task {
+    spawn(fn () {
+        runServeOnce(srv)
+    })
+}
+
+fn rendezvousResponse(req: HttpRequest, count: AtomicInt, gate: Semaphore) -> HttpResponse {
+    let n = count.add(1)
+    if (n == 1) {
+        gate.release(2)
+    }
+    gate.acquire(1)
+    let res = HttpResponse(200)
+    res.setHeader("X-Target", req.target)
+    res.setBodyText("ok:" + req.target)
+    res
+}
+
+test fn loopback_two_detached_workers_serve_concurrently() {
+    match (TcpListener.bind("127.0.0.1", 0)) {
+        case some(l) -> {
+            let count = AtomicInt(0)
+            let gate = Semaphore(0)
+            let srv = HttpServer(l, fn (req: HttpRequest) {
+                rendezvousResponse(req, count, gate)
+            })
+            let port = srv.localPort()
+            let w1Opt = srv.serveOnceDetached(5000)
+            let w2Opt = srv.serveOnceDetached(5000)
+            if (let some(w1) = w1Opt) {
+                if (let some(w2) = w2Opt) {
+                    match (TcpStream.connect("127.0.0.1", port, 5000)) {
+                        case some(c1) -> {
+                            let _t1 = c1.setRecvTimeoutMs(5000)
+                            match (TcpStream.connect("127.0.0.1", port, 5000)) {
+                                case some(c2) -> {
+                                    let _t2 = c2.setRecvTimeoutMs(5000)
+                                    let h1 = HttpConn(c1)
+                                    let h2 = HttpConn(c2)
+                                    let req1 = HttpRequest("GET", "/one")
+                                    req1.setHeader("Host", "127.0.0.1")
+                                    let req2 = HttpRequest("GET", "/two")
+                                    req2.setHeader("Host", "127.0.0.1")
+                                    expect(h1.writeRequest(req1)).toBe(true)
+                                    expect(h2.writeRequest(req2)).toBe(true)
+                                    match (h1.readResponse("GET")) {
+                                        case some(r1) -> {
+                                            expect(r1.status).toBe(200)
+                                            expect(r1.bodyText()).toBe("ok:/one")
+                                        }
+                                        case none -> assert(false, "first detached response was not received")
+                                    }
+                                    match (h2.readResponse("GET")) {
+                                        case some(r2) -> {
+                                            expect(r2.status).toBe(200)
+                                            expect(r2.bodyText()).toBe("ok:/two")
+                                        }
+                                        case none -> assert(false, "second detached response was not received")
+                                    }
+                                    h1.close()
+                                    h2.close()
+                                }
+                                case none -> assert(false, "second loopback client could not connect")
+                            }
+                        }
+                        case none -> assert(false, "first loopback client could not connect")
+                    }
+                    expect(w1.join()).toBe(true)
+                    expect(w2.join()).toBe(true)
+                    expect(count.load()).toBe(2)
+                } else {
+                    assert(false, "second detached worker was not created")
+                }
+            } else {
+                assert(false, "first detached worker was not created")
+            }
+        }
+        case none -> assert(false, "loopback listener could not bind")
+    }
+}
+
+test fn detached_serve_reports_a_closed_server() {
+    match (TcpListener.bind("127.0.0.1", 0)) {
+        case some(l) -> {
+            let srv = HttpServer(l, fn (req: HttpRequest) {
+                HttpResponse(200)
+            })
+            srv.close()
+            expect(srv.serveOnceDetached(1) as? Task).toBe(none)
+        }
+        case none -> assert(false, "loopback listener could not bind")
+    }
+}
+
+test fn loopback_get_roundtrip() {
+    match (TcpListener.bind("127.0.0.1", 0)) {
+        case some(l) -> {
+            let srv = HttpServer(l, fn (req: HttpRequest) {
+                let res = HttpResponse(200)
+                res.setHeader("X-Target", req.target)
+                res.setBodyText("hello")
+                res
+            })
+            let port = srv.localPort()
+            let t = serveAsync(srv)
+            match (HttpClient.connect("127.0.0.1", port, 5000)) {
+                case some(c) -> {
+                    let _to = c.setRecvTimeoutMs(5000)
+                    match (c.get("/greet")) {
+                        case some(res) -> {
+                            expect(res.status).toBe(200)
+                            expect(res.ok()).toBe(true)
+                            expect(res.bodyText()).toBe("hello")
+                            expect(res.headers.getOr("x-target", "")).toBe("/greet")
+                            expect(res.closeAfter).toBe(false)
+                        }
+                        case none -> assert(false, "get failed: " + c.lastError().toString())
+                    }
+                    c.close()
+                }
+                case none -> assert(false, "connect failed")
+            }
+            expect(t.join()).toBe(true)
+            srv.close()
+        }
+        case none -> assert(false, "bind failed")
+    }
+}
+
+test fn loopback_post_echoes_a_binary_body() {
+    match (TcpListener.bind("127.0.0.1", 0)) {
+        case some(l) -> {
+            let srv = HttpServer(l, fn (req: HttpRequest) {
+                let res = HttpResponse(200)
+                res.setHeader("Content-Type", "application/octet-stream")
+                res.setBodyBytes(req.body)
+                res
+            })
+            let port = srv.localPort()
+            let t = serveAsync(srv)
+            let payload = pattern(1024, 7)
+            match (HttpClient.connect("127.0.0.1", port, 5000)) {
+                case some(c) -> {
+                    let _to = c.setRecvTimeoutMs(5000)
+                    match (c.post("/echo", payload)) {
+                        case some(res) -> {
+                            expect(res.status).toBe(200)
+                            expect(res.headers.getOr("content-length", "")).toBe("1024")
+                            expect(sameBytes(res.body, payload)).toBe(true)
+                        }
+                        case none -> assert(false, "post failed: " + c.lastError().toString())
+                    }
+                    c.close()
+                }
+                case none -> assert(false, "connect failed")
+            }
+            expect(t.join()).toBe(true)
+            srv.close()
+        }
+        case none -> assert(false, "bind failed")
+    }
+}
+
+test fn loopback_missing_route_returns_404() {
+    match (TcpListener.bind("127.0.0.1", 0)) {
+        case some(l) -> {
+            let srv = HttpServer(l, fn (req: HttpRequest) {
+                let res = HttpResponse(404)
+                res.setBodyText("missing")
+                res
+            })
+            let port = srv.localPort()
+            let t = serveAsync(srv)
+            match (HttpClient.connect("127.0.0.1", port, 5000)) {
+                case some(c) -> {
+                    let _to = c.setRecvTimeoutMs(5000)
+                    match (c.get("/nope")) {
+                        case some(res) -> {
+                            expect(res.status).toBe(404)
+                            expect(res.reason).toBe("Not Found")
+                            expect(res.ok()).toBe(false)
+                            expect(res.bodyText()).toBe("missing")
+                        }
+                        case none -> assert(false, "get failed: " + c.lastError().toString())
+                    }
+                    c.close()
+                }
+                case none -> assert(false, "connect failed")
+            }
+            expect(t.join()).toBe(true)
+            srv.close()
+        }
+        case none -> assert(false, "bind failed")
+    }
+}
+
+test fn loopback_keep_alive_serves_two_requests() {
+    match (TcpListener.bind("127.0.0.1", 0)) {
+        case some(l) -> {
+            let srv = HttpServer(l, fn (req: HttpRequest) {
+                let res = HttpResponse(200)
+                if (req.target == "/one") {
+                    res.setBodyText("first")
+                } else {
+                    res.setBodyText("second")
+                }
+                if (req.target == "/two") {
+                    res.setHeader("Connection", "close")
+                }
+                res
+            })
+            let port = srv.localPort()
+            let t = serveAsync(srv)
+            match (HttpClient.connect("127.0.0.1", port, 5000)) {
+                case some(c) -> {
+                    let _to = c.setRecvTimeoutMs(5000)
+                    match (c.get("/one")) {
+                        case some(first) -> {
+                            expect(first.bodyText()).toBe("first")
+                            expect(first.closeAfter).toBe(false)
+                            expect(c.reusable).toBe(true)
+                        }
+                        case none -> assert(false, "first get failed: " + c.lastError().toString())
+                    }
+                    match (c.get("/two")) {
+                        case some(second) -> {
+                            expect(second.bodyText()).toBe("second")
+                            expect(second.closeAfter).toBe(true)
+                            expect(c.reusable).toBe(false)
+                        }
+                        case none -> assert(false, "second get failed: " + c.lastError().toString())
+                    }
+                    c.close()
+                }
+                case none -> assert(false, "connect failed")
+            }
+            expect(t.join()).toBe(true)
+            srv.close()
+        }
+        case none -> assert(false, "bind failed")
+    }
+}
+
+test fn loopback_chunked_response() {
+    match (TcpListener.bind("127.0.0.1", 0)) {
+        case some(l) -> {
+            let srv = HttpServer(l, fn (req: HttpRequest) {
+                let res = HttpResponse(200)
+                res.setHeader("Transfer-Encoding", "chunked")
+                res.setBodyText("chunked-body-12345")
+                res
+            })
+            let port = srv.localPort()
+            let t = serveAsync(srv)
+            match (HttpClient.connect("127.0.0.1", port, 5000)) {
+                case some(c) -> {
+                    let _to = c.setRecvTimeoutMs(5000)
+                    match (c.get("/chunk")) {
+                        case some(res) -> {
+                            expect(res.status).toBe(200)
+                            expect(res.headers.getOr("transfer-encoding", "")).toBe("chunked")
+                            expect(res.bodyText()).toBe("chunked-body-12345")
+                            expect(res.trailers.lenHeaders()).toBe(0)
+                        }
+                        case none -> assert(false, "get failed: " + c.lastError().toString())
+                    }
+                    c.close()
+                }
+                case none -> assert(false, "connect failed")
+            }
+            expect(t.join()).toBe(true)
+            srv.close()
+        }
+        case none -> assert(false, "bind failed")
+    }
+}
+
+test fn loopback_head_then_get_on_one_connection() {
+    match (TcpListener.bind("127.0.0.1", 0)) {
+        case some(l) -> {
+            let srv = HttpServer(l, fn (req: HttpRequest) {
+                let res = HttpResponse(200)
+                res.setBodyText("abcdef")
+                res
+            })
+            let port = srv.localPort()
+            let t = serveAsync(srv)
+            match (HttpClient.connect("127.0.0.1", port, 5000)) {
+                case some(c) -> {
+                    let _to = c.setRecvTimeoutMs(5000)
+                    match (c.head("/h")) {
+                        case some(res) -> {
+                            expect(res.status).toBe(200)
+                            expect(res.headers.getOr("content-length", "")).toBe("6")
+                            expect(len(res.body)).toBe(0)
+                        }
+                        case none -> assert(false, "head failed: " + c.lastError().toString())
+                    }
+                    match (c.get("/g")) {
+                        case some(res) -> {
+                            expect(res.status).toBe(200)
+                            expect(res.bodyText()).toBe("abcdef")
+                        }
+                        case none -> assert(false, "get after head failed: " + c.lastError().toString())
+                    }
+                    c.close()
+                }
+                case none -> assert(false, "connect failed")
+            }
+            expect(t.join()).toBe(true)
+            srv.close()
+        }
+        case none -> assert(false, "bind failed")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TLS transport
+// ---------------------------------------------------------------------------
+
+const PFX_PASSWORD: string = "picklescript"
+
+fn slashes(p: string) -> string {
+    var out = ""
+    var i = 0
+    while (i < len(p)) {
+        let ch = p[i] as int
+        if (ch == 92) {
+            out = out + "/"
+        } else {
+            out = out + "{p[i] as char}"
+        }
+        i = i + 1
+    }
+    out
+}
+
+fn slicePath(p: string, end: int) -> string {
+    var out = ""
+    var i = 0
+    while (i < end) {
+        out = out + "{p[i] as char}"
+        i = i + 1
+    }
+    out
+}
+
+fn parentPath(p: string) -> string? {
+    let bs = bytes(p)
+    var end = len(bs) - 1
+    while (end >= 0 && (bs[end] as int) == 47) {
+        end = end - 1
+    }
+    if (end < 0) {
+        return none
+    }
+    var i = end
+    while (i >= 0 && (bs[i] as int) != 47) {
+        i = i - 1
+    }
+    if (i < 0) {
+        return none
+    }
+    slicePath(p, i)
+}
+
+fn readFixture(p: string) -> List<byte>? {
+    match (File(p).read()) {
+        case some(text) -> bytes(text)
+        case none -> none
+    }
+}
+
+fn loadLoopbackPfx() -> List<byte>? {
+    var dir = ""
+    match (current_dir()) {
+        case some(d) -> { dir = slashes(d) }
+        case none -> { return none }
+    }
+    var found = bytes("")
+    var have = 0
+    var done = 0
+    while (done == 0) {
+        match (readFixture(dir + "/stdlib/testdata/tls_loopback.pfx")) {
+            case some(b) -> {
+                found = b
+                have = 1
+                done = 1
+            }
+            case none -> {
+                match (readFixture(dir + "/testdata/tls_loopback.pfx")) {
+                    case some(b2) -> {
+                        found = b2
+                        have = 1
+                        done = 1
+                    }
+                    case none -> {
+                        match (parentPath(dir)) {
+                            case some(parent) -> { dir = parent }
+                            case none -> { done = 1 }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (have == 0) {
+        return none
+    }
+    found
+}
+
+fn acceptTlsAndServe(l: TcpListener, srv: HttpServer, pfx: List<byte>) {
+    match (l.acceptTimeout(5000)) {
+        case some(tcp) -> {
+            let _rt = tcp.setRecvTimeoutMs(5000)
+            match (TlsStream.accept(tcp, pfx, PFX_PASSWORD)) {
+                case some(tls) -> {
+                    let _served = srv.serveConn(tls)
+                }
+                case none -> {}
+            }
+        }
+        case none -> {}
+    }
+}
+
+test fn loopback_https_get() {
+    match (loadLoopbackPfx()) {
+        case none -> assert(false, "missing fixture stdlib/testdata/tls_loopback.pfx")
+        case some(pfx) -> {
+            match (TcpListener.bind("127.0.0.1", 0)) {
+                case some(l) -> {
+                    let srv = HttpServer(l, fn (req: HttpRequest) {
+                        let res = HttpResponse(200)
+                        res.setHeader("X-Secure", "yes")
+                        res.setBodyText("secure:" + req.target)
+                        res
+                    })
+                    let port = srv.localPort()
+                    let t = spawn(fn () {
+                        acceptTlsAndServe(l, srv, pfx)
+                    })
+                    match (TcpStream.connect("127.0.0.1", port, 5000)) {
+                        case some(tcp) -> {
+                            let _ct = tcp.setRecvTimeoutMs(5000)
+                            match (TlsStream.wrap(tcp, "127.0.0.1", false)) {
+                                case some(tls) -> {
+                                    let c = HttpClient.over(tls, "127.0.0.1", port)
+                                    let _to = c.setRecvTimeoutMs(5000)
+                                    match (c.get("/secure")) {
+                                        case some(res) -> {
+                                            expect(res.status).toBe(200)
+                                            expect(res.headers.getOr("x-secure", "")).toBe("yes")
+                                            expect(res.bodyText()).toBe("secure:/secure")
+                                        }
+                                        case none -> assert(false, "https get failed: " + c.lastError().toString())
+                                    }
+                                    c.close()
+                                }
+                                case none -> assert(false, "tls wrap failed")
+                            }
+                        }
+                        case none -> assert(false, "tcp connect failed")
+                    }
+                    expect(t.join()).toBe(true)
+                    srv.close()
+                }
+                case none -> assert(false, "bind failed")
+            }
+        }
+    }
+}

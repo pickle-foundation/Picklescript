@@ -6,6 +6,7 @@ import { abiSemNew, abiSemAcquire, abiSemTryAcquire, abiSemRelease } from runtim
 import { abiAtomicNew, abiAtomicLoad, abiAtomicStore, abiAtomicAdd, abiAtomicCas } from runtime.abi_sync
 import { abiChannelNew, abiChannelCap, abiChannelLen, abiChannelSend, abiChannelTrySend, abiChannelRecv, abiChannelTryRecv, abiChannelClose, abiChannelClosed } from runtime.abi_sync
 import { abiUnboxI64 } from runtime.abi_box
+import { abiThreadSpawn, abiThreadJoin, abiThreadSleepMs } from runtime.abi_threads
 
 /// The unit suite for the data-sync port bodies.
 ///
@@ -20,9 +21,53 @@ import { abiUnboxI64 } from runtime.abi_box
 /// contract): exercising them here would end the whole `pickle test
 /// pickle\runtime` run. They are verified by the standalone parity probes.
 ///
-/// NO TEST BLOCKS. `take` on a permit nobody will hand over spins forever
-/// (the nostd single-thread hang). Every test keeps a permit available at
-/// every blocking call.
+/// THE SECOND HALF OF THE SUITE IS CROSS-THREAD. A waiter parks through
+/// `abi_world.worldPark`, which releases the world lock; the peer that hands
+/// over a permit/signal/value then runs and wakes it. These tests are what pin
+/// the parking behaviour: under the old in-place spin the child would hold the
+/// world lock forever and the waiting parent could never resume. They are
+/// deliberately few and use only the primitives' own state (plus one atomic
+/// counter for the broadcast case) - no helper threads or sleeps are needed to
+/// arrange the races.
+
+/// Void-returning bodies for the spawn closures (`abiThreadSpawn` takes
+/// `fn () -> void`, and every primitive call below returns an int).
+fn releaseOne(s: int) -> void {
+    let _ = abiSemRelease(s, 1)
+}
+
+fn lockSetUnlock(m: int, a: int) -> void {
+    let _ = abiMutexLock(m)
+    let _ = abiAtomicStore(a, 2)
+    let _ = abiMutexUnlock(m)
+}
+
+fn sendSeven(ch: int) -> void {
+    let _ = abiChannelSend(ch, 7)
+}
+
+fn sendTwoThenThree(ch: int) -> void {
+    let _ = abiChannelSend(ch, 2)
+    let _ = abiChannelSend(ch, 3)
+}
+
+fn signalUnderMutex(c: int, m: int) -> void {
+    let _ = abiMutexLock(m)
+    let _ = abiCondSignal(c)
+    let _ = abiMutexUnlock(m)
+}
+
+fn countAndPark(c: int, a: int) -> void {
+    let _ = abiAtomicAdd(a, 1)
+    let _ = abiCondWait(c, 0)
+    let _ = abiAtomicAdd(a, 10)
+}
+
+fn waitForTwo(a: int) -> void {
+    while (abiAtomicLoad(a) < 2) {
+        let _ = abiThreadSleepMs(1)
+    }
+}
 
 test fn handles_are_positive_and_distinct() {
     var m = abiMutexNew()
@@ -171,4 +216,80 @@ test fn channel_close_drains_then_reports_closed() {
     expect(got == 0 as *int).toBe(false)
     expect(abiUnboxI64(got)).toBe(65)
     expect(abiChannelTryRecv(ch) == 0 as *int).toBe(true)
+}
+
+// ---------------------------------------------------------------------------
+// Cross-thread parking. Each test would hang under the old in-place spin: the
+// waiter would hold the world lock while spinning, so the spawning peer could
+// never run to hand over the permit, signal, or value.
+// ---------------------------------------------------------------------------
+
+test fn semaphore_acquire_parks_until_a_thread_releases() {
+    let s = abiSemNew(0)
+    let h = abiThreadSpawn(fn () { releaseOne(s) })
+    expect(abiSemAcquire(s, 1)).toBe(0)
+    expect(abiThreadJoin(h)).toBe(true)
+    expect(abiSemTryAcquire(s, 1)).toBe(false)
+}
+
+test fn mutex_lock_parks_until_the_holder_unlocks() {
+    let m = abiMutexNew()
+    let a = abiAtomicNew(0)
+    expect(abiMutexLock(m)).toBe(0)
+    let h = abiThreadSpawn(fn () { lockSetUnlock(m, a) })
+    // The child cannot take the mutex while this thread holds it. Sleeping
+    // releases the world lock, which is the child's only chance to run; the
+    // store to the atomic is what proves it eventually acquired the mutex.
+    abiThreadSleepMs(50)
+    expect(abiAtomicLoad(a)).toBe(0)
+    abiMutexUnlock(m)
+    expect(abiThreadJoin(h)).toBe(true)
+    expect(abiAtomicLoad(a)).toBe(2)
+}
+
+test fn channel_recv_parks_until_a_thread_sends() {
+    let ch = abiChannelNew(1)
+    let h = abiThreadSpawn(fn () { sendSeven(ch) })
+    expect(abiChannelRecv(ch)).toBe(7)
+    expect(abiThreadJoin(h)).toBe(true)
+}
+
+test fn channel_send_parks_until_a_receiver_drains() {
+    let ch = abiChannelNew(1)
+    abiChannelSend(ch, 1)
+    let h = abiThreadSpawn(fn () { sendTwoThenThree(ch) })
+    // The channel is full, so the child fills its first send only after this
+    // thread drains one value, then parks on the second.
+    abiThreadSleepMs(30)
+    expect(abiChannelLen(ch)).toBe(1)
+    expect(abiChannelRecv(ch)).toBe(1)
+    expect(abiChannelRecv(ch)).toBe(2)
+    expect(abiChannelRecv(ch)).toBe(3)
+    expect(abiThreadJoin(h)).toBe(true)
+}
+
+test fn cond_wait_parks_until_a_signal() {
+    let m = abiMutexNew()
+    let c = abiCondNew()
+    expect(abiMutexLock(m)).toBe(0)
+    let h = abiThreadSpawn(fn () { signalUnderMutex(c, m) })
+    // `wait` releases the mutex and parks; the child then takes the mutex,
+    // signals, and releases. A spin here would never let the child run.
+    expect(abiCondWait(c, m)).toBe(0)
+    abiMutexUnlock(m)
+    expect(abiThreadJoin(h)).toBe(true)
+}
+
+test fn cond_broadcast_wakes_every_parked_waiter() {
+    let c = abiCondNew()
+    let a = abiAtomicNew(0)
+    let h1 = abiThreadSpawn(fn () { countAndPark(c, a) })
+    let h2 = abiThreadSpawn(fn () { countAndPark(c, a) })
+    // Each child bumps the counter and then parks on the same condition with
+    // no world-lock release in between, so seeing 2 means both are parked.
+    waitForTwo(a)
+    expect(abiCondBroadcast(c)).toBe(0)
+    expect(abiThreadJoin(h1)).toBe(true)
+    expect(abiThreadJoin(h2)).toBe(true)
+    expect(abiAtomicLoad(a)).toBe(22)
 }

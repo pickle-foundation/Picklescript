@@ -896,6 +896,10 @@ fn checkClassBodies(ck: Checker, c: ClassDecl) {
                         for (p in cd.params) {
                             let pt = resolveParamTy(ck, p)
                             declare(ck, p.name, pt, true)
+                            if (let some(d) = p.default) {
+                                let dt = checkExpr(ck, d)
+                                checkAssignable(ck, pt, dt, p.span, "default argument")
+                            }
                         }
                         if (let some(_nn) = cd.name) {
                             checkNamedCtorBody(ck, cd, table)
@@ -1663,7 +1667,16 @@ fn checkCall(ck: Checker, e: Expr, callee: Expr, args: List<CallArg>) -> Ty {
                         gi = gi + 1
                     }
                     var gparams = List<Ty>()
+                    var gdefs = false
                     if (let some(ctor) = table.ctor) {
+                        gdefs = argsUseDefaults(ctor.params, args)
+                        if (gdefs) {
+                            var ginfos = List<ParamInfo>()
+                            for (p in ctor.params) {
+                                ginfos.push(ParamInfo(p.name, subst(p.ty, gmap), p.hasDefault, p.rest, p.span))
+                            }
+                            checkArgsInfo(ck, e, ginfos, args)
+                        }
                         for (p in ctor.params) {
                             gparams.push(subst(p.ty, gmap))
                         }
@@ -1673,7 +1686,9 @@ fn checkCall(ck: Checker, e: Expr, callee: Expr, args: List<CallArg>) -> Ty {
                             gparams.push(subst(s, gmap))
                         }
                     }
-                    checkArgs(ck, e, gparams, args)
+                    if (!gdefs) {
+                        checkArgs(ck, e, gparams, args)
+                    }
                     match (entry) {
                         case TypeTableEntry.Class(c) -> { return Ty.Class(c.name, gt) }
                         case TypeTableEntry.Struct(s) -> { return Ty.Struct(s.name, gt) }
@@ -1731,11 +1746,15 @@ fn checkCall(ck: Checker, e: Expr, callee: Expr, args: List<CallArg>) -> Ty {
                         return Ty.Unknown
                     }
                     if (let some(ctor) = c.ctor) {
-                        var cps = List<Ty>()
-                        for (p in ctor.params) {
-                            cps.push(p.ty)
+                        if (argsUseDefaults(ctor.params, args)) {
+                            checkArgsInfo(ck, e, ctor.params, args)
+                        } else {
+                            var cps = List<Ty>()
+                            for (p in ctor.params) {
+                                cps.push(p.ty)
+                            }
+                            checkArgs(ck, e, cps, args)
                         }
-                        checkArgs(ck, e, cps, args)
                     } else {
                         checkArgs(ck, e, synthesizedCtorParamTys(ck, cname), args)
                     }
@@ -1808,10 +1827,90 @@ fn checkCall(ck: Checker, e: Expr, callee: Expr, args: List<CallArg>) -> Ty {
                 return first.ret
             }
         }
+        // A user-defined static method with trailing defaults may be called
+        // with fewer positional arguments; check the supplied ones against the
+        // declared parameters and let the emitter supply the rest.
+        if (isMember) {
+            let smName = match (callee.kind) {
+                case ExprKind.Member(_, n) -> n
+                case _ -> ""
+            }
+            let smObj = match (callee.kind) {
+                case ExprKind.Member(o, _) -> o
+                case _ -> callee
+            }
+            var stName = ""
+            var isTypeName = false
+            match (smObj.kind) {
+                case ExprKind.Ident(n) -> {
+                    stName = n
+                    isTypeName = true
+                }
+                case _ -> {}
+            }
+            if (isTypeName) {
+                if (let some(entry) = ck.resolved.types.get(stName)) {
+                    let gname = entryName(entry)
+                    if (let some(m) = findMethod(ck, gname, smName)) {
+                        if (argsUseDefaults(m.params, args)) {
+                            checkArgsInfo(ck, e, m.params, args)
+                            return methodRetTy(ck, m, Map<string, Ty>())
+                        }
+                    }
+                    if (let some(nc) = findNamedCtor(ck, gname, smName)) {
+                        if (argsUseDefaults(nc.params, args)) {
+                            checkArgsInfo(ck, e, nc.params, args)
+                            match (entry) {
+                                case TypeTableEntry.Class(c) -> { return Ty.Class(c.name, tyVars(c.generics)) }
+                                case TypeTableEntry.Struct(s) -> { return Ty.Struct(s.name, tyVars(s.generics)) }
+                                case _ -> { return Ty.Unknown }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let ct = checkExpr(ck, callee)
         match (ct) {
             case Ty.Fn(params, ret) -> {
-                checkArgs(ck, e, params, args)
+                // A user instance method with trailing defaults may be called
+                // with fewer positional arguments. Resolve the method again to
+                // get its parameter metadata (the `Ty.Fn` placeholder carries
+                // only resolved types) and let the emitter append defaults.
+                var usedDefaults = false
+                if (isMember) {
+                    let dmName = match (callee.kind) {
+                        case ExprKind.Member(_, n) -> n
+                        case _ -> ""
+                    }
+                    let dmObj = match (callee.kind) {
+                        case ExprKind.Member(o, _) -> o
+                        case _ -> callee
+                    }
+                    if (let some(rot0) = ck.types.get(spanKey(dmObj.span))) {
+                        var rot = rot0
+                        match (rot0) {
+                            case Ty.Ptr(i) -> rot = i
+                            case Ty.Ref(i) -> rot = i
+                            case _ -> {}
+                        }
+                        if (let some(tk) = typeKey(ck, rot)) {
+                            if (let some(m) = findMethod(ck, tk.name, dmName)) {
+                                if (argsUseDefaults(m.params, args)) {
+                                    var infos = List<ParamInfo>()
+                                    for (mp in m.params) {
+                                        infos.push(ParamInfo(mp.name, subst(mp.ty, tk.args), mp.hasDefault, mp.rest, mp.span))
+                                    }
+                                    checkArgsInfo(ck, e, infos, args)
+                                    usedDefaults = true
+                                }
+                            }
+                        }
+                    }
+                }
+                if (!usedDefaults) {
+                    checkArgs(ck, e, params, args)
+                }
                 // `Option<T>.map`/`flatMap` and `List<T>.map`: the placeholder
                 // result type from `checkMember` is refined to the container of
                 // the callback's (already checked) return type. `flatMap`
@@ -2351,6 +2450,29 @@ fn inferGenericCall(ck: Checker, e: Expr, f: CallableInfo, args: List<CallArg>) 
 }
 
 
+/// A plain positional call may omit trailing parameters that declare
+/// defaults. The emitter appends those default expressions to the argument
+/// list, so the checker only has to validate the supplied arguments.
+fn argsUseDefaults(params: List<ParamInfo>, args: List<CallArg>) -> bool {
+        if (len(args) >= len(params)) {
+            return false
+        }
+        for (a in args) {
+            if (a.spread) {
+                return false
+            }
+            if (!isNoneStr(a.name)) {
+                return false
+            }
+        }
+        for (p in params) {
+            if (p.hasDefault) {
+                return true
+            }
+        }
+        false
+}
+
 fn checkArgsInfo(ck: Checker, e: Expr, params: List<ParamInfo>, args: List<CallArg>) {
         var restTy: Ty? = none
         var pi = len(params) - 1
@@ -2365,6 +2487,15 @@ fn checkArgsInfo(ck: Checker, e: Expr, params: List<ParamInfo>, args: List<CallA
         for (p in params) {
             if (!p.rest) {
                 fixed = fixed + 1
+            }
+        }
+        // A spread contributes an unknown number of arguments, so the static
+        // arity comparison below cannot decide the call; the emitter checks the
+        // real element count at runtime.
+        var hasSpread = false
+        for (a in args) {
+            if (a.spread) {
+                hasSpread = true
             }
         }
         var position = 0
@@ -2397,30 +2528,42 @@ fn checkArgsInfo(ck: Checker, e: Expr, params: List<ParamInfo>, args: List<CallA
             }
             position = position + 1
         }
-        if (position < fixed) {
+        if (position < fixed && !hasSpread) {
             var allNamed = true
             for (a in args) {
                 if (isNoneStr(a.name)) {
                     allNamed = false
                 }
             }
-            if (allNamed) {
+            var missingRequired = false
+            var mj = position
+            while (mj < fixed) {
+                if (!params[mj].hasDefault) {
+                    missingRequired = true
+                }
+                mj = mj + 1
+            }
+            if (missingRequired && allNamed) {
                 var joined = ""
                 var plural = ""
                 var missCount = 0
-                var mj = position
+                mj = position
                 while (mj < fixed) {
-                    if (missCount > 0) {
-                        joined = joined + ", "
+                    if (!params[mj].hasDefault) {
+                        if (missCount > 0) {
+                            joined = joined + ", "
+                        }
+                        joined = joined + "`" + params[mj].name + "`"
+                        missCount = missCount + 1
                     }
-                    joined = joined + "`" + params[mj].name + "`"
-                    missCount = missCount + 1
                     mj = mj + 1
                 }
                 if (missCount != 1) {
                     plural = "s"
                 }
                 errNote(ck, e.span, "missing argument" + plural + " for parameter" + plural + " `" + joined + "`", "all required parameters must be supplied")
+            } else if (missingRequired) {
+                err(ck, e.span, "expected {fixed} argument(s), found {position}")
             }
         }
 }

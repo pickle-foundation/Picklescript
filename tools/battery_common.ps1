@@ -238,23 +238,27 @@ $rtlibArchive = "tools\diff\rtlib.ar"
 $rtlibDriver = "tools\diff\port\pklc_rtlib.exe"
 $rtlibRuntimeDir = "runtime"
 
-function Get-RtlibArchive() {
+function Get-RtlibArchive([string]$Platform = "win") {
+    if ($Platform -ne "win" -and $Platform -ne "posix" -and $Platform -ne "all") {
+        Write-Host "RTLIB-ARCHIVE: bad platform $Platform (expected win, posix, or all)"
+        return $null
+    }
     if (-not (Invoke-BuildDriver "cli\rtlib.pkl" $rtlibDriver)) {
         Write-Host "RTLIB-ARCHIVE: driver build failed"
         return $null
     }
     $stamp = "$rtlibArchive.hash"
-    $want = (Get-DriverHash) + "|" + (Get-TreeHash @("$rtlibRuntimeDir"))
+    $want = (Get-DriverHash) + "|" + (Get-TreeHash @("$rtlibRuntimeDir")) + "|" + $Platform
     if ((Test-Path -LiteralPath $rtlibArchive) -and (Test-Path -LiteralPath $stamp) -and ((Get-Content -LiteralPath $stamp -Raw).Trim() -eq $want)) {
         return $rtlibArchive
     }
-    Write-Host "RTLIB-ARCHIVE: rebuilding $rtlibArchive ($($rtlibDriver) $rtlibRuntimeDir)"
+    Write-Host "RTLIB-ARCHIVE: rebuilding $rtlibArchive ($($rtlibDriver) $rtlibRuntimeDir platform=$Platform)"
     # Delete the previous archive first. The driver can die before writing
     # anything (a stale driver whose embedded runtime cannot sweep does exactly
     # that), and leaving the old file in place used to stamp it as current and
     # hide the failed build from every later gate.
     if (Test-Path -LiteralPath $rtlibArchive) { Remove-Item -LiteralPath $rtlibArchive -Force }
-    $code = Invoke-NativeQuiet $rtlibDriver @($rtlibRuntimeDir, $rtlibArchive)
+    $code = Invoke-NativeQuiet $rtlibDriver @($rtlibRuntimeDir, $rtlibArchive, $Platform)
     if ($code -eq 0 -and (Test-Path -LiteralPath $rtlibArchive)) {
         Set-Content -LiteralPath $stamp -Value $want -NoNewline
         return $rtlibArchive

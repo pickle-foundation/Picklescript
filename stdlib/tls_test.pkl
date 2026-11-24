@@ -1,0 +1,508 @@
+module std.tls_test
+
+// Integration coverage for std.tls over loopback. The failure-path tests cover
+// TCP/DNS propagation, a plaintext peer, a peer that closes during the
+// handshake, and a read timeout. The loopback tests run a real Schannel server
+// and client in the same process over an ephemeral local port, using the
+// self-signed PKCS#12 fixture in stdlib/testdata. That fixture is not in the
+// machine's trust store, which is exactly what the verify=true rejection test
+// needs; verify=false is the transport test.
+
+import { TcpListener, TcpStream, NetError, ERR_NONE, ERR_TLS, ERR_TIMEOUT, SHUT_WR } from std.net
+import { TlsStream } from std.tls
+import { AtomicInt, spawn } from std.thread
+import { File } from std.fs
+
+test fn tls_connect_to_a_closed_port_fails() {
+    // Reserve then release a port so (almost certainly) nothing listens there.
+    var closedPort = 0
+    match (TcpListener.bind("127.0.0.1", 0)) {
+        case some(l) -> {
+            closedPort = l.localPort()
+            l.close()
+        }
+        case none -> { expect(false).toBe(true) }
+    }
+    if (closedPort > 0) {
+        let e = NetError()
+        match (TlsStream.connect("127.0.0.1", closedPort, 500, true, e)) {
+            case some(t) -> {
+                // Another process may have grabbed the port.
+                t.close()
+                expect(true).toBe(true)
+            }
+            case none -> {
+                expect(e.isSet()).toBe(true)
+                expect(e.kind != ERR_NONE).toBe(true)
+            }
+        }
+    }
+}
+
+test fn tls_connect_rejects_an_unresolvable_host() {
+    let e = NetError()
+    expect(TlsStream.connect("does-not-exist.invalid", 443, 500, true, e) as? TlsStream).toBe(none)
+    expect(e.isSet()).toBe(true)
+    expect(e.kind != ERR_NONE).toBe(true)
+    expect(e.kind != ERR_TLS).toBe(true)
+}
+
+test fn tls_rejects_a_plaintext_peer() {
+    match (TcpListener.bind("127.0.0.1", 0)) {
+        case some(l) -> {
+            let port = l.localPort()
+            match (TcpStream.connect("127.0.0.1", port, 2000)) {
+                case some(c) -> {
+                    match (l.accept()) {
+                        case some(s) -> {
+                            expect(s.writeAll(bytes("HTTP/1.0 400 Bad Request\r\n\r\n"))).toBe(true)
+                            let _ = c.setRecvTimeoutMs(1500)
+                            let e = NetError()
+                            expect(TlsStream.wrap(c, "127.0.0.1", false, e) as? TlsStream).toBe(none)
+                            expect(e.kind).toBe(ERR_TLS)
+                            s.close()
+                        }
+                        case none -> {
+                            c.close()
+                            expect(false).toBe(true)
+                        }
+                    }
+                }
+                case none -> { expect(false).toBe(true) }
+            }
+            l.close()
+        }
+        case none -> { expect(false).toBe(true) }
+    }
+}
+
+test fn tls_reports_a_peer_that_closes_during_the_handshake() {
+    match (TcpListener.bind("127.0.0.1", 0)) {
+        case some(l) -> {
+            let port = l.localPort()
+            match (TcpStream.connect("127.0.0.1", port, 2000)) {
+                case some(c) -> {
+                    match (l.accept()) {
+                        case some(s) -> {
+                            // Half-close instead of close: the client sees a
+                            // clean EOF, not a reset caused by unread data.
+                            expect(s.shutdown(SHUT_WR)).toBe(0)
+                            let _ = c.setRecvTimeoutMs(1500)
+                            let e = NetError()
+                            expect(TlsStream.wrap(c, "127.0.0.1", false, e) as? TlsStream).toBe(none)
+                            expect(e.kind).toBe(ERR_TLS)
+                            s.close()
+                        }
+                        case none -> {
+                            c.close()
+                            expect(false).toBe(true)
+                        }
+                    }
+                }
+                case none -> { expect(false).toBe(true) }
+            }
+            l.close()
+        }
+        case none -> { expect(false).toBe(true) }
+    }
+}
+
+test fn tls_handshake_read_timeout_is_reported() {
+    match (TcpListener.bind("127.0.0.1", 0)) {
+        case some(l) -> {
+            let port = l.localPort()
+            match (TcpStream.connect("127.0.0.1", port, 2000)) {
+                case some(c) -> {
+                    match (l.accept()) {
+                        case some(s) -> {
+                            // Accept but say nothing: the client blocks in the
+                            // handshake read until the socket timeout fires.
+                            let _ = c.setRecvTimeoutMs(300)
+                            let e = NetError()
+                            expect(TlsStream.wrap(c, "127.0.0.1", false, e) as? TlsStream).toBe(none)
+                            expect(e.kind).toBe(ERR_TIMEOUT)
+                            s.close()
+                        }
+                        case none -> {
+                            c.close()
+                            expect(false).toBe(true)
+                        }
+                    }
+                }
+                case none -> { expect(false).toBe(true) }
+            }
+            l.close()
+        }
+        case none -> { expect(false).toBe(true) }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Loopback server fixtures and helpers
+// ---------------------------------------------------------------------------
+
+/// Password protecting stdlib/testdata/tls_loopback.pfx. Test-only material.
+const PFX_PASSWORD: string = "picklescript"
+
+/// `CERT_E_UNTRUSTEDROOT`: the SSL policy's verdict for a self-signed server
+/// certificate that was never installed in a trust store.
+const CERT_E_UNTRUSTEDROOT: int = 2148204809
+
+/// Windows paths use `\`; the path splitting below only knows `/`.
+fn slashes(p: string) -> string {
+    var out = ""
+    var i = 0
+    while (i < len(p)) {
+        let ch = p[i] as int
+        if (ch == 92) {
+            out = out + "/"
+        } else {
+            out = out + "{p[i] as char}"
+        }
+        i = i + 1
+    }
+    out
+}
+
+fn slicePath(p: string, end: int) -> string {
+    var out = ""
+    var i = 0
+    while (i < end) {
+        out = out + "{p[i] as char}"
+        i = i + 1
+    }
+    out
+}
+
+/// The parent of an absolute, `/`-separated path, or none at the root.
+fn parentPath(p: string) -> string? {
+    var end = len(p) - 1
+    while (end >= 0 && (p[end] as int) == 47) {
+        end = end - 1
+    }
+    if (end < 0) {
+        return none
+    }
+    var i = end
+    while (i >= 0 && (p[i] as int) != 47) {
+        i = i - 1
+    }
+    if (i < 0) {
+        return none
+    }
+    slicePath(p, i)
+}
+
+fn readFixture(p: string) -> List<byte>? {
+    match (File(p).read()) {
+        case some(text) -> bytes(text)
+        case none -> none
+    }
+}
+
+/// Locate `stdlib/testdata/tls_loopback.pfx` by walking up from the working
+/// directory, so the lane does not depend on being started at the repo root.
+fn loadLoopbackPfx() -> List<byte>? {
+    var dir = ""
+    match (current_dir()) {
+        case some(d) -> { dir = slashes(d) }
+        case none -> { return none }
+    }
+    var found = bytes("")
+    var have = 0
+    var done = 0
+    while (done == 0) {
+        match (readFixture(dir + "/stdlib/testdata/tls_loopback.pfx")) {
+            case some(b) -> {
+                found = b
+                have = 1
+                done = 1
+            }
+            case none -> {
+                match (readFixture(dir + "/testdata/tls_loopback.pfx")) {
+                    case some(b2) -> {
+                        found = b2
+                        have = 1
+                        done = 1
+                    }
+                    case none -> {
+                        match (parentPath(dir)) {
+                            case some(parent) -> { dir = parent }
+                            case none -> { done = 1 }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (have == 0) {
+        return none
+    }
+    found
+}
+
+/// Deterministic byte pattern: exercises chunked record writes and reads that
+/// span several records without relying on random data.
+fn pattern(n: int, seed: int) -> List<byte> {
+    var out = bytes("")
+    var i = 0
+    while (i < n) {
+        out.push(((i * 31 + seed) & 255) as byte)
+        i = i + 1
+    }
+    out
+}
+
+fn sameBytes(a: List<byte>, b: List<byte>) -> bool {
+    if (len(a) != len(b)) {
+        return false
+    }
+    var i = 0
+    while (i < len(a)) {
+        if (a[i] != b[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+/// Connect, wrap both ends, send `request` each way and check the reply.
+/// Returns 1 from the client task when the reply matched byte for byte.
+fn loopbackExchange(pfx: List<byte>, request: List<byte>, reply: List<byte>, verify: bool) -> int {
+    let clientResult = AtomicInt(0)
+    var serverResult = 0
+    let bindErr = NetError()
+    match (TcpListener.bind("127.0.0.1", 0, bindErr)) {
+        case some(l) -> {
+            let port = l.localPort()
+            let connectErr = NetError()
+            match (TcpStream.connect("127.0.0.1", port, 2000, connectErr)) {
+                case some(tcp) -> {
+                    let _ct = tcp.setRecvTimeoutMs(5000)
+                    let worker = spawn(fn() {
+                        let e = NetError()
+                        match (TlsStream.wrap(tcp, "127.0.0.1", verify, e)) {
+                            case some(client) -> {
+                                var good = 0
+                                if (client.writeAll(request)) {
+                                    match (client.readExact(len(reply))) {
+                                        case some(got) -> {
+                                            if (sameBytes(got, reply)) {
+                                                good = 1
+                                            } else {
+                                                println("client: reply mismatch (" + str(len(got)) + " bytes)")
+                                            }
+                                        }
+                                        case none -> {
+                                            println("client: read failed: " + client.lastError().message)
+                                        }
+                                    }
+                                } else {
+                                    println("client: write failed: " + client.lastError().message)
+                                }
+                                clientResult.store(good)
+                                client.close()
+                            }
+                            case none -> {
+                                clientResult.store(0 - e.code)
+                                println("client: wrap failed: " + e.message)
+                            }
+                        }
+                    })
+
+                    match (l.accept()) {
+                        case some(sc) -> {
+                            let _st = sc.setRecvTimeoutMs(5000)
+                            let se = NetError()
+                            match (TlsStream.accept(sc, pfx, PFX_PASSWORD, se)) {
+                                case some(srv) -> {
+                                    match (srv.readExact(len(request))) {
+                                        case some(got) -> {
+                                            if (sameBytes(got, request)) {
+                                                if (srv.writeAll(reply)) {
+                                                    serverResult = 1
+                                                } else {
+                                                    println("server: write failed: " + srv.lastError().message)
+                                                }
+                                            } else {
+                                                println("server: request mismatch (" + str(len(got)) + " bytes)")
+                                            }
+                                        }
+                                        case none -> {
+                                            println("server: read failed: " + srv.lastError().message)
+                                        }
+                                    }
+                                    srv.close()
+                                }
+                                case none -> {
+                                    println("server: accept failed: " + se.message)
+                                }
+                            }
+                        }
+                        case none -> {
+                            println("server: accept failed")
+                        }
+                    }
+                    l.close()
+                    let _j = worker.join()
+                    if (serverResult != 1) {
+                        println("server side did not complete the exchange")
+                    }
+                    clientResult.load()
+                }
+                case none -> {
+                    l.close()
+                    println("connect failed: " + connectErr.message)
+                    0
+                }
+            }
+        }
+        case none -> {
+            println("bind failed: " + bindErr.message)
+            0
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Loopback server tests
+// ---------------------------------------------------------------------------
+
+test fn tls_loopback_roundtrip() {
+    match (loadLoopbackPfx()) {
+        case some(pfx) -> {
+            let request = bytes("GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            let reply = bytes("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            expect(loopbackExchange(pfx, request, reply, false)).toBe(1)
+        }
+        case none -> {
+            assert(false, "missing fixture stdlib/testdata/tls_loopback.pfx")
+        }
+    }
+}
+
+test fn tls_loopback_large_payload() {
+    // Four 16 KiB records each way: the send path must chunk at
+    // SecPkgContext_StreamSizes.cbMaximumMessage and the read path must join
+    // several records into one readExact answer.
+    match (loadLoopbackPfx()) {
+        case some(pfx) -> {
+            let request = pattern(40000, 11)
+            let reply = pattern(40000, 97)
+            expect(loopbackExchange(pfx, request, reply, false)).toBe(1)
+        }
+        case none -> {
+            assert(false, "missing fixture stdlib/testdata/tls_loopback.pfx")
+        }
+    }
+}
+
+test fn tls_loopback_client_rejects_an_untrusted_server() {
+    match (loadLoopbackPfx()) {
+        case some(pfx) -> {
+            let request = bytes("hello")
+            let reply = bytes("world")
+            // The client task reports the negative certificate error code, so
+            // a successful transport that verified nothing cannot pass.
+            let got = loopbackExchange(pfx, request, reply, true)
+            expect(got).toBe(0 - CERT_E_UNTRUSTEDROOT)
+        }
+        case none -> {
+            assert(false, "missing fixture stdlib/testdata/tls_loopback.pfx")
+        }
+    }
+}
+
+test fn tls_server_rejects_a_bad_pfx_password() {
+    match (loadLoopbackPfx()) {
+        case some(pfx) -> {
+            match (TcpListener.bind("127.0.0.1", 0)) {
+                case some(l) -> {
+                    let port = l.localPort()
+                    match (TcpStream.connect("127.0.0.1", port, 2000)) {
+                        case some(c) -> {
+                            match (l.accept()) {
+                                case some(sc) -> {
+                                    let e = NetError()
+                                    match (TlsStream.accept(sc, pfx, "not-the-password", e)) {
+                                        case some(t) -> {
+                                            t.close()
+                                            expect(false).toBe(true)
+                                        }
+                                        case none -> {
+                                            expect(e.kind).toBe(ERR_TLS)
+                                            match (e.message.indexOf("PKCS#12 import failed")) {
+                                                case some(at) -> { expect(at >= 0).toBe(true) }
+                                                case none -> { expect(false).toBe(true) }
+                                            }
+                                        }
+                                    }
+                                }
+                                case none -> {
+                                    c.close()
+                                    expect(false).toBe(true)
+                                }
+                            }
+                        }
+                        case none -> { expect(false).toBe(true) }
+                    }
+                    l.close()
+                }
+                case none -> { expect(false).toBe(true) }
+            }
+        }
+        case none -> {
+            assert(false, "missing fixture stdlib/testdata/tls_loopback.pfx")
+        }
+    }
+}
+
+test fn tls_server_rejects_a_plaintext_peer() {
+    match (loadLoopbackPfx()) {
+        case some(pfx) -> {
+            match (TcpListener.bind("127.0.0.1", 0)) {
+                case some(l) -> {
+                    let port = l.localPort()
+                    match (TcpStream.connect("127.0.0.1", port, 2000)) {
+                        case some(c) -> {
+                            // Queue an HTTP request instead of a ClientHello, then
+                            // let the server start its handshake against it.
+                            expect(c.writeAll(bytes("HTTP/1.0 400 Bad Request\r\n\r\n"))).toBe(true)
+                            match (l.accept()) {
+                                case some(sc) -> {
+                                    let _st = sc.setRecvTimeoutMs(3000)
+                                    let e = NetError()
+                                    match (TlsStream.accept(sc, pfx, PFX_PASSWORD, e)) {
+                                        case some(t) -> {
+                                            t.close()
+                                            expect(false).toBe(true)
+                                        }
+                                        case none -> {
+                                            expect(e.kind).toBe(ERR_TLS)
+                                            match (e.message.indexOf("handshake")) {
+                                                case some(at) -> { expect(at >= 0).toBe(true) }
+                                                case none -> { expect(false).toBe(true) }
+                                            }
+                                        }
+                                    }
+                                }
+                                case none -> {
+                                    c.close()
+                                    expect(false).toBe(true)
+                                }
+                            }
+                            c.close()
+                        }
+                        case none -> { expect(false).toBe(true) }
+                    }
+                    l.close()
+                }
+                case none -> { expect(false).toBe(true) }
+            }
+        }
+        case none -> {
+            assert(false, "missing fixture stdlib/testdata/tls_loopback.pfx")
+        }
+    }
+}

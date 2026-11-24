@@ -1,0 +1,108 @@
+// Default arguments are lowered at the call site: a plain positional call may
+// omit trailing parameters that declare defaults, and the omitted expressions
+// are evaluated where the call appears (not where the callee is declared).
+
+var bumps = 1
+
+fn defaultSum(a: int, b: int = 10, c: int = 100) -> int {
+    a + b + c
+}
+
+fn defaultText(name: string, suffix: string = "!") -> string {
+    name + suffix
+}
+
+fn defaultOptional(v: int, fallback: int = -1) -> int {
+    if (v > 0) {
+        v
+    } else {
+        fallback
+    }
+}
+
+fn defaultAtCallSite(a: int = bumps) -> int {
+    a
+}
+
+class DefaultBox {
+    var base: int
+
+    constructor(base: int = 5) {
+        this.base = base
+    }
+
+    constructor.make(start: int = 3) {
+        this(start * 10)
+    }
+
+    fn plus(n: int = 1) -> int {
+        this.base + n
+    }
+
+    fn scaled(n: int = 2, k: int = 3) -> int {
+        (this.base + n) * k
+    }
+
+    static fn add(a: int, b: int = 7) -> int {
+        a + b
+    }
+
+    static fn scaleBoth(a: int = 2, b: int = 5) -> int {
+        a * b
+    }
+}
+
+test fn top_level_defaults_fill_trailing_parameters() {
+    expect(defaultSum(1)).toBe(111)
+    expect(defaultSum(1, 2)).toBe(103)
+    expect(defaultSum(1, 2, 3)).toBe(6)
+    // A filled default must not leak into the next call.
+    expect(defaultSum(2, 0, 0)).toBe(2)
+    expect(defaultText("hi")).toBe("hi!")
+    expect(defaultText("hi", "?")).toBe("hi?")
+    expect(defaultOptional(0)).toBe(-1)
+    expect(defaultOptional(4)).toBe(4)
+}
+
+test fn top_level_defaults_are_evaluated_at_the_call_site() {
+    bumps = 1
+    expect(defaultAtCallSite()).toBe(1)
+    bumps = 42
+    expect(defaultAtCallSite()).toBe(42)
+    expect(defaultAtCallSite(7)).toBe(7)
+    bumps = 1
+}
+
+test fn instance_method_defaults() {
+    let b = DefaultBox(20)
+    expect(b.plus()).toBe(21)
+    expect(b.plus(4)).toBe(24)
+    expect(b.scaled()).toBe(66)
+    expect(b.scaled(1)).toBe(63)
+    expect(b.scaled(1, 10)).toBe(210)
+}
+
+test fn static_method_defaults() {
+    expect(DefaultBox.add(1)).toBe(8)
+    expect(DefaultBox.add(1, 2)).toBe(3)
+    expect(DefaultBox.scaleBoth()).toBe(10)
+    expect(DefaultBox.scaleBoth(3)).toBe(15)
+    expect(DefaultBox.scaleBoth(3, 4)).toBe(12)
+}
+
+test fn constructor_defaults() {
+    let a = DefaultBox()
+    expect(a.base).toBe(5)
+    let b = DefaultBox(9)
+    expect(b.base).toBe(9)
+    // Named constructors share the same call-site lowering.
+    let c = DefaultBox.make()
+    expect(c.base).toBe(30)
+    let d = DefaultBox.make(4)
+    expect(d.base).toBe(40)
+}
+
+test fn defaults_inside_a_lambda_capture_stay_correct() {
+    let f = () => DefaultBox.add(2)
+    expect(f()).toBe(9)
+}

@@ -10,12 +10,13 @@ import { newObjs, lowerProgram, lowerProgramEx, lowerModuleObj, lowerModuleObjEx
 /// `runtime/*.pkl` instead of the Rust-built `combined.lib`, and make
 /// the linker print the exact symbol set Pickle cannot yet supply.
 ///
-/// Usage: pickle-cli run cli/selflink.pkl -- <target> <outExe> [rtDir]
-/// Default rtDir is `runtime`. Non-test `.pkl` members are lowered in
-/// sorted order (scanDefs is last-wins per name, so order is part of the
-/// result), the program object always comes first, and the probe reports the
-/// full unresolved list — that list is the real work order for a Pickle-only
-/// runtime, measured per program shape rather than guessed.
+/// Usage: pickle-cli run cli/selflink.pkl -- <target> <outExe> [rtDir] [platform] [--map]
+/// Default rtDir is `runtime`; platform is `win`, `posix`, or `all` (default
+/// `win`). Non-test `.pkl` members are lowered in sorted order (scanDefs is
+/// last-wins per name, so order is part of the result), the program object
+/// always comes first, and the probe reports the full unresolved list - that
+/// list is the real work order for a Pickle-only runtime, measured per program
+/// shape rather than guessed.
 ///
 /// Split objects also need one shared class-id space: a single emitter hands
 /// out `10 + tableIndex`, but once program and members are separate objects
@@ -135,7 +136,7 @@ fn main() {
     }
     pos = len(clean)
     if (pos < 2) {
-        println("SELFLINK NO ARGS: <target> <outExe> [rtDir] [--map]")
+        println("SELFLINK NO ARGS: <target> <outExe> [rtDir] [platform] [--map]")
         return
     }
     let target = clean[0]
@@ -144,16 +145,41 @@ fn main() {
     if (pos > 2) {
         rtDir = clean[2]
     }
+    var platform = "win"
+    if (pos > 3) {
+        platform = clean[3]
+    }
+    if (!validPlatform(platform)) {
+        println("SELFLINK BAD PLATFORM: " + platform + " (expected win, posix, or all)")
+        return
+    }
 
     let srcOpt = read_file(target)
     if (let some(src) = srcOpt) {
-        runLink(target, src, outExe, rtDir, mapOnly)
+        runLink(target, src, outExe, rtDir, platform, mapOnly)
     } else {
         println("SELFLINK FAIL: cannot read source " + target)
     }
 }
 
-fn runLink(target: string, src: string, outExe: string, rtDir: string, mapOnly: bool) {
+fn validPlatform(p: string) -> bool {
+    p == "win" || p == "posix" || p == "all"
+}
+
+fn platformAllows(fp: string, platform: string) -> bool {
+    if (platform == "all") {
+        return true
+    }
+    if (hasSuffix(fp, "_win.pkl")) {
+        return platform == "win"
+    }
+    if (hasSuffix(fp, "_posix.pkl")) {
+        return platform == "posix"
+    }
+    true
+}
+
+fn runLink(target: string, src: string, outExe: string, rtDir: string, platform: string, mapOnly: bool) {
     let sinks = DiagnosticSink()
     let programOpt = lowerProgram(target, src, sinks)
     if (let some(program) = programOpt) {
@@ -162,7 +188,7 @@ fn runLink(target: string, src: string, outExe: string, rtDir: string, mapOnly: 
         if (let some(files) = dirOpt) {
             for (f in files) {
                 let fp = slashes(f)
-                if (hasSuffix(fp, ".pkl") && !hasSuffix(fp, "_test.pkl") && !hasSuffix(fp, "/fs.pkl")) {
+                if (hasSuffix(fp, ".pkl") && !hasSuffix(fp, "_test.pkl") && !hasSuffix(fp, "/fs.pkl") && platformAllows(fp, platform)) {
                     // fs.pkl declares the `Fs` interface but no implementing
                     // class — it is a seam the program (or its tests) binds, so
                     // as a standalone root it fails codegen. Its callers pull it

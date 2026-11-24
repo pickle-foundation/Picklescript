@@ -1054,3 +1054,64 @@ test fn format_is_typed_and_rejects_bad_arguments() {
     expect(len(msgs)).toBe(1)
     expect(countContaining(msgs, "`format` cannot stringify")).toBe(1)
 }
+
+// ---- default arguments --------------------------------------------------------
+
+test fn default_arguments_allow_omitting_trailing_parameters() {
+    let ob = obrace()
+    let cb = cbrace()
+
+    let msgs = checkSource("fn f(a: int, b: int = 2) -> int " + ob + " a + b " + cb + "\nfn main() " + ob + "\n let x: int = f(1) \n let y: int = f(1, 3) \n " + cb)
+    expect(len(msgs)).toBe(0)
+
+    let msgs = checkSource("fn f(a: int, b: string = " + quote() + "x" + quote() + ") -> string " + ob + " str(a) + b " + cb + "\nfn main() " + ob + "\n let s: string = f(1) \n " + cb)
+    expect(len(msgs)).toBe(0)
+
+    // Supplied arguments keep their declared types.
+    let msgs = checkSource("fn f(a: int, b: int = 2) -> int " + ob + " a + b " + cb + "\nfn main() " + ob + "\n let x = f(1, " + quote() + "s" + quote() + ") \n " + cb)
+    expect(len(msgs)).toBe(1)
+    expect(countContaining(msgs, "type mismatch in argument")).toBe(1)
+}
+
+test fn required_parameters_still_report_missing_arguments() {
+    let ob = obrace()
+    let cb = cbrace()
+
+    let msgs = checkSource("fn f(a: int, b: int = 2) -> int " + ob + " a + b " + cb + "\nfn main() " + ob + "\n let x = f() \n " + cb)
+    expect(len(msgs)).toBe(1)
+    expect(countContaining(msgs, "missing argument")).toBe(1)
+
+    let msgs = checkSource("fn g(a: int, b: int) -> int " + ob + " a + b " + cb + "\nfn main() " + ob + "\n let x = g(1) \n " + cb)
+    expect(len(msgs)).toBe(1)
+    expect(countContaining(msgs, "argument(s)")).toBe(1)
+}
+
+test fn spread_calls_do_not_report_static_arity_errors() {
+    let ob = obrace()
+    let cb = cbrace()
+
+    // A spread supplies an unknown number of arguments; the element count is
+    // checked at runtime by the emitter, not as a static missing-argument error.
+    let msgs = checkSource("fn f(a: int, b: int, c: int) -> int " + ob + " a + b + c " + cb + "\nfn main() " + ob + "\n let xs: List<int> = [1, 2, 3] \n let x: int = f(...xs) \n " + cb)
+    expect(len(msgs)).toBe(0)
+}
+
+test fn method_and_constructor_defaults_are_typed() {
+    let ob = obrace()
+    let cb = cbrace()
+
+    let src = "class Box " + ob + "\n var n: int \n constructor(n: int = 1) " + ob + " this.n = n " + cb + "\n constructor.make(start: int = 3) " + ob + " this(start * 10) " + cb + "\n fn plus(k: int = 1) -> int " + ob + " this.n + k " + cb + "\n static fn twice(k: int = 2) -> int " + ob + " k * 2 " + cb + "\n" + cb + "\nfn main() " + ob + "\n let b = Box() \n let c = Box.make() \n let x: int = b.plus() \n let y: int = Box.twice() \n let z: int = b.plus(4) \n " + cb
+    let msgs = checkSource(src)
+    expect(len(msgs)).toBe(0)
+
+    // Constructor defaults are type-checked like function and method defaults;
+    // the emitter relies on those inferred types when filling call sites.
+    let msgs = checkSource("class Box " + ob + "\n constructor(n: int = " + quote() + "x" + quote() + ") " + ob + " " + cb + "\n" + cb + "\nfn main() " + ob + "\n let b = Box() \n " + cb)
+    expect(len(msgs)).toBe(1)
+    expect(countContaining(msgs, "type mismatch in default argument")).toBe(1)
+
+    // The method's required parameter is still enforced.
+    let msgs = checkSource("class Box " + ob + "\n fn plus(n: int, k: int = 1) -> int " + ob + " n + k " + cb + "\n" + cb + "\nfn main() " + ob + "\n let b = Box() \n let x = b.plus() \n " + cb)
+    expect(len(msgs)).toBe(1)
+    expect(countContaining(msgs, "missing argument")).toBe(1)
+}

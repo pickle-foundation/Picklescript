@@ -1,0 +1,826 @@
+module std.net.websocket_test
+
+// Coverage for std.net.websocket. The unit half uses an in-memory `Conn` and
+// fixed RFC 6455 frame bytes, so masking, fragmentation, control frames, UTF-8,
+// and size limits are checked without sockets or timing. The second half runs
+// a real client/server on ephemeral loopback ports, including one `wss://`
+// exchange over the self-signed PKCS#12 fixture.
+
+import { Conn, NetError, TcpListener, TcpStream, ERR_PROTOCOL, ERR_MESSAGE_SIZE, ERR_CLOSED } from std.net
+import { WsConn, WsMessage, WsServer, acceptKey, encodeFrame, clientHandshakeText, OP_CONT, OP_TEXT, OP_BINARY, OP_CLOSE, OP_PING, OP_PONG } from std.net.websocket
+import { TlsStream } from std.tls
+import { spawn, Task, AtomicInt, Semaphore } from std.thread
+import { File } from std.fs
+
+const RFC_KEY: string = "dGhlIHNhbXBsZSBub25jZQ=="
+const RFC_ACCEPT: string = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+const PFX_PASSWORD: string = "picklescript"
+const MASK_KEY: List<int> = [0x37, 0xFA, 0x21, 0x3D]
+
+// ---------------------------------------------------------------------------
+// In-memory transport and helpers
+// ---------------------------------------------------------------------------
+
+class MemoryConn implements Conn {
+    var input: List<byte>
+    var pos: int
+    var output: List<byte>
+    var closed: bool
+    var err: NetError
+
+    constructor(input: List<byte>) {
+        this.input = input
+        this.pos = 0
+        this.output = bytes("")
+        this.closed = false
+        this.err = NetError()
+    }
+
+    fn readSome(max: int) -> List<byte>? {
+        if (this.pos >= len(this.input)) {
+            return bytes("")
+        }
+        var want = max
+        if (want < 0) {
+            want = 0
+        }
+        let left = len(this.input) - this.pos
+        if (want > left) {
+            want = left
+        }
+        var out = bytes("")
+        var i = 0
+        while (i < want) {
+            out.push(this.input[this.pos + i])
+            i = i + 1
+        }
+        this.pos = this.pos + want
+        out
+    }
+
+    fn writeAll(data: List<byte>) -> bool {
+        if (this.closed) {
+            return false
+        }
+        for (b in data) {
+            this.output.push(b)
+        }
+        true
+    }
+
+    fn setRecvTimeoutMs(ms: int) -> bool {
+        true
+    }
+
+    fn lastError() -> NetError {
+        this.err
+    }
+
+    fn close() {
+        this.closed = true
+    }
+}
+
+fn mem(text: string) -> MemoryConn {
+    MemoryConn(bytes(text))
+}
+
+fn bytesOf(values: List<int>) -> List<byte> {
+    var out = bytes("")
+    var i = 0
+    while (i < len(values)) {
+        out.push(values[i] as byte)
+        i = i + 1
+    }
+    out
+}
+
+fn maskBytes() -> List<byte> {
+    bytesOf(MASK_KEY)
+}
+
+fn appendBytes(out: List<byte>, data: List<byte>) {
+    for (b in data) {
+        out.push(b)
+    }
+}
+
+fn sameBytes(a: List<byte>, b: List<byte>) -> bool {
+    if (len(a) != len(b)) {
+        return false
+    }
+    var i = 0
+    while (i < len(a)) {
+        if ((a[i] as int) != (b[i] as int)) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+fn pattern(n: int, seed: int) -> List<byte> {
+    var out = bytes("")
+    var i = 0
+    while (i < n) {
+        out.push(((i * 31 + seed) & 255) as byte)
+        i = i + 1
+    }
+    out
+}
+
+fn unmaskedFrame(opcode: int, payload: List<byte>, fin: bool) -> List<byte> {
+    match (encodeFrame(opcode, payload, fin, false, none)) {
+        case some(f) -> f
+        case none -> {
+            assert(false, "encodeFrame rejected an unmasked frame")
+            bytes("")
+        }
+    }
+}
+
+fn maskedFrame(opcode: int, payload: List<byte>, fin: bool, key: List<byte>) -> List<byte> {
+    match (encodeFrame(opcode, payload, fin, true, key)) {
+        case some(f) -> f
+        case none -> {
+            assert(false, "encodeFrame rejected a masked frame")
+            bytes("")
+        }
+    }
+}
+
+fn frameOpcode(data: List<byte>) -> int {
+    if (len(data) < 2) {
+        return -1
+    }
+    (data[0] as int) & 0x0F
+}
+
+fn frameFin(data: List<byte>) -> bool {
+    if (len(data) < 2) {
+        return false
+    }
+    ((data[0] as int) & 0x80) != 0
+}
+
+fn frameMasked(data: List<byte>) -> bool {
+    if (len(data) < 2) {
+        return false
+    }
+    ((data[1] as int) & 0x80) != 0
+}
+
+fn framePayloadLen(data: List<byte>) -> int {
+    if (len(data) < 2) {
+        return -1
+    }
+    (data[1] as int) & 0x7F
+}
+
+fn requestText(key: string, protocol: string) -> string {
+    var out = "GET /chat HTTP/1.1\r\n"
+    out = out + "Host: example.com\r\n"
+    out = out + "Upgrade: websocket\r\n"
+    out = out + "Connection: Upgrade\r\n"
+    out = out + "Sec-WebSocket-Key: " + key + "\r\n"
+    out = out + "Sec-WebSocket-Version: 13\r\n"
+    if (protocol != "") {
+        out = out + "Sec-WebSocket-Protocol: " + protocol + "\r\n"
+    }
+    out + "\r\n"
+}
+
+fn responseText(accept: string, protocol: string) -> string {
+    var out = "HTTP/1.1 101 Switching Protocols\r\n"
+    out = out + "Upgrade: websocket\r\n"
+    out = out + "Connection: Upgrade\r\n"
+    out = out + "Sec-WebSocket-Accept: " + accept + "\r\n"
+    if (protocol != "") {
+        out = out + "Sec-WebSocket-Protocol: " + protocol + "\r\n"
+    }
+    out + "\r\n"
+}
+
+fn oneProtocol(name: string) -> List<string> {
+    let out = List<string>()
+    out.push(name)
+    out
+}
+
+fn messageText(ws: WsConn) -> string {
+    match (ws.readMessage()) {
+        case some(m) -> m.text()
+        case none -> "<none>"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Handshake
+// ---------------------------------------------------------------------------
+
+test fn accept_key_matches_rfc_6455_vector() {
+    expect(acceptKey(RFC_KEY)).toBe(RFC_ACCEPT)
+}
+
+test fn client_handshake_text_is_well_formed() {
+    let req = clientHandshakeText("example.com", 80, "/chat", RFC_KEY, "chat")
+    expect(req.contains("GET /chat HTTP/1.1\r\n")).toBe(true)
+    expect(req.contains("Host: example.com\r\n")).toBe(true)
+    expect(req.contains("Upgrade: websocket\r\n")).toBe(true)
+    expect(req.contains("Connection: Upgrade\r\n")).toBe(true)
+    expect(req.contains("Sec-WebSocket-Key: " + RFC_KEY + "\r\n")).toBe(true)
+    expect(req.contains("Sec-WebSocket-Version: 13\r\n")).toBe(true)
+    expect(req.contains("Sec-WebSocket-Protocol: chat\r\n")).toBe(true)
+
+    let bare = clientHandshakeText("127.0.0.1", 9001, "", RFC_KEY, "")
+    expect(bare.contains("GET / HTTP/1.1\r\n")).toBe(true)
+    expect(bare.contains("Host: 127.0.0.1:9001\r\n")).toBe(true)
+    expect(bare.contains("Sec-WebSocket-Protocol")).toBe(false)
+}
+
+test fn server_accepts_a_valid_handshake() {
+    let m = mem(requestText(RFC_KEY, "chat"))
+    let wsOpt = WsConn.accept(m, oneProtocol("chat"))
+    match (wsOpt) {
+        case some(ws) -> {
+            expect(ws.protocol).toBe("chat")
+            let out = str(m.output)
+            expect(out.contains("HTTP/1.1 101 Switching Protocols\r\n")).toBe(true)
+            expect(out.contains("Upgrade: websocket\r\n")).toBe(true)
+            expect(out.contains("Connection: Upgrade\r\n")).toBe(true)
+            expect(out.contains("Sec-WebSocket-Accept: " + RFC_ACCEPT + "\r\n")).toBe(true)
+            expect(out.contains("Sec-WebSocket-Protocol: chat\r\n")).toBe(true)
+        }
+        case none -> assert(false, "valid handshake was rejected")
+    }
+}
+
+test fn server_rejects_an_unsupported_version() {
+    let raw = "GET /chat HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + RFC_KEY + "\r\nSec-WebSocket-Version: 8\r\n\r\n"
+    let m = mem(raw)
+    expect(WsConn.accept(m, List<string>()) as? WsConn).toBe(none)
+    let out = str(m.output)
+    expect(out.contains("HTTP/1.1 426 Upgrade Required\r\n")).toBe(true)
+    expect(out.contains("Sec-WebSocket-Version: 13\r\n")).toBe(true)
+}
+
+test fn server_rejects_an_invalid_key() {
+    let raw = "GET /chat HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: not-base64\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    let m = mem(raw)
+    expect(WsConn.accept(m, List<string>()) as? WsConn).toBe(none)
+    expect(str(m.output).contains("HTTP/1.1 400 Bad Request\r\n")).toBe(true)
+}
+
+test fn client_handshake_keeps_early_frame_bytes() {
+    let raw = bytes(responseText(RFC_ACCEPT, "chat"))
+    appendBytes(raw, unmaskedFrame(OP_TEXT, bytes("hello"), true))
+    let m = MemoryConn(raw)
+    let wsOpt = WsConn.handshakeClient(m, "example.com", 80, "/chat", RFC_KEY, "chat")
+    match (wsOpt) {
+        case some(ws) -> {
+            expect(ws.protocol).toBe("chat")
+            expect(str(m.output).contains("GET /chat HTTP/1.1\r\n")).toBe(true)
+            expect(str(m.output).contains("Sec-WebSocket-Key: " + RFC_KEY + "\r\n")).toBe(true)
+            expect(messageText(ws)).toBe("hello")
+        }
+        case none -> assert(false, "valid server response was rejected")
+    }
+}
+
+test fn client_rejects_a_wrong_accept_value() {
+    let m = mem("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: wrong\r\n\r\n")
+    expect(WsConn.handshakeClient(m, "example.com", 80, "/chat", RFC_KEY) as? WsConn).toBe(none)
+}
+
+// ---------------------------------------------------------------------------
+// Frames
+// ---------------------------------------------------------------------------
+
+test fn decodes_an_unmasked_text_frame() {
+    let m = MemoryConn(unmaskedFrame(OP_TEXT, bytes("Hello"), true))
+    let ws = WsConn.attach(m, true)
+    match (ws.readMessage()) {
+        case some(msg) -> {
+            expect(msg.opcode).toBe(OP_TEXT)
+            expect(msg.isText()).toBe(true)
+            expect(msg.text()).toBe("Hello")
+        }
+        case none -> assert(false, "text frame was rejected")
+    }
+}
+
+test fn decodes_the_rfc_masked_text_frame() {
+    let frame = maskedFrame(OP_TEXT, bytes("Hello"), true, maskBytes())
+    expect(len(frame)).toBe(11)
+    expect((frame[0] as int)).toBe(0x81)
+    expect((frame[1] as int)).toBe(0x85)
+    expect((frame[2] as int)).toBe(0x37)
+    expect((frame[3] as int)).toBe(0xFA)
+    expect((frame[4] as int)).toBe(0x21)
+    expect((frame[5] as int)).toBe(0x3D)
+    let ws = WsConn.attach(MemoryConn(frame), false)
+    expect(messageText(ws)).toBe("Hello")
+}
+
+test fn client_rejects_a_masked_server_frame() {
+    let m = MemoryConn(maskedFrame(OP_TEXT, bytes("Hello"), true, maskBytes()))
+    let ws = WsConn.attach(m, true)
+    expect(ws.readMessage() as? WsMessage).toBe(none)
+    expect(ws.closeCode).toBe(1002)
+    expect(frameOpcode(m.output)).toBe(OP_CLOSE)
+}
+
+test fn server_rejects_an_unmasked_client_frame() {
+    let ws = WsConn.attach(MemoryConn(unmaskedFrame(OP_TEXT, bytes("Hello"), true)), false)
+    expect(ws.readMessage() as? WsMessage).toBe(none)
+    expect(ws.closeCode).toBe(1002)
+}
+
+test fn reassembles_fragments_and_answers_ping() {
+    let raw = bytes("")
+    appendBytes(raw, maskedFrame(OP_TEXT, bytes("Hel"), false, maskBytes()))
+    appendBytes(raw, maskedFrame(OP_PING, bytes("p"), true, maskBytes()))
+    appendBytes(raw, maskedFrame(OP_CONT, bytes("lo"), true, maskBytes()))
+    let m = MemoryConn(raw)
+    let ws = WsConn.attach(m, false)
+    expect(messageText(ws)).toBe("Hello")
+    expect(frameOpcode(m.output)).toBe(OP_PONG)
+    expect(frameFin(m.output)).toBe(true)
+    expect(frameMasked(m.output)).toBe(false)
+    expect(framePayloadLen(m.output)).toBe(1)
+}
+
+test fn rejects_invalid_utf8_text() {
+    let m = MemoryConn(unmaskedFrame(OP_TEXT, bytesOf([0x48, 0xFF, 0x49]), true))
+    let ws = WsConn.attach(m, true)
+    expect(ws.readMessage() as? WsMessage).toBe(none)
+    expect(ws.closeCode).toBe(1007)
+    expect(frameOpcode(m.output)).toBe(OP_CLOSE)
+}
+
+test fn rejects_a_fragmented_control_frame() {
+    // FIN=0, PING, masked, empty payload, four mask bytes.
+    let ws = WsConn.attach(MemoryConn(bytesOf([0x09, 0x80, 1, 2, 3, 4])), false)
+    expect(ws.readMessage() as? WsMessage).toBe(none)
+    expect(ws.closeCode).toBe(1002)
+}
+
+test fn rejects_reserved_bits() {
+    // FIN + RSV1 + TEXT, masked, empty payload, four mask bytes.
+    let ws = WsConn.attach(MemoryConn(bytesOf([0xC1, 0x80, 1, 2, 3, 4])), false)
+    expect(ws.readMessage() as? WsMessage).toBe(none)
+    expect(ws.closeCode).toBe(1002)
+}
+
+test fn decodes_a_16_bit_length_frame() {
+    let payload = pattern(300, 7)
+    let frame = unmaskedFrame(OP_BINARY, payload, true)
+    expect(framePayloadLen(frame)).toBe(126)
+    let ws = WsConn.attach(MemoryConn(frame), true)
+    match (ws.readMessage()) {
+        case some(msg) -> {
+            expect(msg.opcode).toBe(OP_BINARY)
+            expect(len(msg.data)).toBe(300)
+            expect(sameBytes(msg.data, payload)).toBe(true)
+        }
+        case none -> assert(false, "16-bit length frame was rejected")
+    }
+}
+
+test fn decodes_a_64_bit_length_frame() {
+    let payload = pattern(70000, 11)
+    let frame = unmaskedFrame(OP_BINARY, payload, true)
+    expect(framePayloadLen(frame)).toBe(127)
+    let ws = WsConn.attach(MemoryConn(frame), true)
+    match (ws.readMessage()) {
+        case some(msg) -> {
+            expect(msg.opcode).toBe(OP_BINARY)
+            expect(len(msg.data)).toBe(70000)
+            expect((msg.data[0] as int)).toBe((payload[0] as int))
+            expect((msg.data[69999] as int)).toBe((payload[69999] as int))
+        }
+        case none -> assert(false, "64-bit length frame was rejected")
+    }
+}
+
+test fn oversized_frame_is_rejected() {
+    let ws = WsConn.attach(MemoryConn(unmaskedFrame(OP_BINARY, pattern(64, 3), true)), true)
+    ws.maxFrame = 16
+    expect(ws.readMessage() as? WsMessage).toBe(none)
+    expect(ws.closeCode).toBe(1009)
+    expect(ws.lastError().kind).toBe(ERR_MESSAGE_SIZE)
+}
+
+test fn close_frame_is_validated_and_echoed() {
+    let payload = bytesOf([0x03, 0xE8, 0x62, 0x79, 0x65]) // 1000, "bye"
+    let m = MemoryConn(maskedFrame(OP_CLOSE, payload, true, maskBytes()))
+    let ws = WsConn.attach(m, false)
+    expect(ws.readMessage() as? WsMessage).toBe(none)
+    expect(ws.isClosed()).toBe(true)
+    expect(ws.closeCode).toBe(1000)
+    expect(ws.closeReason).toBe("bye")
+    expect(frameOpcode(m.output)).toBe(OP_CLOSE)
+    expect(frameMasked(m.output)).toBe(false)
+    expect(framePayloadLen(m.output)).toBe(5)
+}
+
+test fn invalid_close_code_is_a_protocol_error() {
+    let payload = bytesOf([0x03, 0xED]) // 1005 is reserved and must not be sent
+    let m = MemoryConn(maskedFrame(OP_CLOSE, payload, true, maskBytes()))
+    let ws = WsConn.attach(m, false)
+    expect(ws.readMessage() as? WsMessage).toBe(none)
+    expect(ws.closeCode).toBe(1002)
+    expect(frameOpcode(m.output)).toBe(OP_CLOSE)
+}
+
+test fn invalid_close_reason_is_a_payload_error() {
+    let payload = bytesOf([0x03, 0xE8, 0xFF]) // 1000, invalid UTF-8
+    let m = MemoryConn(maskedFrame(OP_CLOSE, payload, true, maskBytes()))
+    let ws = WsConn.attach(m, false)
+    expect(ws.readMessage() as? WsMessage).toBe(none)
+    expect(ws.closeCode).toBe(1007)
+}
+
+test fn one_byte_close_payload_is_a_protocol_error() {
+    let m = MemoryConn(maskedFrame(OP_CLOSE, bytesOf([0x03]), true, maskBytes()))
+    let ws = WsConn.attach(m, false)
+    expect(ws.readMessage() as? WsMessage).toBe(none)
+    expect(ws.closeCode).toBe(1002)
+}
+
+test fn client_frames_are_masked() {
+    let m = MemoryConn(bytes(""))
+    let ws = WsConn.attach(m, true)
+    expect(ws.sendText("Hello")).toBe(true)
+    expect(frameOpcode(m.output)).toBe(OP_TEXT)
+    expect(frameFin(m.output)).toBe(true)
+    expect(frameMasked(m.output)).toBe(true)
+    expect(framePayloadLen(m.output)).toBe(5)
+    let server = WsConn.attach(MemoryConn(m.output), false)
+    expect(messageText(server)).toBe("Hello")
+}
+
+test fn send_close_marks_the_connection_closing() {
+    let m = MemoryConn(bytes(""))
+    let ws = WsConn.attach(m, true)
+    expect(ws.sendClose(1000, "done")).toBe(true)
+    expect(ws.isClosing()).toBe(true)
+    expect(ws.isClosed()).toBe(false)
+    expect(frameOpcode(m.output)).toBe(OP_CLOSE)
+    expect(frameMasked(m.output)).toBe(true)
+    expect(ws.sendClose(1000, "again")).toBe(false)
+}
+
+// ---------------------------------------------------------------------------
+// Loopback integration
+// ---------------------------------------------------------------------------
+
+fn echoLoop(ws: WsConn) {
+    var open = true
+    while (open) {
+        match (ws.readMessage()) {
+            case some(msg) -> {
+                if (!ws.sendMessage(msg.opcode, msg.data)) {
+                    open = false
+                }
+            }
+            case none -> open = false
+        }
+    }
+    ws.close()
+}
+
+fn serveEcho(server: WsServer) {
+    match (server.acceptTimeout(5000)) {
+        case some(ws) -> echoLoop(ws)
+        case none -> {}
+    }
+}
+
+fn rendezvousEcho(ws: WsConn, count: AtomicInt, gate: Semaphore) {
+    match (ws.readMessage()) {
+        case some(msg) -> {
+            let n = count.add(1)
+            if (n == 1) {
+                gate.release(2)
+            }
+            gate.acquire(1)
+            let _ = ws.sendMessage(msg.opcode, msg.data)
+            let _ = ws.readMessage()
+        }
+        case none -> {}
+    }
+    ws.close()
+}
+
+test fn loopback_two_detached_workers_serve_concurrently() {
+    match (TcpListener.bind("127.0.0.1", 0)) {
+        case some(l) -> {
+            let count = AtomicInt(0)
+            let gate = Semaphore(0)
+            let srv = WsServer(l, List<string>())
+            let port = srv.localPort()
+            let w1Opt = srv.serveOnceDetached(5000, fn (ws: WsConn) {
+                rendezvousEcho(ws, count, gate)
+            })
+            let w2Opt = srv.serveOnceDetached(5000, fn (ws: WsConn) {
+                rendezvousEcho(ws, count, gate)
+            })
+            if (let some(w1) = w1Opt) {
+                if (let some(w2) = w2Opt) {
+                    match (WsConn.connect("127.0.0.1", port, "/one", 5000)) {
+                        case some(c1) -> {
+                            match (WsConn.connect("127.0.0.1", port, "/two", 5000)) {
+                                case some(c2) -> {
+                                    expect(c1.sendText("one")).toBe(true)
+                                    expect(c2.sendText("two")).toBe(true)
+                                    match (c1.readMessage()) {
+                                        case some(m1) -> expect(m1.text()).toBe("one")
+                                        case none -> assert(false, "first detached websocket reply was not received")
+                                    }
+                                    match (c2.readMessage()) {
+                                        case some(m2) -> expect(m2.text()).toBe("two")
+                                        case none -> assert(false, "second detached websocket reply was not received")
+                                    }
+                                    expect(c1.sendClose(1000, "")).toBe(true)
+                                    expect(c2.sendClose(1000, "")).toBe(true)
+                                    expect(c1.readMessage() as? WsMessage).toBe(none)
+                                    expect(c2.readMessage() as? WsMessage).toBe(none)
+                                    c1.close()
+                                    c2.close()
+                                }
+                                case none -> assert(false, "second websocket client could not connect")
+                            }
+                        }
+                        case none -> assert(false, "first websocket client could not connect")
+                    }
+                    expect(w1.join()).toBe(true)
+                    expect(w2.join()).toBe(true)
+                    expect(count.load()).toBe(2)
+                } else {
+                    assert(false, "second detached websocket worker was not created")
+                }
+            } else {
+                assert(false, "first detached websocket worker was not created")
+            }
+        }
+        case none -> assert(false, "websocket listener could not bind")
+    }
+}
+
+test fn detached_serve_reports_a_closed_server() {
+    match (TcpListener.bind("127.0.0.1", 0)) {
+        case some(l) -> {
+            let srv = WsServer(l, List<string>())
+            srv.close()
+            expect(srv.serveOnceDetached(1, fn (ws: WsConn) {
+            }) as? Task).toBe(none)
+        }
+        case none -> assert(false, "websocket listener could not bind")
+    }
+}
+
+test fn loopback_echo_text_and_binary() {
+    match (TcpListener.bind("127.0.0.1", 0)) {
+        case some(l) -> {
+            let srv = WsServer(l, oneProtocol("chat"))
+            let port = srv.localPort()
+            let t = spawn(fn () {
+                serveEcho(srv)
+            })
+            match (WsConn.connect("127.0.0.1", port, "/echo", 5000, "chat")) {
+                case some(c) -> {
+                    expect(c.protocol).toBe("chat")
+                    expect(c.sendText("hello websocket")).toBe(true)
+                    expect(messageText(c)).toBe("hello websocket")
+                    let payload = pattern(4096, 5)
+                    expect(c.sendBinary(payload)).toBe(true)
+                    match (c.readMessage()) {
+                        case some(msg) -> {
+                            expect(msg.opcode).toBe(OP_BINARY)
+                            expect(sameBytes(msg.data, payload)).toBe(true)
+                        }
+                        case none -> assert(false, "binary echo was not received")
+                    }
+                    expect(c.sendClose(1000, "done")).toBe(true)
+                    expect(c.readMessage() as? WsMessage).toBe(none)
+                    expect(c.closeCode).toBe(1000)
+                    c.close()
+                }
+                case none -> assert(false, "websocket connect failed")
+            }
+            expect(t.join()).toBe(true)
+            srv.close()
+        }
+        case none -> assert(false, "bind failed")
+    }
+}
+
+test fn loopback_fragmented_message() {
+    match (TcpListener.bind("127.0.0.1", 0)) {
+        case some(l) -> {
+            let srv = WsServer(l, List<string>())
+            let port = srv.localPort()
+            let t = spawn(fn () {
+                serveEcho(srv)
+            })
+            match (WsConn.connect("127.0.0.1", port, "/echo", 5000)) {
+                case some(c) -> {
+                    expect(c.sendFrame(OP_TEXT, bytes("frag"), false)).toBe(true)
+                    expect(c.sendFrame(OP_CONT, bytes("mented"), true)).toBe(true)
+                    expect(messageText(c)).toBe("fragmented")
+                    expect(c.sendClose(0, "")).toBe(true)
+                    expect(c.readMessage() as? WsMessage).toBe(none)
+                    c.close()
+                }
+                case none -> assert(false, "websocket connect failed")
+            }
+            expect(t.join()).toBe(true)
+            srv.close()
+        }
+        case none -> assert(false, "bind failed")
+    }
+}
+
+test fn loopback_ping_is_answered() {
+    match (TcpListener.bind("127.0.0.1", 0)) {
+        case some(l) -> {
+            let srv = WsServer(l, List<string>())
+            let port = srv.localPort()
+            let t = spawn(fn () {
+                serveEcho(srv)
+            })
+            match (WsConn.connect("127.0.0.1", port, "/echo", 5000)) {
+                case some(c) -> {
+                    expect(c.sendPing(bytes("hb"))).toBe(true)
+                    expect(c.sendText("after-ping")).toBe(true)
+                    expect(messageText(c)).toBe("after-ping")
+                    match (c.takePong()) {
+                        case some(p) -> expect(str(p)).toBe("hb")
+                        case none -> assert(false, "pong was not recorded")
+                    }
+                    expect(c.sendClose(1000, "")).toBe(true)
+                    expect(c.readMessage() as? WsMessage).toBe(none)
+                    c.close()
+                }
+                case none -> assert(false, "websocket connect failed")
+            }
+            expect(t.join()).toBe(true)
+            srv.close()
+        }
+        case none -> assert(false, "bind failed")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TLS loopback fixture (same self-signed PKCS#12 used by std.tls/std.net.http)
+// ---------------------------------------------------------------------------
+
+fn slicePath(p: string, end: int) -> string {
+    var out = ""
+    var i = 0
+    while (i < end) {
+        out = out + "{p[i] as char}"
+        i = i + 1
+    }
+    out
+}
+
+fn parentPath(p: string) -> string? {
+    let bs = bytes(p)
+    var end = len(bs) - 1
+    while (end >= 0 && (bs[end] as int) == 47) {
+        end = end - 1
+    }
+    if (end < 0) {
+        return none
+    }
+    var i = end
+    while (i >= 0 && (bs[i] as int) != 47) {
+        i = i - 1
+    }
+    if (i < 0) {
+        return none
+    }
+    slicePath(p, i)
+}
+
+fn slashes(p: string) -> string {
+    var out = ""
+    var i = 0
+    while (i < len(p)) {
+        let ch = p[i] as int
+        if (ch == 92) {
+            out = out + "/"
+        } else {
+            out = out + "{p[i] as char}"
+        }
+        i = i + 1
+    }
+    out
+}
+
+fn readFixture(p: string) -> List<byte>? {
+    match (File(p).read()) {
+        case some(text) -> bytes(text)
+        case none -> none
+    }
+}
+
+fn loadLoopbackPfx() -> List<byte>? {
+    var dir = ""
+    match (current_dir()) {
+        case some(d) -> { dir = slashes(d) }
+        case none -> { return none }
+    }
+    var found = bytes("")
+    var have = 0
+    var done = 0
+    while (done == 0) {
+        match (readFixture(dir + "/stdlib/testdata/tls_loopback.pfx")) {
+            case some(b) -> {
+                found = b
+                have = 1
+                done = 1
+            }
+            case none -> {
+                match (readFixture(dir + "/testdata/tls_loopback.pfx")) {
+                    case some(b2) -> {
+                        found = b2
+                        have = 1
+                        done = 1
+                    }
+                    case none -> {
+                        match (parentPath(dir)) {
+                            case some(parent) -> { dir = parent }
+                            case none -> { done = 1 }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (have == 0) {
+        return none
+    }
+    found
+}
+
+fn serveTlsEcho(l: TcpListener, pfx: List<byte>) {
+    match (l.acceptTimeout(5000)) {
+        case some(tcp) -> {
+            let _rt = tcp.setRecvTimeoutMs(5000)
+            match (TlsStream.accept(tcp, pfx, PFX_PASSWORD)) {
+                case some(tls) -> {
+                    match (WsConn.accept(tls, List<string>())) {
+                        case some(ws) -> echoLoop(ws)
+                        case none -> {}
+                    }
+                }
+                case none -> {}
+            }
+        }
+        case none -> {}
+    }
+}
+
+test fn loopback_wss_echo() {
+    match (loadLoopbackPfx()) {
+        case none -> assert(false, "missing fixture stdlib/testdata/tls_loopback.pfx")
+        case some(pfx) -> {
+            match (TcpListener.bind("127.0.0.1", 0)) {
+                case some(l) -> {
+                    let port = l.localPort()
+                    let t = spawn(fn () {
+                        serveTlsEcho(l, pfx)
+                    })
+                    match (TcpStream.connect("127.0.0.1", port, 5000)) {
+                        case some(tcp) -> {
+                            let _ct = tcp.setRecvTimeoutMs(5000)
+                            match (TlsStream.wrap(tcp, "127.0.0.1", false)) {
+                                case some(tls) -> {
+                                    let _st = tls.setRecvTimeoutMs(5000)
+                                    match (WsConn.over(tls, "127.0.0.1", port, "/secure")) {
+                                        case some(c) -> {
+                                            expect(c.sendText("secure websocket")).toBe(true)
+                                            expect(messageText(c)).toBe("secure websocket")
+                                            expect(c.sendClose(1000, "done")).toBe(true)
+                                            expect(c.readMessage() as? WsMessage).toBe(none)
+                                            c.close()
+                                        }
+                                        case none -> assert(false, "wss handshake failed")
+                                    }
+                                }
+                                case none -> assert(false, "tls wrap failed")
+                            }
+                        }
+                        case none -> assert(false, "tcp connect failed")
+                    }
+                    expect(t.join()).toBe(true)
+                    l.close()
+                }
+                case none -> assert(false, "bind failed")
+            }
+        }
+    }
+}

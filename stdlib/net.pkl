@@ -1,21 +1,696 @@
 module std.net
 
-// std.net v2: blocking TCP/UDP sockets, IPv4 address helpers, deterministic
-// local resolution (numeric dotted-quad and "localhost"), socket options, and
-// portable runtime ABI seam (Windows/Winsock now, plat*/pickle_net_* for future
-// POSIX). Byte-oriented I/O. Higher-level protocols (HTTP) live in std.net.http.
+// std.net: blocking TCP/UDP sockets, IPv4/IPv6 addresses, OS DNS resolution
+// and reverse lookup, timeouts, socket options, and readiness polling.
+//
+// Layering. Every OS call goes through the `net*` platform functions in
+// `runtime.abi_net` (Winsock today; POSIX/ARM64 ports replace only that
+// section). Nothing here depends on an OS type: handles are `int`, addresses
+// are `IpAddr`/`SocketAddr`, and failures are `NetError` with a portable
+// `kind` plus the raw OS `code`.
+//
+// Error convention. Fallible operations return `T?` (or `bool`) and record
+// the reason in the object's `error` field. Static constructors (`connect`,
+// `bind`, `resolve`) accept an optional `NetError` sink argument that is
+// filled on failure; there is no hidden global error state.
+//
+// Resources. Sockets are OS handles and are NOT closed by the collector:
+// call `close()` (idempotent) on every stream, listener and socket.
+//
+// The legacy v2 surface (`resolve4`, `parseIPv4`, `TcpStream.read(n)`,
+// `write`, `writeAll -> bool`, `localPort`, ...) is kept and now runs on the
+// same platform layer.
 
-import { net_tcp_socket, net_close, net_shutdown, net_bind4, net_listen, net_accept, net_connect4, net_send, net_recv, net_local_port4, net_peer_port4, net_local_addr4, net_peer_addr4, net_set_reuseaddr, net_set_nodelay, net_set_keepalive, net_set_broadcast, net_set_recv_timeout_ms, net_set_send_timeout_ms, net_last_error, net_udp_socket, net_sendto4, net_recvfrom4, net_udp_connect4, net_resolve_local4 } from runtime.abi_net
+import { net_last_error, net_resolve_local4, netSocket, netClose, netShutdown, netBind, netListen, netConnect, netAccept, netSend, netRecv, netSendTo, netRecvFrom, netSockName, netPeerName, netAvailable, netPoll, netSetNonBlocking, netSetOpt, netResolve, netReverse, netRandom, netErrorKind } from runtime.abi_net
 
 const INVALID: int = -1
 const SHUT_RD: int = 0
 const SHUT_WR: int = 1
 const SHUT_RDWR: int = 2
 
+/// Portable error kinds (`NetError.kind`).
+const ERR_NONE: int = 0
+const ERR_OTHER: int = 1
+const ERR_TIMEOUT: int = 2
+const ERR_REFUSED: int = 3
+const ERR_RESET: int = 4
+const ERR_ABORTED: int = 5
+const ERR_NOT_CONNECTED: int = 6
+const ERR_ADDR_IN_USE: int = 7
+const ERR_ADDR_NOT_AVAILABLE: int = 8
+const ERR_UNREACHABLE: int = 9
+const ERR_INTERRUPTED: int = 10
+const ERR_WOULD_BLOCK: int = 11
+const ERR_INVALID_INPUT: int = 12
+const ERR_NOT_FOUND: int = 13
+const ERR_CLOSED: int = 14
+const ERR_TLS: int = 15
+const ERR_PROTOCOL: int = 16
+const ERR_TOO_LARGE: int = 17
+const ERR_MESSAGE_SIZE: int = 18
+
+/// Readiness bits for `poll`/`waitReadable`.
+const READY_READ: int = 1
+const READY_WRITE: int = 2
+const READY_ERROR: int = 4
+
+fn kindName(kind: int) -> string {
+    match (kind) {
+        case 0 -> "none"
+        case 2 -> "timed out"
+        case 3 -> "connection refused"
+        case 4 -> "connection reset"
+        case 5 -> "connection aborted"
+        case 6 -> "not connected"
+        case 7 -> "address in use"
+        case 8 -> "address not available"
+        case 9 -> "unreachable"
+        case 10 -> "interrupted"
+        case 11 -> "would block"
+        case 12 -> "invalid input"
+        case 13 -> "not found"
+        case 14 -> "closed"
+        case 15 -> "tls error"
+        case 16 -> "protocol error"
+        case 17 -> "too large"
+        case 18 -> "message too long"
+        case _ -> "network error"
+    }
+}
+
+/// A network failure: portable `kind` (ERR_*), raw OS `code` (0 when the
+/// failure did not come from the OS), and a human-readable `message`.
+class NetError {
+    var kind: int
+    var code: int
+    var message: string
+
+    constructor() {
+        this.kind = ERR_NONE
+        this.code = 0
+        this.message = ""
+    }
+
+    fn set(kind: int, code: int, message: string) {
+        this.kind = kind
+        this.code = code
+        this.message = message
+    }
+
+    fn copyFrom(other: NetError) {
+        this.kind = other.kind
+        this.code = other.code
+        this.message = other.message
+    }
+
+    /// Record an OS error code for `op`.
+    fn setOs(op: string, code: int) {
+        let k = netErrorKind(code)
+        this.set(k, code, op + ": " + kindName(k) + " (os error " + str(code) + ")")
+    }
+
+    fn clear() {
+        this.set(ERR_NONE, 0, "")
+    }
+
+    fn isSet() -> bool {
+        this.kind != ERR_NONE
+    }
+
+    fn isTimeout() -> bool {
+        this.kind == ERR_TIMEOUT
+    }
+
+    fn toString() -> string {
+        if (this.kind == ERR_NONE) {
+            return "no error"
+        }
+        this.message
+    }
+}
+
+fn sinkSet(err: NetError?, kind: int, code: int, message: string) {
+    if (let some(e) = err) {
+        e.set(kind, code, message)
+    }
+}
+
+fn sinkCopy(err: NetError?, src: NetError) {
+    if (let some(e) = err) {
+        e.copyFrom(src)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Raw byte buffers. Low-level helpers shared by std.tls / std.net.http /
+// std.net.websocket to marshal `List<byte>` across the platform ABI. A raw
+// buffer is a word array from `rawAlloc`; it must be released with `rawFree`.
+// ---------------------------------------------------------------------------
+
+/// Allocate a zeroed raw buffer of at least `n` bytes (always >= 8).
+fn rawAlloc(n: int) -> int {
+    var words = (n + 7) / 8
+    if (words < 1) {
+        words = 1
+    }
+    unsafe {
+        let p = alloc(int, words)
+        var i = 0
+        while (i < words) {
+            p[i] = 0
+            i = i + 1
+        }
+        return p as int
+    }
+}
+
+fn rawFree(p: int) {
+    if (p != 0) {
+        unsafe {
+            free(p as *int)
+        }
+    }
+}
+
+fn rawGetByte(p: int, i: int) -> int {
+    unsafe {
+        let w = p as *int
+        return (w[i >> 3] >> ((i & 7) * 8)) & 255
+    }
+}
+
+fn rawPutByte(p: int, i: int, v: int) {
+    unsafe {
+        let w = p as *int
+        let sh = (i & 7) * 8
+        w[i >> 3] = (w[i >> 3] & ((0 - 1) ^ (255 << sh))) | ((v & 255) << sh)
+    }
+}
+
+/// Copy `n` bytes of `data` starting at `off` into the raw buffer `p` at
+/// byte offset `at`.
+fn rawWrite(p: int, at: int, data: List<byte>, off: int, n: int) {
+    var i = 0
+    if ((at & 7) == 0) {
+        unsafe {
+            let w = p as *int
+            // Whole words first: one store per 8 bytes.
+            while (i + 8 <= n) {
+                var v = 0
+                var k = 0
+                while (k < 8) {
+                    v = v | ((data[off + i + k] as int & 255) << (k * 8))
+                    k = k + 1
+                }
+                w[(at + i) >> 3] = v
+                i = i + 8
+            }
+        }
+    }
+    while (i < n) {
+        rawPutByte(p, at + i, data[off + i] as int)
+        i = i + 1
+    }
+}
+
+/// Fresh raw buffer holding `data[off .. off + n]`.
+fn rawFromBytes(data: List<byte>, off: int, n: int) -> int {
+    let p = rawAlloc(n)
+    rawWrite(p, 0, data, off, n)
+    p
+}
+
+/// Append `n` bytes of raw buffer `p` (from byte offset `at`) to `out`.
+fn rawAppend(out: List<byte>, p: int, at: int, n: int) {
+    unsafe {
+        let w = p as *int
+        var i = 0
+        while (i < n) {
+            let j = at + i
+            out.push(((w[j >> 3] >> ((j & 7) * 8)) & 255) as byte)
+            i = i + 1
+        }
+    }
+}
+
+fn rawToBytes(p: int, n: int) -> List<byte> {
+    var out = bytes("")
+    rawAppend(out, p, 0, n)
+    out
+}
+
+/// NUL-terminated copy of `s` for C APIs.
+fn rawCString(s: string) -> int {
+    let b = bytes(s)
+    let p = rawAlloc(len(b) + 1)
+    rawWrite(p, 0, b, 0, len(b))
+    p
+}
+
+/// `n` bytes from the OS cryptographically secure random generator.
+fn randomBytes(n: int) -> List<byte>? {
+    if (n <= 0) {
+        return bytes("")
+    }
+    let p = rawAlloc(n)
+    let rc = netRandom(p, n)
+    if (rc != 0) {
+        rawFree(p)
+        return none
+    }
+    let out = rawToBytes(p, n)
+    rawFree(p)
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Addresses
+// ---------------------------------------------------------------------------
+
+fn hexDigit(v: int) -> string {
+    let h = "0123456789abcdef"
+    "{h[v & 15] as char}"
+}
+
+fn hexVal(ch: int) -> int {
+    if (ch >= 48 && ch <= 57) {
+        return ch - 48
+    }
+    if (ch >= 97 && ch <= 102) {
+        return ch - 87
+    }
+    if (ch >= 65 && ch <= 70) {
+        return ch - 55
+    }
+    -1
+}
+
+/// An IPv4 or IPv6 address. The 16 address bytes are packed little-endian
+/// into `w0`/`w1` (IPv4 uses the low four bytes of `w0`).
+class IpAddr {
+    var family: int
+    var w0: int
+    var w1: int
+
+    constructor(family: int, w0: int, w1: int) {
+        this.family = family
+        this.w0 = w0
+        this.w1 = w1
+    }
+
+    static fn v4(a: int, b: int, c: int, d: int) -> IpAddr {
+        IpAddr(4, (a & 255) | ((b & 255) << 8) | ((c & 255) << 16) | ((d & 255) << 24), 0)
+    }
+
+    /// IPv6 from 16 bytes in network order.
+    static fn v6Bytes(bs: List<int>) -> IpAddr? {
+        if (len(bs) != 16) {
+            return none
+        }
+        var w0 = 0
+        var w1 = 0
+        var i = 0
+        while (i < 8) {
+            w0 = w0 | ((bs[i] & 255) << (i * 8))
+            w1 = w1 | ((bs[8 + i] & 255) << (i * 8))
+            i = i + 1
+        }
+        IpAddr(6, w0, w1)
+    }
+
+    static fn localhost4() -> IpAddr {
+        IpAddr.v4(127, 0, 0, 1)
+    }
+
+    static fn any4() -> IpAddr {
+        IpAddr(4, 0, 0)
+    }
+
+    static fn localhost6() -> IpAddr {
+        IpAddr(6, 0, 1 << 56)
+    }
+
+    static fn any6() -> IpAddr {
+        IpAddr(6, 0, 0)
+    }
+
+    /// Parse a numeric IPv4 ("a.b.c.d") or IPv6 ("::1", "fe80::1:2",
+    /// "::ffff:1.2.3.4") literal. Zone ids ("%eth0") are rejected.
+    static fn parse(text: string) -> IpAddr? {
+        if (let some(o) = parseIPv4(text)) {
+            return IpAddr.v4(o[0], o[1], o[2], o[3])
+        }
+        parseIPv6(text)
+    }
+
+    fn isV4() -> bool {
+        this.family == 4
+    }
+
+    fn isV6() -> bool {
+        this.family == 6
+    }
+
+    /// Address bytes in network order (4 or 16 entries).
+    fn octets() -> List<int> {
+        var out = List<int>()
+        var n = 16
+        if (this.family == 4) {
+            n = 4
+        }
+        var i = 0
+        while (i < n) {
+            if (i < 8) {
+                out.push((this.w0 >> (i * 8)) & 255)
+            } else {
+                out.push((this.w1 >> ((i - 8) * 8)) & 255)
+            }
+            i = i + 1
+        }
+        out
+    }
+
+    fn isLoopback() -> bool {
+        if (this.family == 4) {
+            return (this.w0 & 255) == 127
+        }
+        this.w0 == 0 && this.w1 == (1 << 56)
+    }
+
+    fn isUnspecified() -> bool {
+        this.w0 == 0 && this.w1 == 0
+    }
+
+    fn equals(o: IpAddr) -> bool {
+        this.family == o.family && this.w0 == o.w0 && this.w1 == o.w1
+    }
+
+    fn toString() -> string {
+        let o = this.octets()
+        if (this.family == 4) {
+            return ipv4ToString(o[0], o[1], o[2], o[3])
+        }
+        var groups = List<int>()
+        var g = 0
+        while (g < 8) {
+            groups.push((o[g * 2] << 8) | o[g * 2 + 1])
+            g = g + 1
+        }
+        // Longest run (>= 2) of zero groups becomes "::" (RFC 5952).
+        var bestStart = -1
+        var bestLen = 0
+        var i = 0
+        while (i < 8) {
+            if (groups[i] == 0) {
+                var j = i
+                while (j < 8 && groups[j] == 0) {
+                    j = j + 1
+                }
+                if (j - i > bestLen && j - i >= 2) {
+                    bestStart = i
+                    bestLen = j - i
+                }
+                i = j
+            } else {
+                i = i + 1
+            }
+        }
+        var out = ""
+        i = 0
+        while (i < 8) {
+            if (i == bestStart) {
+                out = out + "::"
+                i = i + bestLen
+                continue
+            }
+            if (len(out) > 0 && !(len(out) >= 2 && out[len(out) - 1] as int == 58 && i == bestStart + bestLen)) {
+                out = out + ":"
+            }
+            out = out + hexGroup(groups[i])
+            i = i + 1
+        }
+        out
+    }
+}
+
+fn hexGroup(v: int) -> string {
+    var out = ""
+    var started = false
+    var sh = 12
+    while (sh >= 0) {
+        let d = (v >> sh) & 15
+        if (d != 0 || started || sh == 0) {
+            out = out + hexDigit(d)
+            started = true
+        }
+        sh = sh - 4
+    }
+    out
+}
+
+/// Parse an IPv6 literal (no brackets, no zone id).
+fn parseIPv6(text: string) -> IpAddr? {
+    let n = len(text)
+    if (n < 2 || n > 45) {
+        return none
+    }
+    var head = List<int>()
+    var tail = List<int>()
+    var seenGap = false
+    var i = 0
+    if (text[0] as int == 58) {
+        if (n < 2 || text[1] as int != 58) {
+            return none
+        }
+        seenGap = true
+        i = 2
+    }
+    while (i < n) {
+        // One group: hex digits, or a trailing dotted IPv4.
+        var j = i
+        var hasDot = false
+        while (j < n && text[j] as int != 58) {
+            if (text[j] as int == 46) {
+                hasDot = true
+            }
+            j = j + 1
+        }
+        if (j == i) {
+            return none
+        }
+        let part = sliceStr(text, i, j)
+        if (hasDot) {
+            if (j != n) {
+                return none
+            }
+            match (parseIPv4(part)) {
+                case some(o) -> {
+                    let hi = (o[0] << 8) | o[1]
+                    let lo = (o[2] << 8) | o[3]
+                    if (seenGap) {
+                        tail.push(hi)
+                        tail.push(lo)
+                    } else {
+                        head.push(hi)
+                        head.push(lo)
+                    }
+                }
+                case none -> {
+                    return none
+                }
+            }
+            i = j
+            break
+        }
+        if (j - i > 4) {
+            return none
+        }
+        var v = 0
+        var k = i
+        while (k < j) {
+            let hv = hexVal(text[k] as int)
+            if (hv < 0) {
+                return none
+            }
+            v = v * 16 + hv
+            k = k + 1
+        }
+        if (seenGap) {
+            tail.push(v)
+        } else {
+            head.push(v)
+        }
+        if (j >= n) {
+            i = j
+            break
+        }
+        // j is at ':'
+        if (j + 1 < n && text[j + 1] as int == 58) {
+            if (seenGap) {
+                return none
+            }
+            seenGap = true
+            i = j + 2
+            if (i >= n) {
+                break
+            }
+        } else {
+            if (j + 1 >= n) {
+                return none
+            }
+            i = j + 1
+        }
+    }
+    let total = len(head) + len(tail)
+    if (seenGap) {
+        if (total > 7) {
+            return none
+        }
+    } else if (total != 8) {
+        return none
+    }
+    var groups = List<int>()
+    for (h in head) {
+        groups.push(h)
+    }
+    var z = 0
+    while (z < 8 - total) {
+        groups.push(0)
+        z = z + 1
+    }
+    for (t in tail) {
+        groups.push(t)
+    }
+    var bs = List<int>()
+    for (gv in groups) {
+        bs.push((gv >> 8) & 255)
+        bs.push(gv & 255)
+    }
+    IpAddr.v6Bytes(bs)
+}
+
+fn sliceStr(s: string, start: int, end: int) -> string {
+    let b = bytes(s)
+    var out = bytes("")
+    var i = start
+    while (i < end && i < len(b)) {
+        out.push(b[i])
+        i = i + 1
+    }
+    str(out)
+}
+
+/// An IP address plus a port.
+class SocketAddr {
+    var ip: IpAddr
+    var port: int
+
+    constructor(ip: IpAddr, port: int) {
+        this.ip = ip
+        this.port = port
+    }
+
+    /// Parse "a.b.c.d:port" or "[v6]:port" (numeric only; see `resolve`).
+    static fn parse(text: string) -> SocketAddr? {
+        if (let some(hp) = splitHostPort(text)) {
+            if (let some(ip) = IpAddr.parse(hp.host)) {
+                return SocketAddr(ip, hp.port)
+            }
+        }
+        none
+    }
+
+    fn toString() -> string {
+        if (this.ip.family == 6) {
+            return "[" + this.ip.toString() + "]:" + str(this.port)
+        }
+        this.ip.toString() + ":" + str(this.port)
+    }
+}
+
+class HostPort {
+    var host: string
+    var port: int
+
+    constructor(host: string, port: int) {
+        this.host = host
+        this.port = port
+    }
+}
+
+/// Split "host:port", "[v6]:port" into its parts. The port must be 0..65535.
+fn splitHostPort(text: string) -> HostPort? {
+    let n = len(text)
+    if (n == 0) {
+        return none
+    }
+    var host = ""
+    var portText = ""
+    if (text[0] as int == 91) {
+        var close = -1
+        var i = 1
+        while (i < n) {
+            if (text[i] as int == 93) {
+                close = i
+                break
+            }
+            i = i + 1
+        }
+        if (close < 0 || close + 1 >= n || text[close + 1] as int != 58) {
+            return none
+        }
+        host = sliceStr(text, 1, close)
+        portText = sliceStr(text, close + 2, n)
+    } else {
+        var colon = -1
+        var count = 0
+        var i = 0
+        while (i < n) {
+            if (text[i] as int == 58) {
+                colon = i
+                count = count + 1
+            }
+            i = i + 1
+        }
+        if (colon < 0 || count != 1) {
+            return none
+        }
+        host = sliceStr(text, 0, colon)
+        portText = sliceStr(text, colon + 1, n)
+    }
+    let port = parsePort(portText)
+    if (port < 0 || len(host) == 0) {
+        return none
+    }
+    HostPort(host, port)
+}
+
+/// Decimal port 0..65535, or -1.
+fn parsePort(text: string) -> int {
+    let n = len(text)
+    if (n == 0 || n > 5) {
+        return -1
+    }
+    var v = 0
+    var i = 0
+    while (i < n) {
+        let c = text[i] as int
+        if (c < 48 || c > 57) {
+            return -1
+        }
+        v = v * 10 + (c - 48)
+        i = i + 1
+    }
+    if (v > 65535) {
+        return -1
+    }
+    v
+}
+
 /// Parse numeric IPv4 dotted quad "a.b.c.d" into [a,b,c,d], or none.
 fn parseIPv4(host: string) -> List<int>? {
     let n = len(host)
-    if (n <= 0) { return none }
+    if (n <= 0 || n > 15) { return none }
     var oct = 0
     var digits = 0
     var val = 0
@@ -57,649 +732,949 @@ fn isIPv4(host: string) -> bool {
     }
 }
 
+/// True for a valid numeric IPv6 literal.
+fn isIPv6(host: string) -> bool {
+    match (parseIPv6(host)) {
+        case some(_) -> true
+        case none -> false
+    }
+}
+
 fn ipv4ToString(a: int, b: int, c: int, d: int) -> string {
     str(a) + "." + str(b) + "." + str(c) + "." + str(d)
 }
 
-/// Format host:port for IPv4 endpoints.
+/// Format host:port (brackets an IPv6 literal).
 fn formatAddr(host: string, port: int) -> string {
+    if (isIPv6(host)) {
+        return "[" + host + "]:" + str(port)
+    }
     host + ":" + str(port)
 }
 
-/// Resolve a host to an IPv4 address string. Deterministic for numeric dotted
-/// quads and "localhost" (127.0.0.1). Returns none for other/unknown hosts.
-fn resolve4(host: string) -> string? {
-    match (parseIPv4(host)) {
-        case some(o) -> {
-            return ipv4ToString(o[0], o[1], o[2], o[3])
+// ---------------------------------------------------------------------------
+// DNS
+// ---------------------------------------------------------------------------
+
+const MAX_RESOLVE: int = 32
+
+/// Resolve `host` to its addresses through the OS resolver. Numeric literals
+/// resolve to themselves without a lookup. `family` is 0 (any), 4 or 6.
+/// Duplicates are removed; resolver order is kept. On failure returns none
+/// and fills `err` (kind ERR_NOT_FOUND for an unknown name).
+fn resolveHost(host: string, family: int = 0, err: NetError? = none) -> List<IpAddr>? {
+    var h = host
+    if (len(h) >= 2 && h[0] as int == 91 && h[len(h) - 1] as int == 93) {
+        h = sliceStr(h, 1, len(h) - 1)
+    }
+    if (len(h) == 0 || len(h) > 253) {
+        sinkSet(err, ERR_INVALID_INPUT, 0, "resolve: invalid host name")
+        return none
+    }
+    if (let some(ip) = IpAddr.parse(h)) {
+        if (family != 0 && ip.family != family) {
+            sinkSet(err, ERR_NOT_FOUND, 0, "resolve: " + h + " is not an IPv" + str(family) + " address")
+            return none
         }
-        case none -> {}
+        return [ip]
     }
-    if (host == "localhost") {
-        return "127.0.0.1"
+    // Reject embedded NULs / control bytes before handing the name to the OS.
+    var i = 0
+    while (i < len(h)) {
+        let c = h[i] as int
+        if (c <= 32 || c == 127) {
+            sinkSet(err, ERR_INVALID_INPUT, 0, "resolve: invalid host name")
+            return none
+        }
+        i = i + 1
     }
-    // Try runtime local resolver (numeric/localhost fast path over raw bytes).
-    let b = bytes(host)
-    let n = len(b)
-    if (n <= 0) { return none }
+    let cs = rawCString(h)
+    let out = rawAlloc(MAX_RESOLVE * 3 * 8)
+    let rc = netResolve(cs, family, out, MAX_RESOLVE)
+    rawFree(cs)
+    if (rc < 0) {
+        rawFree(out)
+        if (let some(e) = err) {
+            e.setOs("resolve " + h, 0 - rc)
+        }
+        return none
+    }
+    var addrs = List<IpAddr>()
     unsafe {
-        var words = (n + 7) / 8
-        if (words < 1) { words = 1 }
-        let buf = alloc(int, words)
-        var i = 0
-        while (i < words) {
-            buf[i] = 0
-            i = i + 1
+        let w = out as *int
+        var k = 0
+        while (k < rc) {
+            let ip = IpAddr(w[k * 3], w[k * 3 + 1], w[k * 3 + 2])
+            var dup = false
+            for (a in addrs) {
+                if (a.equals(ip)) {
+                    dup = true
+                }
+            }
+            if (!dup) {
+                addrs.push(ip)
+            }
+            k = k + 1
         }
-        i = 0
-        while (i < n) {
-            let sh = (i & 7) * 8
-            let mask = 255 << sh
-            let v = b[i] as int
-            buf[i >> 3] = (buf[i >> 3] & ((0 - 1) ^ mask)) | ((v & 255) << sh)
-            i = i + 1
+    }
+    rawFree(out)
+    if (len(addrs) == 0) {
+        sinkSet(err, ERR_NOT_FOUND, 0, "resolve " + h + ": no addresses")
+        return none
+    }
+    addrs
+}
+
+/// Resolve `host` and pair every address with `port`.
+fn resolve(host: string, port: int, family: int = 0, err: NetError? = none) -> List<SocketAddr>? {
+    if (port < 0 || port > 65535) {
+        sinkSet(err, ERR_INVALID_INPUT, 0, "resolve: port out of range")
+        return none
+    }
+    match (resolveHost(host, family, err)) {
+        case some(ips) -> {
+            var out = List<SocketAddr>()
+            for (ip in ips) {
+                out.push(SocketAddr(ip, port))
+            }
+            return out
         }
-        let meta = alloc(int, 4)
-        var m = 0
-        while (m < 4) {
-            meta[m] = 0
-            m = m + 1
+        case none -> {
+            return none
         }
-        let rc = net_resolve_local4(buf as int, n, meta as int)
-        var out: string? = none
-        if (rc == 0) {
-            out = ipv4ToString(meta[0], meta[1], meta[2], meta[3])
-        }
-        free(meta)
-        free(buf)
-        return out
     }
 }
 
-/// Resolve host and return [a,b,c,d] octets, or none.
-fn resolve4Octets(host: string) -> List<int>? {
-    match (resolve4(host)) {
-        case some(h) -> parseIPv4(h)
+/// Reverse lookup (PTR) of `ip`. Returns none when no name is registered.
+fn reverseLookup(ip: IpAddr, err: NetError? = none) -> string? {
+    let buf = rawAlloc(1025)
+    let n = netReverse(ip.family, ip.w0, ip.w1, buf, 1025)
+    if (n < 0) {
+        rawFree(buf)
+        if (let some(e) = err) {
+            e.setOs("reverse lookup " + ip.toString(), 0 - n)
+        }
+        return none
+    }
+    let name = str(rawToBytes(buf, n))
+    rawFree(buf)
+    name
+}
+
+/// Legacy: resolve to the first IPv4 address string, or none.
+fn resolve4(host: string) -> string? {
+    match (resolveHost(host, 4)) {
+        case some(ips) -> ips[0].toString()
         case none -> none
     }
 }
 
-/// Last socket/runtime network error code (platform-specific; 0 if none).
+/// Legacy: resolve host to [a,b,c,d] octets, or none.
+fn resolve4Octets(host: string) -> List<int>? {
+    match (resolveHost(host, 4)) {
+        case some(ips) -> ips[0].octets()
+        case none -> none
+    }
+}
+
+/// Last OS network error code of this thread (legacy; prefer `NetError`).
 fn lastError() -> int {
     net_last_error()
 }
 
-class TcpStream {
+fn metaAddr(meta: int) -> SocketAddr {
+    unsafe {
+        let m = meta as *int
+        return SocketAddr(IpAddr(m[0], m[1], m[2]), m[3])
+    }
+}
+
+fn endpointOf(fd: int, peer: bool, e: NetError) -> SocketAddr? {
+    let meta = rawAlloc(32)
+    var rc = 0
+    if (peer) {
+        rc = netPeerName(fd, meta)
+    } else {
+        rc = netSockName(fd, meta)
+    }
+    if (rc != 0) {
+        e.setOs("getsockname", 0 - rc)
+        rawFree(meta)
+        return none
+    }
+    let sa = metaAddr(meta)
+    rawFree(meta)
+    sa
+}
+
+fn optResult(rc: int, e: NetError, what: string) -> bool {
+    if (rc != 0) {
+        e.setOs(what, 0 - rc)
+        return false
+    }
+    true
+}
+
+fn onOff(on: bool) -> int {
+    if (on) {
+        return 1
+    }
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Byte-stream contract shared by TCP and TLS (consumed by HTTP/WebSocket).
+// ---------------------------------------------------------------------------
+
+/// A connected, reliable, ordered byte stream.
+interface Conn {
+    /// Up to `max` bytes: none on error (see `lastError`), empty on EOF.
+    fn readSome(max: int) -> List<byte>?
+    /// Write every byte, retrying partial writes. False on error.
+    fn writeAll(data: List<byte>) -> bool
+    /// Bound blocking reads; 0 disables the bound.
+    fn setRecvTimeoutMs(ms: int) -> bool
+    /// The error recorded by the last failing call.
+    fn lastError() -> NetError
+    fn close()
+}
+
+/// Default and maximum single read sizes.
+const READ_CHUNK: int = 16384
+
+// ---------------------------------------------------------------------------
+// TCP
+// ---------------------------------------------------------------------------
+
+class TcpStream implements Conn {
     var fd: int
     var closed: bool
+    var error: NetError
 
     constructor(fd: int) {
         this.fd = fd
         this.closed = false
+        this.error = NetError()
     }
 
-    /// Connect to host:port (numeric IPv4 or "localhost"). Returns none on failure.
-    static fn connect(host: string, port: int) -> TcpStream? {
-        match (resolve4Octets(host)) {
-            case some(o) -> {
-                let fd = net_tcp_socket()
-                if (fd == INVALID || fd == 0) {
-                    return none
+    /// Connect to `host:port`. `host` may be a name (resolved through DNS),
+    /// an IPv4 or an IPv6 literal. Every resolved address is tried in order.
+    /// `timeoutMs > 0` bounds each attempt.
+    static fn connect(host: string, port: int, timeoutMs: int = 0, err: NetError? = none) -> TcpStream? {
+        let e = NetError()
+        match (resolve(host, port, 0, e)) {
+            case some(addrs) -> {
+                for (a in addrs) {
+                    if (let some(s) = TcpStream.connectAddr(a, timeoutMs, e)) {
+                        return s
+                    }
                 }
-                let rc = net_connect4(fd, o[0], o[1], o[2], o[3], port)
-                if (rc != 0) {
-                    let _ = net_close(fd)
-                    return none
-                }
-                return TcpStream(fd)
+                sinkCopy(err, e)
+                return none
             }
             case none -> {
+                sinkCopy(err, e)
                 return none
             }
         }
     }
 
-    /// Read up to n bytes. Returns empty list on EOF/error.
-    fn read(n: int) -> List<byte> {
-        var out = bytes("")
-        if (this.closed || n <= 0) { return out }
-        unsafe {
-            var words = (n + 7) / 8
-            if (words < 1) { words = 1 }
-            let buf = alloc(int, words)
-            var i = 0
-            while (i < words) {
-                buf[i] = 0
-                i = i + 1
+    /// Connect to "host:port" / "[v6]:port".
+    static fn connectTo(target: string, timeoutMs: int = 0, err: NetError? = none) -> TcpStream? {
+        match (splitHostPort(target)) {
+            case some(hp) -> TcpStream.connect(hp.host, hp.port, timeoutMs, err)
+            case none -> {
+                sinkSet(err, ERR_INVALID_INPUT, 0, "connect: expected host:port, got " + target)
+                none
             }
-            let got = net_recv(this.fd, buf as int, n)
-            if (got > 0) {
-                var j = 0
-                while (j < got) {
-                    let b = (buf[j >> 3] >> ((j & 7) * 8)) & 255
-                    out.push(b as byte)
-                    j = j + 1
+        }
+    }
+
+    static fn connectAddr(addr: SocketAddr, timeoutMs: int = 0, err: NetError? = none) -> TcpStream? {
+        let fd = netSocket(addr.ip.family, 1)
+        if (fd < 0) {
+            if (let some(e) = err) {
+                e.setOs("socket", 0 - fd)
+            }
+            return none
+        }
+        let rc = netConnect(fd, addr.ip.family, addr.ip.w0, addr.ip.w1, addr.port, timeoutMs)
+        if (rc != 0) {
+            let _c = netClose(fd)
+            if (let some(e) = err) {
+                e.setOs("connect " + addr.toString(), 0 - rc)
+            }
+            return none
+        }
+        TcpStream(fd)
+    }
+
+    fn lastError() -> NetError {
+        this.error
+    }
+
+    fn isClosed() -> bool {
+        this.closed
+    }
+
+    fn failClosed(op: string) {
+        this.error.set(ERR_CLOSED, 0, op + ": stream is closed")
+    }
+
+    /// Up to `max` bytes. none on error (`error` says why), empty on EOF.
+    /// Interrupted calls are retried.
+    fn readSome(max: int) -> List<byte>? {
+        if (this.closed) {
+            this.failClosed("read")
+            return none
+        }
+        var want = max
+        if (want <= 0) {
+            return bytes("")
+        }
+        if (want > 1048576) {
+            want = 1048576
+        }
+        let buf = rawAlloc(want)
+        var got = netRecv(this.fd, buf, want)
+        while (got < 0 && netErrorKind(0 - got) == ERR_INTERRUPTED) {
+            got = netRecv(this.fd, buf, want)
+        }
+        if (got < 0) {
+            this.error.setOs("read", 0 - got)
+            rawFree(buf)
+            return none
+        }
+        let out = rawToBytes(buf, got)
+        rawFree(buf)
+        out
+    }
+
+    /// Legacy: up to n bytes; empty on EOF *or* error.
+    fn read(n: int) -> List<byte> {
+        match (this.readSome(n)) {
+            case some(b) -> b
+            case none -> bytes("")
+        }
+    }
+
+    /// Exactly n bytes, or none on EOF/error before n bytes.
+    fn readExact(n: int) -> List<byte>? {
+        var out = bytes("")
+        while (len(out) < n) {
+            var want = n - len(out)
+            if (want > READ_CHUNK) {
+                want = READ_CHUNK
+            }
+            match (this.readSome(want)) {
+                case some(chunk) -> {
+                    if (len(chunk) == 0) {
+                        this.error.set(ERR_CLOSED, 0, "read: connection closed after " + str(len(out)) + " of " + str(n) + " bytes")
+                        return none
+                    }
+                    for (b in chunk) {
+                        out.push(b)
+                    }
+                }
+                case none -> {
+                    return none
                 }
             }
-            free(buf)
         }
         out
     }
 
-    /// Read exactly n bytes. Returns none on EOF/error before n bytes.
-    fn readExact(n: int) -> List<byte>? {
-        if (n <= 0) { return bytes("") }
-        var out = bytes("")
-        var need = n
-        while (need > 0) {
-            let chunk = this.read(need)
-            let got = len(chunk)
-            if (got <= 0) { return none }
-            var i = 0
-            while (i < got) {
-                out.push(chunk[i])
-                i = i + 1
-            }
-            need = need - got
-        }
-        out
-    }
-
-    /// Write bytes, returns number sent (may be less on error).
+    /// One send call; returns bytes accepted by the OS (may be fewer than
+    /// `len(data)`), or -1 on error.
     fn write(data: List<byte>) -> int {
-        if (this.closed) { return -1 }
-        let n = len(data)
-        if (n <= 0) { return 0 }
-        unsafe {
-            var words = (n + 7) / 8
-            if (words < 1) { words = 1 }
-            let buf = alloc(int, words)
-            var i = 0
-            while (i < words) {
-                buf[i] = 0
-                i = i + 1
-            }
-            i = 0
-            while (i < n) {
-                let sh = (i & 7) * 8
-                let mask = 255 << sh
-                let v = data[i] as int
-                buf[i >> 3] = (buf[i >> 3] & ((0 - 1) ^ mask)) | ((v & 255) << sh)
-                i = i + 1
-            }
-            let sent = net_send(this.fd, buf as int, n)
-            free(buf)
-            return sent
+        if (this.closed) {
+            this.failClosed("write")
+            return -1
         }
+        let n = len(data)
+        if (n == 0) {
+            return 0
+        }
+        let buf = rawFromBytes(data, 0, n)
+        var sent = netSend(this.fd, buf, n)
+        while (sent < 0 && netErrorKind(0 - sent) == ERR_INTERRUPTED) {
+            sent = netSend(this.fd, buf, n)
+        }
+        rawFree(buf)
+        if (sent < 0) {
+            this.error.setOs("write", 0 - sent)
+            return -1
+        }
+        sent
     }
 
-    /// Write all bytes. Returns true only if the full buffer was sent.
+    /// Write every byte, continuing after partial sends.
     fn writeAll(data: List<byte>) -> bool {
+        if (this.closed) {
+            this.failClosed("write")
+            return false
+        }
         let n = len(data)
+        if (n == 0) {
+            return true
+        }
+        let buf = rawFromBytes(data, 0, n)
         var off = 0
+        var ok = true
         while (off < n) {
-            var chunk = bytes("")
-            var i = off
-            while (i < n) {
-                chunk.push(data[i])
-                i = i + 1
+            let sent = netSend(this.fd, buf + off, n - off)
+            if (sent < 0) {
+                if (netErrorKind(0 - sent) == ERR_INTERRUPTED) {
+                    continue
+                }
+                this.error.setOs("write", 0 - sent)
+                ok = false
+                break
             }
-            let sent = this.write(chunk)
-            if (sent <= 0) { return false }
+            if (sent == 0) {
+                this.error.set(ERR_CLOSED, 0, "write: zero-length send")
+                ok = false
+                break
+            }
             off = off + sent
         }
-        true
+        rawFree(buf)
+        ok
     }
 
-    /// Read until EOF/error. Returns all bytes received.
+    fn writeText(text: string) -> bool {
+        this.writeAll(bytes(text))
+    }
+
+    /// Read until EOF, error, or `maxTotal` bytes (default 1 MiB).
     fn readAll(maxTotal: int) -> List<byte> {
         var out = bytes("")
-        var total = 0
         var limit = maxTotal
         if (limit <= 0) { limit = 1048576 }
-        while (total < limit) {
-            var want = limit - total
-            if (want > 4096) { want = 4096 }
-            let chunk = this.read(want)
-            let got = len(chunk)
-            if (got <= 0) { break }
-            var i = 0
-            while (i < got) {
-                out.push(chunk[i])
-                i = i + 1
+        while (len(out) < limit) {
+            var want = limit - len(out)
+            if (want > READ_CHUNK) { want = READ_CHUNK }
+            match (this.readSome(want)) {
+                case some(chunk) -> {
+                    if (len(chunk) == 0) {
+                        break
+                    }
+                    for (b in chunk) {
+                        out.push(b)
+                    }
+                }
+                case none -> {
+                    break
+                }
             }
-            total = total + got
         }
         out
     }
 
-    /// Read all available data as UTF-8 text best-effort (raw bytes -> string).
     fn readText(maxTotal: int) -> string {
         str(this.readAll(maxTotal))
     }
 
-    /// Best-effort close.
+    /// Wait up to `ms` (< 0 = forever) for readable data or EOF.
+    fn waitReadable(ms: int) -> bool {
+        if (this.closed) {
+            return false
+        }
+        let r = netPoll(this.fd, READY_READ, ms)
+        if (r < 0) {
+            this.error.setOs("poll", 0 - r)
+            return false
+        }
+        r != 0
+    }
+
+    /// Bytes that can be read right now without blocking (-1 on error).
+    fn available() -> int {
+        if (this.closed) {
+            return -1
+        }
+        let n = netAvailable(this.fd)
+        if (n < 0) {
+            this.error.setOs("available", 0 - n)
+            return -1
+        }
+        n
+    }
+
+    /// Idempotent close; releases the OS handle.
     fn close() {
         if (!this.closed) {
-            let _ = net_close(this.fd)
+            let _ = netClose(this.fd)
             this.closed = true
             this.fd = INVALID
         }
     }
 
+    /// Half-close: SHUT_RD, SHUT_WR or SHUT_RDWR. Returns 0 or -1.
     fn shutdown(how: int) -> int {
         if (this.closed) { return -1 }
-        net_shutdown(this.fd, how)
+        let rc = netShutdown(this.fd, how)
+        if (rc != 0) {
+            this.error.setOs("shutdown", 0 - rc)
+            return -1
+        }
+        0
+    }
+
+    fn localSocketAddr() -> SocketAddr? {
+        if (this.closed) { return none }
+        endpointOf(this.fd, false, this.error)
+    }
+
+    fn peerSocketAddr() -> SocketAddr? {
+        if (this.closed) { return none }
+        endpointOf(this.fd, true, this.error)
     }
 
     fn localPort() -> int {
-        if (this.closed) { return -1 }
-        net_local_port4(this.fd)
+        match (this.localSocketAddr()) {
+            case some(a) -> a.port
+            case none -> -1
+        }
     }
 
     fn peerPort() -> int {
-        if (this.closed) { return -1 }
-        net_peer_port4(this.fd)
+        match (this.peerSocketAddr()) {
+            case some(a) -> a.port
+            case none -> -1
+        }
     }
 
     fn localHost() -> string? {
-        if (this.closed) { return none }
-        unsafe {
-            let meta = alloc(int, 5)
-            var i = 0
-            while (i < 5) {
-                meta[i] = 0
-                i = i + 1
-            }
-            let rc = net_local_addr4(this.fd, meta as int)
-            var out: string? = none
-            if (rc == 0) {
-                out = ipv4ToString(meta[0], meta[1], meta[2], meta[3])
-            }
-            free(meta)
-            return out
+        match (this.localSocketAddr()) {
+            case some(a) -> a.ip.toString()
+            case none -> none
         }
     }
 
     fn peerHost() -> string? {
-        if (this.closed) { return none }
-        unsafe {
-            let meta = alloc(int, 5)
-            var i = 0
-            while (i < 5) {
-                meta[i] = 0
-                i = i + 1
-            }
-            let rc = net_peer_addr4(this.fd, meta as int)
-            var out: string? = none
-            if (rc == 0) {
-                out = ipv4ToString(meta[0], meta[1], meta[2], meta[3])
-            }
-            free(meta)
-            return out
+        match (this.peerSocketAddr()) {
+            case some(a) -> a.ip.toString()
+            case none -> none
         }
     }
 
     fn localAddr() -> string? {
-        match (this.localHost()) {
-            case some(h) -> formatAddr(h, this.localPort())
+        match (this.localSocketAddr()) {
+            case some(a) -> a.toString()
             case none -> none
         }
     }
 
     fn peerAddr() -> string? {
-        match (this.peerHost()) {
-            case some(h) -> formatAddr(h, this.peerPort())
+        match (this.peerSocketAddr()) {
+            case some(a) -> a.toString()
             case none -> none
         }
     }
 
     fn setNoDelay(on: bool) -> bool {
         if (this.closed) { return false }
-        let v = if (on) { 1 } else { 0 }
-        net_set_nodelay(this.fd, v) == 0
+        optResult(netSetOpt(this.fd, 2, onOff(on)), this.error, "set nodelay")
     }
 
     fn setKeepAlive(on: bool) -> bool {
         if (this.closed) { return false }
-        let v = if (on) { 1 } else { 0 }
-        net_set_keepalive(this.fd, v) == 0
+        optResult(netSetOpt(this.fd, 3, onOff(on)), this.error, "set keepalive")
     }
 
+    /// Bound blocking reads (0 = no bound). A timed-out read fails with
+    /// ERR_TIMEOUT and leaves the stream usable.
     fn setRecvTimeoutMs(ms: int) -> bool {
         if (this.closed) { return false }
-        net_set_recv_timeout_ms(this.fd, ms) == 0
+        optResult(netSetOpt(this.fd, 5, ms), this.error, "set recv timeout")
     }
 
     fn setSendTimeoutMs(ms: int) -> bool {
         if (this.closed) { return false }
-        net_set_send_timeout_ms(this.fd, ms) == 0
+        optResult(netSetOpt(this.fd, 6, ms), this.error, "set send timeout")
+    }
+
+    fn setRecvBufferSize(bytes: int) -> bool {
+        if (this.closed) { return false }
+        optResult(netSetOpt(this.fd, 8, bytes), this.error, "set recv buffer")
+    }
+
+    fn setSendBufferSize(bytes: int) -> bool {
+        if (this.closed) { return false }
+        optResult(netSetOpt(this.fd, 9, bytes), this.error, "set send buffer")
+    }
+
+    /// Non-blocking mode: reads/writes that cannot proceed fail with
+    /// ERR_WOULD_BLOCK instead of waiting.
+    fn setNonBlocking(on: bool) -> bool {
+        if (this.closed) { return false }
+        optResult(netSetNonBlocking(this.fd, onOff(on)), this.error, "set nonblocking")
     }
 }
 
 class TcpListener {
     var fd: int
     var closed: bool
+    var error: NetError
 
     constructor(fd: int) {
         this.fd = fd
         this.closed = false
+        this.error = NetError()
     }
 
-    /// Bind to host:port (numeric IPv4 or "localhost") and listen. port 0 = ephemeral.
-    static fn bind(host: string, port: int) -> TcpListener? {
-        match (resolve4Octets(host)) {
-            case some(o) -> {
-                let fd = net_tcp_socket()
-                if (fd == INVALID || fd == 0) {
-                    return none
+    /// Bind `host:port` and listen. `host` is a literal or a name ("0.0.0.0",
+    /// "::", "localhost", ...). Port 0 picks an ephemeral port.
+    static fn bind(host: string, port: int, err: NetError? = none) -> TcpListener? {
+        let e = NetError()
+        match (resolve(host, port, 0, e)) {
+            case some(addrs) -> {
+                for (a in addrs) {
+                    if (let some(l) = TcpListener.bindAddr(a, 128, e)) {
+                        return l
+                    }
                 }
-                let _ = net_set_reuseaddr(fd, 1)
-                let br = net_bind4(fd, o[0], o[1], o[2], o[3], port)
-                if (br != 0) {
-                    let _ = net_close(fd)
-                    return none
-                }
-                let lr = net_listen(fd, 128)
-                if (lr != 0) {
-                    let _ = net_close(fd)
-                    return none
-                }
-                return TcpListener(fd)
+                sinkCopy(err, e)
+                return none
             }
             case none -> {
+                sinkCopy(err, e)
                 return none
             }
         }
     }
 
-    /// Accept a connection (blocking). Returns none on failure.
-    fn accept() -> TcpStream? {
-        if (this.closed) { return none }
-        let cfd = net_accept(this.fd)
-        if (cfd == INVALID || cfd == 0) {
+    /// Bind "host:port" / "[v6]:port".
+    static fn bindTo(target: string, err: NetError? = none) -> TcpListener? {
+        match (splitHostPort(target)) {
+            case some(hp) -> TcpListener.bind(hp.host, hp.port, err)
+            case none -> {
+                sinkSet(err, ERR_INVALID_INPUT, 0, "bind: expected host:port, got " + target)
+                none
+            }
+        }
+    }
+
+    static fn bindAddr(addr: SocketAddr, backlog: int = 128, err: NetError? = none) -> TcpListener? {
+        let fd = netSocket(addr.ip.family, 1)
+        if (fd < 0) {
+            if (let some(e) = err) {
+                e.setOs("socket", 0 - fd)
+            }
             return none
         }
-        TcpStream(cfd)
+        let br = netBind(fd, addr.ip.family, addr.ip.w0, addr.ip.w1, addr.port)
+        if (br != 0) {
+            let _c = netClose(fd)
+            if (let some(e) = err) {
+                e.setOs("bind " + addr.toString(), 0 - br)
+            }
+            return none
+        }
+        let lr = netListen(fd, backlog)
+        if (lr != 0) {
+            let _c2 = netClose(fd)
+            if (let some(e) = err) {
+                e.setOs("listen", 0 - lr)
+            }
+            return none
+        }
+        TcpListener(fd)
+    }
+
+    fn lastError() -> NetError {
+        this.error
+    }
+
+    /// Accept one connection (blocking).
+    fn accept() -> TcpStream? {
+        if (this.closed) {
+            this.error.set(ERR_CLOSED, 0, "accept: listener is closed")
+            return none
+        }
+        let meta = rawAlloc(32)
+        var c = netAccept(this.fd, meta)
+        while (c < 0 && netErrorKind(0 - c) == ERR_INTERRUPTED) {
+            c = netAccept(this.fd, meta)
+        }
+        rawFree(meta)
+        if (c < 0) {
+            this.error.setOs("accept", 0 - c)
+            return none
+        }
+        TcpStream(c)
+    }
+
+    /// Accept, waiting at most `ms`; none with ERR_TIMEOUT when nobody came.
+    fn acceptTimeout(ms: int) -> TcpStream? {
+        if (this.closed) {
+            this.error.set(ERR_CLOSED, 0, "accept: listener is closed")
+            return none
+        }
+        let r = netPoll(this.fd, READY_READ, ms)
+        if (r < 0) {
+            this.error.setOs("poll", 0 - r)
+            return none
+        }
+        if (r == 0) {
+            this.error.set(ERR_TIMEOUT, 0, "accept: timed out")
+            return none
+        }
+        this.accept()
+    }
+
+    fn localSocketAddr() -> SocketAddr? {
+        if (this.closed) { return none }
+        endpointOf(this.fd, false, this.error)
     }
 
     fn localPort() -> int {
-        if (this.closed) { return -1 }
-        net_local_port4(this.fd)
+        match (this.localSocketAddr()) {
+            case some(a) -> a.port
+            case none -> -1
+        }
     }
 
     fn localHost() -> string? {
-        if (this.closed) { return none }
-        unsafe {
-            let meta = alloc(int, 5)
-            var i = 0
-            while (i < 5) {
-                meta[i] = 0
-                i = i + 1
-            }
-            let rc = net_local_addr4(this.fd, meta as int)
-            var out: string? = none
-            if (rc == 0) {
-                out = ipv4ToString(meta[0], meta[1], meta[2], meta[3])
-            }
-            free(meta)
-            return out
+        match (this.localSocketAddr()) {
+            case some(a) -> a.ip.toString()
+            case none -> none
         }
     }
 
     fn localAddr() -> string? {
-        match (this.localHost()) {
-            case some(h) -> formatAddr(h, this.localPort())
+        match (this.localSocketAddr()) {
+            case some(a) -> a.toString()
             case none -> none
         }
     }
 
     fn close() {
         if (!this.closed) {
-            let _ = net_close(this.fd)
+            let _ = netClose(this.fd)
             this.closed = true
             this.fd = INVALID
         }
     }
 }
 
+// ---------------------------------------------------------------------------
+// UDP
+// ---------------------------------------------------------------------------
+
 class UdpDatagram {
     var data: List<byte>
     var host: string
     var port: int
+    var sender: SocketAddr
 
-    constructor(data: List<byte>, host: string, port: int) {
+    constructor(data: List<byte>, sender: SocketAddr) {
         this.data = data
-        this.host = host
-        this.port = port
+        this.sender = sender
+        this.host = sender.ip.toString()
+        this.port = sender.port
     }
 }
+
+/// Largest UDP payload accepted by `recvFrom` / `recv`.
+const MAX_DATAGRAM: int = 65536
 
 class UdpSocket {
     var fd: int
     var closed: bool
+    var family: int
+    var error: NetError
 
-    constructor(fd: int) {
+    constructor(fd: int, family: int) {
         this.fd = fd
         this.closed = false
+        this.family = family
+        this.error = NetError()
     }
 
-    /// Bind to host:port (numeric IPv4 or "localhost"). port 0 = ephemeral.
-    static fn bind(host: string, port: int) -> UdpSocket? {
-        match (resolve4Octets(host)) {
-            case some(o) -> {
-                let fd = net_udp_socket()
-                if (fd == INVALID || fd == 0) {
-                    return none
+    /// Bind `host:port` (literal or name). Port 0 picks an ephemeral port.
+    static fn bind(host: string, port: int, err: NetError? = none) -> UdpSocket? {
+        let e = NetError()
+        match (resolve(host, port, 0, e)) {
+            case some(addrs) -> {
+                for (a in addrs) {
+                    if (let some(s) = UdpSocket.bindAddr(a, e)) {
+                        return s
+                    }
                 }
-                let _ = net_set_reuseaddr(fd, 1)
-                let br = net_bind4(fd, o[0], o[1], o[2], o[3], port)
-                if (br != 0) {
-                    let _ = net_close(fd)
-                    return none
-                }
-                return UdpSocket(fd)
+                sinkCopy(err, e)
+                return none
             }
             case none -> {
+                sinkCopy(err, e)
                 return none
             }
         }
     }
 
-    /// Connect UDP socket to default peer (numeric IPv4 or "localhost").
+    static fn bindAddr(addr: SocketAddr, err: NetError? = none) -> UdpSocket? {
+        let fd = netSocket(addr.ip.family, 2)
+        if (fd < 0) {
+            if (let some(e) = err) {
+                e.setOs("socket", 0 - fd)
+            }
+            return none
+        }
+        let br = netBind(fd, addr.ip.family, addr.ip.w0, addr.ip.w1, addr.port)
+        if (br != 0) {
+            let _c = netClose(fd)
+            if (let some(e) = err) {
+                e.setOs("bind " + addr.toString(), 0 - br)
+            }
+            return none
+        }
+        UdpSocket(fd, addr.ip.family)
+    }
+
+    fn lastError() -> NetError {
+        this.error
+    }
+
+    fn target(host: string, port: int) -> SocketAddr? {
+        match (resolve(host, port, this.family, this.error)) {
+            case some(addrs) -> addrs[0]
+            case none -> none
+        }
+    }
+
+    /// Fix the default peer so `send`/`recv` can be used.
     fn connect(host: string, port: int) -> bool {
         if (this.closed) { return false }
-        match (resolve4Octets(host)) {
-            case some(o) -> {
-                net_udp_connect4(this.fd, o[0], o[1], o[2], o[3], port) == 0
+        match (this.target(host, port)) {
+            case some(a) -> {
+                let rc = netConnect(this.fd, a.ip.family, a.ip.w0, a.ip.w1, a.port, 0)
+                optResult(rc, this.error, "connect")
             }
             case none -> false
         }
     }
 
-    /// Send on connected UDP socket.
+    /// Send one datagram to the connected peer. Bytes sent or -1.
     fn send(data: List<byte>) -> int {
         if (this.closed) { return -1 }
         let n = len(data)
-        if (n <= 0) { return 0 }
-        unsafe {
-            var words = (n + 7) / 8
-            if (words < 1) { words = 1 }
-            let buf = alloc(int, words)
-            var i = 0
-            while (i < words) {
-                buf[i] = 0
-                i = i + 1
-            }
-            i = 0
-            while (i < n) {
-                let sh = (i & 7) * 8
-                let mask = 255 << sh
-                let v = data[i] as int
-                buf[i >> 3] = (buf[i >> 3] & ((0 - 1) ^ mask)) | ((v & 255) << sh)
-                i = i + 1
-            }
-            let sent = net_send(this.fd, buf as int, n)
-            free(buf)
-            return sent
+        let buf = rawFromBytes(data, 0, n)
+        let sent = netSend(this.fd, buf, n)
+        rawFree(buf)
+        if (sent < 0) {
+            this.error.setOs("send", 0 - sent)
+            return -1
         }
+        sent
     }
 
-    /// Receive on connected UDP socket. Returns none on error.
+    /// One datagram from the connected peer (at most `max` bytes; the rest of
+    /// a larger datagram is discarded by the OS and reported as an error).
     fn recv(max: int) -> List<byte>? {
-        if (this.closed || max <= 0) { return none }
-        unsafe {
-            var words = (max + 7) / 8
-            if (words < 1) { words = 1 }
-            let buf = alloc(int, words)
-            var i = 0
-            while (i < words) {
-                buf[i] = 0
-                i = i + 1
-            }
-            let got = net_recv(this.fd, buf as int, max)
-            if (got < 0) {
-                free(buf)
-                return none
-            }
-            var out = bytes("")
-            var j = 0
-            while (j < got) {
-                let b = (buf[j >> 3] >> ((j & 7) * 8)) & 255
-                out.push(b as byte)
-                j = j + 1
-            }
-            free(buf)
-            return out
-        }
-    }
-
-    fn localPort() -> int {
-        if (this.closed) { return -1 }
-        net_local_port4(this.fd)
-    }
-
-    fn localHost() -> string? {
-        if (this.closed) { return none }
-        unsafe {
-            let meta = alloc(int, 5)
-            var i = 0
-            while (i < 5) {
-                meta[i] = 0
-                i = i + 1
-            }
-            let rc = net_local_addr4(this.fd, meta as int)
-            var out: string? = none
-            if (rc == 0) {
-                out = ipv4ToString(meta[0], meta[1], meta[2], meta[3])
-            }
-            free(meta)
-            return out
+        match (this.recvFrom(max)) {
+            case some(d) -> d.data
+            case none -> none
         }
     }
 
     fn setBroadcast(on: bool) -> bool {
         if (this.closed) { return false }
-        let v = if (on) { 1 } else { 0 }
-        net_set_broadcast(this.fd, v) == 0
+        optResult(netSetOpt(this.fd, 4, onOff(on)), this.error, "set broadcast")
     }
 
     fn setRecvTimeoutMs(ms: int) -> bool {
         if (this.closed) { return false }
-        net_set_recv_timeout_ms(this.fd, ms) == 0
+        optResult(netSetOpt(this.fd, 5, ms), this.error, "set recv timeout")
     }
 
     fn setSendTimeoutMs(ms: int) -> bool {
         if (this.closed) { return false }
-        net_set_send_timeout_ms(this.fd, ms) == 0
+        optResult(netSetOpt(this.fd, 6, ms), this.error, "set send timeout")
     }
 
-    /// Send datagram to host:port (numeric IPv4 or "localhost"). Returns bytes sent or -1.
+    /// Send one datagram to host:port. Bytes sent or -1 (`error` says why).
     fn sendTo(data: List<byte>, host: string, port: int) -> int {
         if (this.closed) { return -1 }
-        match (resolve4Octets(host)) {
-            case some(o) -> {
-                let n = len(data)
-                if (n < 0) { return -1 }
-                if (n == 0) {
-                    unsafe {
-                        let buf = alloc(int, 1)
-                        buf[0] = 0
-                        let sent = net_sendto4(this.fd, buf as int, 0, o[0], o[1], o[2], o[3], port)
-                        free(buf)
-                        return sent
-                    }
-                }
-                unsafe {
-                    var words = (n + 7) / 8
-                    if (words < 1) { words = 1 }
-                    let buf = alloc(int, words)
-                    var i = 0
-                    while (i < words) {
-                        buf[i] = 0
-                        i = i + 1
-                    }
-                    i = 0
-                    while (i < n) {
-                        let sh = (i & 7) * 8
-                        let mask = 255 << sh
-                        let v = data[i] as int
-                        buf[i >> 3] = (buf[i >> 3] & ((0 - 1) ^ mask)) | ((v & 255) << sh)
-                        i = i + 1
-                    }
-                    let sent = net_sendto4(this.fd, buf as int, n, o[0], o[1], o[2], o[3], port)
-                    free(buf)
-                    return sent
-                }
-            }
-            case none -> {
-                return -1
-            }
+        match (this.target(host, port)) {
+            case some(a) -> this.sendToAddr(data, a)
+            case none -> -1
         }
     }
 
-    /// Receive a datagram (blocking). Returns none on error/timeout.
+    fn sendToAddr(data: List<byte>, addr: SocketAddr) -> int {
+        if (this.closed) { return -1 }
+        let n = len(data)
+        let buf = rawFromBytes(data, 0, n)
+        let sent = netSendTo(this.fd, buf, n, addr.ip.family, addr.ip.w0, addr.ip.w1, addr.port)
+        rawFree(buf)
+        if (sent < 0) {
+            this.error.setOs("send to " + addr.toString(), 0 - sent)
+            return -1
+        }
+        sent
+    }
+
+    /// Receive one datagram (blocking unless a timeout is set).
     fn recvFrom(max: int) -> UdpDatagram? {
         if (this.closed || max <= 0) { return none }
-        unsafe {
-            var words = (max + 7) / 8
-            if (words < 1) { words = 1 }
-            let buf = alloc(int, words)
-            var i = 0
-            while (i < words) {
-                buf[i] = 0
-                i = i + 1
-            }
-            let meta = alloc(int, 5)
-            var m = 0
-            while (m < 5) {
-                meta[m] = 0
-                m = m + 1
-            }
-            let got = net_recvfrom4(this.fd, buf as int, max, meta as int)
-            if (got < 0) {
-                free(meta)
-                free(buf)
-                return none
-            }
-            var out = bytes("")
-            var j = 0
-            while (j < got) {
-                let b = (buf[j >> 3] >> ((j & 7) * 8)) & 255
-                out.push(b as byte)
-                j = j + 1
-            }
-            let host = str(meta[0]) + "." + str(meta[1]) + "." + str(meta[2]) + "." + str(meta[3])
-            let port = meta[4]
-            free(meta)
-            free(buf)
-            return UdpDatagram(out, host, port)
+        var want = max
+        if (want > MAX_DATAGRAM) {
+            want = MAX_DATAGRAM
+        }
+        let buf = rawAlloc(want)
+        let meta = rawAlloc(32)
+        var got = netRecvFrom(this.fd, buf, want, meta)
+        while (got < 0 && netErrorKind(0 - got) == ERR_INTERRUPTED) {
+            got = netRecvFrom(this.fd, buf, want, meta)
+        }
+        if (got < 0) {
+            this.error.setOs("recvfrom", 0 - got)
+            rawFree(meta)
+            rawFree(buf)
+            return none
+        }
+        let data = rawToBytes(buf, got)
+        let sender = metaAddr(meta)
+        rawFree(meta)
+        rawFree(buf)
+        UdpDatagram(data, sender)
+    }
+
+    fn waitReadable(ms: int) -> bool {
+        if (this.closed) {
+            return false
+        }
+        let r = netPoll(this.fd, READY_READ, ms)
+        if (r < 0) {
+            this.error.setOs("poll", 0 - r)
+            return false
+        }
+        r != 0
+    }
+
+    fn localSocketAddr() -> SocketAddr? {
+        if (this.closed) { return none }
+        endpointOf(this.fd, false, this.error)
+    }
+
+    fn localPort() -> int {
+        match (this.localSocketAddr()) {
+            case some(a) -> a.port
+            case none -> -1
+        }
+    }
+
+    fn localHost() -> string? {
+        match (this.localSocketAddr()) {
+            case some(a) -> a.ip.toString()
+            case none -> none
         }
     }
 
     fn close() {
         if (!this.closed) {
-            let _ = net_close(this.fd)
+            let _ = netClose(this.fd)
             this.closed = true
             this.fd = INVALID
         }

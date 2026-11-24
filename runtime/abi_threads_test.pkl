@@ -2,65 +2,152 @@ module runtime.abi_threads_test
 
 import { abiThreadSpawn, abiThreadJoin, abiThreadFinished, abiThreadPanicMessage, abiThreadCount, abiThreadCurrent, abiThreadSleepMs, abiThreadYield } from runtime.abi_threads
 
-/// The unit suite for the thread port bodies.
+/// The unit suite for the thread port bodies, written for the real-thread
+/// (non-inline) contract.
 ///
-/// The single-thread divergence is the point under test: a spawn runs its body
-/// inline (the "no peer" world `threads.rs:403` documents for the freestanding
-/// build), and every task answer is derived from the one spawn counter. All
-/// assertions are relative - "current count + 1", "the handle this spawn got"
-/// - never absolute, because the runtime suite runs tests in an unspecified
-/// order.
+/// WHAT THE CONTRACT IS NOW. `pickle_thread_spawn` starts an OS thread, so the
+/// body runs concurrently with the spawner and may not have run when `spawn`
+/// returns. The runtime keeps its single-threaded shape with a world lock (a
+/// GIL) taken around every Pickle instruction: the test thread holds it, and a
+/// fresh child parks in its entry wrapper until the spawner blocks. Every
+/// assertion below is shaped for those two facts - "the handle this spawn got",
+/// "the count grew by one", "the body's effect is visible after join" - never
+/// "the body already ran when spawn returned".
 ///
-/// NO TEST COVERS A TIME-VISIBLE SLEEP. `abiThreadSleepMs` terminates (the
-/// clamp bounds it at 60000ms); the sleep bodies just assert the call returns.
+/// NO TEST SPINS ON A FLAG. A spin loop in the main thread would starve the
+/// child, because the child cannot run until the GIL is released; polling
+/// `abiThreadFinished` in a tight loop is therefore a deadlock, not a wait.
+/// The only waits used here are `abiThreadJoin` and `abiThreadSleepMs`, the two
+/// bodies that release the world lock.
 ///
-/// The body effect is observed through `recordSpawn`, not through a captured
-/// binding: a lambda is captured by value and cannot mutate the enclosing
-/// binding (E0900), so a closure body here only *_calls_* - the recording
-/// happens inside a plain module function.
+/// THE 60s CLAMP IS NOT SLEPT. `abiThreadSleepMs` maps the input into
+/// [0, 60000] and then calls `Sleep`; proving the upper bound would stall the
+/// suite for a minute. The extremes test covers the negative and zero ends, and
+/// the upper clamp stays a property of the same three lines of code.
+///
+/// EFFECTS GO THROUGH MODULE STATE OR RAW CELLS. A lambda is captured by value
+/// and cannot assign to an enclosing binding (E0900), so a body here either
+/// calls a module function that records the effect (`recordSpawn`) or writes
+/// through a raw `*int` cell captured in its environment (`setUpCell`). The raw
+/// cell is deliberately unmanaged: it exercises the closure environment, not
+/// the collector's object graph.
 var seenSpawn: int = 0
 
 fn recordSpawn() -> void {
     seenSpawn = seenSpawn + 1
 }
 
-test fn current_reports_the_unregistered_thread() {
-    expect(abiThreadCurrent()).toBe(0)
+/// Raw-cell write helper. The closure calls this, so the write is an ordinary
+/// function call rather than an assignment to a captured binding.
+fn setUpCell(cell: *int, v: int) {
+    unsafe {
+        cell[0] = v
+    }
 }
 
-test fn yield_is_a_noop() {
+fn readCell(cell: *int) -> int {
+    unsafe {
+        return cell[0]
+    }
+}
+
+/// Void-returning sleep for use as a closure body: a bare `abiThreadSleepMs`
+/// tail expression would infer `() -> int` and not fit `fn () -> void`.
+fn sleepBody(ms: int) {
+    let _ = abiThreadSleepMs(ms)
+}
+
+test fn current_id_is_stable_on_one_thread() {
+    let first = abiThreadCurrent()
+    expect(first >= 0).toBe(true)
+    expect(abiThreadCurrent()).toBe(first)
+}
+
+test fn yield_returns_to_the_caller() {
     abiThreadYield()
+    expect(abiThreadCurrent() >= 0).toBe(true)
 }
 
-test fn sleep_terminates_for_the_extremes() {
+test fn sleep_terminates_for_the_small_extremes() {
     abiThreadSleepMs(-5)
     abiThreadSleepMs(0)
     abiThreadSleepMs(1)
-    abiThreadSleepMs(70000)
 }
 
-test fn the_empty_world_answers_match_the_nostd_reference() {
-    expect(abiThreadCount()).toBe(0)
-    expect(abiThreadFinished(0)).toBe(false)
+test fn unknown_handles_answer_like_an_empty_registry() {
+    let n = abiThreadCount()
     expect(abiThreadFinished(-1)).toBe(false)
-    expect(abiThreadFinished(999)).toBe(false)
-    expect(abiThreadPanicMessage(0) == 0 as *int).toBe(true)
-    expect(abiThreadJoin(0)).toBe(true)
+    expect(abiThreadFinished(n + 999)).toBe(false)
     expect(abiThreadJoin(-7)).toBe(true)
+    expect(abiThreadJoin(n + 999)).toBe(true)
+    expect(abiThreadPanicMessage(n + 999) == 0 as *int).toBe(true)
 }
 
-test fn spawn_runs_inline_in_handle_order() {
-    var before = abiThreadCount()
-    var h0 = abiThreadSpawn(fn () { recordSpawn() })
-    expect(h0).toBe(before)
+test fn spawn_returns_the_next_handle_before_the_body_finishes() {
+    let before = abiThreadCount()
+    let h = abiThreadSpawn(fn () { sleepBody(120) })
+    expect(h).toBe(before)
     expect(abiThreadCount()).toBe(before + 1)
+    // The child is parked in a sleep this thread has not released the world
+    // lock for, so a zero-timeout probe is deterministic in the direction that
+    // matters: a child that has not run cannot have finished. (A body with no
+    // wait would be racy here, which is why this one sleeps.)
+    expect(abiThreadFinished(h)).toBe(false)
+    expect(abiThreadJoin(h)).toBe(true)
+    expect(abiThreadFinished(h)).toBe(true)
+}
+
+test fn join_observes_a_body_that_ran() {
+    let before = seenSpawn
+    let h = abiThreadSpawn(fn () { recordSpawn() })
+    expect(abiThreadJoin(h)).toBe(true)
     expect(seenSpawn).toBe(before + 1)
-    expect(abiThreadFinished(h0)).toBe(true)
-    expect(abiThreadJoin(h0)).toBe(true)
-    expect(abiThreadPanicMessage(h0) == 0 as *int).toBe(true)
-    var h1 = abiThreadSpawn(fn () {})
-    expect(h1).toBe(before + 1)
-    expect(abiThreadCount()).toBe(before + 2)
-    expect(abiThreadFinished(h1)).toBe(true)
-    expect(abiThreadFinished(h1 + 5)).toBe(false)
+}
+
+test fn a_spawned_body_has_its_own_registry_id() {
+    var cell: *int = 0 as *int
+    unsafe {
+        cell = alloc(int, 1)
+    }
+    setUpCell(cell, 0 - 1)
+    let mainId = abiThreadCurrent()
+    let h = abiThreadSpawn(fn () { setUpCell(cell, abiThreadCurrent()) })
+    expect(abiThreadJoin(h)).toBe(true)
+    let childId = readCell(cell)
+    expect(childId >= 0).toBe(true)
+    expect(childId != mainId).toBe(true)
+}
+
+test fn a_captured_environment_survives_a_collection() {
+    var cell: *int = 0 as *int
+    unsafe {
+        cell = alloc(int, 1)
+    }
+    setUpCell(cell, 0)
+    let value = 4242
+    let h = abiThreadSpawn(fn () {
+        sleepBody(80)
+        setUpCell(cell, value)
+    })
+    // The child is parked on the world lock or in its sleep; either way the
+    // closure object and its captured `cell`/`value` hang off the child's
+    // registered shadow frame (or the spawn temp roots, before it starts). A
+    // collection here must reclaim neither, or the write below lands in a
+    // freed env.
+    gcCollect(true)
+    expect(abiThreadJoin(h)).toBe(true)
+    expect(readCell(cell)).toBe(4242)
+}
+
+test fn a_throwing_body_is_reported_by_join() {
+    let h = abiThreadSpawn(fn () { throw "task boom" })
+    expect(abiThreadJoin(h)).toBe(false)
+    expect(abiThreadFinished(h)).toBe(true)
+    expect(abiThreadPanicMessage(h) == 0 as *int).toBe(true)
+}
+
+test fn a_joined_task_stays_joinable() {
+    let h = abiThreadSpawn(fn () {})
+    expect(abiThreadJoin(h)).toBe(true)
+    expect(abiThreadJoin(h)).toBe(true)
 }

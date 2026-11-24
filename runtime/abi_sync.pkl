@@ -36,28 +36,38 @@ module runtime.abi_sync
 /// STATE BLOCKS. Each primitive is a raw word block from `alloc` (unmanaged,
 /// invisible to the collector, never reclaimed - exactly the raw-arena
 /// contract the box and list port bodies already rely on). Word 0 is the kind,
-/// the rest are that kind's fields, all raw `i64`:
+/// the rest are that kind's fields, all raw `i64`. The last word of each
+/// blocking kind is a zero-initialized wait cell (a `CONDITION_VARIABLE` in the
+/// Windows backend), addressed only through `abi_world`:
 ///
-///   mutex    [0 kind=1, 1 permits=1, 2 held]
-///   cond     [0 kind=2, 1 permits=0, 2 parked]
-///   sem      [0 kind=3, 1 permits,    2 parked]
+///   mutex    [0 kind=1, 1 permits=1, 2 held, 3 wait cell]
+///   cond     [0 kind=2, 1 permits=0, 2 parked, 3 wait cell]
+///   sem      [0 kind=3, 1 permits,    2 parked, 3 wait cell]
 ///   atomic   [0 kind=4, 1 value]
-///   channel  [0 kind=6, 1 cap, 2 head, 3 count, 4 closed, 5 buf]
+///   channel  [0 kind=6, 1 cap, 2 head, 3 count, 4 closed, 5 buf, 6 wait cell]
 ///
 /// A channel's `buf` word is the address of a separate `cap`-word block holding
 /// the ring (values are raw scalars, boxed only by `pickle_channel_try_recv`'s
 /// `abiBoxI64` hand-off, the same shape the native `recv` returns unboxed).
 ///
-/// THE SINGLE-THREAD DIVERGENCE. The port runs under the same "no peer" answer
-/// as the freestanding build: `take` spins in place instead of parking, and a
-/// `parked` register exists only so `broadcast` reads it truthfully - it can
-/// never be non-zero while one thread runs, so broadcast hands out zero permits
-/// (a `give_all(0)`, matching native's `give_all(parked())` for that case).
-/// There is no contention to exclude; `mutex`/`sem` exclude through their
-/// permit counts, which is the one-thread behaviour shared with the native
-/// build. A program that waits for a permit nobody will hand over spins
-/// forever, visibly, exactly as the freestanding slice does - so the blocking
-/// paths are absent from every probe and unit test below.
+/// BLOCKING AND THE WORLD LOCK. Real OS threads (see `abi_threads.pkl`) make
+/// the old "spin in place" answer a deadlock: a waiter holding the world lock
+/// would starve the thread that releases a permit. Every blocking path here is
+/// therefore a predicate loop around `worldPark(cell)`, the portable condition
+/// seam in `abi_world.pkl`; the backend releases the world lock while the
+/// thread is parked and reacquires it before returning. Each blocking state
+/// block carries one zeroed wait cell, so a wake never names an OS object
+/// outside the backend.
+///
+/// WAKE RULES. `mutex_unlock` and `cond_signal` wake one; `cond_broadcast`,
+/// `sem_release`, and every channel state change wake all. Waking all is
+/// coarse but keeps the channel correct without two separate notifiers: a
+/// channel has at most one kind of waiter at a time, and a closed channel must
+/// release both kinds.
+///
+/// ATOMICS NEED NO PARKING. Every Pickle instruction runs under the world
+/// lock, so `atomic` load/store/add/cas are serialized already; the block is
+/// kept because the ABI surface and the handle kinds are part of the contract.
 ///
 /// THE FATAL PATH. Wrong-kind and channel-protocol failures reproduce native
 /// `panic::fatal` byte-for-byte on stderr and exit 1 (the same three-write +
@@ -73,6 +83,7 @@ module runtime.abi_sync
 import { abiBoxI64 } from runtime.abi_box
 import { abiStrFromI64 } from runtime.abi_string
 import { writeStderr } from runtime.abi_stdio
+import { worldPark, worldWake, worldWakeAll } from runtime.abi_world
 import { STR_BYTES_OFF } from runtime.layout
 
 const KIND_MUTEX: int = 1
@@ -80,6 +91,13 @@ const KIND_COND: int = 2
 const KIND_SEM: int = 3
 const KIND_ATOMIC: int = 4
 const KIND_CHANNEL: int = 6
+
+/// Wait-cell word indexes. See the layout table in the header; the cell is
+/// always the last word of a blocking kind.
+const MUTEX_WAIT: int = 3
+const COND_WAIT: int = 3
+const SEM_WAIT: int = 3
+const CHANNEL_WAIT: int = 6
 
 /// The handle registry: a flat word block of state-block addresses.
 var syncBase: int = 0
@@ -229,24 +247,21 @@ fn fatalCap(cap: int) -> int {
 }
 
 /// ---------------------------------------------------------------------------
-/// PERMIT PRIMITIVE (the single-thread spin build of `PSemaphore`)
+/// PERMIT PRIMITIVE (`PSemaphore`, now parking through `abi_world`)
 /// ---------------------------------------------------------------------------
 
-/// `b[1] < n` - the permit predicate the spin loops re-test.
-fn permitLt(b: *int, n: int) -> bool {
-    unsafe {
-        return b[1] < n
-    }
+/// Address of the wait cell at word `idx` of a state block.
+fn waitCell(b: *int, idx: int) -> int {
+    return (b as int) + idx * 8
 }
 
-/// Wait for `b[1]` to hold at least `n` permits, then subtract `n`. The spin
-/// re-reads the permit word each iteration, the same predicate re-test the
-/// freestanding `take` loop performs; with no peer the loop is the visible
-/// hang the nostd contract documents.
-fn takePermits(b: *int, n: int) -> int {
+/// Wait for `b[1]` to hold at least `n` permits, then subtract `n`. The world
+/// lock is released while parked, so the releaser can run; every wake returns
+/// to the predicate check, which also absorbs a spurious wake.
+fn takePermits(b: *int, n: int, cell: int) -> int {
     unsafe {
-        while (permitLt(b, n)) {
-            let _ = b[1]
+        while (b[1] < n) {
+            worldPark(cell)
         }
         b[1] = b[1] - n
         return 0
@@ -264,12 +279,12 @@ fn tryTakePermits(b: *int, n: int) -> bool {
     }
 }
 
-/// Add `n` permits. No peer is waiting, so there is no wake (the nostd body's
-/// notification is a no-op).
-fn givePermits(b: *int, n: int) -> int {
+/// Add `n` permits. The caller issues the wake after this, because the right
+/// wake width is the primitive's choice (one for a binary mutex, all for a
+/// counting semaphore).
+fn addPermits(b: *int, n: int) {
     unsafe {
         b[1] = b[1] + n
-        return 0
     }
 }
 
@@ -280,10 +295,11 @@ fn givePermits(b: *int, n: int) -> int {
 #[symbol("pickle_mutex_new")]
 fn abiMutexNew() -> int {
     unsafe {
-        var b = alloc(int, 3)
+        var b = alloc(int, 4)
         b[0] = KIND_MUTEX
         b[1] = 1
         b[2] = 0
+        b[3] = 0
         return register(b as int)
     }
 }
@@ -294,7 +310,7 @@ fn abiMutexLock(handle: int) -> int {
     if (m == 0 as *int) {
         fatalIsNot(handle, "a mutex")
     }
-    takePermits(m, 1)
+    takePermits(m, 1, waitCell(m, MUTEX_WAIT))
     unsafe { m[2] = 1 }
     return 0
 }
@@ -329,7 +345,8 @@ fn abiMutexUnlock(handle: int) -> int {
         }
         m[2] = 0
     }
-    givePermits(m, 1)
+    addPermits(m, 1)
+    worldWake(waitCell(m, MUTEX_WAIT))
     return 0
 }
 
@@ -340,10 +357,11 @@ fn abiMutexUnlock(handle: int) -> int {
 #[symbol("pickle_cond_new")]
 fn abiCondNew() -> int {
     unsafe {
-        var b = alloc(int, 3)
+        var b = alloc(int, 4)
         b[0] = KIND_COND
         b[1] = 0
         b[2] = 0
+        b[3] = 0
         return register(b as int)
     }
 }
@@ -354,7 +372,8 @@ fn abiCondSignal(handle: int) -> int {
     if (c == 0 as *int) {
         fatalIsNot(handle, "a cond")
     }
-    givePermits(c, 1)
+    addPermits(c, 1)
+    worldWake(waitCell(c, COND_WAIT))
     return 0
 }
 
@@ -364,10 +383,13 @@ fn abiCondBroadcast(handle: int) -> int {
     if (c == 0 as *int) {
         fatalIsNot(handle, "a cond")
     }
+    var parked = 0
     unsafe {
-        givePermits(c, c[2])
-        return 0
+        parked = c[2]
     }
+    addPermits(c, parked)
+    worldWakeAll(waitCell(c, COND_WAIT))
+    return 0
 }
 
 /// Release `mutex`, wait on `cond`, retake `mutex`. A null mutex waits without one.
@@ -377,13 +399,18 @@ fn abiCondWait(cond: int, mutex: int) -> int {
     if (c == 0 as *int) {
         fatalIsNot(cond, "a cond")
     }
+    let cell = waitCell(c, COND_WAIT)
     var m = ofKind(mutex, KIND_MUTEX)
     if (m == 0 as *int) {
-        takePermits(c, 1)
+        unsafe { c[2] = c[2] + 1 }
+        takePermits(c, 1, cell)
+        unsafe { c[2] = c[2] - 1 }
         return 0
     }
     abiMutexUnlock(mutex)
-    takePermits(c, 1)
+    unsafe { c[2] = c[2] + 1 }
+    takePermits(c, 1, cell)
+    unsafe { c[2] = c[2] - 1 }
     abiMutexLock(mutex)
     return 0
 }
@@ -399,10 +426,11 @@ fn abiSemNew(permits: int) -> int {
         if (p < 0) {
             p = 0
         }
-        var b = alloc(int, 3)
+        var b = alloc(int, 4)
         b[0] = KIND_SEM
         b[1] = p
         b[2] = 0
+        b[3] = 0
         return register(b as int)
     }
 }
@@ -417,7 +445,7 @@ fn abiSemAcquire(handle: int, n: int) -> int {
     if (count < 1) {
         count = 1
     }
-    takePermits(s, count)
+    takePermits(s, count, waitCell(s, SEM_WAIT))
     return 0
 }
 
@@ -444,7 +472,8 @@ fn abiSemRelease(handle: int, n: int) -> int {
     if (count < 1) {
         count = 1
     }
-    givePermits(s, count)
+    addPermits(s, count)
+    worldWakeAll(waitCell(s, SEM_WAIT))
     return 0
 }
 
@@ -544,13 +573,14 @@ fn abiChannelNew(cap: int) -> int {
             buf[i] = 0
             i = i + 1
         }
-        var b = alloc(int, 6)
+        var b = alloc(int, 7)
         b[0] = KIND_CHANNEL
         b[1] = cap
         b[2] = 0
         b[3] = 0
         b[4] = 0
         b[5] = buf as int
+        b[6] = 0
         return register(b as int)
     }
 }
@@ -584,8 +614,9 @@ fn abiChannelSend(handle: int, value: int) -> int {
         fatalIsNot(handle, "a channel")
     }
     unsafe {
+        let cell = waitCell(ch, CHANNEL_WAIT)
         while (channelFull(ch)) {
-            let _ = ch[3]
+            worldPark(cell)
         }
         if (ch[4] != 0) {
             fatalLit("pickle: send on closed channel")
@@ -593,6 +624,7 @@ fn abiChannelSend(handle: int, value: int) -> int {
         var i = (ch[2] + ch[3]) % ch[1]
         (ch[5] as *int)[i] = value
         ch[3] = ch[3] + 1
+        worldWakeAll(cell)
         return 0
     }
 }
@@ -613,6 +645,7 @@ fn abiChannelTrySend(handle: int, value: int) -> bool {
         var i = (ch[2] + ch[3]) % ch[1]
         (ch[5] as *int)[i] = value
         ch[3] = ch[3] + 1
+        worldWakeAll(waitCell(ch, CHANNEL_WAIT))
         return true
     }
 }
@@ -624,8 +657,9 @@ fn abiChannelRecv(handle: int) -> int {
         fatalIsNot(handle, "a channel")
     }
     unsafe {
+        let cell = waitCell(ch, CHANNEL_WAIT)
         while (channelEmpty(ch)) {
-            let _ = ch[3]
+            worldPark(cell)
         }
         if (ch[3] == 0) {
             fatalLit("pickle: receive on a closed, empty channel")
@@ -634,6 +668,7 @@ fn abiChannelRecv(handle: int) -> int {
         var v = (ch[5] as *int)[i]
         ch[2] = (ch[2] + 1) % ch[1]
         ch[3] = ch[3] - 1
+        worldWakeAll(cell)
         return v
     }
 }
@@ -654,6 +689,7 @@ fn abiChannelTryRecv(handle: int) -> *int {
         var v = (ch[5] as *int)[i]
         ch[2] = (ch[2] + 1) % ch[1]
         ch[3] = ch[3] - 1
+        worldWakeAll(waitCell(ch, CHANNEL_WAIT))
         return abiBoxI64(v)
     }
 }
@@ -665,6 +701,7 @@ fn abiChannelClose(handle: int) -> int {
         fatalIsNot(handle, "a channel")
     }
     unsafe { ch[4] = 1 }
+    worldWakeAll(waitCell(ch, CHANNEL_WAIT))
     return 0
 }
 

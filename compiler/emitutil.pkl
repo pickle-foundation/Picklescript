@@ -1648,6 +1648,41 @@ fn flatBuiltin(name: string) -> (string, List<IrTy>, bool, IrTy, List<string>)? 
             // body can occupy `pickle_thread_sleep_ms` with wall-clock sleep
             // and no Rust shim.
             case "win_sleep" -> ("__imp_Sleep", [IrTy.Int], false, IrTy.Int, ["ms"])
+            // Real OS threads, so a `#[symbol]` body can own the whole
+            // `pickle_thread_*` family. `CreateThread` takes six machine words
+            // (security attributes, stack size, start routine, parameter,
+            // creation flags, out thread id) and returns the HANDLE; the
+            // start routine follows the single Win64 calling convention, so a
+            // compiled Pickle closure body - which already takes its closure
+            // object in RCX - can be entered directly, with the closure object
+            // as the parameter. `GetExitCodeThread` reads the value the
+            // routine returned (STILL_ACTIVE = 259 while running).
+            case "win_create_thread" -> ("__imp_CreateThread", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["attr", "stack", "start", "param", "flags", "id"])
+            case "win_get_exit_code_thread" -> ("__imp_GetExitCodeThread", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["handle", "code"])
+            case "win_switch_to_thread" -> ("__imp_SwitchToThread", List<IrTy>(), true, IrTy.Int, List<string>())
+            // The world/registry lock primitives. `InterlockedCompareExchange64`
+            // is a compiler intrinsic, not a KERNEL32 export, so the spinlock
+            // spelling of this is not linkable. SRW locks are real exports, a
+            // zero-initialized `SRWLOCK` is a valid unlocked lock (one owner
+            // word, and the runtime's globals are zero image data), and the
+            // acquire/release pair is the OS's own blocking implementation -
+            // no spinning and no lost wakeups. They are not recursive, which
+            // matches the runtime's discipline: a thread only takes the world
+            // lock on entry and after it released it around a blocking call.
+            case "win_acquire_srw_exclusive" -> ("__imp_AcquireSRWLockExclusive", [IrTy.Int], false, IrTy.Int, ["lock"])
+            case "win_release_srw_exclusive" -> ("__imp_ReleaseSRWLockExclusive", [IrTy.Int], false, IrTy.Int, ["lock"])
+            case "win_try_acquire_srw_exclusive" -> ("__imp_TryAcquireSRWLockExclusive", [IrTy.Int], true, IrTy.Int, ["lock"])
+            // The parking half of the world seam. `CONDITION_VARIABLE` is one
+            // zero-initialized pointer word (so a zeroed lock word in a raw
+            // state block is already a valid condition), and
+            // `SleepConditionVariableSRW(cv, &worldLock, INFINITE, 0)` releases
+            // the world SRWLOCK and reacquires it atomically - the classic
+            // condvar lost-wakeup fix. All three names are KERNEL32 exports;
+            // `WaitOnAddress`/`WakeByAddressSingle` are KERNELBASE-only, which
+            // the current single-DLL import path cannot reach.
+            case "win_sleep_condition_variable_srw" -> ("__imp_SleepConditionVariableSRW", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["cv", "lock", "ms", "flags"])
+            case "win_wake_condition_variable" -> ("__imp_WakeConditionVariable", [IrTy.Int], false, IrTy.Int, ["cv"])
+            case "win_wake_all_condition_variable" -> ("__imp_WakeAllConditionVariable", [IrTy.Int], false, IrTy.Int, ["cv"])
             // Win32 import. `__imp_` is the MSVC import-symbol prefix, and
             // the backend treats that prefix as "resolve me from a system
             // DLL" rather than "find me in the runtime archive".
@@ -1762,6 +1797,35 @@ fn flatBuiltin(name: string) -> (string, List<IrTy>, bool, IrTy, List<string>)? 
             case "win_getnameinfo" -> ("__imp_getnameinfo", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["sa", "salen", "host", "hostlen", "serv", "servlen", "flags"])
             case "win_htons" -> ("__imp_htons", [IrTy.Int], true, IrTy.Int, ["hostshort"])
             case "win_htonl" -> ("__imp_htonl", [IrTy.Int], true, IrTy.Int, ["hostlong"])
+            // --- TLS (SECUR32 Schannel/SSPI, CRYPT32 certificates), RNG (BCRYPT), socket readiness ---
+            //
+            // All arguments are machine words. 32-bit SECURITY_STATUS/BOOL/int results are masked
+            // by the runtime bodies; pelink groups these by DLL (see `dllForImp`).
+            case "win_ioctlsocket" -> ("__imp_ioctlsocket", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2"])
+            case "win_wsa_poll" -> ("__imp_WSAPoll", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2"])
+            case "win_acquire_credentials_handle_w" -> ("__imp_AcquireCredentialsHandleW", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8"])
+            case "win_initialize_security_context_w" -> ("__imp_InitializeSecurityContextW", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "a9", "a10", "a11"])
+            case "win_accept_security_context" -> ("__imp_AcceptSecurityContext", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8"])
+            case "win_delete_security_context" -> ("__imp_DeleteSecurityContext", [IrTy.Int], true, IrTy.Int, ["a0"])
+            case "win_free_credentials_handle" -> ("__imp_FreeCredentialsHandle", [IrTy.Int], true, IrTy.Int, ["a0"])
+            case "win_free_context_buffer" -> ("__imp_FreeContextBuffer", [IrTy.Int], true, IrTy.Int, ["a0"])
+            case "win_query_context_attributes_w" -> ("__imp_QueryContextAttributesW", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2"])
+            case "win_encrypt_message" -> ("__imp_EncryptMessage", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2", "a3"])
+            case "win_decrypt_message" -> ("__imp_DecryptMessage", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2", "a3"])
+            case "win_apply_control_token" -> ("__imp_ApplyControlToken", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1"])
+            case "win_pfx_import_cert_store" -> ("__imp_PFXImportCertStore", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2"])
+            case "win_cert_find_certificate_in_store" -> ("__imp_CertFindCertificateInStore", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2", "a3", "a4", "a5"])
+            case "win_cert_free_certificate_context" -> ("__imp_CertFreeCertificateContext", [IrTy.Int], true, IrTy.Int, ["a0"])
+            case "win_cert_close_store" -> ("__imp_CertCloseStore", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1"])
+            case "win_cert_open_store" -> ("__imp_CertOpenStore", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2", "a3", "a4"])
+            case "win_cert_create_certificate_context" -> ("__imp_CertCreateCertificateContext", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2"])
+            case "win_cert_add_certificate_context_to_store" -> ("__imp_CertAddCertificateContextToStore", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2", "a3"])
+            case "win_cert_create_certificate_chain_engine" -> ("__imp_CertCreateCertificateChainEngine", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1"])
+            case "win_cert_free_certificate_chain_engine" -> ("__imp_CertFreeCertificateChainEngine", [IrTy.Int], false, IrTy.Int, ["a0"])
+            case "win_cert_get_certificate_chain" -> ("__imp_CertGetCertificateChain", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7"])
+            case "win_cert_free_certificate_chain" -> ("__imp_CertFreeCertificateChain", [IrTy.Int], false, IrTy.Int, ["a0"])
+            case "win_cert_verify_certificate_chain_policy" -> ("__imp_CertVerifyCertificateChainPolicy", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2", "a3"])
+            case "win_bcrypt_gen_random" -> ("__imp_BCryptGenRandom", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2", "a3"])
             case "mutex_new" -> ("pickle_mutex_new", List<IrTy>(), true, IrTy.Int, List<string>())
             case "mutex_lock" -> ("pickle_mutex_lock", [IrTy.Int], false, IrTy.Int, ["m"])
             case "mutex_trylock" -> ("pickle_mutex_trylock", [IrTy.Int], true, IrTy.Bool, ["m"])

@@ -1,0 +1,127 @@
+module std.crypto_test
+
+// Known-answer tests for the pure-Pickle hashes/HMAC plus OS randomness and
+// constant-time comparison. Vectors are FIPS 180-4, RFC 4231, and boundary
+// padding cases (55/56/63/64/65 bytes) produced with Python's hashlib.
+
+import { sha1, sha256, hmacSha256, constantTimeEquals, randomBytes } from std.crypto
+import { encode as base64Encode } from std.encoding.base64
+import { encode as hexEncode, decode as hexDecode } from std.encoding.hex
+
+fn fromHex(text: string) -> List<byte> {
+    match (hexDecode(text)) {
+        case some(b) -> b
+        case none -> {
+            expect(false).toBe(true)
+            bytes("")
+        }
+    }
+}
+
+fn repeatByte(v: int, n: int) -> List<byte> {
+    let out = bytes("")
+    var i = 0
+    while (i < n) {
+        out.push((v & 255) as byte)
+        i = i + 1
+    }
+    out
+}
+
+/// Deterministic 0..n bytes: A, B, C, ... Z, A, ... (same as the vector script).
+fn patterned(n: int) -> List<byte> {
+    let out = bytes("")
+    var i = 0
+    while (i < n) {
+        out.push((65 + (i % 26)) as byte)
+        i = i + 1
+    }
+    out
+}
+
+test fn sha1_known_answers() {
+    expect(hexEncode(sha1(bytes("")))).toBe("da39a3ee5e6b4b0d3255bfef95601890afd80709")
+    expect(hexEncode(sha1(bytes("abc")))).toBe("a9993e364706816aba3e25717850c26c9cd0d89d")
+    expect(hexEncode(sha1(patterned(55)))).toBe("ebd854f0c7c9f58a1d5af5dee2b4c039902f945b")
+    expect(hexEncode(sha1(patterned(56)))).toBe("45fe53c317500145812034ecf0061f12af48d782")
+    expect(hexEncode(sha1(patterned(64)))).toBe("220faa7c1778bd2cc286c8b9ccec03e1131b52d8")
+    expect(hexEncode(sha1(patterned(65)))).toBe("8c0cb26e8dea375bc6bce44b385942f967994e44")
+    expect(hexEncode(sha1(patterned(128)))).toBe("f113310a7d2ca67c152400c68027d62e769f4ad8")
+}
+
+test fn websocket_accept_handshake_vector() {
+    // RFC 6455 section 1.3: base64(SHA-1(client key + GUID)). This is the
+    // exact recurrence std.websocket will use for `Sec-WebSocket-Accept`.
+    let joined = bytes("dGhlIHNhbXBsZSBub25jZQ==258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+    let digest = sha1(joined)
+    expect(hexEncode(digest)).toBe("b37a4f2cc0624f1690f64606cf385945b2bec4ea")
+    expect(base64Encode(digest)).toBe("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+}
+
+test fn sha256_known_answers() {
+    expect(hexEncode(sha256(bytes("")))).toBe("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    expect(hexEncode(sha256(bytes("abc")))).toBe("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    expect(hexEncode(sha256(patterned(55)))).toBe("5be2d480ff0ea4094fb05e7adb2c1dbf1d7bd99dec429827ea4b9c1ddc7d3bf1")
+    expect(hexEncode(sha256(patterned(56)))).toBe("f257b5e23c5cb81d044c7a9074ceeac9235ff5c1b377048c7c368ef1038462a2")
+    expect(hexEncode(sha256(patterned(63)))).toBe("8abf253c52140a4203ed43a606808e342ec84856c5c32bb8e4e3869885f83534")
+    expect(hexEncode(sha256(patterned(64)))).toBe("9b0c3567683f6d5198d714b00c40df3039f7717ba5ca65c2b6617688b63b42fa")
+    expect(hexEncode(sha256(patterned(65)))).toBe("19811f1e6f2c8ef24d605283ec0fe0d35122b3d4a7a65d593797b8e2cf8e8865")
+    expect(hexEncode(sha256(patterned(128)))).toBe("b470b0f27ccf983862f868fdc64b4be3ce096ae3a79191dc2de42e325f9d5c72")
+}
+
+test fn hashes_do_not_mutate_input() {
+    let input = patterned(100)
+    let before = hexEncode(input)
+    let _ = sha1(input)
+    let _ = sha256(input)
+    expect(hexEncode(input)).toBe(before)
+}
+
+test fn hmac_sha256_rfc4231() {
+    // Case 1: 20-byte 0x0b key.
+    expect(hexEncode(hmacSha256(repeatByte(0x0b, 20), bytes("Hi There")))).toBe("b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7")
+    // Case 2: short ASCII key.
+    expect(hexEncode(hmacSha256(bytes("Jefe"), bytes("what do ya want for nothing?")))).toBe("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")
+    // Case 6: a key longer than the 64-byte block is hashed first.
+    expect(hexEncode(hmacSha256(repeatByte(0xaa, 131), bytes("Test Using Larger Than Block-Size Key - Hash Key First")))).toBe("60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54")
+    // Empty key and message.
+    expect(hexEncode(hmacSha256(bytes(""), bytes("")))).toBe("b613679a0814d9ec772f95d778c35fc5ff1697c493715653c6c712144292c5ad")
+    expect(hexEncode(hmacSha256(bytes("a"), bytes("")))).toBe("3acdaa86b3d73e8d18b7019d3f520000531a23db3b6dda7a94ad28db61a9008c")
+}
+
+test fn constant_time_equality() {
+    expect(constantTimeEquals(bytes(""), bytes(""))).toBe(true)
+    expect(constantTimeEquals(bytes("abc"), bytes("abc"))).toBe(true)
+    expect(constantTimeEquals(bytes("abc"), bytes("abd"))).toBe(false)
+    expect(constantTimeEquals(bytes("abc"), bytes("ab"))).toBe(false)
+    expect(constantTimeEquals(bytes("ab"), bytes("abc"))).toBe(false)
+    expect(constantTimeEquals(fromHex("00ff80"), fromHex("00ff80"))).toBe(true)
+    expect(constantTimeEquals(fromHex("00ff80"), fromHex("00ff81"))).toBe(false)
+}
+
+test fn os_randomness() {
+    match (randomBytes(0)) {
+        case some(b) -> expect(len(b)).toBe(0)
+        case none -> expect(false).toBe(true)
+    }
+    expect(randomBytes(-1) as? List<byte>).toBe(none)
+    match (randomBytes(1)) {
+        case some(b) -> expect(len(b)).toBe(1)
+        case none -> expect(false).toBe(true)
+    }
+    match (randomBytes(32)) {
+        case some(a) -> {
+            expect(len(a)).toBe(32)
+            match (randomBytes(32)) {
+                case some(b) -> {
+                    expect(len(b)).toBe(32)
+                    // A repeated draw has probability 2^-256; a duplicate here
+                    // means the RNG is not producing fresh bytes.
+                    expect(constantTimeEquals(a, b)).toBe(false)
+                }
+                case none -> expect(false).toBe(true)
+            }
+        }
+        case none -> expect(false).toBe(true)
+    }
+}

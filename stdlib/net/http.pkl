@@ -1,25 +1,246 @@
 module std.net.http
 
-// Minimal HTTP/1.1 request/response support over std.net TCP streams.
-// Designed for loopback-deterministic tests and practical basic client/server use.
-// Supports: request/status lines, headers, Content-Length bodies, Connection: close,
-// and simple client helpers. Chunked transfer encoding is not implemented in v2.
+// HTTP/1.1 client and server over the `std.net.Conn` byte-stream contract.
+//
+// SCOPE. This module owns the message layer: request/status lines, headers,
+// body framing (Content-Length, chunked, and close-delimited responses),
+// keep-alive rules, and serialization. It deliberately does not own transport
+// or connection setup. A `Conn` is a `TcpStream` or a `TlsStream`, so the same
+// code serves plaintext and TLS with no branch here:
+//
+//     let tcp = TcpStream.connect(host, port)
+//     let tls = TlsStream.wrap(tcp, host, verify)
+//     let client = HttpClient.over(tls, host, port)
+//
+// BINARY SAFETY. Bodies are `List<byte>` end to end. Parsing works on bytes,
+// never on a string re-encoding, so a body containing NUL, 0xFF, or a lone
+// invalid UTF-8 sequence survives. Only header names/values and the start line
+// are decoded as text, and those are validated as ASCII at parse time.
+//
+// FRAMING. Reading a message is a strict state machine:
+//
+//   - a message begins with up to `maxHeadBytes` of CRLF-terminated lines
+//   - Content-Length bodies are read exactly; a conflicting duplicate length
+//     is a protocol error
+//   - chunked bodies decode chunk sizes (with extensions), enforce a size
+//     limit, and consume/record trailers
+//   - a response with neither framing header is close-delimited and therefore
+//     can never be reused
+//   - a request (excluding its status) without framing has no body
+//   - HEAD, 1xx, 204, and 304 responses never carry a body regardless of the
+//     headers, so the next message on a kept-alive connection stays aligned
+//
+// KEEP-ALIVE. HTTP/1.1 is persistent by default; HTTP/1.0 is not, unless the
+// peer sends `Connection: keep-alive`. `HttpRequest.closeAfter` and
+// `HttpResponse.closeAfter` are the computed decision for that message.
+//
+// ERRORS. Every parse/framing failure returns `none` and records a
+// `NetError` in `HttpConn.lastError()`. End of stream before a message starts
+// is a clean close and records nothing; end of stream inside a message is a
+// protocol error.
+//
+// DELIBERATE LIMITS. This is HTTP/1.1 only: no HTTP/2, no `Expect:
+// 100-continue` handshake, no content-coding decompression (a gzip body is
+// returned in its coded form when the peer chose a close-delimited transfer),
+// and no request pipelining. `HttpServer.serveOnce` is single-threaded;
+// `HttpServer.serveOnceDetached` runs the same accept-and-serve path on a new
+// task, so a caller can run several workers against one listener.
 
-import { TcpStream, TcpListener, formatAddr } from std.net
-import { filled } from std.collections.list
+import { Conn, NetError, TcpStream, TcpListener, ERR_NONE, ERR_OTHER, ERR_PROTOCOL, ERR_TOO_LARGE, READ_CHUNK } from std.net
+import { Task, spawn } from std.thread
 
+// ---------------------------------------------------------------------------
+// Limits and framing constants
+// ---------------------------------------------------------------------------
+
+/// Default cap on one message's start line plus header block, in bytes.
+const HTTP_MAX_HEAD: int = 65536
+/// Default cap on one decoded body, in bytes.
+const HTTP_MAX_BODY: int = 8388608
+/// Longest single header line, including its CRLF.
+const HTTP_MAX_LINE: int = 8192
+/// Longest chunk-size line (size plus extensions).
+const HTTP_MAX_CHUNK_LINE: int = 1024
+
+const BODY_NONE: int = 0
+const BODY_LENGTH: int = 1
+const BODY_CHUNKED: int = 2
+const BODY_UNTIL_CLOSE: int = 3
+const BODY_INVALID: int = 4
+
+const TE_NONE: int = 0
+const TE_CHUNKED: int = 1
+const TE_OTHER: int = 2
+
+const CL_MISSING: int = -1
+const CL_INVALID: int = -2
+
+// ---------------------------------------------------------------------------
+// Byte / ASCII helpers
+// ---------------------------------------------------------------------------
+
+fn byteSlice(data: List<byte>, lo: int, hi: int) -> List<byte> {
+    var out = bytes("")
+    var a = lo
+    var b = hi
+    if (a < 0) { a = 0 }
+    if (b < a) { b = a }
+    if (b > len(data)) { b = len(data) }
+    var i = a
+    while (i < b) {
+        out.push(data[i])
+        i = i + 1
+    }
+    out
+}
+
+fn bytesEqual(a: List<byte>, b: List<byte>) -> bool {
+    if (len(a) != len(b)) {
+        return false
+    }
+    var i = 0
+    while (i < len(a)) {
+        if ((a[i] as int) != (b[i] as int)) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+fn indexOfByte(data: List<byte>, needle: int, start: int) -> int {
+    var i = start
+    while (i < len(data)) {
+        if ((data[i] as int) == needle) {
+            return i
+        }
+        i = i + 1
+    }
+    -1
+}
+
+fn isOws(c: int) -> bool {
+    c == 32 || c == 9
+}
+
+/// RFC 7230 tchar, the bytes allowed in a field name or method token.
+fn isTokenChar(c: int) -> bool {
+    if (c >= 48 && c <= 57) { return true }
+    if (c >= 65 && c <= 90) { return true }
+    if (c >= 97 && c <= 122) { return true }
+    if (c == 33 || c == 35 || c == 36 || c == 37 || c == 38 || c == 39) { return true }
+    if (c == 42 || c == 43 || c == 45 || c == 46) { return true }
+    if (c == 94 || c == 95 || c == 96 || c == 124 || c == 126) { return true }
+    false
+}
+
+/// A visible ASCII text byte or horizontal tab (accepted in field values).
+fn isValueChar(c: int) -> bool {
+    c == 9 || (c >= 32 && c <= 126)
+}
+
+fn asciiText(data: List<byte>, lo: int, hi: int) -> string? {
+    var out = ""
+    var i = lo
+    while (i < hi) {
+        let c = data[i] as int
+        if (c < 32 || c > 126) {
+            return none
+        }
+        out = out + str(c as char)
+        i = i + 1
+    }
+    out
+}
+
+fn fieldText(data: List<byte>, lo: int, hi: int) -> string? {
+    var out = ""
+    var i = lo
+    while (i < hi) {
+        let c = data[i] as int
+        if (!isValueChar(c)) {
+            return none
+        }
+        out = out + str(c as char)
+        i = i + 1
+    }
+    out
+}
+
+fn asciiLowerByte(c: int) -> int {
+    if (c >= 65 && c <= 90) {
+        return c + 32
+    }
+    c
+}
+
+fn asciiLower(s: string) -> string {
+    let b = bytes(s)
+    var out = ""
+    var i = 0
+    while (i < len(b)) {
+        out = out + str(asciiLowerByte(b[i] as int) as char)
+        i = i + 1
+    }
+    out
+}
+
+fn eqIgnoreCase(a: string, b: string) -> bool {
+    if (len(a) != len(b)) {
+        return false
+    }
+    let ab = bytes(a)
+    let bb = bytes(b)
+    var i = 0
+    while (i < len(ab)) {
+        if (asciiLowerByte(ab[i] as int) != asciiLowerByte(bb[i] as int)) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+/// Split a comma-list header value into trimmed, lowercased tokens.
+fn commaTokens(value: string) -> List<string> {
+    let b = bytes(value)
+    var out = List<string>()
+    var start = 0
+    var i = 0
+    while (i <= len(b)) {
+        if (i == len(b) || (b[i] as int) == 44) {
+            var s = start
+            var e = i
+            while (s < e && isOws(b[s] as int)) { s = s + 1 }
+            while (e > s && isOws(b[e - 1] as int)) { e = e - 1 }
+            if (e > s) {
+                out.push(asciiLower(str(byteSlice(b, s, e))))
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Headers
+// ---------------------------------------------------------------------------
+
+/// Ordered, case-insensitive multimap of header fields. Lookup preserves the
+/// original spelling; comparisons fold ASCII `A-Z` only.
 class HttpHeaders {
     var names: List<string>
     var values: List<string>
 
     constructor() {
-        this.names = filled("", 0)
-        this.values = filled("", 0)
+        this.names = List<string>()
+        this.values = List<string>()
     }
 
     fn clear() {
-        this.names = filled("", 0)
-        this.values = filled("", 0)
+        this.names = List<string>()
+        this.values = List<string>()
     }
 
     fn lenHeaders() -> int {
@@ -27,39 +248,24 @@ class HttpHeaders {
     }
 
     fn nameAt(i: int) -> string {
-        if (i < 0 || i >= len(this.names)) { return "" }
+        if (i < 0 || i >= len(this.names)) {
+            return ""
+        }
         this.names[i]
     }
 
     fn valueAt(i: int) -> string {
-        if (i < 0 || i >= len(this.values)) { return "" }
+        if (i < 0 || i >= len(this.values)) {
+            return ""
+        }
         this.values[i]
     }
 
-    fn lowerAscii(s: string) -> string {
-        var out = ""
-        var i = 0
-        let n = len(s)
-        while (i < n) {
-            let c = s[i] as int
-            if (c >= 65 && c <= 90) {
-                out = out + str((c + 32) as char)
-            } else {
-                out = out + substringSafe(s, i, i + 1)
-            }
-            i = i + 1
-        }
-        out
-    }
-
-    fn eqIgnoreCase(a: string, b: string) -> bool {
-        this.lowerAscii(a) == this.lowerAscii(b)
-    }
-
+    /// Replace the first matching field, or append a new one.
     fn set(name: string, value: string) {
         var i = 0
         while (i < len(this.names)) {
-            if (this.eqIgnoreCase(this.names[i], name)) {
+            if (eqIgnoreCase(this.names[i], name)) {
                 this.values[i] = value
                 return
             }
@@ -69,6 +275,7 @@ class HttpHeaders {
         this.values.push(value)
     }
 
+    /// Append a field, keeping an existing one with the same name.
     fn add(name: string, value: string) {
         this.names.push(name)
         this.values.push(value)
@@ -77,7 +284,7 @@ class HttpHeaders {
     fn get(name: string) -> string? {
         var i = 0
         while (i < len(this.names)) {
-            if (this.eqIgnoreCase(this.names[i], name)) {
+            if (eqIgnoreCase(this.names[i], name)) {
                 return this.values[i]
             }
             i = i + 1
@@ -92,6 +299,30 @@ class HttpHeaders {
         }
     }
 
+    fn getAll(name: string) -> List<string> {
+        var out = List<string>()
+        var i = 0
+        while (i < len(this.names)) {
+            if (eqIgnoreCase(this.names[i], name)) {
+                out.push(this.values[i])
+            }
+            i = i + 1
+        }
+        out
+    }
+
+    fn countOf(name: string) -> int {
+        var n = 0
+        var i = 0
+        while (i < len(this.names)) {
+            if (eqIgnoreCase(this.names[i], name)) {
+                n = n + 1
+            }
+            i = i + 1
+        }
+        n
+    }
+
     fn has(name: string) -> bool {
         match (this.get(name)) {
             case some(_) -> true
@@ -100,11 +331,11 @@ class HttpHeaders {
     }
 
     fn remove(name: string) {
-        var nn = filled("", 0)
-        var vv = filled("", 0)
+        var nn = List<string>()
+        var vv = List<string>()
         var i = 0
         while (i < len(this.names)) {
-            if (!this.eqIgnoreCase(this.names[i], name)) {
+            if (!eqIgnoreCase(this.names[i], name)) {
                 nn.push(this.names[i])
                 vv.push(this.values[i])
             }
@@ -113,7 +344,171 @@ class HttpHeaders {
         this.names = nn
         this.values = vv
     }
+
+    /// True when every name is a token and every value is visible ASCII/tab.
+    fn isValid() -> bool {
+        var i = 0
+        while (i < len(this.names)) {
+            if (!isTokenText(this.names[i])) {
+                return false
+            }
+            if (!isFieldText(this.values[i])) {
+                return false
+            }
+            i = i + 1
+        }
+        true
+    }
 }
+
+fn isTokenText(s: string) -> bool {
+    if (len(s) == 0) {
+        return false
+    }
+    let b = bytes(s)
+    var i = 0
+    while (i < len(b)) {
+        if (!isTokenChar(b[i] as int)) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+/// Visible ASCII or tab; no CR, LF, NUL, or other controls.
+fn isFieldText(s: string) -> bool {
+    let b = bytes(s)
+    var i = 0
+    while (i < len(b)) {
+        let c = b[i] as int
+        if (c < 128 && !isValueChar(c)) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+/// True when any `name` field contains `token` in its comma-list.
+fn headerHasToken(h: HttpHeaders, name: string, token: string) -> bool {
+    let want = asciiLower(token)
+    var i = 0
+    while (i < h.lenHeaders()) {
+        if (eqIgnoreCase(h.nameAt(i), name)) {
+            for (tok in commaTokens(h.valueAt(i))) {
+                if (tok == want) {
+                    return true
+                }
+            }
+        }
+        i = i + 1
+    }
+    false
+}
+
+/// Transfer coding of the final `Transfer-Encoding` token, per RFC 7230.
+fn transferCoding(h: HttpHeaders) -> int {
+    var seen = false
+    var last = ""
+    var i = 0
+    while (i < h.lenHeaders()) {
+        if (eqIgnoreCase(h.nameAt(i), "Transfer-Encoding")) {
+            for (tok in commaTokens(h.valueAt(i))) {
+                seen = true
+                last = tok
+            }
+        }
+        i = i + 1
+    }
+    if (!seen) {
+        return TE_NONE
+    }
+    if (last == "chunked") {
+        return TE_CHUNKED
+    }
+    TE_OTHER
+}
+
+/// Parse one non-negative decimal, rejecting signs, blanks, and overflow.
+fn parseDecimal(s: string) -> int {
+    let b = bytes(s)
+    if (len(b) == 0) {
+        return -1
+    }
+    var v = 0
+    var i = 0
+    while (i < len(b)) {
+        let c = b[i] as int
+        if (c < 48 || c > 57) {
+            return -1
+        }
+        if (v > 100000000000) {
+            return -1
+        }
+        v = v * 10 + (c - 48)
+        i = i + 1
+    }
+    v
+}
+
+/// Lowercase hexadecimal for a chunk-size line. RFC 7230 chunk sizes are hex,
+/// not decimal; a decimal length such as 18 is otherwise read as 0x18.
+fn chunkSizeText(n: int) -> string {
+    if (n <= 0) {
+        return "0"
+    }
+    let digits = bytes("0123456789abcdef")
+    var reversed = bytes("")
+    var v = n
+    while (v > 0) {
+        reversed.push(digits[v & 15])
+        v = v >> 4
+    }
+    var out = bytes("")
+    var i = len(reversed) - 1
+    while (i >= 0) {
+        out.push(reversed[i])
+        i = i - 1
+    }
+    str(out)
+}
+
+/// Decoded Content-Length: `CL_MISSING`, `CL_INVALID`, or the value. Every
+/// field and every comma-list element must agree.
+fn contentLength(h: HttpHeaders) -> int {
+    var found = false
+    var value = 0
+    var i = 0
+    while (i < h.lenHeaders()) {
+        if (eqIgnoreCase(h.nameAt(i), "Content-Length")) {
+            let toks = commaTokens(h.valueAt(i))
+            if (len(toks) == 0) {
+                return CL_INVALID
+            }
+            for (tok in toks) {
+                let n = parseDecimal(tok)
+                if (n < 0) {
+                    return CL_INVALID
+                }
+                if (found && n != value) {
+                    return CL_INVALID
+                }
+                found = true
+                value = n
+            }
+        }
+        i = i + 1
+    }
+    if (!found) {
+        return CL_MISSING
+    }
+    value
+}
+
+// ---------------------------------------------------------------------------
+// Messages
+// ---------------------------------------------------------------------------
 
 class HttpRequest {
     var method: string
@@ -121,6 +516,9 @@ class HttpRequest {
     var version: string
     var headers: HttpHeaders
     var body: List<byte>
+    var trailers: HttpHeaders
+    /// Computed on read: the connection must not carry another request.
+    var closeAfter: bool
 
     constructor(method: string, target: string) {
         this.method = method
@@ -128,27 +526,34 @@ class HttpRequest {
         this.version = "HTTP/1.1"
         this.headers = HttpHeaders()
         this.body = bytes("")
+        this.trailers = HttpHeaders()
+        this.closeAfter = false
     }
 
     fn setHeader(name: string, value: string) {
         this.headers.set(name, value)
     }
 
+    fn addHeader(name: string, value: string) {
+        this.headers.add(name, value)
+    }
+
     fn header(name: string) -> string? {
         this.headers.get(name)
     }
 
+    /// Decode the body as UTF-8 text. Lossy for non-text bodies; use `body`
+    /// when the bytes matter.
     fn bodyText() -> string {
         str(this.body)
     }
 
     fn setBodyBytes(data: List<byte>) {
         this.body = data
-        this.headers.set("Content-Length", str(len(data)))
     }
 
     fn setBodyText(text: string) {
-        this.setBodyBytes(bytes(text))
+        this.body = bytes(text)
     }
 }
 
@@ -158,17 +563,26 @@ class HttpResponse {
     var reason: string
     var headers: HttpHeaders
     var body: List<byte>
+    var trailers: HttpHeaders
+    /// Computed on read: the connection must not carry another response.
+    var closeAfter: bool
 
-    constructor(status: int, reason: string) {
+    constructor(status: int, reason: string = "") {
         this.version = "HTTP/1.1"
         this.status = status
         this.reason = reason
         this.headers = HttpHeaders()
         this.body = bytes("")
+        this.trailers = HttpHeaders()
+        this.closeAfter = false
     }
 
     fn setHeader(name: string, value: string) {
         this.headers.set(name, value)
+    }
+
+    fn addHeader(name: string, value: string) {
+        this.headers.add(name, value)
     }
 
     fn header(name: string) -> string? {
@@ -181,11 +595,10 @@ class HttpResponse {
 
     fn setBodyBytes(data: List<byte>) {
         this.body = data
-        this.headers.set("Content-Length", str(len(data)))
     }
 
     fn setBodyText(text: string) {
-        this.setBodyBytes(bytes(text))
+        this.body = bytes(text)
     }
 
     fn ok() -> bool {
@@ -194,20 +607,36 @@ class HttpResponse {
 }
 
 fn reasonForStatus(status: int) -> string {
+    if (status == 100) { return "Continue" }
+    if (status == 101) { return "Switching Protocols" }
     if (status == 200) { return "OK" }
     if (status == 201) { return "Created" }
+    if (status == 202) { return "Accepted" }
     if (status == 204) { return "No Content" }
+    if (status == 206) { return "Partial Content" }
     if (status == 301) { return "Moved Permanently" }
     if (status == 302) { return "Found" }
+    if (status == 303) { return "See Other" }
     if (status == 304) { return "Not Modified" }
+    if (status == 307) { return "Temporary Redirect" }
+    if (status == 308) { return "Permanent Redirect" }
     if (status == 400) { return "Bad Request" }
     if (status == 401) { return "Unauthorized" }
     if (status == 403) { return "Forbidden" }
     if (status == 404) { return "Not Found" }
     if (status == 405) { return "Method Not Allowed" }
+    if (status == 409) { return "Conflict" }
+    if (status == 411) { return "Length Required" }
+    if (status == 413) { return "Payload Too Large" }
+    if (status == 414) { return "URI Too Long" }
+    if (status == 415) { return "Unsupported Media Type" }
+    if (status == 426) { return "Upgrade Required" }
+    if (status == 429) { return "Too Many Requests" }
     if (status == 500) { return "Internal Server Error" }
+    if (status == 501) { return "Not Implemented" }
     if (status == 502) { return "Bad Gateway" }
     if (status == 503) { return "Service Unavailable" }
+    if (status == 504) { return "Gateway Timeout" }
     "Unknown"
 }
 
@@ -215,351 +644,1125 @@ fn response(status: int) -> HttpResponse {
     HttpResponse(status, reasonForStatus(status))
 }
 
-fn indexOfChar(s: string, ch: int, start: int) -> int {
-    var i = start
-    let n = len(s)
-    while (i < n) {
-        if ((s[i] as int) == ch) { return i }
-        i = i + 1
+fn statusHasNoBody(status: int) -> bool {
+    if (status >= 100 && status < 200) {
+        return true
     }
-    -1
+    status == 204 || status == 304
 }
 
-fn substringSafe(s: string, start: int, end: int) -> string {
-    var a = start
-    var b = end
-    if (a < 0) { a = 0 }
-    if (b < a) { b = a }
-    let n = len(s)
-    if (a > n) { a = n }
-    if (b > n) { b = n }
-    var out = bytes("")
-    let src = bytes(s)
-    var i = a
-    while (i < b) {
-        out.push(src[i])
-        i = i + 1
+fn requestWantsKeepAlive(req: HttpRequest) -> bool {
+    if (headerHasToken(req.headers, "Connection", "close")) {
+        return false
     }
-    str(out)
+    if (req.version == "HTTP/1.0") {
+        return headerHasToken(req.headers, "Connection", "keep-alive")
+    }
+    true
 }
 
-fn trimSpaces(s: string) -> string {
-    var a = 0
-    var b = len(s)
-    while (a < b) {
-        let c = s[a] as int
-        if (c == 32 || c == 9 || c == 13 || c == 10) { a = a + 1 } else { break }
+fn responseWantsKeepAlive(res: HttpResponse) -> bool {
+    if (headerHasToken(res.headers, "Connection", "close")) {
+        return false
     }
-    while (b > a) {
-        let c = s[b - 1] as int
-        if (c == 32 || c == 9 || c == 13 || c == 10) { b = b - 1 } else { break }
+    if (res.version == "HTTP/1.0") {
+        return headerHasToken(res.headers, "Connection", "keep-alive")
     }
-    substringSafe(s, a, b)
+    true
 }
 
-fn parseIntSafe(s: string) -> int {
-    let t = trimSpaces(s)
-    let n = len(t)
-    if (n <= 0) { return -1 }
-    var i = 0
-    var neg = false
-    if ((t[0] as int) == 45) {
-        neg = true
-        i = 1
+// ---------------------------------------------------------------------------
+// Start-line and header parsing
+// ---------------------------------------------------------------------------
+
+class HttpStartLine {
+    var first: string
+    var second: string
+    var third: string
+
+    constructor(first: string, second: string, third: string) {
+        this.first = first
+        this.second = second
+        this.third = third
     }
-    if (i >= n) { return -1 }
-    var v = 0
-    while (i < n) {
-        let c = t[i] as int
-        if (c < 48 || c > 57) { return -1 }
-        v = v * 10 + (c - 48)
-        i = i + 1
-    }
-    if (neg) { return 0 - v }
-    v
 }
 
-fn bytesToStringRaw(data: List<byte>) -> string {
-    str(data)
+fn isHttpVersion(s: string) -> bool {
+    s == "HTTP/1.0" || s == "HTTP/1.1"
 }
 
-fn splitLinesCRLF(text: string) -> List<string> {
-    var out = filled("", 0)
-    var cur = ""
-    var i = 0
-    let n = len(text)
-    while (i < n) {
-        let c = text[i] as int
-        if (c == 13) { // \r
-            if (i + 1 < n && (text[i + 1] as int) == 10) {
-                out.push(cur)
-                cur = ""
-                i = i + 2
-                continue
-            }
-            out.push(cur)
-            cur = ""
-            i = i + 1
-            continue
-        }
-        if (c == 10) { // \n
-            out.push(cur)
-            cur = ""
-            i = i + 1
-            continue
-        }
-        cur = cur + substringSafe(text, i, i + 1)
-        i = i + 1
+/// `METHOD SP request-target SP HTTP-version`, exactly two spaces.
+fn parseRequestLine(line: List<byte>) -> HttpStartLine? {
+    let sp1 = indexOfByte(line, 32, 0)
+    if (sp1 <= 0) {
+        return none
     }
-    out.push(cur)
-    out
-}
-
-fn parseRequest(text: string) -> HttpRequest? {
-    let lines = splitLinesCRLF(text)
-    if (len(lines) <= 0) { return none }
-    let start = lines[0]
-    let sp1 = indexOfChar(start, 32, 0)
-    if (sp1 < 0) { return none }
-    let sp2 = indexOfChar(start, 32, sp1 + 1)
-    if (sp2 < 0) { return none }
-    let method = substringSafe(start, 0, sp1)
-    let target = substringSafe(start, sp1 + 1, sp2)
-    let version = substringSafe(start, sp2 + 1, len(start))
-    var req = HttpRequest(method, target)
-    req.version = version
-    var i = 1
-    var inBody = false
-    var body = ""
-    while (i < len(lines)) {
-        let line = lines[i]
-        if (!inBody) {
-            if (line == "") {
-                inBody = true
-                i = i + 1
-                continue
-            }
-            let colon = indexOfChar(line, 58, 0)
-            if (colon > 0) {
-                let name = trimSpaces(substringSafe(line, 0, colon))
-                let value = trimSpaces(substringSafe(line, colon + 1, len(line)))
-                req.headers.add(name, value)
-            }
-        } else {
-            if (body == "") { body = line } else { body = body + "\n" + line }
-        }
-        i = i + 1
+    let sp2 = indexOfByte(line, 32, sp1 + 1)
+    if (sp2 <= sp1 + 1) {
+        return none
     }
-    req.body = bytes(body)
-    req
-}
-
-fn parseResponse(text: string) -> HttpResponse? {
-    let lines = splitLinesCRLF(text)
-    if (len(lines) <= 0) { return none }
-    let start = lines[0]
-    let sp1 = indexOfChar(start, 32, 0)
-    if (sp1 < 0) { return none }
-    let sp2 = indexOfChar(start, 32, sp1 + 1)
-    let version = substringSafe(start, 0, sp1)
-    var statusStr = ""
-    var reason = ""
-    if (sp2 < 0) {
-        statusStr = substringSafe(start, sp1 + 1, len(start))
-        reason = ""
-    } else {
-        statusStr = substringSafe(start, sp1 + 1, sp2)
-        reason = substringSafe(start, sp2 + 1, len(start))
+    if (indexOfByte(line, 32, sp2 + 1) >= 0) {
+        return none
     }
-    let status = parseIntSafe(statusStr)
-    if (status < 0) { return none }
-    var res = HttpResponse(status, reason)
-    res.version = version
-    var i = 1
-    var inBody = false
-    var body = ""
-    while (i < len(lines)) {
-        let line = lines[i]
-        if (!inBody) {
-            if (line == "") {
-                inBody = true
-                i = i + 1
-                continue
-            }
-            let colon = indexOfChar(line, 58, 0)
-            if (colon > 0) {
-                let name = trimSpaces(substringSafe(line, 0, colon))
-                let value = trimSpaces(substringSafe(line, colon + 1, len(line)))
-                res.headers.add(name, value)
-            }
-        } else {
-            if (body == "") { body = line } else { body = body + "\n" + line }
-        }
-        i = i + 1
-    }
-    res.body = bytes(body)
-    res
-}
-
-fn serializeRequest(req: HttpRequest) -> string {
-    var out = req.method + " " + req.target + " " + req.version + "\r\n"
-    // Ensure Content-Length if body present
-    if (!req.headers.has("Content-Length")) {
-        req.headers.set("Content-Length", str(len(req.body)))
-    }
-    var i = 0
-    while (i < req.headers.lenHeaders()) {
-        out = out + req.headers.nameAt(i) + ": " + req.headers.valueAt(i) + "\r\n"
-        i = i + 1
-    }
-    out = out + "\r\n"
-    out = out + str(req.body)
-    out
-}
-
-fn serializeResponse(res: HttpResponse) -> string {
-    var reason = res.reason
-    if (reason == "") { reason = reasonForStatus(res.status) }
-    var out = res.version + " " + str(res.status) + " " + reason + "\r\n"
-    if (!res.headers.has("Content-Length")) {
-        res.headers.set("Content-Length", str(len(res.body)))
-    }
-    var i = 0
-    while (i < res.headers.lenHeaders()) {
-        out = out + res.headers.nameAt(i) + ": " + res.headers.valueAt(i) + "\r\n"
-        i = i + 1
-    }
-    out = out + "\r\n"
-    out = out + str(res.body)
-    out
-}
-
-fn writeRequest(stream: TcpStream, req: HttpRequest) -> bool {
-    stream.writeAll(bytes(serializeRequest(req)))
-}
-
-fn writeResponse(stream: TcpStream, res: HttpResponse) -> bool {
-    stream.writeAll(bytes(serializeResponse(res)))
-}
-
-fn readHttpMessage(stream: TcpStream, maxBytes: int) -> string? {
-    // Read until end of headers; then read Content-Length body if present.
-    var limit = maxBytes
-    if (limit <= 0) { limit = 65536 }
-    var buf = ""
-    while (len(buf) < limit) {
-        let chunk = stream.read(1024)
-        let got = len(chunk)
-        if (got <= 0) { break }
-        buf = buf + str(chunk)
-        let end = indexOfString(buf, "\r\n\r\n")
-        if (end >= 0) {
-            // found headers end
-            let headerPart = substringSafe(buf, 0, end + 4)
-            var rest = substringSafe(buf, end + 4, len(buf))
-            let tmp = splitLinesCRLF(headerPart)
-            var contentLen = 0
-            var hasLen = false
-            var i = 1
-            while (i < len(tmp)) {
-                let line = tmp[i]
-                if (line == "") { break }
-                let colon = indexOfChar(line, 58, 0)
-                if (colon > 0) {
-                    let name = trimSpaces(substringSafe(line, 0, colon))
-                    let value = trimSpaces(substringSafe(line, colon + 1, len(line)))
-                    if (eqAsciiIgnoreCaseSimple(name, "Content-Length")) {
-                        contentLen = parseIntSafe(value)
-                        if (contentLen < 0) { contentLen = 0 }
-                        hasLen = true
+    let method = asciiText(line, 0, sp1)
+    let target = asciiText(line, sp1 + 1, sp2)
+    let version = asciiText(line, sp2 + 1, len(line))
+    match (method) {
+        case some(m) -> {
+            match (target) {
+                case some(t) -> {
+                    match (version) {
+                        case some(v) -> {
+                            if (!isHttpVersion(v)) {
+                                return none
+                            }
+                            return HttpStartLine(m, t, v)
+                        }
+                        case none -> none
                     }
                 }
-                i = i + 1
+                case none -> none
             }
-            if (hasLen) {
-                while (len(rest) < contentLen && len(headerPart) + len(rest) < limit) {
-                    let more = stream.read(contentLen - len(rest))
-                    if (len(more) <= 0) { break }
-                    rest = rest + str(more)
-                }
-                if (len(rest) > contentLen) {
-                    rest = substringSafe(rest, 0, contentLen)
-                }
-                return headerPart + rest
-            }
-            // No Content-Length: for responses to requests we often close; return what we have.
-            return headerPart + rest
         }
+        case none -> none
     }
-    if (len(buf) > 0) { return buf }
-    none
 }
 
-fn indexOfString(s: string, needle: string) -> int {
-    let n = len(s)
-    let m = len(needle)
-    if (m <= 0) { return 0 }
-    if (m > n) { return -1 }
+/// `HTTP-version SP status [SP reason-phrase]`; the reason may contain spaces.
+fn parseStatusLine(line: List<byte>) -> HttpStartLine? {
+    let sp1 = indexOfByte(line, 32, 0)
+    if (sp1 <= 0) {
+        return none
+    }
+    var sp2 = indexOfByte(line, 32, sp1 + 1)
+    var statusEnd = len(line)
+    var reasonLo = len(line)
+    if (sp2 >= 0) {
+        statusEnd = sp2
+        reasonLo = sp2 + 1
+    }
+    if (statusEnd != sp1 + 4) {
+        return none
+    }
+    let version = asciiText(line, 0, sp1)
+    let statusText = asciiText(line, sp1 + 1, statusEnd)
+    let reason = fieldText(line, reasonLo, len(line))
+    match (version) {
+        case some(v) -> {
+            match (statusText) {
+                case some(st) -> {
+                    match (reason) {
+                        case some(r) -> {
+                            if (!isHttpVersion(v)) {
+                                return none
+                            }
+                            let code = parseDecimal(st)
+                            if (code < 100 || code > 999) {
+                                return none
+                            }
+                            return HttpStartLine(v, st, r)
+                        }
+                        case none -> none
+                    }
+                }
+                case none -> none
+            }
+        }
+        case none -> none
+    }
+}
+
+/// Parse and append one `name: value` line. Names are token bytes with no
+/// whitespace before the colon; values are trimmed OWS.
+fn appendHeaderLine(h: HttpHeaders, line: List<byte>) -> bool {
+    let colon = indexOfByte(line, 58, 0)
+    if (colon <= 0) {
+        return false
+    }
     var i = 0
-    while (i <= n - m) {
-        var ok = true
-        var j = 0
-        while (j < m) {
-            if ((s[i + j] as int) != (needle[j] as int)) {
-            ok = false
-            break
+    while (i < colon) {
+        if (!isTokenChar(line[i] as int)) {
+            return false
         }
-            j = j + 1
-        }
-        if (ok) { return i }
         i = i + 1
     }
-    -1
+    let name = asciiText(line, 0, colon)
+    var vs = colon + 1
+    var ve = len(line)
+    while (vs < ve && isOws(line[vs] as int)) { vs = vs + 1 }
+    while (ve > vs && isOws(line[ve - 1] as int)) { ve = ve - 1 }
+    let value = fieldText(line, vs, ve)
+    match (name) {
+        case some(n) -> {
+            match (value) {
+                case some(v) -> {
+                    h.add(n, v)
+                    true
+                }
+                case none -> false
+            }
+        }
+        case none -> false
+    }
 }
 
-fn eqAsciiIgnoreCaseSimple(a: string, b: string) -> bool {
-    let n = len(a)
-    if (n != len(b)) { return false }
+// ---------------------------------------------------------------------------
+// Serialization
+// ---------------------------------------------------------------------------
+
+/// Fill in the framing headers a sender must provide. Idempotent.
+fn prepareRequest(req: HttpRequest) {
+    let te = transferCoding(req.headers)
+    if (te != TE_NONE) {
+        req.headers.remove("Content-Length")
+        return
+    }
+    req.headers.set("Content-Length", str(len(req.body)))
+}
+
+fn prepareResponse(res: HttpResponse) {
+    if (statusHasNoBody(res.status)) {
+        return
+    }
+    let te = transferCoding(res.headers)
+    if (te != TE_NONE) {
+        res.headers.remove("Content-Length")
+        return
+    }
+    res.headers.set("Content-Length", str(len(res.body)))
+}
+
+fn headersBlock(h: HttpHeaders) -> string? {
+    if (!h.isValid()) {
+        return none
+    }
+    var out = ""
     var i = 0
-    while (i < n) {
-        var ca = a[i] as int
-        var cb = b[i] as int
-        if (ca >= 65 && ca <= 90) { ca = ca + 32 }
-        if (cb >= 65 && cb <= 90) { cb = cb + 32 }
-        if (ca != cb) { return false }
+    while (i < h.lenHeaders()) {
+        out = out + h.nameAt(i) + ": " + h.valueAt(i) + "\r\n"
+        i = i + 1
+    }
+    out
+}
+
+fn isRequestTarget(s: string) -> bool {
+    if (len(s) == 0) {
+        return false
+    }
+    let b = bytes(s)
+    var i = 0
+    while (i < len(b)) {
+        let c = b[i] as int
+        if (c < 33 || c > 126) {
+            return false
+        }
         i = i + 1
     }
     true
 }
 
-fn readRequest(stream: TcpStream) -> HttpRequest? {
-    match (readHttpMessage(stream, 65536)) {
-        case some(text) -> parseRequest(text)
-        case none -> none
+fn serializeRequestHead(req: HttpRequest) -> string? {
+    prepareRequest(req)
+    if (req.closeAfter && !req.headers.has("Connection")) {
+        req.headers.set("Connection", "close")
     }
-}
-
-fn readResponse(stream: TcpStream) -> HttpResponse? {
-    match (readHttpMessage(stream, 65536)) {
-        case some(text) -> parseResponse(text)
-        case none -> none
-    }
-}
-
-fn request(method: string, host: string, port: int, target: string, bodyText: string) -> HttpResponse? {
-    match (TcpStream.connect(host, port)) {
-        case some(s) -> {
-            var req = HttpRequest(method, target)
-            req.setHeader("Host", formatAddr(host, port))
-            req.setHeader("Connection", "close")
-            if (len(bodyText) > 0) {
-                req.setBodyText(bodyText)
-            } else {
-                req.setHeader("Content-Length", "0")
+    let hb = headersBlock(req.headers)
+    match (hb) {
+        case some(h) -> {
+            if (!isTokenText(req.method)) {
+                return none
             }
-            let _ = writeRequest(s, req)
-            let res = readResponse(s)
-            s.close()
+            if (!isHttpVersion(req.version)) {
+                return none
+            }
+            if (!isRequestTarget(req.target)) {
+                return none
+            }
+            return req.method + " " + req.target + " " + req.version + "\r\n" + h + "\r\n"
+        }
+        case none -> none
+    }
+}
+
+fn serializeResponseHead(res: HttpResponse) -> string? {
+    prepareResponse(res)
+    if (res.closeAfter && !res.headers.has("Connection")) {
+        res.headers.set("Connection", "close")
+    }
+    let hb = headersBlock(res.headers)
+    match (hb) {
+        case some(h) -> {
+            if (!isHttpVersion(res.version)) {
+                return none
+            }
+            var reason = res.reason
+            if (reason == "") {
+                reason = reasonForStatus(res.status)
+            }
+            if (!isFieldText(reason)) {
+                return none
+            }
+            return res.version + " " + str(res.status) + " " + reason + "\r\n" + h + "\r\n"
+        }
+        case none -> none
+    }
+}
+
+fn appendChunkedBody(out: List<byte>, body: List<byte>) {
+    if (len(body) > 0) {
+        let sizeLine = bytes(chunkSizeText(len(body)) + "\r\n")
+        for (b in sizeLine) { out.push(b) }
+        for (b in body) { out.push(b) }
+        let crlf = bytes("\r\n")
+        for (b in crlf) { out.push(b) }
+    }
+    let last = bytes("0\r\n\r\n")
+    for (b in last) { out.push(b) }
+}
+
+/// Full request bytes, including a chunked encoding when the headers ask for
+/// one. Returns `none` when a header is not serializable.
+fn serializeRequest(req: HttpRequest) -> List<byte>? {
+    let head = serializeRequestHead(req)
+    match (head) {
+        case some(h) -> {
+            var out = bytes(h)
+            if (transferCoding(req.headers) == TE_CHUNKED) {
+                appendChunkedBody(out, req.body)
+            } else {
+                for (b in req.body) { out.push(b) }
+            }
+            return out
+        }
+        case none -> none
+    }
+}
+
+fn serializeResponse(res: HttpResponse) -> List<byte>? {
+    let head = serializeResponseHead(res)
+    match (head) {
+        case some(h) -> {
+            var out = bytes(h)
+            if (statusHasNoBody(res.status)) {
+                return out
+            }
+            if (transferCoding(res.headers) == TE_CHUNKED) {
+                appendChunkedBody(out, res.body)
+            } else {
+                for (b in res.body) { out.push(b) }
+            }
+            return out
+        }
+        case none -> none
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Buffered byte reader
+// ---------------------------------------------------------------------------
+
+/// A buffering layer over one `Conn`. The buffer is what makes keep-alive
+/// correct: bytes read past one message's body stay here for the next one.
+class HttpReader {
+    var conn: Conn
+    var buf: List<byte>
+    var pos: int
+    var eof: bool
+    var failed: bool
+    var error: NetError
+    var maxHeadBytes: int
+    var maxBodyBytes: int
+    var lastTrailers: HttpHeaders
+
+    constructor(conn: Conn, maxHeadBytes: int = HTTP_MAX_HEAD, maxBodyBytes: int = HTTP_MAX_BODY) {
+        this.conn = conn
+        this.buf = bytes("")
+        this.pos = 0
+        this.eof = false
+        this.failed = false
+        this.error = NetError()
+        this.maxHeadBytes = maxHeadBytes
+        this.maxBodyBytes = maxBodyBytes
+        this.lastTrailers = HttpHeaders()
+    }
+
+    fn available() -> int {
+        len(this.buf) - this.pos
+    }
+
+    fn fail(kind: int, message: string) {
+        this.failed = true
+        this.error.set(kind, 0, message)
+    }
+
+    fn failProtocol(message: string) {
+        this.fail(ERR_PROTOCOL, message)
+    }
+
+    fn failTooLarge(message: string) {
+        this.fail(ERR_TOO_LARGE, message)
+    }
+
+    fn reset() {
+        this.buf = bytes("")
+        this.pos = 0
+        this.eof = false
+        this.failed = false
+        this.error.clear()
+        this.lastTrailers = HttpHeaders()
+    }
+
+    /// Drop the consumed prefix. Called only after a complete unit (line or
+    /// exact block) has been copied out.
+    fn compact() {
+        if (this.pos == len(this.buf)) {
+            this.buf = bytes("")
+            this.pos = 0
+            return
+        }
+        if (this.pos >= 65536) {
+            this.buf = byteSlice(this.buf, this.pos, len(this.buf))
+            this.pos = 0
+        }
+    }
+
+    /// 1: data appended; 0: clean EOF; -1: error (recorded in `error`).
+    fn fill() -> int {
+        if (this.eof) {
+            return 0
+        }
+        if (this.failed) {
+            return -1
+        }
+        match (this.conn.readSome(READ_CHUNK)) {
+            case some(chunk) -> {
+                if (len(chunk) == 0) {
+                    this.eof = true
+                    return 0
+                }
+                for (b in chunk) {
+                    this.buf.push(b)
+                }
+                return 1
+            }
+            case none -> {
+                let e = this.conn.lastError()
+                if (e.kind == ERR_NONE) {
+                    this.error.set(ERR_OTHER, 0, "read failed without a recorded error")
+                } else {
+                    this.error.copyFrom(e)
+                }
+                this.failed = true
+                return -1
+            }
+        }
+    }
+
+    /// One line without its CRLF/LF. `none` on EOF or error. A partial line at
+    /// EOF is a protocol error; EOF before any byte is a clean close.
+    fn readLine(max: int) -> List<byte>? {
+        while (true) {
+            var i = this.pos
+            while (i < len(this.buf)) {
+                if ((this.buf[i] as int) == 10) {
+                    var end = i
+                    if (end > this.pos && (this.buf[end - 1] as int) == 13) {
+                        end = end - 1
+                    }
+                    if (end - this.pos > max) {
+                        this.failTooLarge("HTTP line exceeds " + str(max) + " bytes")
+                        return none
+                    }
+                    let out = byteSlice(this.buf, this.pos, end)
+                    this.pos = i + 1
+                    this.compact()
+                    return out
+                }
+                i = i + 1
+            }
+            if (len(this.buf) - this.pos > max) {
+                this.failTooLarge("HTTP line exceeds " + str(max) + " bytes")
+                return none
+            }
+            let f = this.fill()
+            if (f < 0) {
+                return none
+            }
+            if (f == 0) {
+                if (this.available() > 0) {
+                    this.failProtocol("connection closed inside an HTTP line")
+                }
+                return none
+            }
+        }
+    }
+
+    /// Exactly `n` bytes; a short stream is a protocol error.
+    fn readExact(n: int) -> List<byte>? {
+        if (n < 0) {
+            this.failProtocol("negative body length")
+            return none
+        }
+        while (this.available() < n) {
+            let f = this.fill()
+            if (f < 0) {
+                return none
+            }
+            if (f == 0) {
+                this.failProtocol("connection closed after " + str(this.available()) + " of " + str(n) + " body bytes")
+                return none
+            }
+        }
+        let out = byteSlice(this.buf, this.pos, this.pos + n)
+        this.pos = this.pos + n
+        this.compact()
+        out
+    }
+
+    /// Every remaining byte up to EOF, bounded by `limit`.
+    fn readToEof(limit: int) -> List<byte>? {
+        var out = bytes("")
+        while (true) {
+            let take = this.available()
+            if (take > 0) {
+                if (len(out) + take > limit) {
+                    this.failTooLarge("HTTP body exceeds " + str(limit) + " bytes")
+                    return none
+                }
+                let part = byteSlice(this.buf, this.pos, this.pos + take)
+                for (b in part) {
+                    out.push(b)
+                }
+                this.pos = this.pos + take
+                this.compact()
+            }
+            let f = this.fill()
+            if (f < 0) {
+                return none
+            }
+            if (f == 0) {
+                return out
+            }
+        }
+    }
+
+    fn readChunked(limit: int) -> List<byte>? {
+        this.lastTrailers = HttpHeaders()
+        var body = bytes("")
+        while (true) {
+            let sizeLine = this.readLine(HTTP_MAX_CHUNK_LINE)
+            match (sizeLine) {
+                case none -> {
+                    return none
+                }
+                case some(line) -> {
+                    let size = parseChunkSize(line)
+                    if (size < 0) {
+                        this.failProtocol("malformed chunk size")
+                        return none
+                    }
+                    if (size == 0) {
+                        let tr = this.readTrailers()
+                        match (tr) {
+                            case none -> {
+                                return none
+                            }
+                            case some(t) -> {
+                                this.lastTrailers = t
+                                return body
+                            }
+                        }
+                    }
+                    if (len(body) + size > limit) {
+                        this.failTooLarge("HTTP body exceeds " + str(limit) + " bytes")
+                        return none
+                    }
+                    let chunk = this.readExact(size)
+                    match (chunk) {
+                        case none -> {
+                            return none
+                        }
+                        case some(data) -> {
+                            for (b in data) {
+                                body.push(b)
+                            }
+                        }
+                    }
+                    let crlf = this.readLine(2)
+                    match (crlf) {
+                        case none -> {
+                            return none
+                        }
+                        case some(tail) -> {
+                            if (len(tail) != 0) {
+                                this.failProtocol("missing CRLF after a chunk")
+                                return none
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Consume trailer fields after a zero chunk. Returns the trailers, or
+    /// `none` on error. A zero-size return value means an empty set.
+    fn readTrailers() -> HttpHeaders? {
+        var tr = HttpHeaders()
+        var total = 0
+        while (true) {
+            let line = this.readLine(HTTP_MAX_LINE)
+            match (line) {
+                case none -> {
+                    return none
+                }
+                case some(l) -> {
+                    total = total + len(l) + 2
+                    if (total > this.maxHeadBytes) {
+                        this.failTooLarge("HTTP trailers exceed " + str(this.maxHeadBytes) + " bytes")
+                        return none
+                    }
+                    if (len(l) == 0) {
+                        return tr
+                    }
+                    if (!appendHeaderLine(tr, l)) {
+                        this.failProtocol("malformed trailer field")
+                        return none
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Chunk size: hex digits before an optional `;extension`, OWS-trimmed.
+fn parseChunkSize(line: List<byte>) -> int {
+    var end = len(line)
+    let semi = indexOfByte(line, 59, 0)
+    if (semi >= 0) {
+        end = semi
+    }
+    var lo = 0
+    var hi = end
+    while (lo < hi && isOws(line[lo] as int)) { lo = lo + 1 }
+    while (hi > lo && isOws(line[hi - 1] as int)) { hi = hi - 1 }
+    if (hi <= lo) {
+        return -1
+    }
+    var v = 0
+    var i = lo
+    while (i < hi) {
+        let c = line[i] as int
+        var d = -1
+        if (c >= 48 && c <= 57) { d = c - 48 }
+        if (c >= 65 && c <= 70) { d = c - 55 }
+        if (c >= 97 && c <= 102) { d = c - 87 }
+        if (d < 0) {
+            return -1
+        }
+        if (v > 100000000000) {
+            return -1
+        }
+        v = v * 16 + d
+        i = i + 1
+    }
+    v
+}
+
+// ---------------------------------------------------------------------------
+// Connection: read/write whole messages
+// ---------------------------------------------------------------------------
+
+/// One HTTP/1.1 connection over a `Conn`. Owns the `Conn` unless `ownsConn` is
+/// false. Messages carry their own keep-alive decision (`closeAfter`).
+class HttpConn {
+    var conn: Conn
+    var reader: HttpReader
+    var closed: bool
+    var ownsConn: bool
+
+    constructor(conn: Conn, maxHeadBytes: int = HTTP_MAX_HEAD, maxBodyBytes: int = HTTP_MAX_BODY, ownsConn: bool = true) {
+        this.conn = conn
+        this.reader = HttpReader(conn, maxHeadBytes, maxBodyBytes)
+        this.closed = false
+        this.ownsConn = ownsConn
+    }
+
+    fn lastError() -> NetError {
+        this.reader.error
+    }
+
+    fn reset() {
+        this.reader.reset()
+    }
+
+    fn setRecvTimeoutMs(ms: int) -> bool {
+        this.conn.setRecvTimeoutMs(ms)
+    }
+
+    fn readHeaderBlock(first: List<byte>, headers: HttpHeaders) -> bool {
+        var total = len(first) + 2
+        while (true) {
+            let line = this.reader.readLine(HTTP_MAX_LINE)
+            match (line) {
+                case none -> {
+                    return false
+                }
+                case some(l) -> {
+                    total = total + len(l) + 2
+                    if (total > this.reader.maxHeadBytes) {
+                        this.reader.failTooLarge("HTTP header block exceeds " + str(this.reader.maxHeadBytes) + " bytes")
+                        return false
+                    }
+                    if (len(l) == 0) {
+                        return true
+                    }
+                    if (!appendHeaderLine(headers, l)) {
+                        this.reader.failProtocol("malformed header field")
+                        return false
+                    }
+                }
+            }
+        }
+    }
+
+    fn readRequestBody(req: HttpRequest) -> bool {
+        let te = transferCoding(req.headers)
+        let cl = contentLength(req.headers)
+        if (te == TE_CHUNKED) {
+            if (cl != CL_MISSING) {
+                this.reader.failProtocol("request has both Transfer-Encoding and Content-Length")
+                return false
+            }
+            let body = this.reader.readChunked(this.reader.maxBodyBytes)
+            match (body) {
+                case none -> {
+                    return false
+                }
+                case some(b) -> {
+                    req.body = b
+                    req.trailers = this.reader.lastTrailers
+                    return true
+                }
+            }
+        }
+        if (te == TE_OTHER) {
+            this.reader.failProtocol("unsupported request transfer coding")
+            return false
+        }
+        if (cl == CL_INVALID) {
+            this.reader.failProtocol("invalid Content-Length")
+            return false
+        }
+        if (cl == CL_MISSING || cl == 0) {
+            req.body = bytes("")
+            return true
+        }
+        if (cl > this.reader.maxBodyBytes) {
+            this.reader.failTooLarge("HTTP body exceeds " + str(this.reader.maxBodyBytes) + " bytes")
+            return false
+        }
+        let body = this.reader.readExact(cl)
+        match (body) {
+            case none -> {
+                return false
+            }
+            case some(b) -> {
+                req.body = b
+                return true
+            }
+        }
+    }
+
+    fn readResponseBody(res: HttpResponse, method: string) -> bool {
+        if (method == "HEAD" || statusHasNoBody(res.status) || res.status == 101) {
+            res.body = bytes("")
+            return true
+        }
+        let te = transferCoding(res.headers)
+        let cl = contentLength(res.headers)
+        if (te == TE_CHUNKED) {
+            let body = this.reader.readChunked(this.reader.maxBodyBytes)
+            match (body) {
+                case none -> {
+                    return false
+                }
+                case some(b) -> {
+                    res.body = b
+                    res.trailers = this.reader.lastTrailers
+                    return true
+                }
+            }
+        }
+        if (te == TE_OTHER) {
+            // The final coding is not chunked, so framing is close-delimited.
+            // Bytes stay in their transfer coding; this module does not decode
+            // gzip/etc.
+            let coded = this.reader.readToEof(this.reader.maxBodyBytes)
+            match (coded) {
+                case none -> {
+                    return false
+                }
+                case some(b) -> {
+                    res.body = b
+                    res.closeAfter = true
+                    return true
+                }
+            }
+        }
+        if (cl == CL_INVALID) {
+            this.reader.failProtocol("invalid Content-Length")
+            return false
+        }
+        if (cl != CL_MISSING) {
+            if (cl > this.reader.maxBodyBytes) {
+                this.reader.failTooLarge("HTTP body exceeds " + str(this.reader.maxBodyBytes) + " bytes")
+                return false
+            }
+            let body = this.reader.readExact(cl)
+            match (body) {
+                case none -> {
+                    return false
+                }
+                case some(b) -> {
+                    res.body = b
+                    return true
+                }
+            }
+        }
+        // No framing header: the body runs to connection close.
+        let body = this.reader.readToEof(this.reader.maxBodyBytes)
+        match (body) {
+            case none -> {
+                return false
+            }
+            case some(b) -> {
+                res.body = b
+                res.closeAfter = true
+                return true
+            }
+        }
+    }
+
+    /// Read one request. `none` means a clean close or a parse/framing error;
+    /// `lastError()` tells them apart.
+    fn readRequest() -> HttpRequest? {
+        let first = this.reader.readLine(HTTP_MAX_LINE)
+        match (first) {
+            case none -> {
+                return none
+            }
+            case some(line) -> {
+                let parts = parseRequestLine(line)
+                match (parts) {
+                    case none -> {
+                        this.reader.failProtocol("malformed request line")
+                        return none
+                    }
+                    case some(sl) -> {
+                        let headers = HttpHeaders()
+                        if (!this.readHeaderBlock(line, headers)) {
+                            return none
+                        }
+                        let req = HttpRequest(sl.first, sl.second)
+                        req.version = sl.third
+                        req.headers = headers
+                        if (!this.readRequestBody(req)) {
+                            return none
+                        }
+                        req.closeAfter = !requestWantsKeepAlive(req)
+                        return req
+                    }
+                }
+            }
+        }
+    }
+
+    /// Read one response. Pass the request method so HEAD framing (and the
+    /// 1xx/204/304 rules) stay aligned with the peer. Interim 1xx responses
+    /// are consumed until the final one; 101 is returned to the caller.
+    fn readResponse(method: string = "") -> HttpResponse? {
+        var interim = 0
+        while (true) {
+            let first = this.reader.readLine(HTTP_MAX_LINE)
+            match (first) {
+                case none -> {
+                    return none
+                }
+                case some(line) -> {
+                    let parts = parseStatusLine(line)
+                    match (parts) {
+                        case none -> {
+                            this.reader.failProtocol("malformed status line")
+                            return none
+                        }
+                        case some(sl) -> {
+                            let headers = HttpHeaders()
+                            if (!this.readHeaderBlock(line, headers)) {
+                                return none
+                            }
+                            let status = parseDecimal(sl.second)
+                            let res = HttpResponse(status, sl.third)
+                            res.version = sl.first
+                            res.headers = headers
+                            if (status == 101) {
+                                res.body = bytes("")
+                                res.closeAfter = true
+                                return res
+                            }
+                            if (status >= 100 && status < 200) {
+                                interim = interim + 1
+                                if (interim > 8) {
+                                    this.reader.failProtocol("too many interim responses")
+                                    return none
+                                }
+                                continue
+                            }
+                            if (!this.readResponseBody(res, method)) {
+                                return none
+                            }
+                            if (!res.closeAfter) {
+                                res.closeAfter = !responseWantsKeepAlive(res)
+                            }
+                            return res
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn writeAll(data: List<byte>) -> bool {
+        if (len(data) == 0) {
+            return true
+        }
+        if (!this.conn.writeAll(data)) {
+            let e = this.conn.lastError()
+            if (e.kind != ERR_NONE) {
+                this.reader.error.copyFrom(e)
+            } else {
+                this.reader.error.set(ERR_OTHER, 0, "write failed without a recorded error")
+            }
+            return false
+        }
+        true
+    }
+
+    fn writeRequest(req: HttpRequest) -> bool {
+        let head = serializeRequestHead(req)
+        match (head) {
+            case none -> {
+                this.reader.error.set(ERR_PROTOCOL, 0, "request has an unserializable header or start line")
+                return false
+            }
+            case some(h) -> {
+                if (!this.writeAll(bytes(h))) {
+                    return false
+                }
+                if (transferCoding(req.headers) == TE_CHUNKED) {
+                    if (len(req.body) > 0) {
+                        if (!this.writeAll(bytes(chunkSizeText(len(req.body)) + "\r\n"))) { return false }
+                        if (!this.writeAll(req.body)) { return false }
+                        if (!this.writeAll(bytes("\r\n"))) { return false }
+                    }
+                    return this.writeAll(bytes("0\r\n\r\n"))
+                }
+                return this.writeAll(req.body)
+            }
+        }
+    }
+
+    fn writeResponse(res: HttpResponse, method: string = "") -> bool {
+        let head = serializeResponseHead(res)
+        match (head) {
+            case none -> {
+                this.reader.error.set(ERR_PROTOCOL, 0, "response has an unserializable header or start line")
+                return false
+            }
+            case some(h) -> {
+                if (!this.writeAll(bytes(h))) {
+                    return false
+                }
+                if (method == "HEAD" || statusHasNoBody(res.status) || res.status == 101) {
+                    return true
+                }
+                if (transferCoding(res.headers) == TE_CHUNKED) {
+                    if (len(res.body) > 0) {
+                        if (!this.writeAll(bytes(chunkSizeText(len(res.body)) + "\r\n"))) { return false }
+                        if (!this.writeAll(res.body)) { return false }
+                        if (!this.writeAll(bytes("\r\n"))) { return false }
+                    }
+                    return this.writeAll(bytes("0\r\n\r\n"))
+                }
+                return this.writeAll(res.body)
+            }
+        }
+    }
+
+    /// Idempotent close. Only closes the underlying `Conn` when this object
+    /// owns it.
+    fn close() {
+        if (!this.closed) {
+            this.closed = true
+            if (this.ownsConn) {
+                this.conn.close()
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Client
+// ---------------------------------------------------------------------------
+
+/// `Host` header value. IPv6 literals are bracketed; port 80 and a
+/// non-positive port are omitted (pass 0 when the caller terminates TLS and
+/// wants the scheme's default port left implicit).
+fn hostHeader(host: string, port: int) -> string {
+    var h = host
+    let b = bytes(host)
+    var hasColon = false
+    var i = 0
+    while (i < len(b)) {
+        if ((b[i] as int) == 58) {
+            hasColon = true
+        }
+        i = i + 1
+    }
+    var bracketed = false
+    if (len(b) >= 2) {
+        if ((b[0] as int) == 91 && (b[len(b) - 1] as int) == 93) {
+            bracketed = true
+        }
+    }
+    if (hasColon && !bracketed) {
+        h = "[" + host + "]"
+    }
+    if (port <= 0 || port == 80) {
+        return h
+    }
+    h + ":" + str(port)
+}
+
+/// A persistent HTTP client over one `Conn`. It does not auto-reconnect: once
+/// a response is close-delimited or says `Connection: close`, `send` refuses
+/// to reuse the connection and the caller closes it (or opens a new one).
+class HttpClient {
+    var conn: Conn
+    var http: HttpConn
+    var host: string
+    var port: int
+    var keepAlive: bool
+    var reusable: bool
+    var closed: bool
+
+    constructor(conn: Conn, host: string, port: int = 80) {
+        this.conn = conn
+        this.http = HttpConn(conn)
+        this.host = host
+        this.port = port
+        this.keepAlive = true
+        this.reusable = true
+        this.closed = false
+    }
+
+    /// Plain TCP connect. For TLS, connect/wrap yourself and use `over`.
+    static fn connect(host: string, port: int, timeoutMs: int = 0, err: NetError? = none) -> HttpClient? {
+        match (TcpStream.connect(host, port, timeoutMs, err)) {
+            case some(t) -> HttpClient(t, host, port)
+            case none -> none
+        }
+    }
+
+    /// Take over an already-connected transport (usually a `TlsStream`).
+    static fn over(conn: Conn, host: string, port: int = 80) -> HttpClient {
+        HttpClient(conn, host, port)
+    }
+
+    fn lastError() -> NetError {
+        this.http.lastError()
+    }
+
+    fn setRecvTimeoutMs(ms: int) -> bool {
+        this.conn.setRecvTimeoutMs(ms)
+    }
+
+    fn close() {
+        if (!this.closed) {
+            this.closed = true
+            this.http.close()
+        }
+    }
+
+    /// Send one request and read its response. `none` on transport/framing
+    /// error (see `lastError`) or when the connection is no longer reusable.
+    fn send(req: HttpRequest) -> HttpResponse? {
+        if (this.closed) {
+            this.http.lastError().set(ERR_PROTOCOL, 0, "http client is closed")
+            return none
+        }
+        if (!this.reusable) {
+            this.http.lastError().set(ERR_PROTOCOL, 0, "connection is not reusable; open a new one")
+            return none
+        }
+        if (!req.headers.has("Host")) {
+            req.headers.set("Host", hostHeader(this.host, this.port))
+        }
+        if (!this.keepAlive && !req.headers.has("Connection")) {
+            req.headers.set("Connection", "close")
+        }
+        if (!this.http.writeRequest(req)) {
+            this.reusable = false
+            return none
+        }
+        let res = this.http.readResponse(req.method)
+        match (res) {
+            case none -> {
+                this.reusable = false
+                none
+            }
+            case some(r) -> {
+                this.reusable = !r.closeAfter
+                r
+            }
+        }
+    }
+
+    fn exchange(method: string, target: string, body: List<byte>) -> HttpResponse? {
+        let req = HttpRequest(method, target)
+        req.body = body
+        this.send(req)
+    }
+
+    fn get(target: string) -> HttpResponse? {
+        let req = HttpRequest("GET", target)
+        this.send(req)
+    }
+
+    fn head(target: string) -> HttpResponse? {
+        let req = HttpRequest("HEAD", target)
+        this.send(req)
+    }
+
+    fn post(target: string, body: List<byte>) -> HttpResponse? {
+        this.exchange("POST", target, body)
+    }
+
+    fn postText(target: string, text: string) -> HttpResponse? {
+        this.exchange("POST", target, bytes(text))
+    }
+}
+
+/// One-shot request: connect, send with `Connection: close`, read, close.
+fn request(host: string, port: int, method: string, target: string, body: List<byte>) -> HttpResponse? {
+    match (TcpStream.connect(host, port)) {
+        case some(t) -> {
+            let client = HttpClient.over(t, host, port)
+            let req = HttpRequest(method, target)
+            req.body = body
+            req.headers.set("Connection", "close")
+            let res = client.send(req)
+            client.close()
             res
         }
         case none -> none
@@ -567,34 +1770,156 @@ fn request(method: string, host: string, port: int, target: string, bodyText: st
 }
 
 fn get(host: string, port: int, target: string) -> HttpResponse? {
-    request("GET", host, port, target, "")
+    request(host, port, "GET", target, bytes(""))
 }
 
-fn post(host: string, port: int, target: string, bodyText: string) -> HttpResponse? {
-    request("POST", host, port, target, bodyText)
+fn post(host: string, port: int, target: string, body: List<byte>) -> HttpResponse? {
+    request(host, port, "POST", target, body)
 }
 
-// Serve one accepted connection with a handler that returns an HttpResponse.
-// Returns true if a request was handled.
-fn serveOnce(listener: TcpListener, handler: fn(HttpRequest) -> HttpResponse) -> bool {
-    match (listener.accept()) {
-        case some(s) -> {
-            match (readRequest(s)) {
-                case some(req) -> {
-                    var res = handler(req)
-                    if (!res.headers.has("Connection")) {
-                        res.headers.set("Connection", "close")
-                    }
-                    let _ = writeResponse(s, res)
-                    s.close()
-                    return true
-                }
+fn postText(host: string, port: int, target: string, text: string) -> HttpResponse? {
+    request(host, port, "POST", target, bytes(text))
+}
+
+// ---------------------------------------------------------------------------
+// Server
+// ---------------------------------------------------------------------------
+
+/// An HTTP server over one listener. `serveOnce` accepts one connection and
+/// serves that connection's requests until the peer closes or a response says
+/// `Connection: close`; it runs on the caller's thread. `serveOnceDetached`
+/// runs the same path on a new task, so several workers can serve one
+/// listener concurrently. The handler runs on whichever thread serves the
+/// connection.
+class HttpServer {
+    var listener: TcpListener
+    var handler: fn (HttpRequest) -> HttpResponse
+    var error: NetError
+    var closed: bool
+
+    constructor(listener: TcpListener, handler: fn (HttpRequest) -> HttpResponse) {
+        this.listener = listener
+        this.handler = handler
+        this.error = NetError()
+        this.closed = false
+    }
+
+    static fn bind(host: string, port: int, handler: fn (HttpRequest) -> HttpResponse, err: NetError? = none) -> HttpServer? {
+        match (TcpListener.bind(host, port, err)) {
+            case some(l) -> HttpServer(l, handler)
+            case none -> none
+        }
+    }
+
+    fn localPort() -> int {
+        this.listener.localPort()
+    }
+
+    fn lastError() -> NetError {
+        this.error
+    }
+
+    /// Serve requests on one already-accepted transport (plain or TLS).
+    /// Returns the number of requests handled and closes the connection.
+    fn serveConn(conn: Conn) -> int {
+        let hc = HttpConn(conn)
+        var served = 0
+        while (true) {
+            let reqOpt = hc.readRequest()
+            match (reqOpt) {
                 case none -> {
-                    s.close()
-                    return false
+                    let e = hc.lastError()
+                    if (e.isSet()) {
+                        this.error.copyFrom(e)
+                    }
+                    break
+                }
+                case some(req) -> {
+                    let res = this.handler(req)
+                    let want = requestWantsKeepAlive(req) && responseWantsKeepAlive(res)
+                    if (!want) {
+                        res.closeAfter = true
+                    }
+                    let ok = hc.writeResponse(res, req.method)
+                    served = served + 1
+                    if (!ok) {
+                        let e = hc.lastError()
+                        if (e.isSet()) {
+                            this.error.copyFrom(e)
+                        }
+                        break
+                    }
+                    if (!want) {
+                        break
+                    }
                 }
             }
         }
-        case none -> false
+        hc.close()
+        served
     }
+
+    /// Accept one connection and serve it. False when accept failed or no
+    /// request was handled.
+    fn serveOnce() -> bool {
+        if (this.closed) {
+            this.error.set(ERR_OTHER, 0, "server is closed")
+            return false
+        }
+        match (this.listener.accept()) {
+            case some(t) -> {
+                this.serveConn(t)
+                true
+            }
+            case none -> {
+                this.error.copyFrom(this.listener.lastError())
+                false
+            }
+        }
+    }
+
+    /// `serveOnce` with a bound on how long to wait for the peer.
+    fn serveOnceTimeout(ms: int) -> bool {
+        if (this.closed) {
+            this.error.set(ERR_OTHER, 0, "server is closed")
+            return false
+        }
+        match (this.listener.acceptTimeout(ms)) {
+            case some(t) -> {
+                this.serveConn(t)
+                true
+            }
+            case none -> {
+                this.error.copyFrom(this.listener.lastError())
+                false
+            }
+        }
+    }
+
+    /// Accept and serve one connection on a new task. `none` when the server
+    /// is already closed; the caller joins the task to wait for the
+    /// connection to finish. Several detached workers may share one listener.
+    fn serveOnceDetached(ms: int) -> Task? {
+        if (this.closed) {
+            this.error.set(ERR_OTHER, 0, "server is closed")
+            return none
+        }
+        let srv = this
+        spawn(fn () {
+            let _ = srv.serveOnceTimeout(ms)
+        })
+    }
+
+    fn close() {
+        if (!this.closed) {
+            this.closed = true
+            this.listener.close()
+        }
+    }
+}
+
+/// Compatibility helper: serve one accepted connection with `handler`.
+fn serveOnce(listener: TcpListener, handler: fn (HttpRequest) -> HttpResponse) -> bool {
+    let srv = HttpServer(listener, handler)
+    srv.serveOnce()
 }

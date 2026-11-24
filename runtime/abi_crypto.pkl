@@ -1,0 +1,32 @@
+module runtime.abi_crypto
+
+// Platform seam for cryptographic primitives that cannot be written portably
+// or must come from the OS. Hashes and HMAC currently live in `std.crypto` as
+// ordinary Pickle code; only the CSPRNG is platform-backed.
+//
+// Windows: BCryptGenRandom with the system-preferred RNG. A POSIX backend
+// replaces this body (getrandom/urandom) without changing `std.crypto`.
+// Nothing here is used for TLS record cryptography: TLS is implemented by the
+// OS TLS provider, never by std.crypto.
+
+/// Copy of a 32-bit C/NT status in the low half of rax, sign-extended.
+fn s32(v: int) -> int {
+    let m = v & 4294967295
+    if (m >= 2147483648) {
+        return m - 4294967296
+    }
+    return m
+}
+
+/// Fill `n` bytes at `buf` from the OS CSPRNG. Returns 0 on success or a
+/// negative platform status. `n <= 0` is a no-op.
+fn cryptoRandom(buf: int, n: int) -> int {
+    if (n <= 0) {
+        return 0
+    }
+    let st = s32(win_bcrypt_gen_random(0, buf, n, 2))
+    if (st != 0) {
+        return 0 - (st & 4294967295)
+    }
+    return 0
+}

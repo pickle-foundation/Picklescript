@@ -1,0 +1,486 @@
+module std.tls
+
+// std.tls: TLS client and server connections over `std.net`, backed by the OS
+// TLS provider (Schannel on Windows; `runtime.abi_tls` is the only platform
+// seam).
+//
+// The public type is a `Conn`, exactly like `TcpStream`, so HTTP and WebSocket
+// can be written once against the byte-stream contract and run over either
+// transport. Nothing here performs cryptography: record protection, key
+// exchange and certificate chain validation belong to the OS provider.
+//
+// Certificate validation is ON by default for clients. A successful
+// `connect`/`wrap` means the peer presented a chain that reaches a trusted root
+// and a leaf whose name matches `host` (CN or subjectAltName) under the
+// CryptoAPI SSL policy. `verify = false` exists for loopback tests and private
+// PKI; it is never the default. Servers present the certificate in their
+// PKCS#12 blob; client-certificate authentication is not requested.
+//
+// Ownership: `wrap`/`accept` take over the TCP stream they are given. On
+// handshake failure that stream is closed; on success `TlsStream.close` closes
+// both the TLS session (best-effort close_notify) and the TCP stream.
+
+import { Conn, TcpStream, NetError, ERR_CLOSED, ERR_TLS, READ_CHUNK } from std.net
+import { tlsClientConnect, tlsServerAccept, tlsRead, tlsWrite, tlsClose, tlsErrStage, tlsErrStatus, tlsErrDetail, tlsLastStage, tlsLastStatus, tlsLastDetail, TLS_STAGE_NONE, TLS_STAGE_ALLOC, TLS_STAGE_CREDENTIALS, TLS_STAGE_HANDSHAKE, TLS_STAGE_CERT_QUERY, TLS_STAGE_CHAIN, TLS_STAGE_VERIFY, TLS_STAGE_SIZES, TLS_STAGE_SEND, TLS_STAGE_RECV, TLS_STAGE_RECORD, TLS_STAGE_TRUNCATED, TLS_STAGE_CLOSED, TLS_CRED_DETAIL_IMPORT, TLS_CRED_DETAIL_CERT, TLS_CRED_DETAIL_ACQUIRE } from runtime.abi_tls
+
+/// Largest single `readSome` request.
+const MAX_READ: int = 1048576
+
+// ---------------------------------------------------------------------------
+// Raw byte buffers
+//
+// The ABI exchanges raw buffers; these mirror the helpers in `std.net` so this
+// module does not depend on another stdlib module's internals.
+// ---------------------------------------------------------------------------
+
+fn rawAlloc(n: int) -> int {
+    var words = (n + 7) / 8
+    if (words < 1) {
+        words = 1
+    }
+    unsafe {
+        let p = alloc(int, words)
+        var i = 0
+        while (i < words) {
+            p[i] = 0
+            i = i + 1
+        }
+        return p as int
+    }
+}
+
+fn rawFree(p: int) {
+    if (p != 0) {
+        unsafe {
+            free(p as *int)
+        }
+    }
+}
+
+fn rawPutByte(p: int, i: int, v: int) {
+    unsafe {
+        let w = p as *int
+        let sh = (i & 7) * 8
+        w[i >> 3] = (w[i >> 3] & ((0 - 1) ^ (255 << sh))) | ((v & 255) << sh)
+    }
+}
+
+fn rawAppend(out: List<byte>, p: int, at: int, n: int) {
+    unsafe {
+        let w = p as *int
+        var i = 0
+        while (i < n) {
+            let j = at + i
+            out.push(((w[j >> 3] >> ((j & 7) * 8)) & 255) as byte)
+            i = i + 1
+        }
+    }
+}
+
+fn rawToBytes(p: int, n: int) -> List<byte> {
+    var out = bytes("")
+    rawAppend(out, p, 0, n)
+    out
+}
+
+fn rawFromBytes(data: List<byte>, off: int, n: int) -> int {
+    let p = rawAlloc(n)
+    var i = 0
+    while (i < n) {
+        rawPutByte(p, i, data[off + i] as int)
+        i = i + 1
+    }
+    p
+}
+
+// ---------------------------------------------------------------------------
+// Error formatting
+// ---------------------------------------------------------------------------
+
+fn hex32(v: int) -> string {
+    let digits = "0123456789abcdef"
+    var out = ""
+    var sh = 28
+    while (sh >= 0) {
+        out = out + "{digits[(v >> sh) & 15] as char}"
+        sh = sh - 4
+    }
+    out
+}
+
+fn stageName(stage: int) -> string {
+    if (stage == TLS_STAGE_ALLOC) {
+        return "buffer setup"
+    }
+    if (stage == TLS_STAGE_CREDENTIALS) {
+        return "credential acquisition"
+    }
+    if (stage == TLS_STAGE_HANDSHAKE) {
+        return "handshake"
+    }
+    if (stage == TLS_STAGE_CERT_QUERY) {
+        return "certificate query"
+    }
+    if (stage == TLS_STAGE_CHAIN) {
+        return "certificate chain build"
+    }
+    if (stage == TLS_STAGE_VERIFY) {
+        return "certificate verification"
+    }
+    if (stage == TLS_STAGE_SIZES) {
+        return "stream size query"
+    }
+    if (stage == TLS_STAGE_SEND) {
+        return "record send"
+    }
+    if (stage == TLS_STAGE_RECV) {
+        return "record receive"
+    }
+    if (stage == TLS_STAGE_RECORD) {
+        return "record processing"
+    }
+    if (stage == TLS_STAGE_TRUNCATED) {
+        return "truncated connection"
+    }
+    if (stage == TLS_STAGE_CLOSED) {
+        return "closed stream"
+    }
+    "stage " + str(stage)
+}
+
+/// The `NetError` for a failed `tlsClientConnect`, read from the ABI's
+/// one-slot report before any other connect can overwrite it.
+fn connectError(host: string) -> NetError {
+    let stage = tlsLastStage()
+    let status = tlsLastStatus()
+    let detail = tlsLastDetail()
+    let e = NetError()
+    if (stage == TLS_STAGE_VERIFY) {
+        e.set(ERR_TLS, detail, "tls connect " + host + ": certificate verification failed (0x" + hex32(detail) + ")")
+        return e
+    }
+    if (stage == TLS_STAGE_TRUNCATED) {
+        e.set(ERR_TLS, 0, "tls connect " + host + ": connection closed during the handshake")
+        return e
+    }
+    if (stage == TLS_STAGE_RECV || stage == TLS_STAGE_SEND) {
+        if (status < 0) {
+            e.setOs("tls connect " + host, 0 - status)
+            return e
+        }
+    }
+    e.set(ERR_TLS, status, "tls connect " + host + ": " + stageName(stage) + " failed (status 0x" + hex32(status) + ")")
+    e
+}
+
+/// The `NetError` for a failed `tlsServerAccept`, read from the ABI's one-slot
+/// report before any other accept can overwrite it.
+fn acceptError() -> NetError {
+    let stage = tlsLastStage()
+    let status = tlsLastStatus()
+    let detail = tlsLastDetail()
+    let e = NetError()
+    if (stage == TLS_STAGE_CREDENTIALS && detail != 0) {
+        e.set(ERR_TLS, detail, "tls accept: server credential setup failed (" + credDetailName(detail) + ")")
+        return e
+    }
+    if (stage == TLS_STAGE_TRUNCATED) {
+        e.set(ERR_TLS, 0, "tls accept: connection closed during the handshake")
+        return e
+    }
+    if (stage == TLS_STAGE_RECV || stage == TLS_STAGE_SEND) {
+        if (status < 0) {
+            e.setOs("tls accept", 0 - status)
+            return e
+        }
+    }
+    e.set(ERR_TLS, status, "tls accept: " + stageName(stage) + " failed (status 0x" + hex32(status) + ")")
+    e
+}
+
+/// Human name for the credential sub-stage of a failed accept.
+fn credDetailName(detail: int) -> string {
+    if (detail == TLS_CRED_DETAIL_IMPORT) {
+        return "PKCS#12 import failed"
+    }
+    if (detail == TLS_CRED_DETAIL_CERT) {
+        return "no certificate in the PKCS#12 store"
+    }
+    if (detail == TLS_CRED_DETAIL_ACQUIRE) {
+        return "AcquireCredentialsHandle failed"
+    }
+    "detail " + str(detail)
+}
+
+// ---------------------------------------------------------------------------
+// TlsStream
+// ---------------------------------------------------------------------------
+
+class TlsStream implements Conn {
+    var inner: TcpStream
+    var handle: int
+    var error: NetError
+    var closed: bool
+    var host: string
+
+    constructor(inner: TcpStream, handle: int, host: string) {
+        this.inner = inner
+        this.handle = handle
+        this.error = NetError()
+        this.closed = false
+        this.host = host
+    }
+
+    /// Connect to `host:port` and start TLS. `host` is both the SNI name and
+    /// the name checked against the peer certificate. `timeoutMs > 0` bounds
+    /// each TCP attempt only.
+    static fn connect(host: string, port: int, timeoutMs: int = 0, verify: bool = true, err: NetError? = none) -> TlsStream? {
+        match (TcpStream.connect(host, port, timeoutMs, err)) {
+            case some(t) -> TlsStream.wrap(t, host, verify, err)
+            case none -> none
+        }
+    }
+
+    /// Start TLS over an already-connected TCP stream. On failure the stream
+    /// is closed and the reason is recorded in `err` (when supplied).
+    static fn wrap(inner: TcpStream, host: string, verify: bool = true, err: NetError? = none) -> TlsStream? {
+        var v = 0
+        if (verify) {
+            v = 1
+        }
+        let h = tlsClientConnect(inner.fd, host, v)
+        if (h == 0) {
+            let e = connectError(host)
+            if (let some(sink) = err) {
+                sink.copyFrom(e)
+            }
+            inner.close()
+            return none
+        }
+        TlsStream(inner, h, host)
+    }
+
+    /// Start TLS on the server side of an accepted TCP stream. `pfx` is a
+    /// PKCS#12 (PFX) blob holding the server certificate and its private key;
+    /// `password` unlocks it. On failure the stream is closed and the reason
+    /// is recorded in `err` (when supplied). Server streams have no host name,
+    /// so `hostName()` is empty.
+    static fn accept(inner: TcpStream, pfx: List<byte>, password: string, err: NetError? = none) -> TlsStream? {
+        let n = len(pfx)
+        let raw = rawAlloc(n)
+        var i = 0
+        while (i < n) {
+            rawPutByte(raw, i, pfx[i] as int)
+            i = i + 1
+        }
+        let h = tlsServerAccept(inner.fd, raw, n, password)
+        rawFree(raw)
+        if (h == 0) {
+            let e = acceptError()
+            if (let some(sink) = err) {
+                sink.copyFrom(e)
+            }
+            inner.close()
+            return none
+        }
+        TlsStream(inner, h, "")
+    }
+
+    fn lastError() -> NetError {
+        this.error
+    }
+
+    fn isClosed() -> bool {
+        this.closed
+    }
+
+    fn hostName() -> string {
+        this.host
+    }
+
+    fn failClosed(op: string) {
+        this.error.set(ERR_CLOSED, 0, op + ": TLS stream is closed")
+    }
+
+    /// Up to `max` plaintext bytes. none on error, empty on orderly EOF.
+    fn readSome(max: int) -> List<byte>? {
+        if (this.closed) {
+            this.failClosed("read")
+            return none
+        }
+        var want = max
+        if (want <= 0) {
+            return bytes("")
+        }
+        if (want > MAX_READ) {
+            want = MAX_READ
+        }
+        let buf = rawAlloc(want)
+        let got = tlsRead(this.handle, buf, want)
+        if (got < 0) {
+            this.recordAbiError("read")
+            rawFree(buf)
+            return none
+        }
+        let out = rawToBytes(buf, got)
+        rawFree(buf)
+        out
+    }
+
+    /// Legacy: up to n bytes; empty on EOF *or* error.
+    fn read(n: int) -> List<byte> {
+        match (this.readSome(n)) {
+            case some(b) -> b
+            case none -> bytes("")
+        }
+    }
+
+    /// Exactly n bytes, or none on EOF/error before n bytes.
+    fn readExact(n: int) -> List<byte>? {
+        var out = bytes("")
+        while (len(out) < n) {
+            var want = n - len(out)
+            if (want > READ_CHUNK) {
+                want = READ_CHUNK
+            }
+            match (this.readSome(want)) {
+                case some(chunk) -> {
+                    if (len(chunk) == 0) {
+                        this.error.set(ERR_CLOSED, 0, "read: connection closed after " + str(len(out)) + " of " + str(n) + " bytes")
+                        return none
+                    }
+                    for (b in chunk) {
+                        out.push(b)
+                    }
+                }
+                case none -> {
+                    return none
+                }
+            }
+        }
+        out
+    }
+
+    /// Read until EOF, error, or `maxTotal` bytes (default 1 MiB).
+    fn readAll(maxTotal: int) -> List<byte> {
+        var out = bytes("")
+        var limit = maxTotal
+        if (limit <= 0) {
+            limit = MAX_READ
+        }
+        while (len(out) < limit) {
+            var want = limit - len(out)
+            if (want > READ_CHUNK) {
+                want = READ_CHUNK
+            }
+            match (this.readSome(want)) {
+                case some(chunk) -> {
+                    if (len(chunk) == 0) {
+                        break
+                    }
+                    for (b in chunk) {
+                        out.push(b)
+                    }
+                }
+                case none -> {
+                    break
+                }
+            }
+        }
+        out
+    }
+
+    fn readText(maxTotal: int) -> string {
+        str(this.readAll(maxTotal))
+    }
+
+    /// Write every byte of `data` as one or more TLS records.
+    fn writeAll(data: List<byte>) -> bool {
+        if (this.closed) {
+            this.failClosed("write")
+            return false
+        }
+        let n = len(data)
+        if (n == 0) {
+            return true
+        }
+        let buf = rawFromBytes(data, 0, n)
+        let rc = tlsWrite(this.handle, buf, n)
+        rawFree(buf)
+        if (rc != 0) {
+            this.recordAbiError("write")
+            return false
+        }
+        true
+    }
+
+    fn writeText(text: string) -> bool {
+        this.writeAll(bytes(text))
+    }
+
+    /// Bound blocking reads (0 = no bound). Forwarded to the TCP socket.
+    fn setRecvTimeoutMs(ms: int) -> bool {
+        if (this.closed) {
+            this.failClosed("set recv timeout")
+            return false
+        }
+        let ok = this.inner.setRecvTimeoutMs(ms)
+        if (!ok) {
+            this.error.copyFrom(this.inner.lastError())
+        }
+        ok
+    }
+
+    fn peerAddr() -> string? {
+        this.inner.peerAddr()
+    }
+
+    fn localAddr() -> string? {
+        this.inner.localAddr()
+    }
+
+    /// Best-effort close_notify, then release the TLS state and the TCP
+    /// stream. Idempotent.
+    fn close() {
+        if (!this.closed) {
+            if (this.handle != 0) {
+                tlsClose(this.handle)
+                this.handle = 0
+            }
+            this.inner.close()
+            this.closed = true
+        }
+    }
+
+    /// Turn the ABI's staged failure into a portable `NetError`.
+    fn recordAbiError(op: string) {
+        if (this.handle == 0) {
+            this.failClosed(op)
+            return
+        }
+        let stage = tlsErrStage(this.handle)
+        let status = tlsErrStatus(this.handle)
+        let detail = tlsErrDetail(this.handle)
+        if (stage == TLS_STAGE_RECV || stage == TLS_STAGE_SEND) {
+            if (status < 0) {
+                this.error.setOs(op, 0 - status)
+                return
+            }
+            this.error.set(ERR_TLS, detail, op + ": " + stageName(stage) + " failed (status 0x" + hex32(status) + ")")
+            return
+        }
+        if (stage == TLS_STAGE_VERIFY) {
+            this.error.set(ERR_TLS, detail, op + ": certificate verification failed (0x" + hex32(detail) + ")")
+            return
+        }
+        if (stage == TLS_STAGE_TRUNCATED) {
+            this.error.set(ERR_TLS, 0, op + ": connection closed inside a TLS record (" + str(detail) + " bytes buffered)")
+            return
+        }
+        if (stage == TLS_STAGE_CLOSED) {
+            this.failClosed(op)
+            return
+        }
+        this.error.set(ERR_TLS, status, op + ": " + stageName(stage) + " failed (status 0x" + hex32(status) + ")")
+    }
+}

@@ -9,6 +9,7 @@
 // raw-byte helpers for struct/IO marshalling.
 
 import { abiRawAlloc } from runtime.abi_raw
+import { worldAcquire, worldRelease } from runtime.abi_world
 
 const AF_INET: int = 2
 const SOCK_STREAM: int = 1
@@ -129,13 +130,21 @@ fn platListen(s: int, backlog: int) -> int {
     return win_listen(s, backlog)
 }
 
+/// Every blocking socket call releases the world lock around the OS call. The
+/// peer endpoint may be another Pickle thread in this process (the loopback
+/// handshake tests), and it cannot make progress while the caller holds the
+/// only world lock. The buffer(s) stay valid because they are either raw
+/// `alloc` blocks or reachable from the caller's shadow frame, and the
+/// collector's mark walks every registered thread's frame chain.
 fn platAccept(s: int) -> int {
     unsafe {
         let sa = alloc(int, 16) // room for storage + len
         zeroBuf(sa, 16)
         let lenp = alloc(int, 1)
         lenp[0] = 16
+        worldRelease()
         let client = win_accept(s, sa as int, lenp as int)
+        worldAcquire()
         free(lenp)
         free(sa)
         return client
@@ -146,18 +155,26 @@ fn platConnect4(s: int, a: int, b: int, c: int, d: int, port: int) -> int {
     unsafe {
         let sa = alloc(int, 2)
         fillSockaddrIn4(sa, a, b, c, d, port)
+        worldRelease()
         let rc = win_connect(s, sa as int, 16)
+        worldAcquire()
         free(sa)
         return rc
     }
 }
 
 fn platSend(s: int, buf: *int, n: int) -> int {
-    return win_send(s, buf as int, n, 0)
+    worldRelease()
+    let rc = win_send(s, buf as int, n, 0)
+    worldAcquire()
+    return rc
 }
 
 fn platRecv(s: int, buf: *int, n: int) -> int {
-    return win_recv(s, buf as int, n, 0)
+    worldRelease()
+    let rc = win_recv(s, buf as int, n, 0)
+    worldAcquire()
+    return rc
 }
 
 fn platSetsockoptInt(s: int, level: int, opt: int, val: int) -> int {
@@ -299,7 +316,9 @@ fn platSendTo4(s: int, buf: *int, n: int, a: int, b: int, c: int, d: int, port: 
     unsafe {
         let sa = alloc(int, 2)
         fillSockaddrIn4(sa, a, b, c, d, port)
+        worldRelease()
         let rc = win_sendto(s, buf as int, n, 0, sa as int, 16)
+        worldAcquire()
         free(sa)
         return rc
     }
@@ -313,7 +332,9 @@ fn platRecvFrom4(s: int, buf: *int, n: int, meta: *int) -> int {
         zeroBuf(sa, 4)
         let lenp = alloc(int, 1)
         lenp[0] = 16
+        worldRelease()
         let rc = win_recvfrom(s, buf as int, n, 0, sa as int, lenp as int)
+        worldAcquire()
         if (rc >= 0) {
             let a = rawByteAtBuf(sa, 4)
             let b = rawByteAtBuf(sa, 5)
@@ -544,4 +565,623 @@ fn net_resolve_local4(hostBuf: int, hostLen: int, meta: int) -> int {
     unsafe {
         return platResolveLocal4(meta as *int, hostBuf as *int, hostLen)
     }
+}
+
+// ===========================================================================
+// v3 portable surface: family-agnostic (IPv4 + IPv6) sockets, timeouts,
+// readiness polling, DNS (getaddrinfo), reverse lookup, OS randomness, and a
+// portable error-kind mapping.
+//
+// PORTABILITY CONTRACT. Everything above the `net*` functions below (std.net,
+// std.tls, std.net.http, std.net.websocket) sees only:
+//   * socket handles as `int` (-1 = invalid),
+//   * addresses as (family 4|6, w0, w1, port): the 16 address bytes packed
+//     little-endian into two words (IPv4 uses the low 4 bytes of w0),
+//   * results >= 0 on success and `-code` (a positive OS error code) on
+//     failure, plus `netErrorKind(code)` for the portable classification.
+// A Linux/POSIX or ARM64 port replaces only the bodies in this section (and
+// the AF_*/SO_* numbers, sockaddr and addrinfo layouts, which are OS ABI
+// facts); no stdlib module changes.
+// ===========================================================================
+
+const AF_INET6: int = 23
+const IPPROTO_IPV6: int = 41
+const IPV6_V6ONLY: int = 27
+const SO_ERROR: int = 4103      // 0x1007
+const SO_SNDBUF: int = 4097     // 0x1001
+const SO_RCVBUF: int = 4098     // 0x1002
+const FIONBIO: int = 2147772030 // 0x8004667E
+const FIONREAD: int = 1074030207 // 0x4004667F
+const POLLRDNORM: int = 256
+const POLLWRNORM: int = 16
+const POLLERR: int = 1
+const POLLHUP: int = 2
+const POLLNVAL: int = 4
+const NI_NAMEREQD: int = 4
+const WSAEWOULDBLOCK: int = 10035
+const WSAEINPROGRESS: int = 10036
+const WSAETIMEDOUT: int = 10060
+
+/// Portable error kinds. Keep in step with `std.net` (`ERR_*`).
+const KIND_OTHER: int = 1
+const KIND_TIMEOUT: int = 2
+const KIND_REFUSED: int = 3
+const KIND_RESET: int = 4
+const KIND_ABORTED: int = 5
+const KIND_NOT_CONNECTED: int = 6
+const KIND_ADDR_IN_USE: int = 7
+const KIND_ADDR_NOT_AVAILABLE: int = 8
+const KIND_UNREACHABLE: int = 9
+const KIND_INTERRUPTED: int = 10
+const KIND_WOULD_BLOCK: int = 11
+const KIND_INVALID_INPUT: int = 12
+const KIND_NOT_FOUND: int = 13
+const KIND_MESSAGE_SIZE: int = 18
+
+/// Sign-extend a 32-bit C `int` result. Import results arrive in rax and only
+/// the low half is defined for `int`-returning Winsock calls.
+fn s32(v: int) -> int {
+    let m = v & 4294967295
+    if (m >= 2147483648) {
+        return m - 4294967296
+    }
+    return m
+}
+
+fn wsaErr() -> int {
+    let e = s32(win_wsa_get_last_error())
+    if (e <= 0) {
+        return 1
+    }
+    return e
+}
+
+/// Byte-swapped 16-bit port as it sits in a little-endian u16 load.
+fn portBE(port: int) -> int {
+    return ((port & 255) << 8) | ((port >> 8) & 255)
+}
+
+/// Build a sockaddr for (fam, w0, w1, port) in `sa` (>= 4 words). Returns its
+/// byte length, or -1 for an unknown family.
+fn fillSockaddr(sa: *int, fam: int, w0: int, w1: int, port: int) -> int {
+    unsafe {
+        zeroBuf(sa, 4)
+        if (fam == 4) {
+            sa[0] = AF_INET | (portBE(port) << 16) | ((w0 & 4294967295) << 32)
+            return 16
+        }
+        if (fam == 6) {
+            sa[0] = AF_INET6 | (portBE(port) << 16)
+            sa[1] = w0
+            sa[2] = w1
+            sa[3] = 0
+            return 28
+        }
+        return -1
+    }
+}
+
+/// Decode a sockaddr into meta[0..3] = family(4|6), w0, w1, port.
+fn readSockaddr(sa: *int, meta: *int) -> int {
+    unsafe {
+        let fam = sa[0] & 65535
+        let pbe = (sa[0] >> 16) & 65535
+        let port = ((pbe & 255) << 8) | ((pbe >> 8) & 255)
+        if (fam == AF_INET) {
+            meta[0] = 4
+            meta[1] = (sa[0] >> 32) & 4294967295
+            meta[2] = 0
+            meta[3] = port
+            return 0
+        }
+        if (fam == AF_INET6) {
+            meta[0] = 6
+            meta[1] = sa[1]
+            meta[2] = sa[2]
+            meta[3] = port
+            return 0
+        }
+        return -1
+    }
+}
+
+fn netSocket(fam: int, kind: int) -> int {
+    let rc = netEnsureWsa()
+    if (rc != 0) {
+        return 0 - rc
+    }
+    var af = AF_INET
+    if (fam == 6) {
+        af = AF_INET6
+    } else if (fam != 4) {
+        return 0 - 10047
+    }
+    var s = INVALID_SOCKET
+    if (kind == 1) {
+        s = win_socket(af, SOCK_STREAM, IPPROTO_TCP)
+    } else {
+        s = win_socket(af, SOCK_DGRAM, IPPROTO_UDP)
+    }
+    if (s == INVALID_SOCKET) {
+        return 0 - wsaErr()
+    }
+    return s
+}
+
+fn netClose(s: int) -> int {
+    if (s < 0) {
+        return 0
+    }
+    if (s32(win_closesocket(s)) != 0) {
+        return 0 - wsaErr()
+    }
+    return 0
+}
+
+fn netShutdown(s: int, how: int) -> int {
+    if (s32(win_shutdown(s, how)) != 0) {
+        return 0 - wsaErr()
+    }
+    return 0
+}
+
+fn netBind(s: int, fam: int, w0: int, w1: int, port: int) -> int {
+    unsafe {
+        let sa = alloc(int, 4)
+        let n = fillSockaddr(sa, fam, w0, w1, port)
+        var rc = 0
+        if (n < 0) {
+            rc = 0 - 10047
+        } else if (s32(win_bind(s, sa as int, n)) != 0) {
+            rc = 0 - wsaErr()
+        }
+        free(sa)
+        return rc
+    }
+}
+
+fn netListen(s: int, backlog: int) -> int {
+    var b = backlog
+    if (b <= 0) {
+        b = SOMAXCONN
+    }
+    if (s32(win_listen(s, b)) != 0) {
+        return 0 - wsaErr()
+    }
+    return 0
+}
+
+fn netSetNonBlocking(s: int, on: int) -> int {
+    unsafe {
+        let p = alloc(int, 1)
+        p[0] = on
+        let rc = s32(win_ioctlsocket(s, FIONBIO, p as int))
+        free(p)
+        if (rc != 0) {
+            return 0 - wsaErr()
+        }
+        return 0
+    }
+}
+
+/// Wait until `s` is readable (events & 1) and/or writable (events & 2).
+/// Returns a readiness mask (1 readable, 2 writable, 4 error/hangup), 0 on
+/// timeout, or -code. `ms < 0` waits forever.
+fn netPoll(s: int, events: int, ms: int) -> int {
+    unsafe {
+        let pfd = alloc(int, 2)
+        pfd[0] = s
+        var ev = 0
+        if ((events & 1) != 0) {
+            ev = ev | POLLRDNORM
+        }
+        if ((events & 2) != 0) {
+            ev = ev | POLLWRNORM
+        }
+        pfd[1] = ev
+        var t = ms
+        if (t < 0) {
+            t = -1
+        }
+        // A poll is a blocking wait: release the world lock or no peer thread
+        // (for example a loopback client that has not connected yet) can run
+        // to make the socket ready.
+        worldRelease()
+        let rc = s32(win_wsa_poll(pfd as int, 1, t))
+        worldAcquire()
+        var out = 0
+        if (rc < 0) {
+            out = 0 - wsaErr()
+        } else if (rc > 0) {
+            let rev = (pfd[1] >> 16) & 65535
+            if ((rev & POLLRDNORM) != 0) {
+                out = out | 1
+            }
+            if ((rev & POLLWRNORM) != 0) {
+                out = out | 2
+            }
+            if ((rev & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+                out = out | 4
+            }
+        }
+        free(pfd)
+        return out
+    }
+}
+
+fn netSockError(s: int) -> int {
+    unsafe {
+        let v = alloc(int, 1)
+        v[0] = 0
+        let lp = alloc(int, 1)
+        lp[0] = 4
+        let rc = s32(win_getsockopt(s, SOL_SOCKET, SO_ERROR, v as int, lp as int))
+        var e = v[0] & 4294967295
+        if (rc != 0) {
+            e = wsaErr()
+        }
+        free(lp)
+        free(v)
+        return e
+    }
+}
+
+/// Connect, optionally bounded by `timeoutMs` (> 0). Returns 0 or -code.
+fn netConnect(s: int, fam: int, w0: int, w1: int, port: int, timeoutMs: int) -> int {
+    unsafe {
+        let sa = alloc(int, 4)
+        let n = fillSockaddr(sa, fam, w0, w1, port)
+        if (n < 0) {
+            free(sa)
+            return 0 - 10047
+        }
+        if (timeoutMs <= 0) {
+            var rc0 = 0
+            if (s32(win_connect(s, sa as int, n)) != 0) {
+                rc0 = 0 - wsaErr()
+            }
+            free(sa)
+            return rc0
+        }
+        let nb = netSetNonBlocking(s, 1)
+        if (nb != 0) {
+            free(sa)
+            return nb
+        }
+        var rc = 0
+        if (s32(win_connect(s, sa as int, n)) != 0) {
+            let e = wsaErr()
+            if (e == WSAEWOULDBLOCK || e == WSAEINPROGRESS) {
+                let pr = netPoll(s, 2, timeoutMs)
+                if (pr < 0) {
+                    rc = pr
+                } else if (pr == 0) {
+                    rc = 0 - WSAETIMEDOUT
+                } else {
+                    let se = netSockError(s)
+                    if (se != 0) {
+                        rc = 0 - se
+                    }
+                }
+            } else {
+                rc = 0 - e
+            }
+        }
+        free(sa)
+        let _r = netSetNonBlocking(s, 0)
+        return rc
+    }
+}
+
+/// Accept one connection; writes the peer address to meta[0..3].
+fn netAccept(s: int, meta: int) -> int {
+    unsafe {
+        let sa = alloc(int, 16)
+        zeroBuf(sa, 16)
+        let lp = alloc(int, 1)
+        lp[0] = 128
+        // `accept` is a blocking wait on a listener with no pending connection.
+        // Release the world lock exactly like `platAccept`: two detached
+        // workers can poll the same listener and both enter accept after one
+        // connection becomes ready; holding the GIL here would prevent the
+        // winner from running the handshake (and the client from timing out).
+        worldRelease()
+        let c = win_accept(s, sa as int, lp as int)
+        worldAcquire()
+        var out = c
+        if (c == INVALID_SOCKET) {
+            out = 0 - wsaErr()
+        } else {
+            let _m = readSockaddr(sa, meta as *int)
+        }
+        free(lp)
+        free(sa)
+        return out
+    }
+}
+
+fn netSend(s: int, buf: int, n: int) -> int {
+    worldRelease()
+    let raw = win_send(s, buf, n, 0)
+    worldAcquire()
+    let rc = s32(raw)
+    if (rc < 0) {
+        return 0 - wsaErr()
+    }
+    return rc
+}
+
+/// Receive up to n bytes. 0 = orderly shutdown by the peer.
+fn netRecv(s: int, buf: int, n: int) -> int {
+    worldRelease()
+    let raw = win_recv(s, buf, n, 0)
+    worldAcquire()
+    let rc = s32(raw)
+    if (rc < 0) {
+        return 0 - wsaErr()
+    }
+    return rc
+}
+
+fn netSendTo(s: int, buf: int, n: int, fam: int, w0: int, w1: int, port: int) -> int {
+    unsafe {
+        let sa = alloc(int, 4)
+        let sl = fillSockaddr(sa, fam, w0, w1, port)
+        var rc = 0 - 10047
+        if (sl > 0) {
+            worldRelease()
+            rc = s32(win_sendto(s, buf, n, 0, sa as int, sl))
+            worldAcquire()
+            if (rc < 0) {
+                rc = 0 - wsaErr()
+            }
+        }
+        free(sa)
+        return rc
+    }
+}
+
+fn netRecvFrom(s: int, buf: int, n: int, meta: int) -> int {
+    unsafe {
+        let sa = alloc(int, 16)
+        zeroBuf(sa, 16)
+        let lp = alloc(int, 1)
+        lp[0] = 128
+        worldRelease()
+        var rc = s32(win_recvfrom(s, buf, n, 0, sa as int, lp as int))
+        worldAcquire()
+        if (rc < 0) {
+            rc = 0 - wsaErr()
+        } else {
+            let _m = readSockaddr(sa, meta as *int)
+        }
+        free(lp)
+        free(sa)
+        return rc
+    }
+}
+
+fn netEndpoint(s: int, meta: int, peer: bool) -> int {
+    unsafe {
+        let sa = alloc(int, 16)
+        zeroBuf(sa, 16)
+        let lp = alloc(int, 1)
+        lp[0] = 128
+        var rc = 0
+        if (peer) {
+            rc = s32(win_getpeername(s, sa as int, lp as int))
+        } else {
+            rc = s32(win_getsockname(s, sa as int, lp as int))
+        }
+        var out = 0
+        if (rc != 0) {
+            out = 0 - wsaErr()
+        } else if (readSockaddr(sa, meta as *int) != 0) {
+            out = 0 - 10047
+        }
+        free(lp)
+        free(sa)
+        return out
+    }
+}
+
+fn netSockName(s: int, meta: int) -> int {
+    return netEndpoint(s, meta, false)
+}
+
+fn netPeerName(s: int, meta: int) -> int {
+    return netEndpoint(s, meta, true)
+}
+
+/// Bytes readable without blocking, or -code.
+fn netAvailable(s: int) -> int {
+    unsafe {
+        let p = alloc(int, 1)
+        p[0] = 0
+        let rc = s32(win_ioctlsocket(s, FIONREAD, p as int))
+        let v = p[0] & 4294967295
+        free(p)
+        if (rc != 0) {
+            return 0 - wsaErr()
+        }
+        return v
+    }
+}
+
+/// Portable socket options: 1 reuseaddr, 2 nodelay, 3 keepalive, 4 broadcast,
+/// 5 recv timeout ms, 6 send timeout ms, 7 IPv6-only, 8 recv buffer, 9 send
+/// buffer. Returns 0 or -code.
+fn netSetOpt(s: int, which: int, val: int) -> int {
+    var level = SOL_SOCKET
+    var opt = 0
+    var v = val
+    if (which == 1) {
+        opt = SO_REUSEADDR
+    } else if (which == 2) {
+        level = IPPROTO_TCP
+        opt = TCP_NODELAY
+    } else if (which == 3) {
+        opt = SO_KEEPALIVE
+    } else if (which == 4) {
+        opt = SO_BROADCAST
+    } else if (which == 5) {
+        opt = SO_RCVTIMEO
+        if (v < 0) {
+            v = 0
+        }
+    } else if (which == 6) {
+        opt = SO_SNDTIMEO
+        if (v < 0) {
+            v = 0
+        }
+    } else if (which == 7) {
+        level = IPPROTO_IPV6
+        opt = IPV6_V6ONLY
+    } else if (which == 8) {
+        opt = SO_RCVBUF
+    } else if (which == 9) {
+        opt = SO_SNDBUF
+    } else {
+        return 0 - 10022
+    }
+    if (s32(platSetsockoptInt(s, level, opt, v)) != 0) {
+        return 0 - wsaErr()
+    }
+    return 0
+}
+
+/// Resolve the NUL-terminated host in `hostBuf` through the OS resolver.
+/// `fam` is 0 (any), 4 or 6. Writes up to `max` entries of 3 words
+/// (family, w0, w1) into `out` and returns the count, or -code.
+fn netResolve(hostBuf: int, fam: int, out: int, max: int) -> int {
+    let wr = netEnsureWsa()
+    if (wr != 0) {
+        return 0 - wr
+    }
+    unsafe {
+        let hints = alloc(int, 6)
+        zeroBuf(hints, 6)
+        var af = 0
+        if (fam == 4) {
+            af = AF_INET
+        } else if (fam == 6) {
+            af = AF_INET6
+        }
+        // addrinfo (x64 Windows): ai_flags@0 ai_family@4 ai_socktype@8 ...
+        hints[0] = af << 32
+        hints[1] = SOCK_STREAM
+        let res = alloc(int, 1)
+        res[0] = 0
+        let rc = s32(win_getaddrinfo(hostBuf, 0, hints as int, res as int))
+        free(hints)
+        if (rc != 0) {
+            free(res)
+            return 0 - rc
+        }
+        let o = out as *int
+        let meta = alloc(int, 4)
+        var count = 0
+        var node = res[0]
+        while (node != 0 && count < max) {
+            let np = node as *int
+            let addr = np[4]
+            if (addr != 0) {
+                if (readSockaddr(addr as *int, meta) == 0) {
+                    o[count * 3] = meta[0]
+                    o[count * 3 + 1] = meta[1]
+                    o[count * 3 + 2] = meta[2]
+                    count = count + 1
+                }
+            }
+            node = np[5]
+        }
+        free(meta)
+        win_freeaddrinfo(res[0])
+        free(res)
+        return count
+    }
+}
+
+/// Reverse-resolve an address into the NUL-terminated name buffer `out`
+/// (`cap` bytes). Returns the name length, or -code (no name = not found).
+fn netReverse(fam: int, w0: int, w1: int, out: int, cap: int) -> int {
+    let wr = netEnsureWsa()
+    if (wr != 0) {
+        return 0 - wr
+    }
+    unsafe {
+        let sa = alloc(int, 4)
+        let sl = fillSockaddr(sa, fam, w0, w1, 0)
+        if (sl < 0) {
+            free(sa)
+            return 0 - 10047
+        }
+        let rc = s32(win_getnameinfo(sa as int, sl, out, cap, 0, 0, NI_NAMEREQD))
+        free(sa)
+        if (rc != 0) {
+            return 0 - rc
+        }
+        let ob = out as *int
+        var n = 0
+        while (n < cap && rawByteAtBuf(ob, n) != 0) {
+            n = n + 1
+        }
+        return n
+    }
+}
+
+/// Fill `n` bytes at `buf` from the OS CSPRNG. Returns 0 or -status.
+fn netRandom(buf: int, n: int) -> int {
+    let st = s32(win_bcrypt_gen_random(0, buf, n, 2))
+    if (st != 0) {
+        return 0 - (st & 4294967295)
+    }
+    return 0
+}
+
+/// Classify an OS socket/resolver error code into a portable kind.
+fn netErrorKind(code: int) -> int {
+    if (code == 10060) {
+        return KIND_TIMEOUT
+    }
+    if (code == 10061) {
+        return KIND_REFUSED
+    }
+    if (code == 10054) {
+        return KIND_RESET
+    }
+    if (code == 10053) {
+        return KIND_ABORTED
+    }
+    if (code == 10057 || code == 10058) {
+        return KIND_NOT_CONNECTED
+    }
+    if (code == 10048) {
+        return KIND_ADDR_IN_USE
+    }
+    if (code == 10049) {
+        return KIND_ADDR_NOT_AVAILABLE
+    }
+    if (code == 10050 || code == 10051 || code == 10065) {
+        return KIND_UNREACHABLE
+    }
+    if (code == 10004) {
+        return KIND_INTERRUPTED
+    }
+    if (code == 10035 || code == 10036) {
+        return KIND_WOULD_BLOCK
+    }
+    if (code == 10022 || code == 10047 || code == 10038 || code == 10014) {
+        return KIND_INVALID_INPUT
+    }
+    if (code == 11001 || code == 11004) {
+        return KIND_NOT_FOUND
+    }
+    if (code == 11002) {
+        return KIND_TIMEOUT
+    }
+    if (code == 10040) {
+        return KIND_MESSAGE_SIZE
+    }
+    return KIND_OTHER
 }

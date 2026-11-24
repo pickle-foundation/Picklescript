@@ -1,0 +1,1338 @@
+module runtime.abi_tls
+
+// Windows TLS seam: one stateful connection object over Schannel/SSPI.
+//
+// WHY THIS IS A RAW STATE BLOCK AND NOT A CLASS. The ABI modules stay below
+// the collector: they are the code the collector may call, so they must not
+// allocate managed objects, register class ids, or run shadow-stack pushes.
+// `abi_raw.pkl` records that split, and `abi_net.pkl` keeps its socket state
+// in the caller's hands for the same reason. TLS needs mutable state across
+// calls (two SSPI handles, stream sizes, a record buffer, pending plaintext),
+// so it lives in one `alloc(int, ST_WORDS)` block and the public handle is the
+// block's byte address. `std.tls` holds that integer in `TlsStream.handle`;
+// nothing above this layer knows what a CredHandle or a CtxtHandle is.
+//
+// WHY THE OS OWNS THE CRYPTOGRAPHY. TLS record protection is Schannel's job,
+// never `std.crypto`'s. This module only moves buffers between the socket and
+// `EncryptMessage`/`DecryptMessage`. Chain building and hostname validation
+// are CryptoAPI's job (`CertGetCertificateChain` +
+// `CertVerifyCertificateChainPolicy(CERT_CHAIN_POLICY_SSL)`), because Schannel
+// is started with `ISC_REQ_MANUAL_CRED_VALIDATION`: the package must not
+// second-guess a certificate the caller has not accepted, and it must not
+// silently accept one either.
+//
+// WHY TLS 1.2 AND NOT 1.3. TLS 1.3 requires the `SCH_CREDENTIALS` credential
+// form; `SCHANNEL_CRED` is the legacy form and negotiates up to TLS 1.2 on
+// current Windows. TLS 1.2 is what every public server still accepts, and the
+// implementation below is the documented Schannel stream API. Moving to
+// `SCH_CREDENTIALS` later changes only `tlsAcquire`; the record path stays.
+//
+// ERROR STAGING. Every operation records `stage`/`status`/`detail` in the
+// state block, so concurrent streams never share an error slot. A failed
+// *connect* is the one case with no handle to ask, so it copies the same three
+// values into module globals right before freeing the partial state; `std.tls`
+// reads them through `tlsLastStage/Status/Detail`. `stage` is one of the
+// TLS_STAGE_* values, `status` is a 32-bit SECURITY_STATUS (zero-extended) or
+// a negative Winsock code for send/recv failures, and `detail` carries a
+// CryptoAPI certificate error when the stage is TLS_STAGE_VERIFY.
+//
+// ABI FACTS (Windows SDK 10.0.26100). SCHANNEL_CRED is 80 bytes with
+// dwVersion at 0 and dwFlags at 72. SecBuffer is 16 bytes (cbBuffer at 0,
+// BufferType at 4, pvBuffer at 8); SecBufferDesc is 16 (ulVersion, cBuffers,
+// pBuffers). SecPkgContext_StreamSizes is five ULONGs. CERT_CHAIN_PARA's
+// legacy layout is 32 bytes (cbSize + CERT_USAGE_MATCH, no
+// CERT_CHAIN_PARA_HAS_EXTRA_FIELDS); CERT_CHAIN_POLICY_PARA is 16,
+// CERT_CHAIN_POLICY_STATUS is 24, and SSL_EXTRA_CERT_CHAIN_POLICY_PARA
+// (HTTPSPolicyCallbackData) is 24. All buffers below are zeroed first, so only
+// the fields that must be non-zero are written by name.
+
+import { abiRawAlloc } from runtime.abi_raw
+import { netSend, netRecv } from runtime.abi_net
+// The one UTF-8 -> UTF-16 conversion already in the runtime. TLS needs wide
+// strings for the SSPI package name, the SNI target and the hostname policy
+// check; `abi_fs` owns that conversion, and a future platform split should
+// lift it (and this import) into a shared wide-string module rather than
+// duplicate the surrogate handling.
+import { wideBuf } from runtime.abi_fs
+
+// ------------------------------------------------------------- Schannel ABI
+
+const SCHANNEL_CRED_VERSION: int = 4
+const SCHANNEL_CRED_WORDS: int = 10 // 80 bytes
+const SCH_USE_STRONG_CRYPTO: int = 4194304 // 0x00400000
+
+const SECPKG_CRED_INBOUND: int = 1
+const SECPKG_CRED_OUTBOUND: int = 2
+const SECURITY_NATIVE_DREP: int = 16 // 0x10
+
+const ISC_REQ_REPLAY_DETECT: int = 4
+const ISC_REQ_SEQUENCE_DETECT: int = 8
+const ISC_REQ_CONFIDENTIALITY: int = 16
+const ISC_REQ_ALLOCATE_MEMORY: int = 256
+const ISC_REQ_EXTENDED_ERROR: int = 16384
+const ISC_REQ_STREAM: int = 32768
+const ISC_REQ_MANUAL_CRED_VALIDATION: int = 524288
+
+// Server-side context requirements. These are NOT the ISC_REQ_* numbers even
+// where the names match: the SDK defines ASC_REQ_EXTENDED_ERROR as 0x8000 and
+// ASC_REQ_STREAM as 0x10000, while the client-side mirrors are 0x4000 and
+// 0x8000. Copying the client constants would ask for the wrong bits. There is
+// no ASC_REQ_MANUAL_CRED_VALIDATION: a server presents a certificate, it does
+// not validate its own.
+const ASC_REQ_REPLAY_DETECT: int = 4
+const ASC_REQ_SEQUENCE_DETECT: int = 8
+const ASC_REQ_CONFIDENTIALITY: int = 16
+const ASC_REQ_ALLOCATE_MEMORY: int = 256
+const ASC_REQ_EXTENDED_ERROR: int = 32768
+const ASC_REQ_STREAM: int = 65536
+
+const SECBUFFER_EMPTY: int = 0
+const SECBUFFER_DATA: int = 1
+const SECBUFFER_TOKEN: int = 2
+const SECBUFFER_EXTRA: int = 5
+const SECBUFFER_STREAM_TRAILER: int = 6
+const SECBUFFER_STREAM_HEADER: int = 7
+const SECBUFFER_VERSION: int = 0
+
+const SECPKG_ATTR_STREAM_SIZES: int = 4
+const SECPKG_ATTR_REMOTE_CERT_CONTEXT: int = 83 // 0x53
+
+const SEC_E_OK: int = 0
+const SEC_I_CONTINUE_NEEDED: int = 590610 // 0x00090312
+const SEC_I_CONTEXT_EXPIRED: int = 590615 // 0x00090317
+const SEC_I_RENEGOTIATE: int = 590625 // 0x00090321
+const SEC_E_INCOMPLETE_MESSAGE: int = 2148077336 // 0x80090318
+
+const SCHANNEL_SHUTDOWN: int = 1
+
+// ------------------------------------------------------------ CryptoAPI ABI
+
+const CERT_CHAIN_POLICY_SSL: int = 4
+const CERT_CHAIN_PARA_BYTES: int = 32
+const CERT_CHAIN_POLICY_PARA_BYTES: int = 16
+const CERT_CHAIN_POLICY_STATUS_BYTES: int = 24
+const SSL_EXTRA_POLICY_BYTES: int = 24
+const AUTHTYPE_SERVER: int = 2
+
+// PKCS#12 import: CRYPT_DATA_BLOB is {DWORD cbData; BYTE *pbData}, 16 bytes
+// with the pointer at 8. The PFX store is temporary (a memory store with
+// private keys in a per-process key container), and `CertFindCertificateInStore`
+// with CERT_FIND_ANY returns its single leaf.
+const CRYPT_DATA_BLOB_BYTES: int = 16
+const X509_ASN_ENCODING: int = 1
+const PKCS_7_ASN_ENCODING: int = 65536
+const CERT_FIND_ANY: int = 0
+
+/// Extra detail for a TLS_STAGE_CREDENTIALS failure with no SECURITY_STATUS.
+const TLS_CRED_DETAIL_IMPORT: int = 1
+const TLS_CRED_DETAIL_CERT: int = 2
+const TLS_CRED_DETAIL_ACQUIRE: int = 3
+
+// ------------------------------------------------------------- state layout
+
+const ST_SOCK: int = 0
+const ST_CRED: int = 1 // CredHandle: two words
+const ST_CRED_VALID: int = 3
+const ST_CTX: int = 4 // CtxtHandle: two words
+const ST_CTX_VALID: int = 6
+const ST_CLOSED: int = 7
+const ST_HEADER: int = 8
+const ST_TRAILER: int = 9
+const ST_MAXMSG: int = 10
+const ST_BUFFERS: int = 11
+const ST_BLOCKSIZE: int = 12
+const ST_RECVBUF: int = 13
+const ST_RECVCAP: int = 14
+const ST_RECVLEN: int = 15
+const ST_PLAINBUF: int = 16
+const ST_PLAINCAP: int = 17
+const ST_PLAINLEN: int = 18
+const ST_PLAINOFF: int = 19
+const ST_SENDBUF: int = 20
+const ST_SENDCAP: int = 21
+const ST_ERRSTAGE: int = 22
+const ST_ERRSTATUS: int = 23
+const ST_ERRDETAIL: int = 24
+const ST_EOF: int = 25
+const ST_CREDDATA: int = 26
+// Server credentials: the PFX store and its leaf certificate must outlive the
+// SCHANNEL_CRED that points at them, and `paCred` needs a real array, not the
+// address of a temporary.
+const ST_STORE: int = 27
+const ST_CERT: int = 28
+const ST_CERTPTRS: int = 29
+const ST_WORDS: int = 30
+
+/// Failure stages. `std.tls` turns these into messages and `NetError.kind`s.
+const TLS_STAGE_NONE: int = 0
+const TLS_STAGE_ALLOC: int = 1
+const TLS_STAGE_CREDENTIALS: int = 2
+const TLS_STAGE_HANDSHAKE: int = 3
+const TLS_STAGE_CERT_QUERY: int = 4
+const TLS_STAGE_CHAIN: int = 5
+const TLS_STAGE_VERIFY: int = 6
+const TLS_STAGE_SIZES: int = 7
+const TLS_STAGE_SEND: int = 8
+const TLS_STAGE_RECV: int = 9
+const TLS_STAGE_RECORD: int = 10
+const TLS_STAGE_TRUNCATED: int = 11
+const TLS_STAGE_CLOSED: int = 12
+
+/// One TLS record is at most 2^14 plaintext plus 2048 of overhead. 64 KiB
+/// holds any single record with room for coalesced reads, and it is also the
+/// handshake buffer: handshake messages are fragmented into records, so one
+/// record at a time is all the loop ever needs.
+const RECV_CAP: int = 65536
+
+/// SecBuffer array in front of the contiguous header/data/trailer block.
+const SECBUF_BYTES: int = 16
+const SEND_HDR_OFF: int = 4 * SECBUF_BYTES
+
+const WSAEINTR: int = 10004
+
+/// The failed-connect report, valid until the next connect attempt.
+var tlsFailStage: int = 0
+var tlsFailStatus: int = 0
+var tlsFailDetail: int = 0
+
+// ------------------------------------------------------------------ helpers
+
+/// A 32-bit SECURITY_STATUS, zero-extended. Status values compare as unsigned
+/// 32-bit quantities: SEC_E_INCOMPLETE_MESSAGE is 0x80090318, not a negative
+/// number, and the staged `win_*` intrinsics only define the low half.
+fn hres(v: int) -> int {
+    v & 4294967295
+}
+
+fn statePtr(s: *int, word: int) -> int {
+    (s as int) + word * 8
+}
+
+fn rawByteAt(p: *int, i: int) -> int {
+    unsafe {
+        return (p[i >> 3] >> ((i & 7) * 8)) & 255
+    }
+}
+
+fn putRawByte(p: *int, i: int, v: int) {
+    unsafe {
+        let sh = (i & 7) * 8
+        let mask = 255 << sh
+        p[i >> 3] = (p[i >> 3] & ((0 - 1) ^ mask)) | ((v & 255) << sh)
+    }
+}
+
+fn zeroWords(p: *int, n: int) {
+    unsafe {
+        var i = 0
+        while (i < n) {
+            p[i] = 0
+            i = i + 1
+        }
+    }
+}
+
+fn putDword(p: *int, off: int, v: int) {
+    var i = 0
+    while (i < 4) {
+        putRawByte(p, off + i, (v >> (i * 8)) & 255)
+        i = i + 1
+    }
+}
+
+fn getDword(p: *int, off: int) -> int {
+    var v = 0
+    var i = 0
+    while (i < 4) {
+        v = v | (rawByteAt(p, off + i) << (i * 8))
+        i = i + 1
+    }
+    v
+}
+
+fn putQword(p: *int, off: int, v: int) {
+    var i = 0
+    while (i < 8) {
+        putRawByte(p, off + i, (v >> (i * 8)) & 255)
+        i = i + 1
+    }
+}
+
+fn getQword(p: *int, off: int) -> int {
+    var v = 0
+    var i = 0
+    while (i < 8) {
+        v = v | (rawByteAt(p, off + i) << (i * 8))
+        i = i + 1
+    }
+    v
+}
+
+/// Copy `n` bytes from byte address `src` to byte address `dst`. Safe for
+/// non-overlapping blocks and for `dst < src` (the only overlap this module
+/// creates: shifting a record's EXTRA bytes down to the buffer front).
+fn copyRaw(dst: int, src: int, n: int) {
+    unsafe {
+        let d = dst as *int
+        let s = src as *int
+        var i = 0
+        while (i < n) {
+            putRawByte(d, i, rawByteAt(s, i))
+            i = i + 1
+        }
+    }
+}
+
+fn secBufSet(arr: *int, idx: int, cb: int, typ: int, pv: int) {
+    let at = idx * SECBUF_BYTES
+    putDword(arr, at, cb)
+    putDword(arr, at + 4, typ)
+    putQword(arr, at + 8, pv)
+}
+
+fn secBufField(arr: *int, idx: int, off: int) -> int {
+    getDword(arr, idx * SECBUF_BYTES + off)
+}
+
+fn secBufType(arr: *int, idx: int) -> int {
+    secBufField(arr, idx, 4)
+}
+
+fn secBufPv(arr: *int, idx: int) -> int {
+    getQword(arr, idx * SECBUF_BYTES + 8)
+}
+
+fn secDescInit(d: *int, count: int, arr: int) {
+    putDword(d, 0, SECBUFFER_VERSION)
+    putDword(d, 4, count)
+    putQword(d, 8, arr)
+}
+
+fn setErr(s: *int, stage: int, status: int, detail: int) {
+    unsafe {
+        s[ST_ERRSTAGE] = stage
+        s[ST_ERRSTATUS] = status
+        s[ST_ERRDETAIL] = detail
+    }
+}
+
+fn clearErr(s: *int) {
+    setErr(s, TLS_STAGE_NONE, 0, 0)
+}
+
+// ------------------------------------------------------------------- connect
+
+/// Sends any pending output token. Returns 0 on success or a negative Winsock
+/// code. Interrupted sends are retried.
+fn sendAll(sock: int, buf: int, n: int) -> int {
+    var off = 0
+    while (off < n) {
+        var rc = netSend(sock, buf + off, n - off)
+        while (rc == 0 - WSAEINTR) {
+            rc = netSend(sock, buf + off, n - off)
+        }
+        if (rc < 0) {
+            return rc
+        }
+        if (rc == 0) {
+            return 0 - 1
+        }
+        off = off + rc
+    }
+    0
+}
+
+fn freeState(s: *int) {
+    unsafe {
+        if (s[ST_CTX_VALID] == 1) {
+            let _ = win_delete_security_context(statePtr(s, ST_CTX))
+            s[ST_CTX_VALID] = 0
+        }
+        if (s[ST_CRED_VALID] == 1) {
+            let _ = win_free_credentials_handle(statePtr(s, ST_CRED))
+            s[ST_CRED_VALID] = 0
+        }
+        // Server credentials hold a certificate context from a PFX store. Drop
+        // the certificate first, then the store that owns its key container.
+        if (s[ST_CERT] != 0) {
+            let _f = win_cert_free_certificate_context(s[ST_CERT])
+            s[ST_CERT] = 0
+        }
+        if (s[ST_STORE] != 0) {
+            let _c = win_cert_close_store(s[ST_STORE], 0)
+            s[ST_STORE] = 0
+        }
+        if (s[ST_CERTPTRS] != 0) {
+            free(s[ST_CERTPTRS] as *int)
+            s[ST_CERTPTRS] = 0
+        }
+        if (s[ST_RECVBUF] != 0) {
+            free(s[ST_RECVBUF] as *int)
+            s[ST_RECVBUF] = 0
+        }
+        if (s[ST_PLAINBUF] != 0) {
+            free(s[ST_PLAINBUF] as *int)
+            s[ST_PLAINBUF] = 0
+        }
+        if (s[ST_SENDBUF] != 0) {
+            free(s[ST_SENDBUF] as *int)
+            s[ST_SENDBUF] = 0
+        }
+        if (s[ST_CREDDATA] != 0) {
+            free(s[ST_CREDDATA] as *int)
+            s[ST_CREDDATA] = 0
+        }
+        free(s)
+    }
+}
+
+/// Best-effort close_notify, then delete the context. A failure here does not
+/// change the state's error slot: the caller asked to close, not to report.
+fn shutdownGraceful(s: *int) {
+    unsafe {
+        let ctl = alloc(int, 2) // one SecBuffer (16 bytes)
+        zeroWords(ctl, 2)
+        let val = alloc(int, 1)
+        zeroWords(val, 1)
+        putDword(val, 0, SCHANNEL_SHUTDOWN)
+        secBufSet(ctl, 0, 4, SECBUFFER_TOKEN, val as int)
+
+        let ctlDesc = alloc(int, 2)
+        zeroWords(ctlDesc, 2)
+        secDescInit(ctlDesc, 1, ctl as int)
+
+        let _a = hres(win_apply_control_token(statePtr(s, ST_CTX), ctlDesc as int))
+
+        // Generate the alert token the control token implies.
+        let outBuf = alloc(int, 2)
+        zeroWords(outBuf, 2)
+        secBufSet(outBuf, 0, 0, SECBUFFER_TOKEN, 0)
+        let outDesc = alloc(int, 2)
+        zeroWords(outDesc, 2)
+        secDescInit(outDesc, 1, outBuf as int)
+        let attrs = alloc(int, 1)
+        zeroWords(attrs, 1)
+
+        let flags = ISC_REQ_ALLOCATE_MEMORY | ISC_REQ_STREAM
+        let st = hres(win_initialize_security_context_w(
+            statePtr(s, ST_CRED),
+            statePtr(s, ST_CTX),
+            0,
+            flags,
+            0,
+            SECURITY_NATIVE_DREP,
+            0,
+            0,
+            statePtr(s, ST_CTX),
+            outDesc as int,
+            attrs as int,
+            0))
+        let cb = secBufField(outBuf, 0, 0)
+        let pv = secBufPv(outBuf, 0)
+        if (st == SEC_E_OK && cb > 0 && pv != 0) {
+            let _w = sendAll(s[ST_SOCK], pv, cb)
+        }
+        if (pv != 0) {
+            let _f = win_free_context_buffer(pv)
+        }
+        free(attrs)
+        free(outDesc)
+        free(outBuf)
+        free(ctlDesc)
+        free(val)
+        free(ctl)
+    }
+}
+
+/// Validate the peer certificate against the system roots and `host`.
+/// Schannel was started with manual validation, so nothing has checked it yet.
+fn validatePeer(s: *int, host: string) -> int {
+    unsafe {
+        let certSlot = alloc(int, 1)
+        zeroWords(certSlot, 1)
+        var st = hres(win_query_context_attributes_w(
+            statePtr(s, ST_CTX),
+            SECPKG_ATTR_REMOTE_CERT_CONTEXT,
+            certSlot as int))
+        if (st != 0) {
+            setErr(s, TLS_STAGE_CERT_QUERY, st, 0)
+            free(certSlot)
+            return -1
+        }
+        let cert = certSlot[0]
+        free(certSlot)
+        if (cert == 0) {
+            setErr(s, TLS_STAGE_CERT_QUERY, 0, 0)
+            return -1
+        }
+
+        // CERT_CHAIN_PARA: cbSize only. Zero RequestedUsage means "any usage";
+        // the SSL policy below is what actually checks EKU and the hostname.
+        let chainPara = alloc(int, 4) // 32 bytes
+        zeroWords(chainPara, 4)
+        putDword(chainPara, 0, CERT_CHAIN_PARA_BYTES)
+
+        let chainSlot = alloc(int, 1)
+        zeroWords(chainSlot, 1)
+        let built = win_cert_get_certificate_chain(
+            0,
+            cert,
+            0,
+            0,
+            chainPara as int,
+            0,
+            0,
+            chainSlot as int)
+        free(chainPara)
+        if (built == 0 || chainSlot[0] == 0) {
+            setErr(s, TLS_STAGE_CHAIN, 0, 0)
+            free(chainSlot)
+            let _f = win_cert_free_certificate_context(cert)
+            return -1
+        }
+        let chain = chainSlot[0]
+        free(chainSlot)
+
+        let wHost = wideBuf(host)
+        let extra = alloc(int, 3) // SSL_EXTRA_CERT_CHAIN_POLICY_PARA, 24 bytes
+        zeroWords(extra, 3)
+        putDword(extra, 0, SSL_EXTRA_POLICY_BYTES)
+        putDword(extra, 4, AUTHTYPE_SERVER)
+        putDword(extra, 8, 0)
+        putQword(extra, 16, wHost as int)
+
+        let ppara = alloc(int, 2) // CERT_CHAIN_POLICY_PARA, 16 bytes
+        zeroWords(ppara, 2)
+        putDword(ppara, 0, CERT_CHAIN_POLICY_PARA_BYTES)
+        putDword(ppara, 4, 0)
+        putQword(ppara, 8, extra as int)
+
+        let pstat = alloc(int, 3) // CERT_CHAIN_POLICY_STATUS, 24 bytes
+        zeroWords(pstat, 3)
+        putDword(pstat, 0, CERT_CHAIN_POLICY_STATUS_BYTES)
+
+        let ok = win_cert_verify_certificate_chain_policy(
+            CERT_CHAIN_POLICY_SSL,
+            chain,
+            ppara as int,
+            pstat as int)
+        let certErr = getDword(pstat, 4)
+
+        free(pstat)
+        free(ppara)
+        free(extra)
+        free(wHost)
+        win_cert_free_certificate_chain(chain)
+        let _f = win_cert_free_certificate_context(cert)
+
+        if (ok == 0) {
+            setErr(s, TLS_STAGE_VERIFY, 0, 0)
+            return -1
+        }
+        if (certErr != 0) {
+            setErr(s, TLS_STAGE_VERIFY, certErr, certErr)
+            return -1
+        }
+        return 0
+    }
+}
+
+/// Append one socket read to the record buffer.
+///   > 0 bytes added, 0 orderly EOF, -1 error (stage/status set).
+fn fillRecv(s: *int) -> int {
+    unsafe {
+        let cap = s[ST_RECVCAP]
+        let len = s[ST_RECVLEN]
+        let avail = cap - len
+        if (avail <= 0) {
+            setErr(s, TLS_STAGE_RECORD, 0, len)
+            return -1
+        }
+        var n = netRecv(s[ST_SOCK], s[ST_RECVBUF] + len, avail)
+        while (n == 0 - WSAEINTR) {
+            n = netRecv(s[ST_SOCK], s[ST_RECVBUF] + len, avail)
+        }
+        if (n < 0) {
+            setErr(s, TLS_STAGE_RECV, n, 0)
+            return -1
+        }
+        if (n == 0) {
+            return 0
+        }
+        s[ST_RECVLEN] = len + n
+        return n
+    }
+}
+
+/// After a Schannel call, keep only the bytes it did not consume. The EXTRA
+/// pointer always lies inside the record buffer, so moving down is safe.
+fn keepExtra(s: *int, arr: *int, count: int) {
+    unsafe {
+        var i = 0
+        while (i < count) {
+            if (secBufType(arr, i) == SECBUFFER_EXTRA) {
+                let cb = secBufField(arr, i, 0)
+                if (cb > 0) {
+                    copyRaw(s[ST_RECVBUF], secBufPv(arr, i), cb)
+                    s[ST_RECVLEN] = cb
+                    return
+                }
+            }
+            i = i + 1
+        }
+        s[ST_RECVLEN] = 0
+    }
+}
+
+/// Run the client handshake. Returns 0 on success; the state error slot says
+/// what failed otherwise.
+fn handshake(s: *int, host: string) -> int {
+    unsafe {
+        let wPkg = wideBuf("Microsoft Unified Security Protocol Provider")
+        let wHost = wideBuf(host)
+
+        // SCHANNEL_CRED. dwVersion at 0, dwFlags at 72. cCreds and paCred stay
+        // zero: this is a client credential with no local certificate, which
+        // is exactly what an outbound anonymous Schannel credential is.
+        let cred = alloc(int, SCHANNEL_CRED_WORDS)
+        zeroWords(cred, SCHANNEL_CRED_WORDS)
+        putDword(cred, 0, SCHANNEL_CRED_VERSION)
+        putDword(cred, 72, SCH_USE_STRONG_CRYPTO)
+        // Keep the description block alive for the credential's lifetime: the
+        // SDK does not promise the package copies `pAuthData`, and freeing it
+        // early would be a use-after-free inside Schannel.
+        s[ST_CREDDATA] = cred as int
+
+        var st = hres(win_acquire_credentials_handle_w(
+            0,
+            wPkg as int,
+            SECPKG_CRED_OUTBOUND,
+            0,
+            cred as int,
+            0,
+            0,
+            statePtr(s, ST_CRED),
+            0))
+        free(wPkg)
+        if (st != 0) {
+            setErr(s, TLS_STAGE_CREDENTIALS, st, 0)
+            free(wHost)
+            return -1
+        }
+        s[ST_CRED_VALID] = 1
+
+        // Every flag Schannel's stream API expects, plus manual validation.
+        let flags = ISC_REQ_SEQUENCE_DETECT
+            | ISC_REQ_REPLAY_DETECT
+            | ISC_REQ_CONFIDENTIALITY
+            | ISC_REQ_EXTENDED_ERROR
+            | ISC_REQ_ALLOCATE_MEMORY
+            | ISC_REQ_STREAM
+            | ISC_REQ_MANUAL_CRED_VALIDATION
+
+        let inArr = alloc(int, 4) // two SecBuffers
+        zeroWords(inArr, 4)
+        let inDesc = alloc(int, 2)
+        zeroWords(inDesc, 2)
+        let outBuf = alloc(int, 2)
+        zeroWords(outBuf, 2)
+        let outDesc = alloc(int, 2)
+        zeroWords(outDesc, 2)
+        let attrs = alloc(int, 1)
+        zeroWords(attrs, 1)
+
+        var first = 1
+        var done = 0
+        var aborted = 0
+        while (done == 0) {
+            var inPtr = 0
+            if (s[ST_RECVLEN] > 0) {
+                secBufSet(inArr, 0, s[ST_RECVLEN], SECBUFFER_TOKEN, s[ST_RECVBUF])
+                secBufSet(inArr, 1, 0, SECBUFFER_EMPTY, 0)
+                secDescInit(inDesc, 2, inArr as int)
+                inPtr = inDesc as int
+            }
+            secBufSet(outBuf, 0, 0, SECBUFFER_TOKEN, 0)
+            secDescInit(outDesc, 1, outBuf as int)
+
+            var ctxIn = 0
+            var target = 0
+            if (first == 0) {
+                ctxIn = statePtr(s, ST_CTX)
+            } else {
+                // The target name (SNI) is a first-call-only argument; later
+                // calls must pass NULL.
+                target = wHost as int
+            }
+            st = hres(win_initialize_security_context_w(
+                statePtr(s, ST_CRED),
+                ctxIn,
+                target,
+                flags,
+                0,
+                SECURITY_NATIVE_DREP,
+                inPtr,
+                0,
+                statePtr(s, ST_CTX),
+                outDesc as int,
+                attrs as int,
+                0))
+
+            let tokenCb = secBufField(outBuf, 0, 0)
+            let tokenPv = secBufPv(outBuf, 0)
+            if (st == SEC_E_OK || st == SEC_I_CONTINUE_NEEDED) {
+                s[ST_CTX_VALID] = 1
+            }
+            if (tokenCb > 0 && tokenPv != 0) {
+                let rc = sendAll(s[ST_SOCK], tokenPv, tokenCb)
+                if (rc != 0) {
+                    setErr(s, TLS_STAGE_SEND, rc, 0)
+                    aborted = 1
+                }
+            }
+            if (tokenPv != 0) {
+                let _f = win_free_context_buffer(tokenPv)
+            }
+            first = 0
+
+            if (aborted == 1) {
+                done = 2
+            } else if (st == SEC_E_OK) {
+                // The server's first application bytes can arrive in the same
+                // read as its Finished message; keep them for the record path.
+                keepExtra(s, inArr, 2)
+                done = 1
+            } else if (st == SEC_I_CONTINUE_NEEDED) {
+                keepExtra(s, inArr, 2)
+                if (s[ST_RECVLEN] == 0) {
+                    let n = fillRecv(s)
+                    if (n == 0) {
+                        setErr(s, TLS_STAGE_TRUNCATED, 0, 0)
+                        done = 2
+                    } else if (n < 0) {
+                        done = 2
+                    }
+                }
+            } else if (st == SEC_E_INCOMPLETE_MESSAGE) {
+                let n = fillRecv(s)
+                if (n == 0) {
+                    setErr(s, TLS_STAGE_TRUNCATED, 0, 0)
+                    done = 2
+                } else if (n < 0) {
+                    done = 2
+                }
+            } else {
+                setErr(s, TLS_STAGE_HANDSHAKE, st, 0)
+                done = 2
+            }
+        }
+
+        free(attrs)
+        free(outDesc)
+        free(outBuf)
+        free(inDesc)
+        free(inArr)
+        free(wHost)
+
+        if (done == 2) {
+            return -1
+        }
+        return 0
+    }
+}
+
+/// Query the negotiated stream sizes and allocate the plaintext and send
+/// buffers. Both roles share this: the record layout is symmetric and comes
+/// from the context, never from an assumption about the cipher suite.
+/// Returns 0 on success; the state error slot says what failed otherwise.
+fn setupBuffers(s: *int) -> int {
+    unsafe {
+        let sizes = alloc(int, 3) // SecPkgContext_StreamSizes: 20 bytes
+        zeroWords(sizes, 3)
+        let st = hres(win_query_context_attributes_w(
+            statePtr(s, ST_CTX),
+            SECPKG_ATTR_STREAM_SIZES,
+            sizes as int))
+        if (st != 0) {
+            setErr(s, TLS_STAGE_SIZES, st, 0)
+            free(sizes)
+            return -1
+        }
+        s[ST_HEADER] = getDword(sizes, 0)
+        s[ST_TRAILER] = getDword(sizes, 4)
+        s[ST_MAXMSG] = getDword(sizes, 8)
+        s[ST_BUFFERS] = getDword(sizes, 12)
+        s[ST_BLOCKSIZE] = getDword(sizes, 16)
+        free(sizes)
+
+        if (s[ST_MAXMSG] <= 0) {
+            setErr(s, TLS_STAGE_SIZES, 0, 0)
+            return -1
+        }
+        if (RECV_CAP < s[ST_HEADER] + s[ST_MAXMSG] + s[ST_TRAILER]) {
+            setErr(s, TLS_STAGE_ALLOC, 0, RECV_CAP)
+            return -1
+        }
+
+        let pb = alloc(int, s[ST_MAXMSG] / 8 + 1)
+        zeroWords(pb, s[ST_MAXMSG] / 8 + 1)
+        s[ST_PLAINBUF] = pb as int
+        s[ST_PLAINCAP] = s[ST_MAXMSG]
+
+        let sendCap = SEND_HDR_OFF + s[ST_HEADER] + s[ST_MAXMSG] + s[ST_TRAILER]
+        let sb = alloc(int, sendCap / 8 + 1)
+        zeroWords(sb, sendCap / 8 + 1)
+        s[ST_SENDBUF] = sb as int
+        s[ST_SENDCAP] = sendCap
+        0
+    }
+}
+
+/// Import a PKCS#12 blob and build an inbound Schannel credential from its
+/// certificate. The store, the certificate context and the one-element
+/// `paCred` array stay alive until `freeState`: Schannel's credential keeps
+/// referring to the certificate it was built from.
+fn acquireServerCredentials(s: *int, pfx: int, pfxLen: int, password: string) -> int {
+    unsafe {
+        let blob = alloc(int, 2) // CRYPT_DATA_BLOB: cbData (DWORD), pbData (ptr)
+        zeroWords(blob, 2)
+        putDword(blob, 0, pfxLen)
+        putQword(blob, 8, pfx)
+
+        let wPass = wideBuf(password)
+        let store = win_pfx_import_cert_store(blob as int, wPass as int, 0)
+        free(wPass)
+        free(blob)
+        if (store == 0) {
+            setErr(s, TLS_STAGE_CREDENTIALS, 0, TLS_CRED_DETAIL_IMPORT)
+            return -1
+        }
+        s[ST_STORE] = store
+
+        let cert = win_cert_find_certificate_in_store(
+            store,
+            X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+            0,
+            CERT_FIND_ANY,
+            0,
+            0)
+        if (cert == 0) {
+            setErr(s, TLS_STAGE_CREDENTIALS, 0, TLS_CRED_DETAIL_CERT)
+            return -1
+        }
+        s[ST_CERT] = cert
+
+        let ptrs = alloc(int, 1)
+        zeroWords(ptrs, 1)
+        ptrs[0] = cert
+        s[ST_CERTPTRS] = ptrs as int
+
+        let cred = alloc(int, SCHANNEL_CRED_WORDS)
+        zeroWords(cred, SCHANNEL_CRED_WORDS)
+        putDword(cred, 0, SCHANNEL_CRED_VERSION)
+        putDword(cred, 4, 1) // cCreds
+        putQword(cred, 8, ptrs as int) // paCred
+        putDword(cred, 72, SCH_USE_STRONG_CRYPTO)
+        s[ST_CREDDATA] = cred as int
+
+        let wPkg = wideBuf("Microsoft Unified Security Protocol Provider")
+        let st = hres(win_acquire_credentials_handle_w(
+            0,
+            wPkg as int,
+            SECPKG_CRED_INBOUND,
+            0,
+            cred as int,
+            0,
+            0,
+            statePtr(s, ST_CRED),
+            0))
+        free(wPkg)
+        if (st != 0) {
+            setErr(s, TLS_STAGE_CREDENTIALS, st, TLS_CRED_DETAIL_ACQUIRE)
+            return -1
+        }
+        s[ST_CRED_VALID] = 1
+        return 0
+    }
+}
+
+/// Run the server handshake. Returns 0 on success; the state error slot says
+/// what failed otherwise.
+fn serverHandshake(s: *int, pfx: int, pfxLen: int, password: string) -> int {
+    unsafe {
+        if (acquireServerCredentials(s, pfx, pfxLen, password) != 0) {
+            return -1
+        }
+
+        let flags = ASC_REQ_SEQUENCE_DETECT
+            | ASC_REQ_REPLAY_DETECT
+            | ASC_REQ_CONFIDENTIALITY
+            | ASC_REQ_EXTENDED_ERROR
+            | ASC_REQ_ALLOCATE_MEMORY
+            | ASC_REQ_STREAM
+
+        let inArr = alloc(int, 4) // two SecBuffers
+        zeroWords(inArr, 4)
+        let inDesc = alloc(int, 2)
+        zeroWords(inDesc, 2)
+        let outBuf = alloc(int, 2)
+        zeroWords(outBuf, 2)
+        let outDesc = alloc(int, 2)
+        zeroWords(outDesc, 2)
+        let attrs = alloc(int, 1)
+        zeroWords(attrs, 1)
+
+        var first = 1
+        var done = 0
+        var aborted = 0
+        while (done == 0) {
+            if (s[ST_RECVLEN] == 0) {
+                let n = fillRecv(s)
+                if (n == 0) {
+                    setErr(s, TLS_STAGE_TRUNCATED, 0, 0)
+                    done = 2
+                    continue
+                }
+                if (n < 0) {
+                    done = 2
+                    continue
+                }
+            }
+
+            secBufSet(inArr, 0, s[ST_RECVLEN], SECBUFFER_TOKEN, s[ST_RECVBUF])
+            secBufSet(inArr, 1, 0, SECBUFFER_EMPTY, 0)
+            secDescInit(inDesc, 2, inArr as int)
+
+            secBufSet(outBuf, 0, 0, SECBUFFER_TOKEN, 0)
+            secDescInit(outDesc, 1, outBuf as int)
+
+            var ctxIn = 0
+            if (first == 0) {
+                ctxIn = statePtr(s, ST_CTX)
+            }
+            let st = hres(win_accept_security_context(
+                statePtr(s, ST_CRED),
+                ctxIn,
+                inDesc as int,
+                flags,
+                SECURITY_NATIVE_DREP,
+                statePtr(s, ST_CTX),
+                outDesc as int,
+                attrs as int,
+                0))
+
+            let cb = secBufField(outBuf, 0, 0)
+            let pv = secBufPv(outBuf, 0)
+            if (st == SEC_E_OK || st == SEC_I_CONTINUE_NEEDED) {
+                s[ST_CTX_VALID] = 1
+            }
+            if (cb > 0 && pv != 0) {
+                let rc = sendAll(s[ST_SOCK], pv, cb)
+                if (rc != 0) {
+                    setErr(s, TLS_STAGE_SEND, rc, 0)
+                    aborted = 1
+                }
+            }
+            if (pv != 0) {
+                let _f = win_free_context_buffer(pv)
+            }
+            first = 0
+
+            if (aborted == 1) {
+                done = 2
+            } else if (st == SEC_E_OK) {
+                // The client's first application bytes can arrive in the same
+                // read as its Finished message; keep them for the record path.
+                keepExtra(s, inArr, 2)
+                done = 1
+            } else if (st == SEC_I_CONTINUE_NEEDED) {
+                keepExtra(s, inArr, 2)
+            } else if (st == SEC_E_INCOMPLETE_MESSAGE) {
+                // Nothing was consumed; append the next chunk to the record.
+                let n = fillRecv(s)
+                if (n == 0) {
+                    setErr(s, TLS_STAGE_TRUNCATED, 0, 0)
+                    done = 2
+                } else if (n < 0) {
+                    done = 2
+                }
+            } else {
+                setErr(s, TLS_STAGE_HANDSHAKE, st, 0)
+                done = 2
+            }
+        }
+
+        free(attrs)
+        free(outDesc)
+        free(outBuf)
+        free(inDesc)
+        free(inArr)
+
+        if (done == 2) {
+            return -1
+        }
+        return 0
+    }
+}
+
+/// Accept a TLS session on an already-accepted socket. `pfx` is a PKCS#12
+/// blob of `pfxLen` bytes and `password` unlocks it. Returns the state handle,
+/// or 0 on failure with the reason in `tlsLastStage/Status/Detail`; on failure
+/// the partial state is freed and the socket is left open (caller owns it).
+fn tlsServerAccept(sock: int, pfx: int, pfxLen: int, password: string) -> int {
+    unsafe {
+        let s = alloc(int, ST_WORDS)
+        zeroWords(s, ST_WORDS)
+        s[ST_SOCK] = sock
+
+        let rb = alloc(int, RECV_CAP / 8)
+        zeroWords(rb, RECV_CAP / 8)
+        s[ST_RECVBUF] = rb as int
+        s[ST_RECVCAP] = RECV_CAP
+        s[ST_RECVLEN] = 0
+
+        var failed = 0
+        if (serverHandshake(s, pfx, pfxLen, password) != 0) {
+            failed = 1
+        }
+        if (failed == 0) {
+            if (setupBuffers(s) != 0) {
+                failed = 1
+            }
+        }
+
+        if (failed != 0) {
+            tlsFailStage = s[ST_ERRSTAGE]
+            tlsFailStatus = s[ST_ERRSTATUS]
+            tlsFailDetail = s[ST_ERRDETAIL]
+            freeState(s)
+            return 0
+        }
+        clearErr(s)
+        return s as int
+    }
+}
+
+/// Connect the socket to `host` as a TLS client.
+///
+/// Returns the state handle, or 0 on failure. On failure the reason is in
+/// `tlsLastStage/Status/Detail`; the partial state has already been freed and
+/// the socket is left open (the caller owns it).
+fn tlsClientConnect(sock: int, host: string, verify: int) -> int {
+    unsafe {
+        let s = alloc(int, ST_WORDS)
+        zeroWords(s, ST_WORDS)
+        s[ST_SOCK] = sock
+
+        let rb = alloc(int, RECV_CAP / 8)
+        zeroWords(rb, RECV_CAP / 8)
+        s[ST_RECVBUF] = rb as int
+        s[ST_RECVCAP] = RECV_CAP
+        s[ST_RECVLEN] = 0
+
+        var failed = 0
+        if (handshake(s, host) != 0) {
+            failed = 1
+        }
+
+        if (failed == 0) {
+            if (setupBuffers(s) != 0) {
+                failed = 1
+            }
+        }
+
+        if (failed == 0 && verify != 0) {
+            if (validatePeer(s, host) != 0) {
+                failed = 1
+            }
+        }
+
+        if (failed != 0) {
+            tlsFailStage = s[ST_ERRSTAGE]
+            tlsFailStatus = s[ST_ERRSTATUS]
+            tlsFailDetail = s[ST_ERRDETAIL]
+            freeState(s)
+            return 0
+        }
+        clearErr(s)
+        return s as int
+    }
+}
+
+// --------------------------------------------------------------- record I/O
+
+/// Decrypt one record into the plaintext buffer.
+///   1 decrypted (plainLen/plainOff describe it)
+///   0 peer sent close_notify
+///  -1 error (stage/status set)
+fn decryptRecord(s: *int) -> int {
+    unsafe {
+        let arr = alloc(int, 8) // four SecBuffers
+        zeroWords(arr, 8)
+        let desc = alloc(int, 2)
+        zeroWords(desc, 2)
+
+        var result = 0 - 1
+        var looping = 1
+        while (looping == 1) {
+            if (s[ST_RECVLEN] == 0) {
+                let n = fillRecv(s)
+                if (n == 0) {
+                    setErr(s, TLS_STAGE_TRUNCATED, 0, 0)
+                    looping = 0
+                    continue
+                }
+                if (n < 0) {
+                    looping = 0
+                    continue
+                }
+            }
+
+            secBufSet(arr, 0, s[ST_RECVLEN], SECBUFFER_DATA, s[ST_RECVBUF])
+            secBufSet(arr, 1, 0, SECBUFFER_EMPTY, 0)
+            secBufSet(arr, 2, 0, SECBUFFER_EMPTY, 0)
+            secBufSet(arr, 3, 0, SECBUFFER_EMPTY, 0)
+            secDescInit(desc, 4, arr as int)
+            let qop = alloc(int, 1)
+            zeroWords(qop, 1)
+            let st = hres(win_decrypt_message(
+                statePtr(s, ST_CTX),
+                desc as int,
+                0,
+                qop as int))
+            free(qop)
+
+            if (st == SEC_E_INCOMPLETE_MESSAGE) {
+                var more = 1
+                while (more == 1) {
+                    let n = fillRecv(s)
+                    if (n == 0) {
+                        setErr(s, TLS_STAGE_TRUNCATED, 0, s[ST_RECVLEN])
+                        looping = 0
+                        more = 0
+                    } else if (n < 0) {
+                        looping = 0
+                        more = 0
+                    } else {
+                        more = 0
+                    }
+                }
+                continue
+            }
+
+            if (st == SEC_E_OK || st == SEC_I_RENEGOTIATE) {
+                // Copy DATA out before EXTRA is shifted over it.
+                var dataLen = 0
+                var dataPv = 0
+                var i = 0
+                while (i < 4) {
+                    if (secBufType(arr, i) == SECBUFFER_DATA) {
+                        dataLen = secBufField(arr, i, 0)
+                        dataPv = secBufPv(arr, i)
+                    }
+                    i = i + 1
+                }
+                if (dataLen > s[ST_PLAINCAP]) {
+                    setErr(s, TLS_STAGE_RECORD, 0, dataLen)
+                    looping = 0
+                    continue
+                }
+                if (dataLen > 0) {
+                    copyRaw(s[ST_PLAINBUF], dataPv, dataLen)
+                }
+                s[ST_PLAINLEN] = dataLen
+                s[ST_PLAINOFF] = 0
+                keepExtra(s, arr, 4)
+
+                if (st == SEC_I_RENEGOTIATE) {
+                    // A second handshake needs a new context and is not
+                    // implemented. Fail instead of silently running on an
+                    // unvalidated session.
+                    setErr(s, TLS_STAGE_RECORD, st, 0)
+                    looping = 0
+                    continue
+                }
+                result = 1
+                looping = 0
+                continue
+            }
+
+            if (st == SEC_I_CONTEXT_EXPIRED) {
+                s[ST_EOF] = 1
+                s[ST_RECVLEN] = 0
+                result = 0
+                looping = 0
+                continue
+            }
+
+            setErr(s, TLS_STAGE_RECORD, st, 0)
+            looping = 0
+        }
+
+        free(desc)
+        free(arr)
+        return result
+    }
+}
+
+/// Read up to `n` plaintext bytes into the raw buffer at `buf`.
+///   >= 0 bytes copied (0 = orderly EOF)
+///   -1   error (stage/status set)
+fn tlsRead(h: int, buf: int, n: int) -> int {
+    if (h == 0) {
+        return -1
+    }
+    unsafe {
+        let s = h as *int
+        if (s[ST_CLOSED] == 1) {
+            setErr(s, TLS_STAGE_CLOSED, 0, 0)
+            return -1
+        }
+        if (n <= 0) {
+            return 0
+        }
+        if (s[ST_EOF] == 1) {
+            return 0
+        }
+
+        var have = s[ST_PLAINLEN] - s[ST_PLAINOFF]
+        while (have <= 0) {
+            let rc = decryptRecord(s)
+            if (rc <= 0) {
+                return rc
+            }
+            have = s[ST_PLAINLEN] - s[ST_PLAINOFF]
+        }
+
+        var take = n
+        if (take > have) {
+            take = have
+        }
+        copyRaw(buf, s[ST_PLAINBUF] + s[ST_PLAINOFF], take)
+        s[ST_PLAINOFF] = s[ST_PLAINOFF] + take
+        if (s[ST_PLAINOFF] >= s[ST_PLAINLEN]) {
+            s[ST_PLAINOFF] = 0
+            s[ST_PLAINLEN] = 0
+        }
+        return take
+    }
+}
+
+/// Encrypt and send `n` plaintext bytes from the raw buffer at `buf`.
+///   0 success, -1 error (stage/status set)
+fn tlsWrite(h: int, buf: int, n: int) -> int {
+    if (h == 0) {
+        return -1
+    }
+    unsafe {
+        let s = h as *int
+        if (s[ST_CLOSED] == 1) {
+            setErr(s, TLS_STAGE_CLOSED, 0, 0)
+            return -1
+        }
+        if (n <= 0) {
+            return 0
+        }
+
+        let arr = s[ST_SENDBUF] as *int
+        let maxMsg = s[ST_MAXMSG]
+        let hdr = s[ST_HEADER]
+        let trl = s[ST_TRAILER]
+        var off = 0
+        while (off < n) {
+            var chunk = maxMsg
+            if (chunk > n - off) {
+                chunk = n - off
+            }
+            // header | plaintext | trailer, with the SecBuffer array in front.
+            copyRaw(s[ST_SENDBUF] + SEND_HDR_OFF + hdr, buf + off, chunk)
+            secBufSet(arr, 0, hdr, SECBUFFER_STREAM_HEADER, s[ST_SENDBUF] + SEND_HDR_OFF)
+            secBufSet(arr, 1, chunk, SECBUFFER_DATA, s[ST_SENDBUF] + SEND_HDR_OFF + hdr)
+            secBufSet(arr, 2, trl, SECBUFFER_STREAM_TRAILER, s[ST_SENDBUF] + SEND_HDR_OFF + hdr + chunk)
+            secBufSet(arr, 3, 0, SECBUFFER_EMPTY, 0)
+            let desc = alloc(int, 2)
+            zeroWords(desc, 2)
+            secDescInit(desc, 4, arr as int)
+            let st = hres(win_encrypt_message(
+                statePtr(s, ST_CTX),
+                0,
+                desc as int,
+                0))
+            free(desc)
+            if (st != 0) {
+                setErr(s, TLS_STAGE_SEND, st, 0)
+                return -1
+            }
+            let total = secBufField(arr, 0, 0) + secBufField(arr, 1, 0) + secBufField(arr, 2, 0)
+            let rc = sendAll(s[ST_SOCK], s[ST_SENDBUF] + SEND_HDR_OFF, total)
+            if (rc != 0) {
+                setErr(s, TLS_STAGE_SEND, rc, 0)
+                return -1
+            }
+            off = off + chunk
+        }
+        return 0
+    }
+}
+
+// ------------------------------------------------------------------- errors
+
+fn tlsErrStage(h: int) -> int {
+    if (h == 0) {
+        return TLS_STAGE_NONE
+    }
+    unsafe {
+        return (h as *int)[ST_ERRSTAGE]
+    }
+}
+
+fn tlsErrStatus(h: int) -> int {
+    if (h == 0) {
+        return 0
+    }
+    unsafe {
+        return (h as *int)[ST_ERRSTATUS]
+    }
+}
+
+fn tlsErrDetail(h: int) -> int {
+    if (h == 0) {
+        return 0
+    }
+    unsafe {
+        return (h as *int)[ST_ERRDETAIL]
+    }
+}
+
+fn tlsLastStage() -> int {
+    tlsFailStage
+}
+
+fn tlsLastStatus() -> int {
+    tlsFailStatus
+}
+
+fn tlsLastDetail() -> int {
+    tlsFailDetail
+}
+
+// -------------------------------------------------------------------- close
+
+/// Best-effort close_notify, then release the context, credentials, buffers
+/// and state block. The socket stays open; `std.tls` owns it. Idempotent for
+/// a zero handle.
+fn tlsClose(h: int) {
+    if (h == 0) {
+        return
+    }
+    unsafe {
+        let s = h as *int
+        if (s[ST_CLOSED] == 0) {
+            if (s[ST_CTX_VALID] == 1) {
+                shutdownGraceful(s)
+            }
+            s[ST_CLOSED] = 1
+        }
+        freeState(s)
+    }
+}

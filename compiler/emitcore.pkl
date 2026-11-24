@@ -4058,6 +4058,55 @@ fn call(em: Emitter, e: Expr, callee: Expr, args: List<CallArg>) -> int? {
         r
     }
 
+/// Fill trailing omitted arguments with their declared default expressions.
+/// Only plain positional calls are handled; named arguments and spreads have
+/// their own resolution paths. A default is evaluated at the call site, so a
+/// default may not refer to another parameter. The checker has already
+/// type-checked every default against its parameter type.
+fn fillDefaultArgs(em: Emitter, span: Span, fid: int, args: List<CallArg>) -> List<CallArg>? {
+        for (a in args) {
+            if (a.spread) {
+                return args
+            }
+            if (let some(_) = a.name) {
+                return args
+            }
+        }
+        var params = List<Param>()
+        if (let some(src) = em.fsource.get(fid)) {
+            match (src) {
+                case FnSource.TopLevel(f) -> params = f.params
+                case FnSource.Method(table, md) -> params = md.params
+                case FnSource.NamedCtor(table, ctor) -> params = ctor.params
+                case FnSource.Ctor(table, inits, blocks, ctor) -> {
+                    if (let some(cd) = ctor) {
+                        params = cd.params
+                    }
+                }
+                case _ -> {}
+            }
+        }
+        if (len(params) == 0 || len(args) >= len(params)) {
+            return args
+        }
+        var out = List<CallArg>()
+        var i = 0
+        while (i < len(params)) {
+            if (i < len(args)) {
+                out.push(args[i])
+            } else {
+                if (let some(d) = params[i].default) {
+                    out.push(CallArg(none, d, false, d.span))
+                } else {
+                    bad(em, span, "expected " + str(len(params)) + " argument(s), found " + str(len(args)))
+                    return none
+                }
+            }
+            i = i + 1
+        }
+        out
+}
+
 fn call1(em: Emitter, e: Expr, callee: Expr, args: List<CallArg>) -> int? {
         if (!icePoke(em, "call1")) {
             return none
@@ -4161,6 +4210,12 @@ fn call1(em: Emitter, e: Expr, callee: Expr, args: List<CallArg>) -> int? {
         }
 var fidO = em.irModule.funcsByName.get(name)
         if (let some(fid) = fidO) {
+            let filled = fillDefaultArgs(em, e.span, fid, args)
+            if (let some(fa) = filled) {
+                args = fa
+            } else {
+                return none
+            }
             if (anySpread(args)) {
                 var pty = srcParamList(em, fid)
                 var rt = callRetFor(em, fid)
@@ -4220,6 +4275,12 @@ var cidO = em.classByName.get(name)
         if (let some(cid) = cidO) {
             var ctorO = em.ctorIds.get(cid)
             if (let some(fid) = ctorO) {
+                let filled = fillDefaultArgs(em, e.span, fid, args)
+                if (let some(fa) = filled) {
+                    args = fa
+                } else {
+                    return none
+                }
                 if (anySpread(args)) {
                     var pty = srcParamList(em, fid)
                     return spreadStaticCall(em, e, e.span, fid, pty, Ty.Class(name, List<Ty>()), none, args)
@@ -6000,6 +6061,12 @@ fn callMethod(em: Emitter, e: Expr, fid: int, args: List<CallArg>, receiver: int
         if (!icePoke(em, "callMethod")) {
             return none
         }
+        let filled = fillDefaultArgs(em, e.span, fid, args)
+        if (let some(fa) = filled) {
+            args = fa
+        } else {
+            return none
+        }
         if (anySpread(args)) {
             var pty = srcParamList(em, fid)
             var rt = callRetFor(em, fid)
@@ -6398,6 +6465,12 @@ fn tryStmt(em: Emitter, body: Block, binder: string?, handler: Block?, fin: Bloc
     /// falls through to the statically-resolved `fallback_fid`. Mirrors
     /// `virtual_method_call`.
 fn virtualMethodCall(em: Emitter, e: Expr, fallbackFid: int, args: List<CallArg>, receiver: int, branches: List<DispatchBranch>) -> int? {
+        let filled = fillDefaultArgs(em, e.span, fallbackFid, args)
+        if (let some(fa) = filled) {
+            args = fa
+        } else {
+            return none
+        }
         if (anySpread(args)) {
             bad(em, e.span, "spread arguments cannot dispatch virtually (the method is overridden)")
             return none

@@ -1,0 +1,1572 @@
+module std.net.websocket
+
+// RFC 6455 WebSocket client and server over the `std.net.Conn` byte-stream
+// contract. A `Conn` is a `TcpStream` or a `TlsStream`, so the same handshake,
+// framing, and control logic serves `ws://` and `wss://` with no branch here:
+//
+//     let ws = WsConn.connect(host, port, "/chat", 5000)
+//     let tcp = TcpStream.connect(host, port)
+//     let tls = TlsStream.wrap(tcp, host, true)
+//     let wss = WsConn.over(tls, host, port, "/chat")
+//
+// SERVER SIDE. `WsServer` owns a listener and accepts one connection at a
+// time. `serveOnceDetached` accepts, upgrades, and runs a handler on a new
+// task, so several workers can share one listener. `WsConn.accept(conn,
+// protocols)` upgrades an already-connected `Conn` (useful after
+// `TlsStream.accept`), and `WsConn.attach(conn, client)` wraps a stream that
+// both peers have already upgraded by other means.
+//
+// FRAMING. This implements the RFC 6455 framing layer: FIN/continuation
+// reassembly, 7/16/64-bit payload lengths, client-to-server masking (client
+// writes masked, server writes unmasked, and the opposite is a protocol
+// error), text/binary data, and ping/pong/close control frames. Control frames
+// are handled inside `readMessage`: a ping is answered with a pong carrying the
+// same payload, a pong is recorded for `takePong`, and a close is validated,
+// echoed when not already sent, and ends the connection. No extensions are
+// negotiated; a peer that sets an RSV bit or selects an extension is rejected.
+//
+// TEXT. Text messages (including fragmented ones) must be valid UTF-8. A
+// malformed message fails with close code 1007. Binary messages are opaque.
+//
+// LIMITS. `WsConn.maxFrame` (default 8 MiB) bounds one frame and
+// `WsConn.maxMessage` (default 8 MiB) bounds one reassembled message. An
+// over-limit peer is failed with close code 1009.
+//
+// ERRORS. Operations return `false`/`none` and record a `NetError` in
+// `lastError()`. A clean close frame sets `isClosed()` and exposes
+// `closeCode`/`closeReason`; a transport end without a close frame is reported
+// as code 1006. Protocol failures send a close frame before closing.
+//
+// DELIBERATE LIMITS. No permessage-deflate or other extension, no HTTP
+// redirects or cookies on the handshake, no proxy CONNECT, and no subprotocol
+// validation beyond exact matching against the server's supported list. The
+// handshake parser is a strict HTTP/1.1 subset and does not read beyond the
+// blank line, so bytes sent immediately after the handshake stay available to
+// the frame reader.
+
+import { Conn, NetError, TcpStream, TcpListener, ERR_NONE, ERR_OTHER, ERR_CLOSED, ERR_PROTOCOL, ERR_TIMEOUT, ERR_INVALID_INPUT, ERR_MESSAGE_SIZE, READ_CHUNK, sinkCopy, sinkSet } from std.net
+import { HttpHeaders, appendHeaderLine, headerHasToken, eqIgnoreCase, asciiText, byteSlice, indexOfByte } from std.net.http
+import { sha1, randomBytes } from std.crypto
+import { encode as base64Encode, decode as base64Decode } from std.encoding.base64
+import { isValid as isUtf8 } from std.text.unicode
+import { Task, spawn } from std.thread
+
+// ---------------------------------------------------------------------------
+// Protocol constants
+// ---------------------------------------------------------------------------
+
+/// The fixed GUID appended to the client key for the accept hash.
+const WS_GUID: string = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+const OP_CONT: int = 0
+const OP_TEXT: int = 1
+const OP_BINARY: int = 2
+const OP_CLOSE: int = 8
+const OP_PING: int = 9
+const OP_PONG: int = 10
+
+const WS_MAX_HEAD: int = 16384
+const WS_MAX_LINE: int = 8192
+const WS_MAX_CONTROL: int = 125
+const WS_MAX_FRAME: int = 8388608
+const WS_MAX_MESSAGE: int = 8388608
+
+const CLOSE_NORMAL: int = 1000
+const CLOSE_GOING_AWAY: int = 1001
+const CLOSE_PROTOCOL: int = 1002
+const CLOSE_DATA: int = 1003
+const CLOSE_NO_STATUS: int = 1005
+const CLOSE_ABNORMAL: int = 1006
+const CLOSE_BAD_PAYLOAD: int = 1007
+const CLOSE_TOO_BIG: int = 1009
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+fn isControlOpcode(opcode: int) -> bool {
+    opcode >= 8
+}
+
+fn isValidOpcode(opcode: int) -> bool {
+    opcode == OP_CONT || opcode == OP_TEXT || opcode == OP_BINARY || opcode == OP_CLOSE || opcode == OP_PING || opcode == OP_PONG
+}
+
+fn isDataOpcode(opcode: int) -> bool {
+    opcode == OP_CONT || opcode == OP_TEXT || opcode == OP_BINARY
+}
+
+/// A close code that may appear on the wire. 1004-1006 and 1015 are reserved
+/// for local use and must never be sent; application codes are 3000-4999.
+fn isValidCloseCode(code: int) -> bool {
+    if (code >= 1000 && code <= 1014) {
+        if (code == 1004 || code == 1005 || code == 1006) {
+            return false
+        }
+        return true
+    }
+    code >= 3000 && code <= 4999
+}
+
+fn appendBe16(out: List<byte>, v: int) {
+    out.push(((v >> 8) & 255) as byte)
+    out.push((v & 255) as byte)
+}
+
+fn readBe16(data: List<byte>) -> int {
+    ((data[0] as int) << 8) | (data[1] as int)
+}
+
+fn appendBe64(out: List<byte>, v: int) {
+    var sh = 56
+    while (sh >= 0) {
+        out.push(((v >> sh) & 255) as byte)
+        sh = sh - 8
+    }
+}
+
+fn applyMask(data: List<byte>, key: List<byte>) -> bool {
+    if (len(key) != 4) {
+        return false
+    }
+    var i = 0
+    while (i < len(data)) {
+        data[i] = (((data[i] as int) ^ (key[i & 3] as int)) & 255) as byte
+        i = i + 1
+    }
+    true
+}
+
+fn normalizePath(path: string) -> string {
+    let b = bytes(path)
+    if (len(b) == 0) {
+        return "/"
+    }
+    if ((b[0] as int) != 47) {
+        return "/" + path
+    }
+    path
+}
+
+/// `Host` header value for the handshake. IPv6 literals are bracketed; port 80
+/// is omitted (the default for a plain `ws://` handshake).
+fn wsHostHeader(host: string, port: int) -> string {
+    var h = host
+    let b = bytes(host)
+    var hasColon = false
+    var bracketed = false
+    var i = 0
+    while (i < len(b)) {
+        if ((b[i] as int) == 58) {
+            hasColon = true
+        }
+        i = i + 1
+    }
+    if (len(b) >= 2) {
+        if ((b[0] as int) == 91 && (b[len(b) - 1] as int) == 93) {
+            bracketed = true
+        }
+    }
+    if (hasColon && !bracketed) {
+        h = "[" + host + "]"
+    }
+    if (port <= 0 || port == 80) {
+        return h
+    }
+    h + ":" + str(port)
+}
+
+/// Parse `a b c` or, for a response with no reason phrase, `a b`.
+fn splitStartLine(line: List<byte>, allowMissingReason: bool) -> List<string>? {
+    let n = len(line)
+    let p1 = indexOfByte(line, 32, 0)
+    if (p1 <= 0) {
+        return none
+    }
+    let p2raw = indexOfByte(line, 32, p1 + 1)
+    var p2 = p2raw
+    if (p2 < 0) {
+        if (!allowMissingReason) {
+            return none
+        }
+        p2 = n
+    }
+    if (p2 <= p1 + 1) {
+        return none
+    }
+    let aOpt = asciiText(line, 0, p1)
+    let bOpt = asciiText(line, p1 + 1, p2)
+    let cOpt = asciiText(line, p2 + 1, n)
+    if (let some(a) = aOpt) {
+        if (let some(b) = bOpt) {
+            if (let some(c) = cOpt) {
+                let out = List<string>()
+                out.push(a)
+                out.push(b)
+                out.push(c)
+                return out
+            }
+        }
+    }
+    none
+}
+
+fn parseDecimalStrict(text: string) -> int {
+    let b = bytes(text)
+    if (len(b) == 0) {
+        return -1
+    }
+    var v = 0
+    var i = 0
+    while (i < len(b)) {
+        let c = b[i] as int
+        if (c < 48 || c > 57) {
+            return -1
+        }
+        v = v * 10 + (c - 48)
+        i = i + 1
+    }
+    v
+}
+
+// ---------------------------------------------------------------------------
+// Handshake values and serialization
+// ---------------------------------------------------------------------------
+
+/// RFC 6455 section 4.2.2 accept value for a client's `Sec-WebSocket-Key`.
+fn acceptKey(clientKey: string) -> string {
+    base64Encode(sha1(bytes(clientKey + WS_GUID)))
+}
+
+/// Client handshake request text. `key` must be the base64 of 16 random
+/// bytes; use `WsConn.over`/`WsConn.connect` unless a deterministic key is
+/// required. `protocol` may be empty.
+fn clientHandshakeText(host: string, port: int, path: string, key: string, protocol: string) -> string {
+    var out = "GET " + normalizePath(path) + " HTTP/1.1\r\n"
+    out = out + "Host: " + wsHostHeader(host, port) + "\r\n"
+    out = out + "Upgrade: websocket\r\n"
+    out = out + "Connection: Upgrade\r\n"
+    out = out + "Sec-WebSocket-Key: " + key + "\r\n"
+    out = out + "Sec-WebSocket-Version: 13\r\n"
+    if (protocol != "") {
+        out = out + "Sec-WebSocket-Protocol: " + protocol + "\r\n"
+    }
+    out + "\r\n"
+}
+
+fn serverAcceptText(accept: string, protocol: string) -> string {
+    var out = "HTTP/1.1 101 Switching Protocols\r\n"
+    out = out + "Upgrade: websocket\r\n"
+    out = out + "Connection: Upgrade\r\n"
+    out = out + "Sec-WebSocket-Accept: " + accept + "\r\n"
+    if (protocol != "") {
+        out = out + "Sec-WebSocket-Protocol: " + protocol + "\r\n"
+    }
+    out + "\r\n"
+}
+
+fn rejectHandshake(conn: Conn, status: int, reason: string, extra: string) {
+    var text = "HTTP/1.1 " + str(status) + " " + reason + "\r\n"
+    text = text + "Connection: close\r\n"
+    if (extra != "") {
+        text = text + extra
+    }
+    text = text + "Content-Length: 0\r\n\r\n"
+    let _ = conn.writeAll(bytes(text))
+}
+
+fn isClientKey(value: string) -> bool {
+    match (base64Decode(value)) {
+        case some(b) -> len(b) == 16
+        case none -> false
+    }
+}
+
+/// Split a comma-separated header value, trimming OWS and preserving case
+/// (subprotocol names are case-sensitive).
+fn splitProtocols(value: string) -> List<string> {
+    let b = bytes(value)
+    var out = List<string>()
+    var start = 0
+    var i = 0
+    while (i <= len(b)) {
+        if (i == len(b) || (b[i] as int) == 44) {
+            var lo = start
+            var hi = i
+            while (lo < hi) {
+                let c = b[lo] as int
+                if (c != 32 && c != 9) {
+                    break
+                }
+                lo = lo + 1
+            }
+            while (hi > lo) {
+                let c = b[hi - 1] as int
+                if (c != 32 && c != 9) {
+                    break
+                }
+                hi = hi - 1
+            }
+            if (hi > lo) {
+                let piece = byteSlice(b, lo, hi)
+                if (let some(s) = asciiText(piece, 0, len(piece))) {
+                    if (s != "") {
+                        out.push(s)
+                    }
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    out
+}
+
+fn offeredProtocols(h: HttpHeaders) -> List<string> {
+    var out = List<string>()
+    var i = 0
+    while (i < h.lenHeaders()) {
+        if (eqIgnoreCase(h.nameAt(i), "Sec-WebSocket-Protocol")) {
+            for (p in splitProtocols(h.valueAt(i))) {
+                out.push(p)
+            }
+        }
+        i = i + 1
+    }
+    out
+}
+
+fn selectProtocol(h: HttpHeaders, supported: List<string>) -> string {
+    for (offered in offeredProtocols(h)) {
+        for (candidate in supported) {
+            if (offered == candidate) {
+                return offered
+            }
+        }
+    }
+    ""
+}
+
+// ---------------------------------------------------------------------------
+// Buffered transport reader
+// ---------------------------------------------------------------------------
+
+/// Byte reader shared by the handshake and the frame layer. Keeping one buffer
+/// means bytes that arrived in the same TCP segment as the end of the
+/// handshake are not lost when the connection switches to WebSocket frames.
+class WsReader {
+    var conn: Conn
+    var buf: List<byte>
+    var pos: int
+    var eof: bool
+    var failed: bool
+    var error: NetError
+
+    constructor(conn: Conn) {
+        this.conn = conn
+        this.buf = bytes("")
+        this.pos = 0
+        this.eof = false
+        this.failed = false
+        this.error = NetError()
+    }
+
+    fn available() -> int {
+        len(this.buf) - this.pos
+    }
+
+    fn fail(kind: int, message: string) {
+        if (!this.failed) {
+            this.failed = true
+            this.error.set(kind, 0, message)
+        }
+    }
+
+    fn compact() {
+        if (this.pos == len(this.buf)) {
+            this.buf = bytes("")
+            this.pos = 0
+            return
+        }
+        if (this.pos >= 65536) {
+            this.buf = byteSlice(this.buf, this.pos, len(this.buf))
+            this.pos = 0
+        }
+    }
+
+    /// 1: data appended; 0: clean EOF; -1: error (recorded in `error`).
+    fn fill() -> int {
+        if (this.eof) {
+            return 0
+        }
+        if (this.failed) {
+            return -1
+        }
+        match (this.conn.readSome(READ_CHUNK)) {
+            case some(chunk) -> {
+                if (len(chunk) == 0) {
+                    this.eof = true
+                    return 0
+                }
+                if (this.pos == len(this.buf) && len(this.buf) > 0) {
+                    this.buf = bytes("")
+                    this.pos = 0
+                }
+                for (b in chunk) {
+                    this.buf.push(b)
+                }
+                1
+            }
+            case none -> {
+                let e = this.conn.lastError()
+                if (e.kind == ERR_NONE) {
+                    this.error.set(ERR_OTHER, 0, "websocket: read failed without a recorded error")
+                } else {
+                    this.error.copyFrom(e)
+                }
+                this.failed = true
+                return -1
+            }
+        }
+    }
+
+    /// One line without its CRLF/LF. `none` at EOF or on error.
+    fn readLine(max: int) -> List<byte>? {
+        while (true) {
+            var i = this.pos
+            while (i < len(this.buf)) {
+                if ((this.buf[i] as int) == 10) {
+                    var end = i
+                    if (end > this.pos && (this.buf[end - 1] as int) == 13) {
+                        end = end - 1
+                    }
+                    if (end - this.pos > max) {
+                        this.fail(ERR_MESSAGE_SIZE, "websocket: line exceeds " + str(max) + " bytes")
+                        return none
+                    }
+                    let out = byteSlice(this.buf, this.pos, end)
+                    this.pos = i + 1
+                    this.compact()
+                    return out
+                }
+                i = i + 1
+            }
+            if (len(this.buf) - this.pos > max) {
+                this.fail(ERR_MESSAGE_SIZE, "websocket: line exceeds " + str(max) + " bytes")
+                return none
+            }
+            let f = this.fill()
+            if (f < 0) {
+                return none
+            }
+            if (f == 0) {
+                if (this.available() > 0) {
+                    this.fail(ERR_PROTOCOL, "websocket: connection closed inside the handshake")
+                }
+                return none
+            }
+        }
+    }
+
+    /// Exactly `n` bytes. A short stream is an abnormal close.
+    fn readExact(n: int) -> List<byte>? {
+        if (n < 0) {
+            this.fail(ERR_PROTOCOL, "websocket: negative frame length")
+            return none
+        }
+        var out = bytes("")
+        while (len(out) < n) {
+            if (this.pos >= len(this.buf)) {
+                let f = this.fill()
+                if (f < 0) {
+                    return none
+                }
+                if (f == 0) {
+                    this.fail(ERR_CLOSED, "websocket: connection closed inside a frame")
+                    return none
+                }
+            }
+            let avail = len(this.buf) - this.pos
+            var take = n - len(out)
+            if (take > avail) {
+                take = avail
+            }
+            var i = 0
+            while (i < take) {
+                out.push(this.buf[this.pos + i])
+                i = i + 1
+            }
+            this.pos = this.pos + take
+        }
+        this.compact()
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Handshake heads
+// ---------------------------------------------------------------------------
+
+class WsRequestHead {
+    var method: string
+    var target: string
+    var version: string
+    var headers: HttpHeaders
+
+    constructor(method: string, target: string, version: string, headers: HttpHeaders) {
+        this.method = method
+        this.target = target
+        this.version = version
+        this.headers = headers
+    }
+}
+
+class WsResponseHead {
+    var version: string
+    var status: int
+    var reason: string
+    var headers: HttpHeaders
+
+    constructor(version: string, status: int, reason: string, headers: HttpHeaders) {
+        this.version = version
+        this.status = status
+        this.reason = reason
+        this.headers = headers
+    }
+}
+
+fn readHeaderBlock(r: WsReader, used: int) -> HttpHeaders? {
+    var total = used
+    let h = HttpHeaders()
+    while (true) {
+        let lineOpt = r.readLine(WS_MAX_LINE)
+        match (lineOpt) {
+            case none -> { return none }
+            case some(line) -> {
+                total = total + len(line) + 2
+                if (total > WS_MAX_HEAD) {
+                    r.fail(ERR_MESSAGE_SIZE, "websocket: handshake headers exceed " + str(WS_MAX_HEAD) + " bytes")
+                    return none
+                }
+                if (len(line) == 0) {
+                    return h
+                }
+                if (!appendHeaderLine(h, line)) {
+                    r.fail(ERR_PROTOCOL, "websocket: malformed handshake header field")
+                    return none
+                }
+            }
+        }
+    }
+}
+
+fn readRequestHead(r: WsReader) -> WsRequestHead? {
+    let lineOpt = r.readLine(WS_MAX_LINE)
+    match (lineOpt) {
+        case none -> none
+        case some(line) -> {
+            let partsOpt = splitStartLine(line, false)
+            match (partsOpt) {
+                case none -> {
+                    r.fail(ERR_PROTOCOL, "websocket: malformed request line")
+                    none
+                }
+                case some(parts) -> {
+                    if (parts[0] != "GET") {
+                        r.fail(ERR_PROTOCOL, "websocket: handshake method must be GET")
+                        return none
+                    }
+                    let target = parts[1]
+                    let tb = bytes(target)
+                    if (len(tb) == 0 || (tb[0] as int) != 47) {
+                        r.fail(ERR_PROTOCOL, "websocket: request target must be origin-form")
+                        return none
+                    }
+                    if (parts[2] != "HTTP/1.1") {
+                        r.fail(ERR_PROTOCOL, "websocket: handshake requires HTTP/1.1")
+                        return none
+                    }
+                    let hOpt = readHeaderBlock(r, len(line) + 2)
+                    match (hOpt) {
+                        case some(h) -> WsRequestHead(parts[0], target, parts[2], h)
+                        case none -> none
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn readResponseHead(r: WsReader) -> WsResponseHead? {
+    let lineOpt = r.readLine(WS_MAX_LINE)
+    match (lineOpt) {
+        case none -> none
+        case some(line) -> {
+            let partsOpt = splitStartLine(line, true)
+            match (partsOpt) {
+                case none -> {
+                    r.fail(ERR_PROTOCOL, "websocket: malformed status line")
+                    none
+                }
+                case some(parts) -> {
+                    if (parts[0] != "HTTP/1.1") {
+                        r.fail(ERR_PROTOCOL, "websocket: handshake requires HTTP/1.1")
+                        return none
+                    }
+                    let status = parseDecimalStrict(parts[1])
+                    if (status < 100 || status > 999) {
+                        r.fail(ERR_PROTOCOL, "websocket: malformed status code")
+                        return none
+                    }
+                    let hOpt = readHeaderBlock(r, len(line) + 2)
+                    match (hOpt) {
+                        case some(h) -> WsResponseHead(parts[0], status, parts[2], h)
+                        case none -> none
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Frames
+// ---------------------------------------------------------------------------
+
+class WsFrameHead {
+    var fin: bool
+    var opcode: int
+    var masked: bool
+    var length: int
+    var maskKey: List<byte>
+
+    constructor(fin: bool, opcode: int, masked: bool, length: int, maskKey: List<byte>) {
+        this.fin = fin
+        this.opcode = opcode
+        this.masked = masked
+        this.length = length
+        this.maskKey = maskKey
+    }
+}
+
+class WsFrame {
+    var fin: bool
+    var opcode: int
+    var masked: bool
+    var payload: List<byte>
+
+    constructor(fin: bool, opcode: int, masked: bool, payload: List<byte>) {
+        this.fin = fin
+        this.opcode = opcode
+        this.masked = masked
+        this.payload = payload
+    }
+}
+
+/// Encode one frame. `payload` is copied. A masked frame needs a 4-byte
+/// `maskKey`; control frames must be final and at most 125 bytes.
+fn encodeFrame(opcode: int, payload: List<byte>, fin: bool, masked: bool, maskKey: List<byte>?) -> List<byte>? {
+    if (!isValidOpcode(opcode)) {
+        return none
+    }
+    let n = len(payload)
+    if (isControlOpcode(opcode)) {
+        if (!fin || n > WS_MAX_CONTROL) {
+            return none
+        }
+    }
+    var key = bytes("")
+    if (masked) {
+        match (maskKey) {
+            case some(k) -> {
+                if (len(k) != 4) {
+                    return none
+                }
+                key = k
+            }
+            case none -> { return none }
+        }
+    }
+    var out = bytes("")
+    var b0 = opcode
+    if (fin) {
+        b0 = b0 | 0x80
+    }
+    out.push(b0 as byte)
+    var maskBit = 0
+    if (masked) {
+        maskBit = 0x80
+    }
+    if (n <= 125) {
+        out.push((maskBit | n) as byte)
+    } else if (n <= 65535) {
+        out.push((maskBit | 126) as byte)
+        appendBe16(out, n)
+    } else {
+        out.push((maskBit | 127) as byte)
+        appendBe64(out, n)
+    }
+    if (masked) {
+        for (b in key) {
+            out.push(b)
+        }
+    }
+    var body = byteSlice(payload, 0, n)
+    if (masked) {
+        let _ = applyMask(body, key)
+    }
+    for (b in body) {
+        out.push(b)
+    }
+    out
+}
+
+fn readPayloadLength(r: WsReader, len7: int) -> int? {
+    if (len7 < 126) {
+        return len7
+    }
+    if (len7 == 126) {
+        let twoOpt = r.readExact(2)
+        match (twoOpt) {
+            case some(two) -> readBe16(two)
+            case none -> none
+        }
+    } else {
+        let eightOpt = r.readExact(8)
+        match (eightOpt) {
+            case some(b) -> {
+                if ((b[0] as int) >= 128) {
+                    r.fail(ERR_MESSAGE_SIZE, "websocket: frame length exceeds 63 bits")
+                    return none
+                }
+                var v = 0
+                var i = 0
+                while (i < 8) {
+                    v = (v << 8) | (b[i] as int)
+                    i = i + 1
+                }
+                return v
+            }
+            case none -> none
+        }
+    }
+}
+
+fn readFrameHead(r: WsReader, expectMasked: bool, maxFrame: int) -> WsFrameHead? {
+    let twoOpt = r.readExact(2)
+    match (twoOpt) {
+        case none -> none
+        case some(two) -> {
+            let b0 = two[0] as int
+            let b1 = two[1] as int
+            let fin = (b0 & 0x80) != 0
+            let opcode = b0 & 0x0F
+            let masked = (b1 & 0x80) != 0
+            let len7 = b1 & 0x7F
+            if ((b0 & 0x70) != 0) {
+                r.fail(ERR_PROTOCOL, "websocket: reserved frame bits are set")
+                return none
+            }
+            if (!isValidOpcode(opcode)) {
+                r.fail(ERR_PROTOCOL, "websocket: reserved opcode " + str(opcode))
+                return none
+            }
+            if (isControlOpcode(opcode)) {
+                if (!fin) {
+                    r.fail(ERR_PROTOCOL, "websocket: control frame is fragmented")
+                    return none
+                }
+                if (len7 > WS_MAX_CONTROL) {
+                    r.fail(ERR_PROTOCOL, "websocket: control frame payload exceeds 125 bytes")
+                    return none
+                }
+            }
+            if (masked != expectMasked) {
+                if (masked) {
+                    r.fail(ERR_PROTOCOL, "websocket: server frames must not be masked")
+                } else {
+                    r.fail(ERR_PROTOCOL, "websocket: client frames must be masked")
+                }
+                return none
+            }
+            let lenOpt = readPayloadLength(r, len7)
+            match (lenOpt) {
+                case none -> none
+                case some(n) -> {
+                    if (n > maxFrame) {
+                        r.fail(ERR_MESSAGE_SIZE, "websocket: frame of " + str(n) + " bytes exceeds the limit")
+                        return none
+                    }
+                    var key = bytes("")
+                    if (masked) {
+                        let keyOpt = r.readExact(4)
+                        match (keyOpt) {
+                            case some(k) -> { key = k }
+                            case none -> { return none }
+                        }
+                    }
+                    WsFrameHead(fin, opcode, masked, n, key)
+                }
+            }
+        }
+    }
+}
+
+fn decodeFrame(r: WsReader, expectMasked: bool, maxFrame: int) -> WsFrame? {
+    let headOpt = readFrameHead(r, expectMasked, maxFrame)
+    match (headOpt) {
+        case none -> none
+        case some(head) -> {
+            let dataOpt = r.readExact(head.length)
+            match (dataOpt) {
+                case none -> none
+                case some(data) -> {
+                    if (head.masked) {
+                        if (!applyMask(data, head.maskKey)) {
+                            r.fail(ERR_PROTOCOL, "websocket: malformed mask key")
+                            return none
+                        }
+                    }
+                    WsFrame(head.fin, head.opcode, head.masked, data)
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Messages
+// ---------------------------------------------------------------------------
+
+class WsMessage {
+    var opcode: int
+    var data: List<byte>
+
+    constructor(opcode: int, data: List<byte>) {
+        this.opcode = opcode
+        this.data = data
+    }
+
+    fn isText() -> bool {
+        this.opcode == OP_TEXT
+    }
+
+    fn isBinary() -> bool {
+        this.opcode == OP_BINARY
+    }
+
+    fn text() -> string {
+        str(this.data)
+    }
+}
+
+class WsClose {
+    var code: int
+    var reason: string
+
+    constructor(code: int, reason: string) {
+        this.code = code
+        this.reason = reason
+    }
+}
+
+fn closePayload(code: int, reason: string) -> List<byte> {
+    var out = bytes("")
+    if (code <= 0 || code == CLOSE_NO_STATUS) {
+        return out
+    }
+    appendBe16(out, code)
+    let rb = bytes(reason)
+    var i = 0
+    while (i < len(rb) && i < 123) {
+        out.push(rb[i])
+        i = i + 1
+    }
+    out
+}
+
+fn parseClosePayload(data: List<byte>) -> WsClose? {
+    if (len(data) == 0) {
+        return WsClose(CLOSE_NO_STATUS, "")
+    }
+    if (len(data) == 1) {
+        return none
+    }
+    let code = readBe16(data)
+    if (!isValidCloseCode(code)) {
+        return none
+    }
+    let rb = byteSlice(data, 2, len(data))
+    if (!isUtf8(str(rb))) {
+        return none
+    }
+    WsClose(code, str(rb))
+}
+
+fn closeReasonFor(code: int) -> string {
+    if (code == CLOSE_PROTOCOL) {
+        return "protocol error"
+    }
+    if (code == CLOSE_BAD_PAYLOAD) {
+        return "invalid payload data"
+    }
+    if (code == CLOSE_TOO_BIG) {
+        return "message too big"
+    }
+    ""
+}
+
+// ---------------------------------------------------------------------------
+// Connection
+// ---------------------------------------------------------------------------
+
+/// One upgraded WebSocket connection. Not safe for concurrent use by two
+/// threads: a reader and a writer may run at the same time only if the caller
+/// serializes frames and accepts that `readMessage` can auto-send a pong.
+class WsConn {
+    var conn: Conn
+    var reader: WsReader
+    var client: bool
+    var protocol: string
+    var closed: bool
+    var closeSent: bool
+    var closeCode: int
+    var closeReason: string
+    var error: NetError
+    var maxFrame: int
+    var maxMessage: int
+    var lastPong: List<byte>
+    var pongSeen: bool
+    var fragmentOpcode: int
+    var fragments: List<byte>
+
+    constructor(conn: Conn, reader: WsReader, client: bool, protocol: string, maxFrame: int, maxMessage: int) {
+        this.conn = conn
+        this.reader = reader
+        this.client = client
+        this.protocol = protocol
+        this.closed = false
+        this.closeSent = false
+        this.closeCode = 0
+        this.closeReason = ""
+        this.error = NetError()
+        this.maxFrame = maxFrame
+        this.maxMessage = maxMessage
+        this.lastPong = bytes("")
+        this.pongSeen = false
+        this.fragmentOpcode = 0
+        this.fragments = bytes("")
+    }
+
+    fn lastError() -> NetError {
+        this.error
+    }
+
+    fn isClosed() -> bool {
+        this.closed
+    }
+
+    /// `true` while the local side has sent a close frame, even if the peer's
+    /// close has not arrived yet.
+    fn isClosing() -> bool {
+        this.closeSent
+    }
+
+    /// The most recent pong payload, or `none` if no pong arrived since the
+    /// previous call.
+    fn takePong() -> List<byte>? {
+        if (!this.pongSeen) {
+            return none
+        }
+        this.pongSeen = false
+        this.lastPong
+    }
+
+    fn copyTransportError(src: NetError) {
+        if (this.error.kind != ERR_NONE) {
+            return
+        }
+        if (src.kind == ERR_NONE) {
+            this.error.set(ERR_OTHER, 0, "websocket: transport failed without a recorded error")
+        } else {
+            this.error.copyFrom(src)
+        }
+    }
+
+    // -- construction -------------------------------------------------------
+
+    /// Wrap a stream that both peers have already upgraded (for tests or a
+    /// custom handshake). `client` selects the masking role.
+    static fn attach(conn: Conn, client: bool, protocol: string = "") -> WsConn {
+        WsConn(conn, WsReader(conn), client, protocol, WS_MAX_FRAME, WS_MAX_MESSAGE)
+    }
+
+    /// Perform the client handshake over an existing `Conn`. `key` must be the
+    /// base64 encoding of 16 random bytes; `over` generates one for callers
+    /// that do not need deterministic bytes.
+    static fn handshakeClient(conn: Conn, host: string, port: int, path: string, key: string, protocol: string = "", err: NetError? = none) -> WsConn? {
+        let text = clientHandshakeText(host, port, path, key, protocol)
+        if (!conn.writeAll(bytes(text))) {
+            sinkCopy(err, conn.lastError())
+            return none
+        }
+        let reader = WsReader(conn)
+        let headOpt = readResponseHead(reader)
+        match (headOpt) {
+            case none -> {
+                if (reader.error.kind == ERR_NONE) {
+                    sinkSet(err, ERR_PROTOCOL, 0, "websocket: server closed before the handshake response")
+                } else {
+                    sinkCopy(err, reader.error)
+                }
+                none
+            }
+            case some(h) -> {
+                if (h.status != 101) {
+                    sinkSet(err, ERR_PROTOCOL, 0, "websocket: server returned HTTP " + str(h.status))
+                    return none
+                }
+                if (!headerHasToken(h.headers, "Upgrade", "websocket")) {
+                    sinkSet(err, ERR_PROTOCOL, 0, "websocket: response is missing 'Upgrade: websocket'")
+                    return none
+                }
+                if (!headerHasToken(h.headers, "Connection", "upgrade")) {
+                    sinkSet(err, ERR_PROTOCOL, 0, "websocket: response is missing 'Connection: Upgrade'")
+                    return none
+                }
+                if (h.headers.countOf("Sec-WebSocket-Accept") != 1) {
+                    sinkSet(err, ERR_PROTOCOL, 0, "websocket: response must have exactly one Sec-WebSocket-Accept")
+                    return none
+                }
+                if (h.headers.getOr("Sec-WebSocket-Accept", "") != acceptKey(key)) {
+                    sinkSet(err, ERR_PROTOCOL, 0, "websocket: response Sec-WebSocket-Accept does not match")
+                    return none
+                }
+                if (h.headers.has("Sec-WebSocket-Extensions")) {
+                    sinkSet(err, ERR_PROTOCOL, 0, "websocket: server selected an extension that was not requested")
+                    return none
+                }
+                var selected = ""
+                if (h.headers.countOf("Sec-WebSocket-Protocol") > 1) {
+                    sinkSet(err, ERR_PROTOCOL, 0, "websocket: response selected multiple subprotocols")
+                    return none
+                }
+                let sp = h.headers.getOr("Sec-WebSocket-Protocol", "")
+                if (sp != "") {
+                    if (protocol == "" || sp != protocol) {
+                        sinkSet(err, ERR_PROTOCOL, 0, "websocket: server selected an unrequested subprotocol")
+                        return none
+                    }
+                    selected = sp
+                }
+                WsConn(conn, reader, true, selected, WS_MAX_FRAME, WS_MAX_MESSAGE)
+            }
+        }
+    }
+
+    /// Client handshake over an existing `Conn`, with a fresh random key.
+    static fn over(conn: Conn, host: string, port: int, path: string, protocol: string = "", err: NetError? = none) -> WsConn? {
+        match (randomBytes(16)) {
+            case some(k) -> WsConn.handshakeClient(conn, host, port, path, base64Encode(k), protocol, err)
+            case none -> {
+                sinkSet(err, ERR_OTHER, 0, "websocket: no secure random source")
+                none
+            }
+        }
+    }
+
+    /// Connect over TCP, set the receive timeout used for the handshake, and
+    /// upgrade. `timeoutMs` bounds each connect attempt and the handshake
+    /// read; zero leaves the socket unbounded.
+    static fn connect(host: string, port: int, path: string, timeoutMs: int = 0, protocol: string = "", err: NetError? = none) -> WsConn? {
+        match (TcpStream.connect(host, port, timeoutMs, err)) {
+            case some(tcp) -> {
+                if (timeoutMs > 0) {
+                    let _ = tcp.setRecvTimeoutMs(timeoutMs)
+                }
+                match (WsConn.over(tcp, host, port, path, protocol, err)) {
+                    case some(ws) -> ws
+                    case none -> {
+                        tcp.close()
+                        none
+                    }
+                }
+            }
+            case none -> none
+        }
+    }
+
+    /// Upgrade a server-side `Conn`. On a malformed or unacceptable handshake
+    /// an HTTP error response is written when possible and `none` is returned
+    /// with `err` set.
+    static fn accept(conn: Conn, protocols: List<string>, err: NetError? = none) -> WsConn? {
+        let reader = WsReader(conn)
+        let headOpt = readRequestHead(reader)
+        match (headOpt) {
+            case none -> {
+                if (reader.error.kind == ERR_NONE) {
+                    sinkSet(err, ERR_PROTOCOL, 0, "websocket: client closed before the handshake request")
+                } else {
+                    sinkCopy(err, reader.error)
+                    if (reader.error.kind == ERR_PROTOCOL) {
+                        rejectHandshake(conn, 400, "Bad Request", "")
+                    }
+                }
+                none
+            }
+            case some(h) -> {
+                if (h.headers.countOf("Host") < 1) {
+                    rejectHandshake(conn, 400, "Bad Request", "")
+                    sinkSet(err, ERR_PROTOCOL, 0, "websocket: handshake is missing Host")
+                    return none
+                }
+                if (!headerHasToken(h.headers, "Upgrade", "websocket")) {
+                    rejectHandshake(conn, 400, "Bad Request", "")
+                    sinkSet(err, ERR_PROTOCOL, 0, "websocket: handshake is missing 'Upgrade: websocket'")
+                    return none
+                }
+                if (!headerHasToken(h.headers, "Connection", "upgrade")) {
+                    rejectHandshake(conn, 400, "Bad Request", "")
+                    sinkSet(err, ERR_PROTOCOL, 0, "websocket: handshake is missing 'Connection: Upgrade'")
+                    return none
+                }
+                let version = h.headers.getOr("Sec-WebSocket-Version", "")
+                if (h.headers.countOf("Sec-WebSocket-Version") != 1 || version != "13") {
+                    rejectHandshake(conn, 426, "Upgrade Required", "Sec-WebSocket-Version: 13\r\n")
+                    sinkSet(err, ERR_PROTOCOL, 0, "websocket: unsupported Sec-WebSocket-Version")
+                    return none
+                }
+                if (h.headers.countOf("Sec-WebSocket-Key") != 1) {
+                    rejectHandshake(conn, 400, "Bad Request", "")
+                    sinkSet(err, ERR_PROTOCOL, 0, "websocket: handshake must have exactly one Sec-WebSocket-Key")
+                    return none
+                }
+                let key = h.headers.getOr("Sec-WebSocket-Key", "")
+                if (!isClientKey(key)) {
+                    rejectHandshake(conn, 400, "Bad Request", "")
+                    sinkSet(err, ERR_PROTOCOL, 0, "websocket: Sec-WebSocket-Key is not base64 of 16 bytes")
+                    return none
+                }
+                let selected = selectProtocol(h.headers, protocols)
+                let response = serverAcceptText(acceptKey(key), selected)
+                if (!conn.writeAll(bytes(response))) {
+                    sinkCopy(err, conn.lastError())
+                    return none
+                }
+                WsConn(conn, reader, false, selected, WS_MAX_FRAME, WS_MAX_MESSAGE)
+            }
+        }
+    }
+
+    // -- sending ------------------------------------------------------------
+
+    fn sendRaw(opcode: int, payload: List<byte>, fin: bool) -> bool {
+        var key = bytes("")
+        var masked = false
+        if (this.client) {
+            masked = true
+            match (randomBytes(4)) {
+                case some(k) -> { key = k }
+                case none -> {
+                    this.error.set(ERR_OTHER, 0, "websocket: no secure random source")
+                    return false
+                }
+            }
+        }
+        var encoded: List<byte>? = none
+        if (masked) {
+            encoded = encodeFrame(opcode, payload, fin, true, key)
+        } else {
+            encoded = encodeFrame(opcode, payload, fin, false, none)
+        }
+        match (encoded) {
+            case some(frame) -> {
+                if (!this.conn.writeAll(frame)) {
+                    this.copyTransportError(this.conn.lastError())
+                    return false
+                }
+                true
+            }
+            case none -> {
+                this.error.set(ERR_INVALID_INPUT, 0, "websocket: invalid frame parameters")
+                false
+            }
+        }
+    }
+
+    /// Send a data frame. `opcode` is TEXT, BINARY, or CONT; control frames
+    /// have dedicated methods so their invariants cannot be bypassed.
+    fn sendFrame(opcode: int, payload: List<byte>, fin: bool) -> bool {
+        if (this.closed || this.closeSent) {
+            this.error.set(ERR_CLOSED, 0, "websocket: send on a closed connection")
+            return false
+        }
+        if (opcode != OP_TEXT && opcode != OP_BINARY && opcode != OP_CONT) {
+            this.error.set(ERR_INVALID_INPUT, 0, "websocket: sendFrame accepts data opcodes only")
+            return false
+        }
+        this.sendRaw(opcode, payload, fin)
+    }
+
+    /// Send one complete text or binary message.
+    fn sendMessage(opcode: int, payload: List<byte>) -> bool {
+        this.sendFrame(opcode, payload, true)
+    }
+
+    fn sendText(text: string) -> bool {
+        this.sendFrame(OP_TEXT, bytes(text), true)
+    }
+
+    fn sendBinary(data: List<byte>) -> bool {
+        this.sendFrame(OP_BINARY, data, true)
+    }
+
+    fn sendPing(payload: List<byte>) -> bool {
+        if (this.closed || this.closeSent) {
+            this.error.set(ERR_CLOSED, 0, "websocket: send on a closed connection")
+            return false
+        }
+        if (len(payload) > WS_MAX_CONTROL) {
+            this.error.set(ERR_INVALID_INPUT, 0, "websocket: ping payload exceeds 125 bytes")
+            return false
+        }
+        this.sendRaw(OP_PING, payload, true)
+    }
+
+    fn sendPong(payload: List<byte>) -> bool {
+        if (this.closed) {
+            this.error.set(ERR_CLOSED, 0, "websocket: send on a closed connection")
+            return false
+        }
+        if (len(payload) > WS_MAX_CONTROL) {
+            this.error.set(ERR_INVALID_INPUT, 0, "websocket: pong payload exceeds 125 bytes")
+            return false
+        }
+        this.sendRaw(OP_PONG, payload, true)
+    }
+
+    /// Start the close handshake. The connection remains open until the peer's
+    /// close arrives (`readMessage` completes it) or `close` aborts it. A
+    /// `code` of zero sends an empty close payload (no status).
+    fn sendClose(code: int, reason: string) -> bool {
+        if (this.closed || this.closeSent) {
+            this.error.set(ERR_CLOSED, 0, "websocket: close already sent")
+            return false
+        }
+        if (code != 0) {
+            if (!isValidCloseCode(code)) {
+                this.error.set(ERR_INVALID_INPUT, 0, "websocket: close code " + str(code) + " cannot be sent")
+                return false
+            }
+            if (len(bytes(reason)) > 123) {
+                this.error.set(ERR_INVALID_INPUT, 0, "websocket: close reason exceeds 123 bytes")
+                return false
+            }
+        }
+        let payload = closePayload(code, reason)
+        if (!this.sendRaw(OP_CLOSE, payload, true)) {
+            return false
+        }
+        this.closeSent = true
+        this.closeCode = code
+        this.closeReason = reason
+        true
+    }
+
+    fn close() {
+        this.closed = true
+        this.conn.close()
+    }
+
+    // -- receiving ----------------------------------------------------------
+
+    fn finishMessage(opcode: int, data: List<byte>) -> WsMessage? {
+        if (len(data) > this.maxMessage) {
+            this.failWith(CLOSE_TOO_BIG, ERR_MESSAGE_SIZE, "websocket: message exceeds " + str(this.maxMessage) + " bytes")
+            return none
+        }
+        if (opcode == OP_TEXT && !isUtf8(str(data))) {
+            this.failWith(CLOSE_BAD_PAYLOAD, ERR_PROTOCOL, "websocket: text message is not valid UTF-8")
+            return none
+        }
+        WsMessage(opcode, data)
+    }
+
+    fn failWith(code: int, kind: int, message: string) {
+        if (this.error.kind == ERR_NONE) {
+            this.error.set(kind, 0, message)
+        }
+        if (!this.closeSent) {
+            let payload = closePayload(code, closeReasonFor(code))
+            let _ = this.sendRaw(OP_CLOSE, payload, true)
+            this.closeSent = true
+        }
+        this.closeCode = code
+        this.closed = true
+    }
+
+    fn handleReadFailure() {
+        let e = this.reader.error
+        if (this.error.kind == ERR_NONE) {
+            if (e.kind == ERR_NONE) {
+                this.error.set(ERR_OTHER, 0, "websocket: read failed without a recorded error")
+            } else {
+                this.error.copyFrom(e)
+            }
+        }
+        if (e.kind == ERR_CLOSED) {
+            if (this.closeCode == 0) {
+                this.closeCode = CLOSE_ABNORMAL
+            }
+            this.closed = true
+            return
+        }
+        if (e.kind == ERR_PROTOCOL) {
+            this.failWith(CLOSE_PROTOCOL, ERR_PROTOCOL, e.message)
+            return
+        }
+        if (e.kind == ERR_MESSAGE_SIZE) {
+            this.failWith(CLOSE_TOO_BIG, ERR_MESSAGE_SIZE, e.message)
+            return
+        }
+        if (e.kind == ERR_TIMEOUT) {
+            this.closed = true
+            if (this.closeCode == 0) {
+                this.closeCode = CLOSE_ABNORMAL
+            }
+            return
+        }
+        this.closed = true
+        if (this.closeCode == 0) {
+            this.closeCode = CLOSE_ABNORMAL
+        }
+    }
+
+    fn readFrame() -> WsFrame? {
+        if (this.closed) {
+            return none
+        }
+        let frameOpt = decodeFrame(this.reader, !this.client, this.maxFrame)
+        match (frameOpt) {
+            case some(f) -> f
+            case none -> {
+                this.handleReadFailure()
+                none
+            }
+        }
+    }
+
+    fn handleClose(payload: List<byte>) {
+        // RFC 6455 separates an invalid close code (1002) from an invalid
+        // UTF-8 reason (1007); a one-byte payload is a protocol error.
+        if (len(payload) == 1) {
+            this.failWith(CLOSE_PROTOCOL, ERR_PROTOCOL, "websocket: close frame has a one-byte payload")
+            return
+        }
+        if (len(payload) >= 2) {
+            let code = readBe16(payload)
+            if (!isValidCloseCode(code)) {
+                this.failWith(CLOSE_PROTOCOL, ERR_PROTOCOL, "websocket: invalid close code " + str(code))
+                return
+            }
+            let rb = byteSlice(payload, 2, len(payload))
+            if (!isUtf8(str(rb))) {
+                this.failWith(CLOSE_BAD_PAYLOAD, ERR_PROTOCOL, "websocket: close reason is not valid UTF-8")
+                return
+            }
+        }
+        let parsed = parseClosePayload(payload)
+        match (parsed) {
+            case none -> {
+                this.failWith(CLOSE_PROTOCOL, ERR_PROTOCOL, "websocket: invalid close payload")
+            }
+            case some(c) -> {
+                this.closeCode = c.code
+                this.closeReason = c.reason
+                if (!this.closeSent) {
+                    var echo = payload
+                    if (c.code == CLOSE_NO_STATUS) {
+                        echo = bytes("")
+                    }
+                    let _ = this.sendRaw(OP_CLOSE, echo, true)
+                    this.closeSent = true
+                }
+                this.closed = true
+            }
+        }
+    }
+
+    /// The next complete data message, or `none` when the connection closes or
+    /// fails. Pings are answered and pongs recorded while waiting. Inspect
+    /// `isClosed`, `closeCode`, and `lastError` to distinguish a clean close
+    /// from a transport failure.
+    fn readMessage() -> WsMessage? {
+        while (true) {
+            let frameOpt = this.readFrame()
+            match (frameOpt) {
+                case none -> { return none }
+                case some(f) -> {
+                    if (isControlOpcode(f.opcode)) {
+                        if (f.opcode == OP_PING) {
+                            let _ = this.sendRaw(OP_PONG, f.payload, true)
+                        } else if (f.opcode == OP_PONG) {
+                            this.lastPong = f.payload
+                            this.pongSeen = true
+                        } else if (f.opcode == OP_CLOSE) {
+                            this.handleClose(f.payload)
+                            return none
+                        }
+                    } else {
+                        if (f.opcode == OP_CONT) {
+                            if (this.fragmentOpcode == 0) {
+                                this.failWith(CLOSE_PROTOCOL, ERR_PROTOCOL, "websocket: continuation without a message")
+                                return none
+                            }
+                            if (len(this.fragments) + len(f.payload) > this.maxMessage) {
+                                this.failWith(CLOSE_TOO_BIG, ERR_MESSAGE_SIZE, "websocket: message exceeds " + str(this.maxMessage) + " bytes")
+                                return none
+                            }
+                            for (b in f.payload) {
+                                this.fragments.push(b)
+                            }
+                            if (f.fin) {
+                                let opcode = this.fragmentOpcode
+                                let data = this.fragments
+                                this.fragmentOpcode = 0
+                                this.fragments = bytes("")
+                                return this.finishMessage(opcode, data)
+                            }
+                        } else {
+                            if (this.fragmentOpcode != 0) {
+                                this.failWith(CLOSE_PROTOCOL, ERR_PROTOCOL, "websocket: new data frame inside a fragmented message")
+                                return none
+                            }
+                            if (f.fin) {
+                                return this.finishMessage(f.opcode, f.payload)
+                            }
+                            if (len(f.payload) > this.maxMessage) {
+                                this.failWith(CLOSE_TOO_BIG, ERR_MESSAGE_SIZE, "websocket: message exceeds " + str(this.maxMessage) + " bytes")
+                                return none
+                            }
+                            this.fragmentOpcode = f.opcode
+                            this.fragments = f.payload
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Server
+// ---------------------------------------------------------------------------
+
+/// A TCP listener that upgrades each accepted connection with `WsConn.accept`.
+/// One accept at a time on the caller's thread; `serveOnceDetached` accepts,
+/// upgrades, and runs a handler on a new task so several workers can serve one
+/// listener concurrently.
+class WsServer {
+    var listener: TcpListener
+    var protocols: List<string>
+    var error: NetError
+    var closed: bool
+
+    constructor(listener: TcpListener, protocols: List<string>) {
+        this.listener = listener
+        this.protocols = protocols
+        this.error = NetError()
+        this.closed = false
+    }
+
+    static fn bind(host: string, port: int, protocols: List<string>, err: NetError? = none) -> WsServer? {
+        match (TcpListener.bind(host, port, err)) {
+            case some(l) -> WsServer(l, protocols)
+            case none -> none
+        }
+    }
+
+    fn localPort() -> int {
+        this.listener.localPort()
+    }
+
+    fn lastError() -> NetError {
+        this.error
+    }
+
+    fn accept() -> WsConn? {
+        if (this.closed) {
+            this.error.set(ERR_CLOSED, 0, "websocket: server is closed")
+            return none
+        }
+        match (this.listener.accept()) {
+            case some(stream) -> {
+                let e = NetError()
+                match (WsConn.accept(stream, this.protocols, e)) {
+                    case some(ws) -> ws
+                    case none -> {
+                        this.error.copyFrom(e)
+                        stream.close()
+                        none
+                    }
+                }
+            }
+            case none -> {
+                this.error.copyFrom(this.listener.lastError())
+                none
+            }
+        }
+    }
+
+    fn acceptTimeout(ms: int) -> WsConn? {
+        if (this.closed) {
+            this.error.set(ERR_CLOSED, 0, "websocket: server is closed")
+            return none
+        }
+        match (this.listener.acceptTimeout(ms)) {
+            case some(stream) -> {
+                let e = NetError()
+                match (WsConn.accept(stream, this.protocols, e)) {
+                    case some(ws) -> ws
+                    case none -> {
+                        this.error.copyFrom(e)
+                        stream.close()
+                        none
+                    }
+                }
+            }
+            case none -> {
+                this.error.copyFrom(this.listener.lastError())
+                none
+            }
+        }
+    }
+
+    /// Accept and upgrade one connection on a new task, then run `handler`
+    /// with it on that task. `none` when the server is already closed; the
+    /// caller joins the task to wait for the connection to finish. Several
+    /// detached workers may share one listener.
+    fn serveOnceDetached(ms: int, handler: fn (WsConn)) -> Task? {
+        if (this.closed) {
+            this.error.set(ERR_CLOSED, 0, "websocket: server is closed")
+            return none
+        }
+        let srv = this
+        spawn(fn () {
+            match (srv.acceptTimeout(ms)) {
+                case some(ws) -> {
+                    handler(ws)
+                }
+                case none -> {
+                }
+            }
+        })
+    }
+
+    fn close() {
+        if (!this.closed) {
+            this.listener.close()
+            this.closed = true
+        }
+    }
+}

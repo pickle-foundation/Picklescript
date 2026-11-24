@@ -325,6 +325,28 @@ fn declareBuiltins(rs: Resolver) {
         bs.push(mkBuiltin(span, "win_tls_alloc", List<ParamInfo>(), Ty.Int))
         bs.push(mkBuiltin(span, "win_tls_get", [anyParam(span, "slot")], Ty.Int))
         bs.push(mkBuiltin(span, "win_tls_set", [anyParam(span, "slot"), anyParam(span, "value")], Ty.Int))
+        // Real OS threads as imports, so a `#[symbol]` body can own the
+        // `pickle_thread_*` family. `CreateThread`'s start routine is entered
+        // with the single Win64 calling convention, and a compiled closure
+        // body already receives its closure object in RCX - exactly the
+        // `LPVOID lpParameter` position - so a closure body can be started
+        // directly with the closure as its parameter. The SRW pair is the
+        // world/registry lock: a zeroed `SRWLOCK` is a valid unlocked lock,
+        // and these are real KERNEL32 exports (the Interlocked family is a
+        // compiler intrinsic, not an export, so it is not linkable here).
+        bs.push(mkBuiltin(span, "win_create_thread", [anyParam(span, "attr"), anyParam(span, "stack"), anyParam(span, "start"), anyParam(span, "param"), anyParam(span, "flags"), anyParam(span, "id")], Ty.Int))
+        bs.push(mkBuiltin(span, "win_get_exit_code_thread", [anyParam(span, "handle"), anyParam(span, "code")], Ty.Int))
+        bs.push(mkBuiltin(span, "win_switch_to_thread", List<ParamInfo>(), Ty.Int))
+        bs.push(mkBuiltin(span, "win_acquire_srw_exclusive", [anyParam(span, "lock")], Ty.Empty))
+        bs.push(mkBuiltin(span, "win_release_srw_exclusive", [anyParam(span, "lock")], Ty.Empty))
+        bs.push(mkBuiltin(span, "win_try_acquire_srw_exclusive", [anyParam(span, "lock")], Ty.Int))
+        // The parking half of the world seam: a zero-initialized
+        // CONDITION_VARIABLE cell is valid image/raw data, and the SRW wait
+        // atomically releases the world lock while parked. `wake` and
+        // `wake_all` are the Win32 notification pair.
+        bs.push(mkBuiltin(span, "win_sleep_condition_variable_srw", [anyParam(span, "cv"), anyParam(span, "lock"), anyParam(span, "ms"), anyParam(span, "flags")], Ty.Int))
+        bs.push(mkBuiltin(span, "win_wake_condition_variable", [anyParam(span, "cv")], Ty.Empty))
+        bs.push(mkBuiltin(span, "win_wake_all_condition_variable", [anyParam(span, "cv")], Ty.Empty))
         // Process termination as an import. This exists so a `#[symbol]` body
         // can occupy the `pickle_exit` slot without the Rust implementation
         // behind it: the reference both flushes and exits, and only the flush
@@ -443,6 +465,35 @@ fn declareBuiltins(rs: Resolver) {
         bs.push(mkBuiltin(span, "win_getnameinfo", [anyParam(span, "sa"), anyParam(span, "salen"), anyParam(span, "host"), anyParam(span, "hostlen"), anyParam(span, "serv"), anyParam(span, "servlen"), anyParam(span, "flags")], Ty.Int))
         bs.push(mkBuiltin(span, "win_htons", [anyParam(span, "hostshort")], Ty.Int))
         bs.push(mkBuiltin(span, "win_htonl", [anyParam(span, "hostlong")], Ty.Int))
+        // --- TLS (SECUR32 Schannel/SSPI, CRYPT32 certificates), RNG (BCRYPT), socket readiness ---
+        //
+        // Raw imports for `runtime/abi_net.pkl` and `runtime/abi_tls.pkl`. Every argument is a
+        // machine word (`Int`); the runtime bodies own struct layout and 32-bit status masking.
+        bs.push(mkBuiltin(span, "win_ioctlsocket", [anyParam(span, "a0"), anyParam(span, "a1"), anyParam(span, "a2")], Ty.Int))
+        bs.push(mkBuiltin(span, "win_wsa_poll", [anyParam(span, "a0"), anyParam(span, "a1"), anyParam(span, "a2")], Ty.Int))
+        bs.push(mkBuiltin(span, "win_acquire_credentials_handle_w", [anyParam(span, "a0"), anyParam(span, "a1"), anyParam(span, "a2"), anyParam(span, "a3"), anyParam(span, "a4"), anyParam(span, "a5"), anyParam(span, "a6"), anyParam(span, "a7"), anyParam(span, "a8")], Ty.Int))
+        bs.push(mkBuiltin(span, "win_initialize_security_context_w", [anyParam(span, "a0"), anyParam(span, "a1"), anyParam(span, "a2"), anyParam(span, "a3"), anyParam(span, "a4"), anyParam(span, "a5"), anyParam(span, "a6"), anyParam(span, "a7"), anyParam(span, "a8"), anyParam(span, "a9"), anyParam(span, "a10"), anyParam(span, "a11")], Ty.Int))
+        bs.push(mkBuiltin(span, "win_accept_security_context", [anyParam(span, "a0"), anyParam(span, "a1"), anyParam(span, "a2"), anyParam(span, "a3"), anyParam(span, "a4"), anyParam(span, "a5"), anyParam(span, "a6"), anyParam(span, "a7"), anyParam(span, "a8")], Ty.Int))
+        bs.push(mkBuiltin(span, "win_delete_security_context", [anyParam(span, "a0")], Ty.Int))
+        bs.push(mkBuiltin(span, "win_free_credentials_handle", [anyParam(span, "a0")], Ty.Int))
+        bs.push(mkBuiltin(span, "win_free_context_buffer", [anyParam(span, "a0")], Ty.Int))
+        bs.push(mkBuiltin(span, "win_query_context_attributes_w", [anyParam(span, "a0"), anyParam(span, "a1"), anyParam(span, "a2")], Ty.Int))
+        bs.push(mkBuiltin(span, "win_encrypt_message", [anyParam(span, "a0"), anyParam(span, "a1"), anyParam(span, "a2"), anyParam(span, "a3")], Ty.Int))
+        bs.push(mkBuiltin(span, "win_decrypt_message", [anyParam(span, "a0"), anyParam(span, "a1"), anyParam(span, "a2"), anyParam(span, "a3")], Ty.Int))
+        bs.push(mkBuiltin(span, "win_apply_control_token", [anyParam(span, "a0"), anyParam(span, "a1")], Ty.Int))
+        bs.push(mkBuiltin(span, "win_pfx_import_cert_store", [anyParam(span, "a0"), anyParam(span, "a1"), anyParam(span, "a2")], Ty.Int))
+        bs.push(mkBuiltin(span, "win_cert_find_certificate_in_store", [anyParam(span, "a0"), anyParam(span, "a1"), anyParam(span, "a2"), anyParam(span, "a3"), anyParam(span, "a4"), anyParam(span, "a5")], Ty.Int))
+        bs.push(mkBuiltin(span, "win_cert_free_certificate_context", [anyParam(span, "a0")], Ty.Int))
+        bs.push(mkBuiltin(span, "win_cert_close_store", [anyParam(span, "a0"), anyParam(span, "a1")], Ty.Int))
+        bs.push(mkBuiltin(span, "win_cert_open_store", [anyParam(span, "a0"), anyParam(span, "a1"), anyParam(span, "a2"), anyParam(span, "a3"), anyParam(span, "a4")], Ty.Int))
+        bs.push(mkBuiltin(span, "win_cert_create_certificate_context", [anyParam(span, "a0"), anyParam(span, "a1"), anyParam(span, "a2")], Ty.Int))
+        bs.push(mkBuiltin(span, "win_cert_add_certificate_context_to_store", [anyParam(span, "a0"), anyParam(span, "a1"), anyParam(span, "a2"), anyParam(span, "a3")], Ty.Int))
+        bs.push(mkBuiltin(span, "win_cert_create_certificate_chain_engine", [anyParam(span, "a0"), anyParam(span, "a1")], Ty.Int))
+        bs.push(mkBuiltin(span, "win_cert_free_certificate_chain_engine", [anyParam(span, "a0")], Ty.Empty))
+        bs.push(mkBuiltin(span, "win_cert_get_certificate_chain", [anyParam(span, "a0"), anyParam(span, "a1"), anyParam(span, "a2"), anyParam(span, "a3"), anyParam(span, "a4"), anyParam(span, "a5"), anyParam(span, "a6"), anyParam(span, "a7")], Ty.Int))
+        bs.push(mkBuiltin(span, "win_cert_free_certificate_chain", [anyParam(span, "a0")], Ty.Empty))
+        bs.push(mkBuiltin(span, "win_cert_verify_certificate_chain_policy", [anyParam(span, "a0"), anyParam(span, "a1"), anyParam(span, "a2"), anyParam(span, "a3")], Ty.Int))
+        bs.push(mkBuiltin(span, "win_bcrypt_gen_random", [anyParam(span, "a0"), anyParam(span, "a1"), anyParam(span, "a2"), anyParam(span, "a3")], Ty.Int))
         // --- Garbage collection ---
         //
         // The delegation point from Pickle into the live collector. Named

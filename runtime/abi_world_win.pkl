@@ -1,0 +1,103 @@
+module runtime.abi_world_win
+
+/// Win32 backend for the world lock: `runtime.abi_world` owns the portable
+/// contract, this file owns the only place a Win32 lock primitive is named.
+///
+/// WHY THIS SPLIT MATTERS. A synchronization primitive is the easiest kind of
+/// code to let leak into every caller, and then the whole runtime is pinned to
+/// one OS. The contract in `abi_world` is deliberately platform-neutral:
+///
+///   - one process-wide mutual exclusion lock
+///   - blocking acquire, flat ownership (never taken twice by one thread)
+///   - released around blocking syscalls so a peer thread can run
+///   - a word-sized lock cell helper for platform-owned lock structures
+///   - a word-sized condition cell: park on it while holding the world lock,
+///     and wake one/all from the same lock
+///
+/// A POSIX build provides `runtime/abi_world_posix.pkl` with the same
+/// `winWorld*`/`winLock*` entry points backed by `pthread_mutex_t` (or a
+/// futex/semaphore pair) and its own `alloc`-ed, initialized lock object. The
+/// condition cell can become a futex word or a pointer to a backend-owned
+/// object; the portable side only ever passes its address. The portable
+/// modules import `runtime.abi_world` and never see the difference;
+/// the archive's platform filter picks exactly one backend file.
+///
+/// WHY SRWLOCKS HERE. `InterlockedCompareExchange64` - the obvious spinlock
+/// primitive - is a compiler intrinsic, not a KERNEL32 export, so a runtime
+/// body cannot import it. `AcquireSRWLockExclusive`/`ReleaseSRWLockExclusive`
+/// are real exports, a zero-initialized `SRWLOCK` is the valid unlocked state
+/// (which is exactly what a module-level `var` is), and the OS parks a waiter
+/// instead of burning its quantum. The pair is not recursive; the runtime's
+/// discipline is flat, so recursion never arises.
+///
+/// The owner word lives here, not in the portable module: its size and
+/// encoding are an OS detail (`SRWLOCK` is one word; a `pthread_mutex_t` is
+/// not), and a POSIX backend must be free to lay it out differently.
+
+/// A zero-initialized `SRWLOCK`: the Win32 unlocked state is all-zeroes, so
+/// image data is a valid lock with no initializer.
+var winWorldLock: int = 0
+
+/// Take the world lock, blocking until it is free.
+fn winWorldAcquire() {
+    unsafe {
+        win_acquire_srw_exclusive((&winWorldLock) as int)
+    }
+}
+
+/// Release the world lock. The caller must own it.
+fn winWorldRelease() {
+    unsafe {
+        win_release_srw_exclusive((&winWorldLock) as int)
+    }
+}
+
+/// Non-blocking probe. The low bits of an `SRWLOCK` carry contention flags, so
+/// this is only meaningful when nothing else is running - the lazy-acquire net
+/// on the JIT entry path. Never use it as an ownership test in a live runtime.
+fn winWorldHeld() -> bool {
+    return winWorldLock != 0
+}
+
+/// Acquire a Win32-owned one-word lock cell (an `SRWLOCK` in image data).
+///
+/// This exists for platform modules that own their own lock word - today the
+/// shadow registry - so there is exactly one lock implementation per platform
+/// instead of a second hand-rolled spin. A POSIX shadow backend will use its
+/// own object through the same seam.
+fn winLockAcquire(cell: int) {
+    win_acquire_srw_exclusive(cell)
+}
+
+/// Release a lock cell previously taken by `winLockAcquire`.
+fn winLockRelease(cell: int) {
+    win_release_srw_exclusive(cell)
+}
+
+/// `INFINITE` for `SleepConditionVariableSRW`: a DWORD all-ones.
+const WIN_INFINITE: int = 4294967295
+
+/// Park the calling thread on the condition cell `cv`, which must be a
+/// zero-initialized word owned by the caller's primitive.
+///
+/// The caller must own the world lock: `SleepConditionVariableSRW` releases it
+/// and reacquires it atomically around the wait (flags = 0, exclusive). That
+/// atomic release is what makes the wait race-free: a waker cannot change the
+/// predicate between the caller's check and the park, because the waker would
+/// have to take the same world lock. Spurious wakeups are possible; every
+/// caller re-tests its predicate in a loop.
+fn winWorldPark(cv: int) {
+    unsafe {
+        let _ = win_sleep_condition_variable_srw(cv, (&winWorldLock) as int, WIN_INFINITE, 0)
+    }
+}
+
+/// Wake one thread parked on `cv`. No waiter is not an error.
+fn winWorldWake(cv: int) {
+    win_wake_condition_variable(cv)
+}
+
+/// Wake every thread parked on `cv`.
+fn winWorldWakeAll(cv: int) {
+    win_wake_all_condition_variable(cv)
+}
