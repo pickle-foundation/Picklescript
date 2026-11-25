@@ -21,23 +21,21 @@ module runtime.abi_shadow
 /// (`pickle_gc_unregister_thread`) releases the block the way native's
 /// `Box::from_raw` does.
 ///
-/// THE LOCK. `shadowLock` serialises every mutation of and walk over
-/// `shadowRegHead` and every thread's frame list, one owner word spin with
-/// `win_sleep(0)` between retries (native holds `REGISTRY`, a real
-/// `Mutex<()>`, for exactly the same scope: `push_frame`, `pop_frame`,
-/// `register_thread`, `unregister_thread`, and the collector's whole shadow
-/// walk). Two divergences are recorded:
-///   - The spin is not a hardware atomic: in every qualified image this
-///     runtime serves ONE OS thread (the nostd contract; `spawn` runs its body
-///     inline), so two acquirers can never interleave and a plain
-///     read/write on the owner word is observably identical to the mutex.
-///     A future multithread image must harden this word first.
-///   - The pop-time LIFO check cannot reach the panic channel from this leaf
-///     (`writeStderr` sits above the collector), so a pop out of order is a
-///     silent `win_exit(1)`, not native's panicked
-///     "shadow stack pop out of order" message. The emitter always pops
-///     exactly the frames it pushed, so the check is a debugger aid, not a
-///     runtime contract.
+/// THE LOCK. `shadowLock` (an SRWLOCK) serialises `shadowRegHead`, node
+/// creation/unregistration, and the collector's registry walk. Frame push and
+/// pop are not under it in the steady state: each thread owns its frame chain,
+/// and the collector only walks chains after the barrier has parked every
+/// RUNNING thread. A NATIVE thread cannot mutate its chain, and a thread
+/// leaving a native section polls before it can push again. The lock is still
+/// taken on the one-time TLS-slot and node publication path, and
+/// `shadowInitNode` stays loop-free because the emitter places a safepoint on
+/// every loop header.
+///
+/// The pop-time LIFO check cannot reach the panic channel from this leaf
+/// (`writeStderr` sits above the collector), so a pop out of order is a silent
+/// `win_exit(1)`, not native's panicked "shadow stack pop out of order"
+/// message. The emitter always pops exactly the frames it pushed, so the check
+/// is a debugger aid, not a runtime contract.
 ///
 /// THE UNREGISTER LAW. Native `pop_frame` also runs `ensure_registered`,
 /// which has a same-thread consequence the plain ABI does not show: after
@@ -132,6 +130,12 @@ var shadowTlsSlot: int = -1
 ///  12 parkCv       13 gcEpoch     14 pinned       15 flags
 ///  16 parkLock     17 critical     18 tempBase     19 tempCount
 ///  20 tempCap
+///  21 allocCount  22 regBytes
+///
+/// `allocCount`/`regBytes` are this thread's pending registration statistics:
+/// the collector folds them into the process-wide counters during its registry
+/// pass, and the accessors add them on read. Keeping them per-thread removes
+/// the three shared cache-line writes that every registration used to make.
 ///
 /// `tempBase`/`tempCount`/`tempCap` are this thread's temp-root lease array
 /// (the `gc.rs::temp_root` equivalent). Keeping them on the node makes the
@@ -171,8 +175,13 @@ const SHADOW_W_CRITICAL: int = 17
 const SHADOW_W_TEMP_BASE: int = 18
 const SHADOW_W_TEMP_COUNT: int = 19
 const SHADOW_W_TEMP_CAP: int = 20
-const SHADOW_NODE_WORDS: int = 21
-const SHADOW_NODE_BYTES: int = 168
+/// Registrations appended by this thread since the last collection, and their
+/// byte total. Folded into `rawAllocCount`/`rawAllocBytes`/`regBytes` by the
+/// collector's `geSweepBlock`; read directly by the statistics accessors.
+const SHADOW_W_ALLOC_COUNT: int = 21
+const SHADOW_W_REG_BYTES: int = 22
+const SHADOW_NODE_WORDS: int = 23
+const SHADOW_NODE_BYTES: int = 184
 
 /// Safepoint states.
 const SHADOW_STATE_RUNNING: int = 0
@@ -281,7 +290,7 @@ fn shadowInitNode(node: int) -> int {
         // emitter places a safepoint poll at every loop header in a
         // spawn-capable module. The poll would take `shadowLock` again
         // (`abiGcPoll` -> `abiShadowSelf`) on a non-reentrant SRW lock and
-        // deadlock the collector. Twenty-one stores cost nothing next to the
+        // deadlock the collector. Twenty-three stores cost nothing next to the
         // raw-heap allocation above them.
         (node as *int)[0] = 0
         (node as *int)[1] = 0
@@ -304,6 +313,8 @@ fn shadowInitNode(node: int) -> int {
         (node as *int)[18] = 0
         (node as *int)[19] = 0
         (node as *int)[20] = 0
+        (node as *int)[SHADOW_W_ALLOC_COUNT] = 0
+        (node as *int)[SHADOW_W_REG_BYTES] = 0
         (node as *int)[SHADOW_W_ID] = shadowNextId
         shadowNextId = shadowNextId + 1
         (node as *int)[SHADOW_W_NEXT] = shadowRegHead
@@ -341,18 +352,26 @@ fn shadowEnsureRegisteredLocked() -> int {
 }
 
 /// ABI: push `frame` onto the current thread's shadow stack (native
-/// `push_frame` under the registry lock, with auto-registration).
+/// `push_frame`, with auto-registration).
 ///
-/// INLINED FOR SPEED. Every shadowed runtime function pays push+pop, and the
-/// measured cost of the helpers was almost entirely call overhead: with the
-/// lock, TLS lookup and node link inlined here, a push+pop pair fell from
-/// ~46-57ns to ~20ns (micro10: `realPushPop` vs `tlsGet`/`lockOnly`/`linkOnly`
-/// at 2-3ns/3ns/11ns). The helper forms below remain for `abi_gc`'s walk and
-/// MUST stay in sync with these bodies: same lock word, same TLS slot, same
-/// node layout, same `win_exit(1)` divergence on a failed node allocation.
+/// LOCK-FREE STEADY STATE. The chain head lives in this thread's node and only
+/// this thread mutates it. The collector walks it only after the barrier has
+/// parked every RUNNING thread; a NATIVE thread cannot push, and
+/// `abiGcLeaveNative` polls before returning to Pickle code, so no lock is
+/// needed on the hot path. The registry lock still covers the one-time TLS
+/// slot allocation and node publication. `shadowInitNode` stays loop-free: a
+/// loop there would carry a safepoint poll inside that lock.
 #[symbol("pickle_shadow_push")]
 fn abiShadowPush(frame: *int) {
     unsafe {
+        if (shadowTlsSlot != -1) {
+            let fast = win_tls_get(shadowTlsSlot)
+            if (fast != 0) {
+                frame[0] = (fast as *int)[0]
+                (fast as *int)[0] = frame as int
+                return
+            }
+        }
         let lockAddr = (&shadowLock) as int
         winLockAcquire(lockAddr)
         if (shadowTlsSlot == -1) {
@@ -376,16 +395,25 @@ fn abiShadowPush(frame: *int) {
 }
 
 /// ABI: pop `frame`, which the emitter guarantees is the current head of this
-/// thread's stack (native `pop_frame`: registry lock, frames==frame assert,
-/// then the head unsticks and the popped frame's `prev` clears). Out-of-order
-/// pop takes the silent `win_exit(1)` divergence instead of native's panic
-/// message (the leaf cannot reach `writeStderr`).
-///
-/// Inlined for the same reason as `abiShadowPush`; the bodies must stay in
-/// sync with `shadowEnsureRegisteredLocked`.
+/// thread's stack (native `pop_frame`, with the same LIFO check). The steady
+/// state is lock-free for the same reason as `abiShadowPush`; the lock remains
+/// only for the impossible node-missing path. Out-of-order pop takes the
+/// silent `win_exit(1)` divergence instead of native's panic message (the leaf
+/// cannot reach `writeStderr`).
 #[symbol("pickle_shadow_pop")]
 fn abiShadowPop(frame: *int) {
     unsafe {
+        if (shadowTlsSlot != -1) {
+            let fast = win_tls_get(shadowTlsSlot)
+            if (fast != 0) {
+                if ((fast as *int)[0] != (frame as int)) {
+                    win_exit(1)
+                }
+                (fast as *int)[0] = frame[0]
+                frame[0] = 0
+                return
+            }
+        }
         if (shadowTlsSlot != -1) {
             let lockAddr = (&shadowLock) as int
             winLockAcquire(lockAddr)

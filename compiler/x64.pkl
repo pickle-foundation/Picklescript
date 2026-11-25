@@ -4730,13 +4730,17 @@ class X64Emitter {
         // `regCap` at the same moment, so the capacity check below fails and
         // the append lands in `abiEngineRegister`, whose mode branch owns the
         // calling thread's private block.
-        // `envInited` must be non-zero and `noAutoGc` must be set.
+        // `envInited` must be 2 (fully published) and `noAutoGc` must be set.
+        // State 1 means another thread is still reading the block, so the
+        // registration must take the runtime path and wait for the publish.
+        // `jne` is deliberate: `je` would send the fully-published state to the
+        // slow path and inline only the uninitialized one.
         this.cb.movabsReloc(0, "pkl_global_envInited")
         this.cb.u8(0x48)
         this.cb.u8(0x83)
         this.cb.u8(0x38)
-        this.cb.u8(0)
-        this.emitJcc(0x04, slow)
+        this.cb.u8(2)
+        this.emitJcc(0x05, slow)
         this.cb.movabsReloc(0, "pkl_global_noAutoGc")
         this.cb.u8(0x48)
         this.cb.u8(0x83)
