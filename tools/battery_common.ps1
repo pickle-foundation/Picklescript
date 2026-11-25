@@ -149,7 +149,7 @@ function Get-OracleHash { Get-TreeHash $batteryOracleDirs }
 # captured by tools\capture_goldens.ps1. They are keyed by the sources they are taken
 # from (the battery mains and the stdlib test suite), NOT by the Rust cli: once frozen
 # they let the battery compare port behaviour without a Rust toolchain.
-$batteryGoldenDirs = @("tests\pickle", "stdlib", "tests\uncaught")
+$batteryGoldenDirs = @("tests\pickle", "stdlib", "tests\stdlib", "tests\uncaught")
 $goldenDir = "tools\diff\golden"
 $goldenZip = "tools\diff\golden.zip"
 
@@ -164,6 +164,20 @@ function Get-GoldenKey([string]$path) {
     if ($p.StartsWith("./")) { $p = $p.Substring(2) }
     ($p -replace '[/:]', '_')
 }
+
+# Stdlib tests the Rust oracle cannot compile: the port's stdlib has diverged
+# (optional-member access, port-only crypto/tls/http helpers). GATE11 runs these
+# as behavior checks (exit 0 + 0 failed) instead of byte parity, and
+# capture_goldens.ps1 leaves them out.
+$portOnlyStdlibKeys = @(
+    "tests_stdlib_cli_test",
+    "tests_stdlib_crypto_test",
+    "tests_stdlib_net_test",
+    "tests_stdlib_time_test",
+    "tests_stdlib_tls_test",
+    "tests_stdlib_net_http_test",
+    "tests_stdlib_net_websocket_test"
+)
 
 # Build an AOT driver unless a stamp next to it proves the embedded sources are
 # unchanged since it was last built. Returns $true when the exe exists afterwards.
@@ -232,8 +246,8 @@ function Invoke-Artifact([string]$builder, [string]$source, [string]$lib, [strin
     return $false
 }
 
-# Pickle-built runtime archive in place of the Rust combined.lib (which needs
-# cargo tools\build_combined_lib.ps1). cli/rtlib.pkl is AOT-built to a
+# Pickle-built runtime archive in place of the Rust combined.lib (built by the
+# Rust side with cargo). cli/rtlib.pkl is AOT-built to a
 # driver, then lowers every runtime member to COFF and packs them into one
 # GNU .ar (tools\diff\rtlib.ar) — the exact archive build.pkl/run.pkl link against.
 # It is stamp-gated on the driver tree (compiler+cli+stdlib) plus the runtime

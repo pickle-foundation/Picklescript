@@ -7,16 +7,16 @@
 #   * run/<main>.{out,exit}   - `run tests\\pickle/<main>.pkl` stdout+exit
 #   * irx/<main>.irx          - `irx tests\\pickle/<main>.pkl` (IRX text)
 #   * test/<key>.{out,exit}   - `pickle test <path>` stdout+exit for every
-#                               tests\pickle and stdlib _test.pkl
+#                               tests\pickle and tests\stdlib _test.pkl
 #   * cli/<cmd>.{out,exit}    - fixed-output CLI commands (-V/--version/jar)
 #   * uncaught/<stem>.{out,err,exit} - `pickle run tests\uncaught/<stem>.pkl`
 #                               stdout+stderr+exit, for the crash-stanza gate
 #
-# Goldens are keyed by content, not path, so a byte-stable source produces the
-# same golden regardless of where the battery invokes it from. The `test`
-# goldens DO embed the target path (the `running N test(s) from <path>` banner),
-# so the caller must pass the same spelling the battery will - this script uses
-# the battery's spellings (repo-relative with backslashes).
+# Goldens are keyed by target path (slashes and the drive colon flattened to
+# underscores), so moving a source requires a recapture. The `test` goldens also
+# embed the target path (the `running N test(s) from <path>` banner), so the
+# caller must pass the same spelling the battery will - this script uses the
+# battery's spellings (repo-relative with backslashes).
 #
 # The result ships as one compressed bundle (tools\diff\golden.zip); the
 # extracted dir stays gitignored scratch. Re-run only when the reference
@@ -87,7 +87,7 @@ $syncTxt = "made: count 3 bytes 112`nlive after collect: count 3 bytes 112`nlive
 [System.IO.File]::WriteAllText((Join-Path $repoAbs "$syncBase.out"), $syncTxt)
 Set-Content -LiteralPath "$syncBase.exit" -Value 0 -NoNewline
 
-# ---- test goldens: tests\pickle and the stdlib suite --------------------------
+# ---- test goldens: tests\pickle and the tests\stdlib suite --------------------
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 $testFiles = @(Get-ChildItem "tests\pickle\*_test.pkl")
 foreach ($f in $testFiles) {
@@ -95,10 +95,14 @@ foreach ($f in $testFiles) {
     $key = Get-GoldenKey $target
     Save-Exit "$goldenDir\test\$key" (Invoke-Cap "$goldenDir\test\$key.out" $cli @("test", $target))
 }
-$stdlibTests = @(Get-ChildItem "stdlib" -Recurse -Filter *_test.pkl)
+$stdlibTests = @(Get-ChildItem "tests\stdlib" -Recurse -Filter *_test.pkl)
 foreach ($f in $stdlibTests) {
     $target = $f.FullName.Substring($repoAbs.Length + 1)
     $key = Get-GoldenKey $target
+    if ($portOnlyStdlibKeys -contains $key) {
+        Write-Output "CAPTURE SKIP $($f.BaseName) (port-only; Rust oracle cannot compile it)"
+        continue
+    }
     Save-Exit "$goldenDir\test\$key" (Invoke-Cap "$goldenDir\test\$key.out" $cli @("test", $target))
 }
 Write-Output "CAPTURE test ($($testFiles.Count) battery + $($stdlibTests.Count) stdlib): $($sw.Elapsed.TotalSeconds.ToString('F1'))s"

@@ -29,7 +29,7 @@ $threadGoldenKeys = @(
     "tests_pickle_channel_test",
     "tests_pickle_task_test",
     "tests_pickle_thread_test",
-    "stdlib_thread_test"
+    "tests_stdlib_thread_test"
 )
 
 # ---- Parallel shard plumbing ----------------------------------------------
@@ -227,7 +227,7 @@ foreach ($m in $mains) {
 Write-Output "GATE6 IRX COMPILE COVERAGE (mains lowered by the port, no irfail): PASS=$gate6ok FAIL=$gate6fail"
 
 # ---- GATE 7: port-side unit suite — the port tests itself (native, no Rust) ----
-# `compiler/*_test.pkl` import the ported components and assert on their
+# `tests/compiler/*_test.pkl` import the ported components and assert on their
 # behavior via the `expect` DSL. The AOT-built ported test driver (cli/test.pkl)
 # synthesizes the harness, links it against the pickle runtime archive, spawns it, and
 # propagates its exit code — so the port's own components are exercised entirely on the
@@ -240,7 +240,7 @@ if (-not $rtlibCand) {
     Write-Output "GATE7 PORT UNIT SUITE: RUNTIME ARCHIVE MISSING"
 } else {
 Invoke-BuildDriver "cli\test.pkl" $pklcTest | Out-Null
-$portTests = @(Get-ChildItem "compiler\*_test.pkl")
+$portTests = @(Get-ChildItem "tests\compiler\*_test.pkl")
 $rtlibAbs = Abs $rtlibCand
 $pklcTestAbs = Abs $pklcTest
 $g7dirAbs = Abs $g7dir
@@ -324,7 +324,7 @@ if (-not $rtlibCand) {
 }
 
 # ---- GATE 10: runtime unit suite — the ported runtime tested in Pickle ----
-# The runtime pillar's parallel to GATE7: every `runtime/*_test.pkl` is compiled
+# The runtime pillar's parallel to GATE7: every `tests/runtime/*_test.pkl` is compiled
 # by the ported test driver (AOT-built cli/test.pkl), linked against the pickle
 # runtime archive, spawned, and must report 0 failures — the ported runtime is exercised
 # by Pickle, with no Rust harness and no Rust interpreter in the loop. (The Rust `test`
@@ -341,7 +341,7 @@ if (-not $rtlibCand) {
     $pklcTestAbs = Abs $pklcTest
     $g10dirAbs = Abs $g10dir
     $g10items = @()
-    foreach ($f in @(Get-ChildItem "runtime\*_test.pkl")) {
+    foreach ($f in @(Get-ChildItem "tests\runtime\*_test.pkl")) {
         $g10items += [pscustomobject]@{
             gate = "GATE10"; tag = $f.BaseName
             kind = "result"; exitOnly = $false
@@ -353,7 +353,7 @@ if (-not $rtlibCand) {
         }
     }
     $g10r = Invoke-GateShards $g10items (Join-Path $g10dirAbs "g10.spec") (Join-Path $g10dirAbs "g10res")
-    foreach ($f in @(Get-ChildItem "runtime\*_test.pkl")) {
+    foreach ($f in @(Get-ChildItem "tests\runtime\*_test.pkl")) {
         $cap = Join-Path $g10dirAbs ("g10_" + $f.BaseName + ".txt")
         foreach ($l in (Get-Content -LiteralPath $cap -ErrorAction SilentlyContinue | Select-String "test result:")) {
             if ($l.Line -match "test result: (\d+) passed; (\d+) failed") {
@@ -369,12 +369,12 @@ if (-not $rtlibCand) {
 
 # ---- GATE 11: stdlib byte-parity -- the ported test driver must reproduce the
 # frozen `pickle test` golden stdout+exit for every stdlib *_test.pkl at any depth
-# (top-level fs/io/json/os/process, collections/*, text/*). GATE9 covers only
-# tests/pickle, so the stdlib suite (34+ tests incl. std.process) was previously
-# battery-untested; all 17 stdlib sources also port-compile cleanly (exit=0). The
-# oracle is the frozen golden, so no Rust runs here.
-$g11tests = @(Get-ChildItem "stdlib" -Recurse -Filter *_test.pkl)
-$g11ok = 0; $g11fail = 0; $g11skip = 0; $g11dir = "tools\diff\g11"
+# (top-level fs/io/json/os/process, collections/*, text/*) and now lives under
+# tests/stdlib. GATE9 covers only tests/pickle, so the stdlib suite (77 tests
+# incl. std.process) was previously battery-untested; all stdlib sources also
+# port-compile cleanly (exit=0). The oracle is the frozen golden, so no Rust runs here.
+$g11tests = @(Get-ChildItem "tests\stdlib" -Recurse -Filter *_test.pkl)
+$g11ok = 0; $g11fail = 0; $g11skip = 0; $g11portOnly = 0; $g11dir = "tools\diff\g11"
 New-Item -ItemType Directory -Path $g11dir -Force | Out-Null
 if (-not $rtlibCand) {
     Write-Output "GATE11 STDLIB BYTE-PARITY: RUNTIME ARCHIVE MISSING"
@@ -388,6 +388,17 @@ if (-not $rtlibCand) {
         $target = $m.FullName.Substring((Resolve-Path ".").Path.Length + 1)
         $key = Get-GoldenKey $target
         if ($threadGoldenKeys -contains $key) { $g11skip++; Write-Output "GATE11 SKIP $($m.BaseName) (std-runtime-only OS-thread test; ported runtime is the nostd contract)"; continue }
+        if ($portOnlyStdlibKeys -contains $key) {
+            $g11portOnly++
+            $g11items += [pscustomobject]@{
+                gate = "GATE11"; tag = $m.BaseName
+                kind = "result"; exitOnly = $false
+                exe = $pklcTestAbs; argv = @($target, $rtlibAbs)
+                capture = (Join-Path $g11dirAbs ("port_" + $m.BaseName + ".txt"))
+                budget = 180
+            }
+            continue
+        }
         $goldOut = "$goldenAbs\test\$key.out"
         $goldExit = "$goldenAbs\test\$key.exit"
         if (-not (Test-Path -LiteralPath $goldOut)) { $g11fail++; Write-Output "GATE11 $($m.BaseName): golden missing ($key)"; continue }
@@ -402,7 +413,7 @@ if (-not $rtlibCand) {
     }
     $g11r = Invoke-GateShards $g11items (Join-Path $g11dirAbs "g11.spec") (Join-Path $g11dirAbs "g11res")
     $g11ok = $g11r.ok; $g11fail += $g11r.fail
-    Write-Output "GATE11 STDLIB BYTE-PARITY (stdout+exit, $($g11tests.Count) files, native vs golden, skip=$g11skip): PASS=$g11ok FAIL=$g11fail"
+    Write-Output "GATE11 STDLIB PARITY (stdout+exit, $($g11tests.Count) files, native vs golden, skip=$g11skip port-only=$g11portOnly): PASS=$g11ok FAIL=$g11fail"
 }
 
 # ---- GATE 12: ported AOT build — source -> IR -> x64 -> COFF -> PE-link, all in the port ----

@@ -22,15 +22,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\battery_lite.ps1
 ```
 
 This rebuilds the test drivers from the committed seed, refreshes the runtime
-archive if its inputs changed, then runs the compiler corpus (`compiler/*_test.pkl`,
-19 modules) and the full runtime assert suite (`runtime/*_test.pkl`, 567 tests).
+archive if its inputs changed, then runs the compiler corpus (`tests/compiler/*_test.pkl`,
+27 modules) and the full runtime assert suite (`tests/runtime/*_test.pkl`,
+50 modules).
 Warm wall time is roughly 15-20 minutes on a plain desktop.
 
 ## Build a driver by hand
 
 ```
 tools\diff\selfhost\seed.exe cli\test.pkl tools\diff\rtlib.ar tools\diff\port\pklc_test.exe
-tools\diff\port\pklc_test.exe compiler\x64_test.pkl tools\diff\rtlib.ar
+tools\diff\port\pklc_test.exe tests\compiler\x64_test.pkl tools\diff\rtlib.ar
 exit 0 = pass
 ```
 

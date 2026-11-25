@@ -6,9 +6,9 @@
 # no Rust in the loop, no golden bytes, no CLI/UNCAUGHT parity theater.
 #
 # Gates:
-#   LITE GATE7  - the compiler corpus (compiler\*_test.pkl), exit-only, like
-#                 GATE7's ancestral semantics, sharded.
-#   LITE GATE10 - the runtime suite (runtime\*_test.pkl), requires exit 0 and
+#   LITE GATE7  - the compiler corpus (tests\compiler\*_test.pkl), exit-only,
+#                 like GATE7's ancestral semantics, sharded.
+#   LITE GATE10 - the runtime suite (tests\runtime\*_test.pkl), requires exit 0 and
 #                 zero failing tests per module, sharded.
 #
 # Parity gates (IR/IRX/lex/stdout goldens, mains 12/12b, CLI/UNCAUGHT, GATE8)
@@ -101,7 +101,7 @@ $gdir = Abs "tools\diff\ptest"
 
 # LITE GATE7: the compiler corpus.
 $g7items = @()
-foreach ($pt in @(Get-ChildItem "compiler\*_test.pkl")) {
+foreach ($pt in @(Get-ChildItem "tests\compiler\*_test.pkl")) {
     $g7items += [pscustomobject]@{
         gate = "LITE-GATE7"; tag = $pt.BaseName
         kind = "result"; exitOnly = $true
@@ -122,7 +122,7 @@ if ($SkipRuntime) {
     Write-Output "LITE GATE10 RUNTIME SUITE: SKIPPED (-SkipRuntime)"
 } else {
     $g10items = @()
-    foreach ($f in @(Get-ChildItem "runtime\*_test.pkl")) {
+    foreach ($f in @(Get-ChildItem "tests\runtime\*_test.pkl")) {
         $g10items += [pscustomobject]@{
             gate = "LITE-GATE10"; tag = $f.BaseName
             kind = "result"; exitOnly = $false
@@ -137,7 +137,7 @@ if ($SkipRuntime) {
     }
     $g10r = Invoke-LiteShards $g10items (Join-Path $gdir "lite_g10.spec") (Join-Path $gdir "lite_g10res")
     $g10pass = 0; $g10fail = 0
-    foreach ($f in @(Get-ChildItem "runtime\*_test.pkl")) {
+    foreach ($f in @(Get-ChildItem "tests\runtime\*_test.pkl")) {
         $cap = Join-Path $gdir ("lite_g10_" + $f.BaseName + ".txt")
         foreach ($l in (Get-Content -LiteralPath $cap -ErrorAction SilentlyContinue | Select-String "test result:")) {
             if ($l.Line -match "test result: (\d+) passed; (\d+) failed") {
