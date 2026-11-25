@@ -117,6 +117,76 @@ import { winLockAcquire, winLockRelease } from runtime.abi_world_win
 /// `-1` (`TLS_OUT_OF_INDEXES`) before the first push/registration.
 var shadowTlsSlot: int = -1
 
+/// Per-thread runtime record, stored in the same raw node the shadow registry
+/// already owns. The node began as native's `GcThread { frames, id, next }`;
+/// the words after it are the parallel-runtime extension: a private bump arena,
+/// a private registry block, the allocation bytes since the last collection,
+/// and the safepoint state. Keeping them here means the collector's existing
+/// registry walk already visits every thread's state, and no second registry
+/// or TLS slot has to be kept in sync.
+///
+/// Layout (word offsets, 8 bytes each):
+///   0 frames        1 id            2 next          3 arenaBase
+///   4 arenaUsed     5 arenaCap      6 arenaChunk    7 regBase
+///   8 regCount      9 regCap       10 allocBytes   11 state
+///  12 parkCv       13 gcEpoch     14 pinned       15 flags
+///  16 parkLock     17 reserved
+///
+/// `parkCv`/`parkLock` are a condition variable and the lock cell paired with
+/// it for this thread's safepoint. Both are zero-initialized words, which is
+/// the valid Win32 unlocked state for an `SRWLOCK` and a `CONDITION_VARIABLE`;
+/// their encoding is a backend detail, and the safepoint code only ever passes
+/// their addresses to the `abi_world_win` seam.
+const SHADOW_W_FRAMES: int = 0
+const SHADOW_W_ID: int = 1
+const SHADOW_W_NEXT: int = 2
+const SHADOW_W_ARENA_BASE: int = 3
+const SHADOW_W_ARENA_USED: int = 4
+const SHADOW_W_ARENA_CAP: int = 5
+const SHADOW_W_ARENA_CHUNK: int = 6
+const SHADOW_W_REG_BASE: int = 7
+const SHADOW_W_REG_COUNT: int = 8
+const SHADOW_W_REG_CAP: int = 9
+const SHADOW_W_ALLOC_BYTES: int = 10
+const SHADOW_W_STATE: int = 11
+const SHADOW_W_PARK: int = 12
+const SHADOW_W_EPOCH: int = 13
+const SHADOW_W_PINNED: int = 14
+const SHADOW_W_FLAGS: int = 15
+const SHADOW_W_PARK_LOCK: int = 16
+const SHADOW_NODE_WORDS: int = 18
+const SHADOW_NODE_BYTES: int = 144
+
+/// Safepoint states.
+const SHADOW_STATE_RUNNING: int = 0
+const SHADOW_STATE_PARKED: int = 1
+const SHADOW_STATE_NATIVE: int = 2
+const SHADOW_STATE_COLLECTING: int = 3
+
+/// The current thread's node, registering it if this is its first call. This is
+/// the allocator's and registry's entry to the per-thread record. It takes the
+/// registry lock, so it is a slow-path helper, never the inline fast path.
+fn abiShadowSelf() -> int {
+    unsafe {
+        shadowRegistryLockAcquire()
+        let node = shadowEnsureRegisteredLocked()
+        shadowRegistryLockRelease()
+        return node
+    }
+}
+
+/// The current thread's node if it is already registered, else 0. No lock and
+/// no registration: the collector uses it to avoid creating a node for a
+/// thread that never allocated.
+fn abiShadowSelfIfRegistered() -> int {
+    unsafe {
+        if (shadowTlsSlot == -1) {
+            return 0
+        }
+        return win_tls_get(shadowTlsSlot)
+    }
+}
+
 /// Process registry head: the chain of `GcThread` nodes (native
 /// `THREAD_HEAD`), each `[frames, id, next]` on the raw heap.
 var shadowRegHead: int = 0
@@ -149,6 +219,44 @@ fn shadowRegistryLockRelease() {
     }
 }
 
+/// Initialise a freshly allocated `GcThread` node: zero every word (the raw
+/// heap does not), then link it with its id and the registry head. The
+/// parallel-runtime fields stay zero, which is exactly "no arena, no registry
+/// block, RUNNING, no park cell".
+fn shadowInitNode(node: int) -> int {
+    unsafe {
+        // Straight-line: a loop here is a loop under `shadowLock`, and the
+        // emitter places a safepoint poll at every loop header in a
+        // spawn-capable module. The poll would take `shadowLock` again
+        // (`abiGcPoll` -> `abiShadowSelf`) on a non-reentrant SRW lock and
+        // deadlock the collector. Eighteen stores cost nothing next to the
+        // raw-heap allocation above them.
+        (node as *int)[0] = 0
+        (node as *int)[1] = 0
+        (node as *int)[2] = 0
+        (node as *int)[3] = 0
+        (node as *int)[4] = 0
+        (node as *int)[5] = 0
+        (node as *int)[6] = 0
+        (node as *int)[7] = 0
+        (node as *int)[8] = 0
+        (node as *int)[9] = 0
+        (node as *int)[10] = 0
+        (node as *int)[11] = 0
+        (node as *int)[12] = 0
+        (node as *int)[13] = 0
+        (node as *int)[14] = 0
+        (node as *int)[15] = 0
+        (node as *int)[16] = 0
+        (node as *int)[17] = 0
+        (node as *int)[SHADOW_W_ID] = shadowNextId
+        shadowNextId = shadowNextId + 1
+        (node as *int)[SHADOW_W_NEXT] = shadowRegHead
+        shadowRegHead = node
+        return node
+    }
+}
+
 /// Ensure this thread is registered, assuming the lock is held (native
 /// `ensure_registered_locked`): TLS -1 (unallocated) allocates the slot; TLS
 /// slot 0 (no node) creates the node on the raw heap, links it, remembers the
@@ -165,19 +273,13 @@ fn shadowEnsureRegisteredLocked() -> int {
         var node = win_tls_get(shadowTlsSlot)
         if (node == 0) {
             var heap = win_get_process_heap()
-            node = win_heap_alloc(heap, 0, 24)
+            node = win_heap_alloc(heap, 0, SHADOW_NODE_BYTES)
             if (node == 0) {
                 shadowRegistryLockRelease()
                 win_exit(1)
             }
-            unsafe {
-                (node as *int)[0] = 0
-                (node as *int)[1] = shadowNextId
-                shadowNextId = shadowNextId + 1
-                (node as *int)[2] = shadowRegHead
-                shadowRegHead = node
-                let _ = win_tls_set(shadowTlsSlot, node)
-            }
+            let _ = shadowInitNode(node)
+            let _ = win_tls_set(shadowTlsSlot, node)
         }
         return node
     }
@@ -204,16 +306,12 @@ fn abiShadowPush(frame: *int) {
         var node = win_tls_get(shadowTlsSlot)
         if (node == 0) {
             var heap = win_get_process_heap()
-            node = win_heap_alloc(heap, 0, 24)
+            node = win_heap_alloc(heap, 0, SHADOW_NODE_BYTES)
             if (node == 0) {
                 winLockRelease(lockAddr)
                 win_exit(1)
             }
-            (node as *int)[0] = 0
-            (node as *int)[1] = shadowNextId
-            shadowNextId = shadowNextId + 1
-            (node as *int)[2] = shadowRegHead
-            shadowRegHead = node
+            let _ = shadowInitNode(node)
             let _ = win_tls_set(shadowTlsSlot, node)
         }
         frame[0] = (node as *int)[0]
@@ -239,16 +337,12 @@ fn abiShadowPop(frame: *int) {
             var node = win_tls_get(shadowTlsSlot)
             if (node == 0) {
                 var heap = win_get_process_heap()
-                node = win_heap_alloc(heap, 0, 24)
+                node = win_heap_alloc(heap, 0, SHADOW_NODE_BYTES)
                 if (node == 0) {
                     winLockRelease(lockAddr)
                     win_exit(1)
                 }
-                (node as *int)[0] = 0
-                (node as *int)[1] = shadowNextId
-                shadowNextId = shadowNextId + 1
-                (node as *int)[2] = shadowRegHead
-                shadowRegHead = node
+                let _ = shadowInitNode(node)
                 let _ = win_tls_set(shadowTlsSlot, node)
             }
             if ((node as *int)[0] != (frame as int)) {

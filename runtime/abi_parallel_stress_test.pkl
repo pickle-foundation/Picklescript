@@ -1,0 +1,135 @@
+module runtime.abi_parallel_stress_test
+
+/// Phase 2 gates for the per-thread allocator and registry.
+///
+/// The world lock still serializes Pickle execution, so these tests do not
+/// prove parallel execution. They prove the two properties Phase 2 must hold
+/// before the lock can go away:
+///
+///   1. Several threads can allocate and register concurrently while the lock
+///      is released around a blocking call, and a collection triggered by one
+///      of them leaves every other thread's private registry block valid.
+///   2. A thread parked inside a runtime helper with live objects keeps those
+///      objects across a collection another thread forces.
+///
+/// Run this file twice: once normally, and once with `PKL_STRESS_GC=1`, which
+/// collects at every registration instead of on a byte threshold. The stress
+/// lane is the root test: any temporary held only in a register and not in a
+/// shadow frame dies on the next allocation.
+
+import { Task, Channel, AtomicInt, spawn, yieldNow } from std.thread
+import { abiRegisteredCount } from runtime.abi_raw
+import { abiGcCollect, abiGcSetThreshold } from runtime.abi_gc
+
+/// Allocate `iterations` small strings and drop all but the last 32. The
+/// `yieldNow` every 64 turns is what lets a peer thread run while this one is
+/// parked, so collections interleave with another thread's allocation.
+fn allocateWorker(iterations: int, tag: string) -> int {
+    var keep: List<string> = List<string>()
+    var i = 0
+    while (i < iterations) {
+        let s = tag + str(i)
+        keep.push(s)
+        if (len(keep) > 32) {
+            keep = List<string>()
+            keep.push(s)
+        }
+        if ((i & 63) == 0) {
+            yieldNow()
+        }
+        i = i + 1
+    }
+    if (len(keep) == 0) {
+        return 0
+    }
+    return len(keep[len(keep) - 1])
+}
+
+fn workerBody(total: AtomicInt, iterations: int, tag: string) {
+    let _ = total.add(allocateWorker(iterations, tag))
+}
+
+fn discardWorker(iterations: int, tag: string) {
+    let junk = allocateWorker(iterations, tag)
+    let _ = junk
+}
+
+test fn eight_threads_allocate_across_collections() {
+    // ~64 KiB of live objects per collection: small enough that a run does
+    // hundreds of cycles, large enough that it is not one object per cycle.
+    abiGcSetThreshold(65536)
+    let total = AtomicInt(0)
+    var tasks: List<Task> = List<Task>()
+    var i = 0
+    while (i < 8) {
+        let tag = "w" + str(i) + ":"
+        let t = spawn(() => {
+            workerBody(total, 150, tag)
+        })
+        tasks.push(t)
+        i = i + 1
+    }
+    var j = 0
+    while (j < len(tasks)) {
+        let t = tasks[j]
+        expect(t.join()).toBe(true)
+        j = j + 1
+    }
+    // Collect on the main thread after every worker has gone: every per-thread
+    // block is compacted, so the population must fall back to the live set of
+    // this frame plus the task records - not the ~1.2k strings allocated above.
+    abiGcCollect(true)
+    let live = abiRegisteredCount()
+    expect(live < 2000).toBe(true)
+    expect(total.load() > 0).toBe(true)
+}
+
+test fn a_parked_threads_live_list_survives_a_peer_collection() {
+    let ready = Channel(1)
+    let go = Channel(1)
+    let good = AtomicInt(0)
+    let t = spawn(() => {
+        var keep: List<string> = List<string>()
+        var i = 0
+        while (i < 64) {
+            keep.push("park:" + str(i))
+            i = i + 1
+        }
+        ready.send(1)
+        // Park with `keep` live in this frame. `recv` releases the world lock,
+        // so the main thread can collect while this frame is mid-call.
+        let _ = go.recv()
+        var j = 0
+        var ok = 1
+        while (j < len(keep)) {
+            let want = "park:" + str(j)
+            if (keep[j] != want) {
+                ok = 0
+            }
+            j = j + 1
+        }
+        good.store(ok)
+    })
+    let _ = ready.recv()
+    // Two cycles: the first sweep must keep the list reachable through the
+    // parked frame, and the second must keep it through the compacted block.
+    abiGcCollect(true)
+    abiGcCollect(true)
+    go.send(1)
+    expect(t.join()).toBe(true)
+    expect(good.load()).toBe(1)
+}
+
+test fn a_threads_objects_are_freed_after_the_thread_exits() {
+    // The worker's private block outlives the thread (the node stays in the
+    // registry), so its population must still be swept after the thread is
+    // gone - otherwise every finished task would leak its allocations.
+    abiGcSetThreshold(65536)
+    let t = spawn(() => {
+        discardWorker(150, "gone:")
+    })
+    expect(t.join()).toBe(true)
+    abiGcCollect(true)
+    let live = abiRegisteredCount()
+    expect(live < 1000).toBe(true)
+}

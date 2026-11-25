@@ -190,10 +190,32 @@ const SEND_HDR_OFF: int = 4 * SECBUF_BYTES
 
 const WSAEINTR: int = 10004
 
-/// The failed-connect report, valid until the next connect attempt.
-var tlsFailStage: int = 0
-var tlsFailStatus: int = 0
-var tlsFailDetail: int = 0
+/// The failed-connect report, valid until this thread's next connect attempt.
+/// Three Win32 TLS slots rather than three process globals: a failed handshake
+/// on one thread must not overwrite the stage a peer thread is about to read.
+/// Only failure paths pay for the lookup, so the fast path is untouched.
+var tlsFailStageSlot: int = -1
+var tlsFailStatusSlot: int = -1
+var tlsFailDetailSlot: int = -1
+
+fn tlsFailSlots() {
+    unsafe {
+        if (tlsFailStageSlot == -1) {
+            tlsFailStageSlot = win_tls_alloc()
+            tlsFailStatusSlot = win_tls_alloc()
+            tlsFailDetailSlot = win_tls_alloc()
+        }
+    }
+}
+
+fn tlsFailSet(stage: int, status: int, detail: int) {
+    tlsFailSlots()
+    unsafe {
+        let _ = win_tls_set(tlsFailStageSlot, stage)
+        let _ = win_tls_set(tlsFailStatusSlot, status)
+        let _ = win_tls_set(tlsFailDetailSlot, detail)
+    }
+}
 
 // ------------------------------------------------------------------ helpers
 
@@ -1002,9 +1024,7 @@ fn tlsServerAccept(sock: int, pfx: int, pfxLen: int, password: string) -> int {
         }
 
         if (failed != 0) {
-            tlsFailStage = s[ST_ERRSTAGE]
-            tlsFailStatus = s[ST_ERRSTATUS]
-            tlsFailDetail = s[ST_ERRDETAIL]
+            tlsFailSet(s[ST_ERRSTAGE], s[ST_ERRSTATUS], s[ST_ERRDETAIL])
             freeState(s)
             return 0
         }
@@ -1048,9 +1068,7 @@ fn tlsClientConnect(sock: int, host: string, verify: int) -> int {
         }
 
         if (failed != 0) {
-            tlsFailStage = s[ST_ERRSTAGE]
-            tlsFailStatus = s[ST_ERRSTATUS]
-            tlsFailDetail = s[ST_ERRDETAIL]
+            tlsFailSet(s[ST_ERRSTAGE], s[ST_ERRSTATUS], s[ST_ERRDETAIL])
             freeState(s)
             return 0
         }
@@ -1305,15 +1323,30 @@ fn tlsErrDetail(h: int) -> int {
 }
 
 fn tlsLastStage() -> int {
-    tlsFailStage
+    if (tlsFailStageSlot == -1) {
+        return 0
+    }
+    unsafe {
+        return win_tls_get(tlsFailStageSlot)
+    }
 }
 
 fn tlsLastStatus() -> int {
-    tlsFailStatus
+    if (tlsFailStatusSlot == -1) {
+        return 0
+    }
+    unsafe {
+        return win_tls_get(tlsFailStatusSlot)
+    }
 }
 
 fn tlsLastDetail() -> int {
-    tlsFailDetail
+    if (tlsFailDetailSlot == -1) {
+        return 0
+    }
+    unsafe {
+        return win_tls_get(tlsFailDetailSlot)
+    }
 }
 
 // -------------------------------------------------------------------- close

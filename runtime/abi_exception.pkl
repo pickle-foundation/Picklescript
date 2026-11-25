@@ -141,12 +141,31 @@ fn writeErrObj(obj: *int) {
 /// definition; the exception channel has no such constraint (see the FILE
 /// header's WHY THIS REPLACES TLS notes).
 ///
-/// `excPayload` is deliberately never cleared to null: this language has no
-/// null pointer literal (`0 as *int` is `E0363`), and the residual value is
-/// unobservable (see the note on `abiExcTake`). Start at 0, which IS the null
-/// pointer.
-var excPending: int = 0
-var excPayload: int = 0
+/// `excPending` and `excPayload` are **per-thread** (native's `thread_local
+/// PENDING`/`PAYLOAD`). They used to be process globals, which is only
+/// tolerable while the world lock serializes Pickle: a throw raised while a
+/// peer thread ran (inside a runtime helper that released the lock) could be
+/// clobbered before its own handler saw it. Two Win32 TLS slots carry the pair;
+/// no heap block and no collector interaction. `-1` is `TLS_OUT_OF_INDEXES`,
+/// the same unset sentinel `abi_shadow` uses.
+///
+/// The slots are allocated on first use. That first use cannot race while the
+/// world lock is the execution model: only one thread executes Pickle at a
+/// time. A later multithreaded build needs an atomic or a lock here; the
+/// allocation is once per process, so the cost of hardening it is nil.
+var excPendingSlot: int = -1
+var excPayloadSlot: int = -1
+
+fn excEnsureSlots() {
+    unsafe {
+        if (excPendingSlot == -1) {
+            excPendingSlot = win_tls_alloc()
+        }
+        if (excPayloadSlot == -1) {
+            excPayloadSlot = win_tls_alloc()
+        }
+    }
+}
 
 /// ABI: publish `payload` and raise the pending flag.
 ///
@@ -158,17 +177,26 @@ var excPayload: int = 0
 /// native ABI - the newer exception is the one that reaches the handler.
 #[symbol("pickle_exc_throw")]
 fn abiExcThrow(payload: *int) {
-    excPayload = payload as int
-    excPending = 1
+    excEnsureSlots()
+    unsafe {
+        let _ = win_tls_set(excPayloadSlot, payload as int)
+        let _ = win_tls_set(excPendingSlot, 1)
+    }
 }
 
-/// ABI: is a throw in flight?
+/// ABI: is a throw in flight on this thread?
 #[symbol("pickle_exc_pending")]
 fn abiExcPending() -> bool {
-    excPending == 1
+    if (excPendingSlot == -1) {
+        return false
+    }
+    unsafe {
+        return win_tls_get(excPendingSlot) == 1
+    }
 }
 
-/// ABI: consume the in-flight throw, returning its payload and clearing the flag.
+/// ABI: consume this thread's in-flight throw, returning its payload and
+/// clearing the flag.
 ///
 /// The payload pointer is NOT reset to null afterwards, and that is a deliberate
 /// divergence rather than an oversight. Native returns null here; this cannot,
@@ -182,9 +210,14 @@ fn abiExcPending() -> bool {
 /// leaking one.
 #[symbol("pickle_exc_take")]
 fn abiExcTake() -> *int {
-    let payload = excPayload
-    excPending = 0
-    payload as *int
+    if (excPayloadSlot == -1) {
+        return 0 as *int
+    }
+    unsafe {
+        let payload = win_tls_get(excPayloadSlot)
+        let _ = win_tls_set(excPendingSlot, 0)
+        return payload as *int
+    }
 }
 
 /// ABI: report a throw that escaped the program and exit 1, or return normally
@@ -193,7 +226,7 @@ fn abiExcTake() -> *int {
 /// The backend emits `call pickle_exc_uncaught` on every return out of the
 /// linked entry point (`x64.pkl:852-860`), placed before the frame teardown and
 /// before the return value is loaded, so this runs on the way out of every
-/// ported program. A program that threw nothing pays one field read.
+/// ported program. A program that threw nothing pays one TLS lookup.
 ///
 /// The three writes mirror `exception.rs::report_escaped` exactly, and they must:
 /// `tools/uncaught_parity.ps1:215` compares stderr BYTE-FOR-BYTE against the
@@ -206,7 +239,7 @@ fn abiExcTake() -> *int {
 /// `stderr_stream`/`stream_write`/`stream_flush`.
 #[symbol("pickle_exc_uncaught")]
 fn abiExcUncaught() {
-    if (excPending == 0) {
+    if (!abiExcPending()) {
         return
     }
     let payload = abiExcTake()

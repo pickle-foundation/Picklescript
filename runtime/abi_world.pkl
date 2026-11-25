@@ -51,14 +51,27 @@ module runtime.abi_world
 /// same backend seam when they become real parking.
 
 import { winWorldAcquire, winWorldRelease, winWorldHeld, winWorldPark, winWorldWake, winWorldWakeAll } from runtime.abi_world_win
+import { abiGcEnterNative, abiGcLeaveNative } from runtime.abi_gcengine
 
 /// Take the world lock, blocking until it is free.
+///
+/// A blocked acquirer is in a native section: it touches no managed object
+/// while it waits, so the collector does not count it. `abiGcLeaveNative`
+/// restores the count and runs a safepoint before the caller can use the heap
+/// again. Both are no-ops until the process has a second thread.
 fn worldAcquire() {
+    abiGcEnterNative()
     winWorldAcquire()
+    abiGcLeaveNative()
 }
 
 /// Release the world lock. The caller must own it.
+///
+/// The release starts a native section: every caller continues into a blocking
+/// OS call (or a condition wait) that must not hold up a collection, and pairs
+/// this with `worldAcquire` before it touches the heap again.
 fn worldRelease() {
+    abiGcEnterNative()
     winWorldRelease()
 }
 
@@ -87,8 +100,14 @@ fn worldHeld() -> bool {
 /// The caller must own the world lock. The release/park is atomic with respect
 /// to the waker, which also holds the lock - that is what rules out a lost
 /// wakeup between the predicate check and the sleep.
+///
+/// The sleep is a native section: the world lock is released, so a collection
+/// on another thread must not wait for this one. `abiGcLeaveNative` runs the
+/// safepoint after the lock is reacquired.
 fn worldPark(cell: int) {
+    abiGcEnterNative()
     winWorldPark(cell)
+    abiGcLeaveNative()
 }
 
 /// Wake one thread parked on `cell`; a no-op when nobody is waiting.

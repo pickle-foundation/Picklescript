@@ -1,0 +1,65 @@
+module runtime.abi_parallel_test
+
+/// Phase 0 gate: the blocking I/O paths that used to hold the world lock now
+/// release it, so a peer Pickle thread makes progress while the caller waits.
+/// Both tests use a real second OS thread and a real blocking call; neither
+/// proves *parallel Pickle* (the world lock still serializes execution), only
+/// that a blocked thread no longer stalls the process.
+
+import { spawn, AtomicInt, yieldNow } from std.thread
+import { proc } from std.process
+import { repeat } from std.text.format
+
+/// A worker that counts its own turns and yields every 256 counts. `yieldNow`
+/// is what lets the blocking thread reacquire the world lock; a count far
+/// above the first yield proves the worker ran while the peer was blocked.
+fn spinWorker(done: AtomicInt, spins: AtomicInt) {
+    while (done.load() == 0) {
+        let v = spins.add(1)
+        if ((v & 255) == 0) {
+            yieldNow()
+        }
+    }
+}
+
+test fn a_large_file_read_does_not_serialize_a_peer_thread() {
+    let path = "abi_parallel_read_probe.txt"
+    // 4 MiB = 256 read chunks, each of which releases the world lock.
+    let payload = repeat("0123456789abcdef", 262144)
+    expect(write_file(path, payload)).toBe(true)
+
+    let done = AtomicInt(0)
+    let spins = AtomicInt(0)
+    let t = spawn(() => {
+        spinWorker(done, spins)
+    })
+
+    if (let some(s) = read_file(path)) {
+        expect(len(s)).toBe(len(payload))
+    } else {
+        expect("some").toBe("none")
+    }
+
+    done.store(1)
+    t.join()
+    expect(delete(path)).toBe(true)
+    // With the lock held across the whole read the worker gets one turn
+    // (its first loop iteration yields) and then parks until the read ends.
+    expect(spins.load() > 100).toBe(true)
+}
+
+test fn a_child_process_wait_does_not_serialize_a_peer_thread() {
+    let done = AtomicInt(0)
+    let spins = AtomicInt(0)
+    let t = spawn(() => {
+        spinWorker(done, spins)
+    })
+
+    // `ping -n 2` takes about a second; the wait loop polls every 2 ms.
+    let r = proc(["cmd.exe", "/c", "ping", "-n", "2", "127.0.0.1"] as List<string>)
+    expect(r.ok()).toBe(true)
+
+    done.store(1)
+    t.join()
+    expect(spins.load() > 100).toBe(true)
+}

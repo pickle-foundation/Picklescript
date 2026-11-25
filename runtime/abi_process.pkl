@@ -118,6 +118,11 @@ import { STREAM_OBJECT_SIZE } from runtime.layout
 // Proc stream objects are managed objects built with `alloc(int, 4)`; record
 // them in the port's sweepability registry like `abi_stream.makeStream` does.
 import { abiRegisterObject } from runtime.abi_raw
+// Child creation, waits, and pipe reads can block for a long time. They release
+// the world lock so a peer Pickle thread can run, matching `abi_net`. Every
+// pointer handed across is a raw block, and every managed value held in this
+// module lives in a shadow cell the collector walks, so the release is safe.
+import { worldAcquire, worldRelease } from runtime.abi_world
 
 /// `STARTUPINFOW.dwFlags` bit: the three `hStd*` fields carry real handles.
 /// Only set when at least one of them is non-null, which is the exact
@@ -926,7 +931,10 @@ fn drainPeek(h: int, sink: List<byte>, chunk: *int, cap: int, pN: *int, pAv: *in
                 want = DRAIN_BYTES
             }
             pN[0] = 0
-            if (dword(win_read_file(h, chunk, want, pN, 0)) == 0) {
+            worldRelease()
+            let rcRead = dword(win_read_file(h, chunk, want, pN, 0))
+            worldAcquire()
+            if (rcRead == 0) {
                 return
             }
             let n = dword(pN[0])
@@ -950,7 +958,10 @@ fn drainFinal(h: int, sink: List<byte>, chunk: *int, cap: int, pN: *int) {
         var go = true
         while (go) {
             pN[0] = 0
-            if (dword(win_read_file(h, chunk, DRAIN_BYTES, pN, 0)) == 0) {
+            worldRelease()
+            let rcRead = dword(win_read_file(h, chunk, DRAIN_BYTES, pN, 0))
+            worldAcquire()
+            if (rcRead == 0) {
                 return
             }
             let n = dword(pN[0])
@@ -1192,7 +1203,9 @@ fn abiRunCmd(argv: List<string>, cwd: string?, envs: Map<string, string>?, envRe
         if (capOk) {
             // `inherit_handles: true` and `CREATE_UNICODE_ENVIRONMENT`
             // unconditionally — lines 193 and 324 of `windows.rs`.
+            worldRelease()
             let rc = win_create_process_w(resolved, cmdW, 0, 0, 1, CREATE_UNICODE_ENVIRONMENT, envP, cwdW, si, pi)
+            worldAcquire()
             spawnOk = !(dword(rc) == 0)
             if (spawnOk) {
                 // `PROCESS_INFORMATION`: process handle in word 0, thread
@@ -1248,7 +1261,9 @@ fn abiRunCmd(argv: List<string>, cwd: string?, envs: Map<string, string>?, envRe
                             putRawByte(wbuf, b, sb[b] as int)
                             b = b + 1
                         }
+                        worldRelease()
                         let _ = win_write_file(hInW, wbuf, n, 0, 0)
+                        worldAcquire()
                         free(wbuf)
                     }
                     closeIf(hInW)
@@ -1290,7 +1305,9 @@ fn abiRunCmd(argv: List<string>, cwd: string?, envs: Map<string, string>?, envRe
             // Two milliseconds: the exit check and the loop's pacing in
             // one call — the reference blocks on the handle instead, which
             // a single-threaded port cannot do between drains.
+            worldRelease()
             let rc = dword(win_wait_single(hProc, 2))
+            worldAcquire()
             if (rc == 0) {
                 exited = true
             } else {
@@ -1301,7 +1318,9 @@ fn abiRunCmd(argv: List<string>, cwd: string?, envs: Map<string, string>?, envRe
                     if (deadline >= 0) {
                         if (win_tick_ms64() >= deadline) {
                             let _ = win_terminate_process(hProc, 1)
+                            worldRelease()
                             let _ = win_wait_single(hProc, INFINITE_MS)
+                            worldAcquire()
                             timed = true
                             exited = true
                         }
@@ -1446,7 +1465,10 @@ fn procDrainAt(h: int, buf: *int, inner: *int, lenOff: int, chunk: *int, pN: *in
                 want = DRAIN_BYTES
             }
             pN[0] = 0
-            if (dword(win_read_file(h, chunk, want, pN, 0)) == 0) {
+            worldRelease()
+            let rcRead = dword(win_read_file(h, chunk, want, pN, 0))
+            worldAcquire()
+            if (rcRead == 0) {
                 return
             }
             let n = dword(pN[0])
@@ -1482,7 +1504,10 @@ fn procDrainFinalAt(h: int, buf: *int, inner: *int, lenOff: int, chunk: *int, pN
         var go = true
         while (go) {
             pN[0] = 0
-            if (dword(win_read_file(h, chunk, DRAIN_BYTES, pN, 0)) == 0) {
+            worldRelease()
+            let rcRead = dword(win_read_file(h, chunk, DRAIN_BYTES, pN, 0))
+            worldAcquire()
+            if (rcRead == 0) {
                 return
             }
             let n = dword(pN[0])
@@ -1595,7 +1620,9 @@ fn spawnStreamObject(inner: *int) -> *int {
 fn abiProcClose(inner: *int) -> bool {
     unsafe {
         let _ = win_terminate_process(inner[PROC_HPROC], 1)
+        worldRelease()
         let _ = win_wait_single(inner[PROC_HPROC], INFINITE_MS)
+        worldAcquire()
         closeIf(inner[PROC_HPROC])
         closeIf(inner[PROC_HTHREAD])
         closeIf(inner[PROC_HOUT])
@@ -1750,7 +1777,9 @@ fn abiRunSpawn(argv: List<string>, cwd: string?, envs: Map<string, string>?, env
         var hProc = 0
         var hThread = 0
         if (capOk) {
+            worldRelease()
             let rc = win_create_process_w(resolved, cmdW, 0, 0, 1, CREATE_UNICODE_ENVIRONMENT, envP, cwdW, si, pi)
+            worldAcquire()
             spawnOk = !(dword(rc) == 0)
             if (spawnOk) {
                 hProc = pi[0]
@@ -1839,7 +1868,9 @@ fn abiProcWait(h: *int) -> bool {
         var go = true
         while (go) {
             procPoll(inner)
+            worldRelease()
             let rc = dword(win_wait_single(inner[PROC_HPROC], 2))
+            worldAcquire()
             if (rc == 0) {
                 // Exited: the final drain (the reference's thread join) runs
                 // once more so nothing is left and EOF is set, whether or not

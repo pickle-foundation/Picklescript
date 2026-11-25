@@ -101,3 +101,27 @@ fn winWorldWake(cv: int) {
 fn winWorldWakeAll(cv: int) {
     win_wake_all_condition_variable(cv)
 }
+
+/// Park on `cv` while owning the arbitrary lock cell `lockCell`.
+///
+/// This is the world-lock-free sibling of `winWorldPark`: the caller owns a
+/// per-object lock (a safepoint's own park lock today, a sync primitive's lock
+/// in Phase 4), not the process world lock. `SleepConditionVariableSRW`
+/// releases `lockCell` and reacquires it atomically around the wait, so the
+/// same lost-wakeup argument applies: a waker must take `lockCell` before it
+/// changes the predicate or wakes the cell.
+fn winParkOn(lockCell: int, cv: int) {
+    unsafe {
+        let _ = win_sleep_condition_variable_srw(cv, lockCell, WIN_INFINITE, 0)
+    }
+}
+
+/// Wake one thread parked on `cv` (the caller owns the paired lock cell).
+fn winWakeOn(cv: int) {
+    win_wake_condition_variable(cv)
+}
+
+/// Wake every thread parked on `cv` (the caller owns the paired lock cell).
+fn winWakeAllOn(cv: int) {
+    win_wake_all_condition_variable(cv)
+}

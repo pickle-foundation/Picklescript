@@ -1,8 +1,10 @@
 module runtime.abi_raw
 
-import { abiEngineAllocCount, abiEngineAllocBytes, abiEngineResetCounters, abiEngineRegister, abiEngineUnregister, abiEngineRegisteredCount, abiEngineRegisteredAt, abiEngineRegisteredBytes, abiEngineTempRoot, abiEngineTempUnroot, abiEngineTempCount } from runtime.abi_gcengine
+import { abiEngineAllocCount, abiEngineAllocBytes, abiEngineResetCounters, abiEngineRegister, abiEngineUnregister, abiEngineRegisteredCount, abiEngineRegisteredAt, abiEngineRegisteredBytes, abiEngineTempRoot, abiEngineTempUnroot, abiEngineTempCount, abiEngineParallelOn, abiGcPoll } from runtime.abi_gcengine
 import { writeStderr } from runtime.abi_stdio
 import { STR_BYTES_OFF } from runtime.layout
+import { abiShadowSelf, abiShadowSelfIfRegistered, SHADOW_W_ARENA_BASE, SHADOW_W_ARENA_USED, SHADOW_W_ARENA_CAP, SHADOW_W_ARENA_CHUNK } from runtime.abi_shadow
+import { winLockAcquire, winLockRelease } from runtime.abi_world_win
 
 /// Port of `runtime/src/raw.rs`: the two-slot manual-allocation pair behind
 /// `alloc(int, n)` and `free(p)`.
@@ -140,6 +142,89 @@ var managedArenaUsed: int = 0
 var managedArenaCap: int = 0
 var managedArenaChunk: int = 0
 
+/// Last chunk range matched by `abiManagedRelease`. The sweep frees in registry
+/// order, which is allocation order, so consecutive releases usually land in
+/// the same 1 MiB chunk; this turns the list walk into two compares. Guarded by
+/// `managedChunkLock` like the list itself, and never invalidated because a
+/// chunk is never freed.
+var managedLastChunkBase: int = 0
+var managedLastChunkEnd: int = 0
+
+/// Zero until a second thread exists. The emitter's inline allocation and
+/// registration fast paths check this word first: zero keeps the original
+/// single-threaded bump (one predictable compare, no call), non-zero routes
+/// both paths to the per-thread record. `spawn` flips it before the child
+/// starts, so no allocation can be in flight in the other mode.
+var parallelMode: int = 0
+
+/// Serialises chunk-list mutation and the release walk. Chunk allocation is a
+/// once-per-megabyte event, and the release walk runs only during collection,
+/// so this lock is never on the allocation fast path.
+var managedChunkLock: int = 0
+
+fn abiRawParallelMode() -> int {
+    return parallelMode
+}
+
+/// Turn on the per-thread allocator/registry. Called by `spawn` while the
+/// world lock still serialises Pickle execution, so the flip is observed by
+/// every thread at a call boundary.
+///
+/// Zeroing `managedArenaCap` is what keeps the emitter's inline allocation
+/// fast path free of a mode test. That path's existing `used + n <= cap`
+/// check now fails on every request, so the call reaches `abiManagedAlloc`,
+/// whose `parallelMode` branch owns the per-thread arena. The registry gets
+/// the same treatment in `abiEngineParallelOn`.
+fn abiRawSetParallel() {
+    parallelMode = 1
+    managedArenaCap = 0
+    abiEngineParallelOn()
+}
+
+/// A fresh 1 MiB chunk, linked into the process chunk list. The caller holds
+/// `managedChunkLock`. Returns the bumpable base.
+fn managedChunkNew() -> int {
+    let raw = abiRawAlloc(MANAGED_CHUNK)
+    unsafe {
+        (raw as *int)[0] = managedArenaChunk
+        (raw as *int)[1] = MANAGED_CHUNK
+    }
+    managedArenaChunk = raw
+    return raw + MANAGED_CHUNK_HEADER
+}
+
+/// Per-thread bump allocation. The thread's record is private, so `base`,
+/// `used` and `cap` need no atomics: only the chunk-list link is shared, and
+/// that happens once per megabyte under `managedChunkLock`.
+fn abiManagedAllocParallel(n: int) -> int {
+    // Every Pickle thread registers its shadow node in the function prologue,
+    // so the lock-free lookup answers here. The locking form stays as the
+    // fallback for a caller that allocates before its first frame.
+    var self = abiShadowSelfIfRegistered()
+    if (self == 0) {
+        self = abiShadowSelf()
+    }
+    // Safepoint before the bump. In parallel mode every allocation reaches
+    // this function (the emitted fast path is disabled by the zeroed arena
+    // capacity), so this is the allocation-site poll for the whole program.
+    abiGcPoll()
+    let rec = self as *int
+    unsafe {
+        if (rec[SHADOW_W_ARENA_BASE] == 0 || rec[SHADOW_W_ARENA_USED] + n > rec[SHADOW_W_ARENA_CAP]) {
+            winLockAcquire((&managedChunkLock) as int)
+            let base = managedChunkNew()
+            winLockRelease((&managedChunkLock) as int)
+            rec[SHADOW_W_ARENA_CHUNK] = base - MANAGED_CHUNK_HEADER
+            rec[SHADOW_W_ARENA_BASE] = base
+            rec[SHADOW_W_ARENA_USED] = 0
+            rec[SHADOW_W_ARENA_CAP] = MANAGED_CHUNK - MANAGED_CHUNK_HEADER
+        }
+        let addr = rec[SHADOW_W_ARENA_BASE] + rec[SHADOW_W_ARENA_USED]
+        rec[SHADOW_W_ARENA_USED] = rec[SHADOW_W_ARENA_USED] + n
+        return addr
+    }
+}
+
 /// Allocate `size` bytes for a managed object, 8-byte aligned.
 fn abiManagedAlloc(size: int) -> int {
     var n = size
@@ -149,6 +234,9 @@ fn abiManagedAlloc(size: int) -> int {
     n = (n + 7) & (0 - 8)
     if (n > MANAGED_MAX_BUMP) {
         return abiRawAlloc(n)
+    }
+    if (parallelMode != 0) {
+        return abiManagedAllocParallel(n)
     }
     if (managedArenaUsed + n > managedArenaCap) {
         var raw = abiRawAlloc(MANAGED_CHUNK)
@@ -174,6 +262,21 @@ fn abiManagedRelease(addr: int) {
     if (addr == 0) {
         return
     }
+    // Chunk allocation can prepend to the list from another thread, so the
+    // walk and the append share one lock. This runs only from the sweep, never
+    // from the allocation path.
+    var lockAddr = 0
+    unsafe {
+        lockAddr = (&managedChunkLock) as int
+    }
+    winLockAcquire(lockAddr)
+    // Sweep-order locality: the previous release's chunk is usually this one's
+    // too, so two compares replace a walk over every chunk the process ever
+    // allocated.
+    if (addr >= managedLastChunkBase && addr < managedLastChunkEnd) {
+        winLockRelease(lockAddr)
+        return
+    }
     var chunk = managedArenaChunk
     while (chunk != 0) {
         var next = 0
@@ -183,10 +286,14 @@ fn abiManagedRelease(addr: int) {
             size = (chunk as *int)[1]
         }
         if (addr >= chunk && addr < chunk + size) {
+            managedLastChunkBase = chunk
+            managedLastChunkEnd = chunk + size
+            winLockRelease(lockAddr)
             return
         }
         chunk = next
     }
+    winLockRelease(lockAddr)
     abiRawFree(addr)
 }
 

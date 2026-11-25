@@ -51,9 +51,10 @@ module runtime.abi_gcengine
 /// `regCapGrown` vs `abi_gc`'s `blockCapGrown`), so a helper reused across
 /// modules would collide. Public entry points are `abiEngine*`.
 
-import { shadowRegistryLockAcquire, shadowRegistryLockRelease, abiShadowRegistryHead } from runtime.abi_shadow
+import { shadowRegistryLockAcquire, shadowRegistryLockRelease, abiShadowRegistryHead, abiShadowSelf, abiShadowSelfIfRegistered, SHADOW_W_NEXT, SHADOW_W_REG_BASE, SHADOW_W_REG_COUNT, SHADOW_W_REG_CAP, SHADOW_W_ALLOC_BYTES, SHADOW_W_STATE, SHADOW_W_PARK, SHADOW_W_PARK_LOCK, SHADOW_STATE_RUNNING, SHADOW_STATE_PARKED, SHADOW_STATE_NATIVE, SHADOW_STATE_COLLECTING } from runtime.abi_shadow
 import { abiClassOwnedMaskOf, abiClassFinalizerOf } from runtime.abi_classwords
-import { abiManagedRelease } from runtime.abi_raw
+import { abiManagedRelease, abiRawParallelMode } from runtime.abi_raw
+import { winLockAcquire, winLockRelease, winParkOn, winWakeOn, winWakeAllOn } from runtime.abi_world_win
 import { MAP_BLOOM_OFF } from runtime.layout
 
 /// Managed class ids on object words (mirror of `runtime/object` labels).
@@ -90,6 +91,13 @@ const WO_CLASS_PAYLOAD: int = 3
 /// Transient mark stamp (word 0) written into reachable registered objects
 /// during a collect and cleared on survivors.
 const MARK_SENTINEL: int = 1
+/// A newly registered object whose constructor has not published it yet. It is
+/// kept across a cycle even when no root reaches it, and the pin is cleared
+/// only once a trace actually marks it (`geEnqueue` overwrites the word with
+/// `MARK_SENTINEL`). This is what lets a collection run on another thread
+/// between a maker's `register` and its `return` without sweeping the value
+/// the maker is about to hand back.
+const MARK_PINNED: int = 2
 
 /// `DEFAULT_AUTO_COLLECT_THRESHOLD` in object bytes (runtime/src/gc.rs:137),
 /// spelled out for image initialisation of `threshold`.
@@ -123,6 +131,11 @@ var threshold: int = 8388608
 var thresholdManual: int = 0
 var overrideThreshold: int = 0
 var noAutoGc: int = 0
+/// `PKL_STRESS_GC`: collect at every trigger instead of on a byte threshold.
+/// Under the current execution model the trigger is registration, so this is
+/// "collect after every managed allocation" - the harshest root test available
+/// before safepoints exist. Phase 3 re-points it at the safepoint poll.
+var stressGc: int = 0
 var envInited: int = 0
 /// Non-zero while `abiEngineInitFromEnv` runs: its own `bytes()` scans allocate
 /// managed boxes/lists, and a collection fired by one of those nested registers
@@ -295,16 +308,39 @@ fn geRegGrow(base: int, cap: int, idx: int) -> int {
 }
 
 fn abiEngineRegisteredCount() -> int {
-    return regCount
+    var total = regCount
+    var node = abiShadowRegistryHead()
+    while (node != 0) {
+        unsafe {
+            total = total + ((node as *int)[SHADOW_W_REG_COUNT])
+            node = (node as *int)[SHADOW_W_NEXT]
+        }
+    }
+    return total
 }
 
 fn abiEngineRegisteredAt(i: int) -> int {
-    if (i < 0 || i >= regCount) {
+    if (i < 0) {
         return 0
     }
-    unsafe {
-        return (regBase as *int)[i]
+    if (i < regCount) {
+        unsafe {
+            return (regBase as *int)[i]
+        }
     }
+    var left = i - regCount
+    var node = abiShadowRegistryHead()
+    while (node != 0) {
+        unsafe {
+            let count = (node as *int)[SHADOW_W_REG_COUNT]
+            if (left < count) {
+                return ((node as *int)[SHADOW_W_REG_BASE] as *int)[left]
+            }
+            left = left - count
+            node = (node as *int)[SHADOW_W_NEXT]
+        }
+    }
+    return 0
 }
 
 fn abiEngineRegisteredBytes() -> int {
@@ -331,6 +367,32 @@ fn abiEngineUnregister(obj: *int) {
         }
     }
     if (!found) {
+        // Parallel mode: the object lives in its allocating thread's block.
+        var node = abiShadowRegistryHead()
+        while (node != 0 && !found) {
+            unsafe {
+                let base = (node as *int)[SHADOW_W_REG_BASE] as *int
+                let count = (node as *int)[SHADOW_W_REG_COUNT]
+                var j = 0
+                while (j < count && !found) {
+                    if (base[j] == (obj as int)) {
+                        base[j] = base[count - 1]
+                        base[count - 1] = 0
+                        (node as *int)[SHADOW_W_REG_COUNT] = count - 1
+                        found = true
+                    }
+                    j = j + 1
+                }
+                node = (node as *int)[SHADOW_W_NEXT]
+            }
+        }
+        if (found) {
+            var psize = 0
+            unsafe {
+                psize = obj[2]
+            }
+            regBytes = regBytes - psize
+        }
         return
     }
     unsafe {
@@ -391,6 +453,24 @@ fn geEntryNoAutoGc(w: *int, start: int) -> bool {
     return geUnitAt(w, start + 14) == 61
 }
 
+/// `PKL_STRESS_GC`: force a collection at every trigger.
+fn geEntryStressGc(w: *int, start: int) -> bool {
+    if (geLowerAscii(geUnitAt(w, start + 0)) != 112) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 1)) != 107) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 2)) != 108) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 3)) != 95) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 4)) != 115) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 5)) != 116) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 6)) != 114) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 7)) != 101) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 8)) != 115) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 9)) != 115) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 10)) != 95) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 11)) != 103) { return false }
+    if (geLowerAscii(geUnitAt(w, start + 12)) != 99) { return false }
+    return geUnitAt(w, start + 13) == 61
+}
+
 fn geEntryThreshold(w: *int, start: int) -> bool {
     if (geLowerAscii(geUnitAt(w, start + 0)) != 112) { return false }
     if (geLowerAscii(geUnitAt(w, start + 1)) != 107) { return false }
@@ -429,8 +509,14 @@ fn geEnvFind(w: *int, keySel: int) -> int {
             if (geEntryNoAutoGc(w, start)) {
                 return start + 14 + 1
             }
-        } else if (geEntryThreshold(w, start)) {
-            return start + 16 + 1
+        } else if (keySel == 1) {
+            if (geEntryThreshold(w, start)) {
+                return start + 16 + 1
+            }
+        } else if (keySel == 2) {
+            if (geEntryStressGc(w, start)) {
+                return start + 13 + 1
+            }
         }
         start = start + u + 1
         guard = guard + 1
@@ -498,6 +584,9 @@ fn abiEngineInitFromEnv() {
 thresholdManual = 1
         }
     }
+    if (geEnvFind(block as *int, 2) >= 0) {
+        stressGc = 1
+    }
     let _ = win_free_environment_strings_w(block)
 }
 
@@ -529,7 +618,7 @@ fn geRegObjSize(objAddr: int) -> int {
 /// `geRegUnpin` on both exits.
 fn geRegPin(objAddr: int) {
     unsafe {
-        (objAddr as *int)[0] = MARK_SENTINEL
+        (objAddr as *int)[0] = MARK_PINNED
     }
 }
 
@@ -537,6 +626,74 @@ fn geRegUnpin(objAddr: int) {
     unsafe {
         (objAddr as *int)[0] = 0
     }
+}
+
+/// Append to the calling thread's private registry block. The block is touched
+/// only by its owner, so the append needs no lock; growth is a raw realloc and
+/// copy. Returns 1 when the object was pinned (auto-GC armed), so the caller
+/// knows whether an uncollected registration still needs its pin cleared.
+fn geRegParallel(objAddr: int, size: int) -> int {
+    // The thread's node is created by its first shadow push, which precedes any
+    // allocation in a Pickle frame, so the lock-free lookup answers here. The
+    // locking form stays for a caller that registers before its first frame.
+    var self = abiShadowSelfIfRegistered()
+    if (self == 0) {
+        self = abiShadowSelf()
+    }
+    let rec = self as *int
+    var pinning = 0
+    if (noAutoGc == 0) {
+        geRegPin(objAddr)
+        pinning = 1
+    }
+    var count = 0
+    var cap = 0
+    unsafe {
+        count = rec[SHADOW_W_REG_COUNT]
+        cap = rec[SHADOW_W_REG_CAP]
+    }
+    if (count >= cap) {
+        unsafe {
+            rec[SHADOW_W_REG_BASE] = geRegGrow(rec[SHADOW_W_REG_BASE], cap, count)
+            rec[SHADOW_W_REG_CAP] = geRegCapGrown(cap, count)
+        }
+    }
+    unsafe {
+        ((rec[SHADOW_W_REG_BASE]) as *int)[count] = objAddr
+        rec[SHADOW_W_REG_COUNT] = count + 1
+        rec[SHADOW_W_ALLOC_BYTES] = rec[SHADOW_W_ALLOC_BYTES] + size
+    }
+    regBytes = regBytes + size
+    rawAllocCount = rawAllocCount + 1
+    rawAllocBytes = rawAllocBytes + size
+    return pinning
+}
+
+/// The calling thread's allocation bytes since its last collection. A tiny
+/// unsafe helper so the register path can stay out of `unsafe`.
+fn geAllocBytesOf(rec: *int) -> int {
+    unsafe {
+        return rec[SHADOW_W_ALLOC_BYTES]
+    }
+}
+
+/// Turn off the emitter's inline global-registry append. `abiRawSetParallel`
+/// calls this under the world lock when the process gains its second thread.
+/// Zeroing `regCap` makes the emitted fast path's existing `regCount < regCap`
+/// check fail, so every later registration reaches `abiEngineRegister`, whose
+/// parallel branch appends to the calling thread's private block. In parallel
+/// mode nothing writes the global registry again, so its capacity is dead -
+/// the pre-flip population in `regBase` is still swept and read by count.
+fn abiEngineParallelOn() {
+    regCap = 0
+    // Idempotent: a worker may spawn, and the flip must not reset a live
+    // barrier. The first flip establishes the main thread's count.
+    if (gcParallel != 0) {
+        return
+    }
+    gcParallel = 1
+    gcRequested = 0
+    gcRunningCount = 1
 }
 
 fn abiEngineRegister(objAddr: int) {
@@ -555,6 +712,28 @@ fn abiEngineRegister(objAddr: int) {
         envPhase = 0
     }
     var noGc = noAutoGc
+    // Parallel mode: a private block per thread, no shared registry line. The
+    // collection trigger still runs here for now (the world lock is still the
+    // execution model); Phase 3 moves it to an emitted safepoint.
+    if (abiRawParallelMode() != 0) {
+        let pinning = geRegParallel(objAddr, size)
+        if (noGc != 0) {
+            return
+        }
+        let rec = abiShadowSelf() as *int
+        var th = threshold
+        if (overrideThreshold != 0) {
+            th = overrideThreshold
+        }
+        if (envPhase == 0 && (stressGc != 0 || geAllocBytesOf(rec) >= th)) {
+            abiEngineCollect(false)
+            return
+        }
+        if (pinning != 0) {
+            geRegUnpin(objAddr)
+        }
+        return
+    }
     // Only pay for the pin when a collection is possible. With
     // `PKL_NO_AUTO_GC` set the trigger section below is unreachable, so the
     // mark would be written and cleared untouched - two stores and two calls
@@ -595,7 +774,7 @@ fn abiEngineRegister(objAddr: int) {
     if (overrideThreshold != 0) {
         th = overrideThreshold
     }
-    if (envPhase == 0 && rawAllocBytes >= th) {
+    if (envPhase == 0 && (stressGc != 0 || rawAllocBytes >= th)) {
         abiEngineCollect(false)
     }
     // Clear the register pin unconditionally - native clears the mark even when
@@ -673,7 +852,8 @@ fn geSetHas(candidate: int) -> bool {
 /// Build the cycle's membership set from the current registry: allocate a
 /// zeroed table and insert every registered address. O(regCount).
 fn geSetBuild() {
-    regSetCap = geSetCapFor(regCount)
+    let total = abiEngineRegisteredCount()
+    regSetCap = geSetCapFor(total)
     unsafe {
         regSetBase = alloc(int, regSetCap) as int
     }
@@ -685,7 +865,7 @@ fn geSetBuild() {
         i = i + 1
     }
     i = 0
-    while (i < regCount) {
+    while (i < total) {
         geSetInsert(abiEngineRegisteredAt(i))
         i = i + 1
     }
@@ -695,6 +875,13 @@ fn geSetBuild() {
 fn geMarkedNow(object: int) -> bool {
     unsafe {
         return ((object as int) as *int)[0] == MARK_SENTINEL
+    }
+}
+
+/// True iff `object` is still pinned from its registration (word 0 = 2).
+fn gePinnedNow(object: int) -> bool {
+    unsafe {
+        return ((object as int) as *int)[0] == MARK_PINNED
     }
 }
 
@@ -960,18 +1147,345 @@ fn geFreeOwnedFields(object: int) {
     }
 }
 
+/// One sweep decision. Returns 1 when `address` survives, 0 when it was
+/// released or deferred. A pinned object survives without being cleared: its
+/// maker may still be about to return it, so the pin is dropped only once a
+/// trace reaches the object (`geEnqueue` turns the pin into `MARK_SENTINEL`).
+fn geSweepCandidate(address: int) -> int {
+    if (gePinnedNow(address)) {
+        return 1
+    }
+    if (geMarkedNow(address)) {
+        unsafe {
+            ((address as int) as *int)[0] = 0
+        }
+        return 1
+    }
+    var classId = 0
+    unsafe {
+        classId = (address as *int)[WO_CLASS]
+    }
+    var deferIt = 0
+    if (classId >= 10) {
+        if (abiClassOwnedMaskOf(classId) != 0 || abiClassFinalizerOf(classId) != 0) {
+            deferIt = 1
+        }
+    }
+    if (deferIt == 1) {
+        defBase = geGrow(defBase, defCap, defCount, DEF_INITIAL)
+        defCap = geCapGrown(defCap, defCount, DEF_INITIAL)
+        unsafe {
+            (defBase as *int)[defCount] = address
+        }
+        defCount = defCount + 1
+        return 0
+    }
+    geReleaseOutOfLine(address)
+    // Read the size before freeing: `free` may overwrite the header.
+    var size = 0
+    unsafe {
+        size = (address as *int)[2]
+    }
+    regBytes = regBytes - size
+    abiManagedRelease(address)
+    return 0
+}
+
+/// Compact one thread's private registry block in place, exactly like the
+/// legacy global block, then reset the thread's allocation counter.
+fn geSweepBlock(rec: *int) {
+    var baseAddr = 0
+    var count = 0
+    unsafe {
+        baseAddr = rec[SHADOW_W_REG_BASE]
+        count = rec[SHADOW_W_REG_COUNT]
+    }
+    if (baseAddr != 0 && count > 0) {
+        let base = baseAddr as *int
+        var w = 0
+        var r = 0
+        while (r < count) {
+            var address = 0
+            unsafe {
+                address = base[r]
+            }
+            if (geSweepCandidate(address) == 1) {
+                if (w != r) {
+                    unsafe {
+                        base[w] = address
+                    }
+                }
+                w = w + 1
+            }
+            r = r + 1
+        }
+        unsafe {
+            rec[SHADOW_W_REG_COUNT] = w
+            rec[SHADOW_W_ALLOC_BYTES] = 0
+        }
+    } else {
+        unsafe {
+            rec[SHADOW_W_ALLOC_BYTES] = 0
+        }
+    }
+}
+
+// ------------------------------------------------------------- safepoints
+//
+// PHASE 3: stop-the-world collection. The world lock still serialises Pickle
+// execution today, so these paths mostly observe one running thread; they are
+// the contract Phase 4 removes the lock against. The invariant they build is:
+//
+//   - every thread that can touch the managed heap is counted in
+//     `gcRunningCount` while it is RUNNING;
+//   - before it mutates the heap it passes a safepoint (`abiGcPoll`), which
+//     parks it when `gcRequested` is set;
+//   - a thread in a blocking OS call is NATIVE and not counted;
+//   - the collector sets `gcRequested`, excludes itself, and waits for the
+//     count to reach zero before it marks or sweeps.
+//
+// The count and the collector's wait share `gcCountLock`; each thread parks on
+// its own node's `parkLock`/`parkCv` pair. Lock order is parkLock ->
+// gcCountLock; the collector's wake walk takes only parkLock and its wait
+// takes only gcCountLock, so the graph is acyclic.
+const GE_WORD_BYTES: int = 8
+
+/// 0 until the process gains its second thread. Mirrors the allocator's
+/// `parallelMode`, but lives here so the poll and the collector share one
+/// switch and `abi_gcengine` stays a leaf of `abi_raw`.
+var gcParallel: int = 0
+
+/// 0 when no collection is in progress; 1 while a collector is stopping the
+/// world and running mark/sweep. Written by the collector, read by every poll.
+var gcRequested: int = 0
+
+/// Threads that are RUNNING, plus threads parked at a safepoint until the
+/// poll's decrement lands. Excludes NATIVE threads and the collector.
+var gcRunningCount: int = 0
+
+/// Serialises updates to `gcRunningCount` and guards the collector's wait.
+var gcCountLock: int = 0
+
+/// One collector at a time. Held only across the request/claim transition.
+var gcStartLock: int = 0
+
+/// The collector's condition variable, paired with `gcCountLock`.
+var gcCollectorCv: int = 0
+
+/// Address of a word inside a raw node.
+fn geNodeWord(base: int, word: int) -> int {
+    return base + GE_WORD_BYTES * word
+}
+
+/// Addresses of the safepoint's own synchronization words, for the
+/// `abi_world_win` seam. A zero-initialized `SRWLOCK`/`CONDITION_VARIABLE` is
+/// the Win32 unlocked/empty state, so no explicit initialisation is needed.
+fn geCountLockAddr() -> int {
+    var p = 0
+    unsafe {
+        p = (&gcCountLock) as int
+    }
+    return p
+}
+
+fn geStartLockAddr() -> int {
+    var p = 0
+    unsafe {
+        p = (&gcStartLock) as int
+    }
+    return p
+}
+
+fn geCollectorCvAddr() -> int {
+    var p = 0
+    unsafe {
+        p = (&gcCollectorCv) as int
+    }
+    return p
+}
+
+/// The safepoint. Every thread that can mutate the managed heap passes this
+/// before the mutation: allocation entry, loop back-edges, and the return from
+/// a native section. It is one load and a not-taken branch when no collection
+/// is pending, which is the common case.
+///
+/// The park protocol is the classic condition-variable one: the thread owns its
+/// `parkLock` across the predicate check and the atomic release inside
+/// `winParkOn`, so the collector cannot clear `gcRequested` between the check
+/// and the sleep without first taking `parkLock` - which it can only do after
+/// the sleeper has released it.
+#[symbol("pickle_gc_poll")]
+fn abiGcPoll() {
+    if (gcRequested == 0) {
+        return
+    }
+    var self = abiShadowSelfIfRegistered()
+    if (self == 0) {
+        // No lock, no registration: a poll can run inside `pickle_shadow_push`
+        // before the thread's TLS slot is published, and `abiShadowSelf` would
+        // take the non-reentrant `shadowLock` that push already holds. A poll
+        // on a thread the collector cannot see is also meaningless - the
+        // collector only waits for counted threads, and registration happens
+        // before the first heap mutation.
+        return
+    }
+    let node = self as *int
+    let lockAddr = geNodeWord(self, SHADOW_W_PARK_LOCK)
+    let cvAddr = geNodeWord(self, SHADOW_W_PARK)
+    unsafe {
+        // A finalizer running on the collector thread must never park on the
+        // collection it is part of.
+        if (node[SHADOW_W_STATE] == SHADOW_STATE_COLLECTING) {
+            return
+        }
+        winLockAcquire(lockAddr)
+        if (gcRequested != 0) {
+            node[SHADOW_W_STATE] = SHADOW_STATE_PARKED
+            winLockAcquire(geCountLockAddr())
+            gcRunningCount = gcRunningCount - 1
+            winWakeOn(geCollectorCvAddr())
+            winLockRelease(geCountLockAddr())
+            while (gcRequested != 0) {
+                winParkOn(lockAddr, cvAddr)
+            }
+            node[SHADOW_W_STATE] = SHADOW_STATE_RUNNING
+            winLockAcquire(geCountLockAddr())
+            gcRunningCount = gcRunningCount + 1
+            winLockRelease(geCountLockAddr())
+        }
+        winLockRelease(lockAddr)
+    }
+}
+
+/// Mark this thread as blocked in an OS call: it will not touch the managed
+/// heap until `abiGcLeaveNative`, so the collector must not wait for it.
+/// Idempotent, and a no-op on the collector thread (already excluded).
+fn abiGcEnterNative() {
+    if (gcParallel == 0) {
+        return
+    }
+    var self = abiShadowSelfIfRegistered()
+    if (self == 0) {
+        self = abiShadowSelf()
+    }
+    let node = self as *int
+    unsafe {
+        let state = node[SHADOW_W_STATE]
+        if (state == SHADOW_STATE_NATIVE || state == SHADOW_STATE_COLLECTING) {
+            return
+        }
+        node[SHADOW_W_STATE] = SHADOW_STATE_NATIVE
+    }
+    winLockAcquire(geCountLockAddr())
+    gcRunningCount = gcRunningCount - 1
+    // Wake the collector while the count lock is still held: a collector that
+    // has already decided to wait must not miss this decrement. A wake after
+    // the release can arrive between the predicate check and the sleep.
+    winWakeOn(geCollectorCvAddr())
+    winLockRelease(geCountLockAddr())
+}
+
+/// Return from a native section: count the thread again, then run a safepoint
+/// before it can touch the heap. The poll may park; the count is restored
+/// first so the collector's barrier already covers this thread.
+fn abiGcLeaveNative() {
+    if (gcParallel == 0) {
+        return
+    }
+    var self = abiShadowSelfIfRegistered()
+    if (self == 0) {
+        return
+    }
+    let node = self as *int
+    unsafe {
+        if (node[SHADOW_W_STATE] != SHADOW_STATE_NATIVE) {
+            return
+        }
+        node[SHADOW_W_STATE] = SHADOW_STATE_RUNNING
+    }
+    winLockAcquire(geCountLockAddr())
+    gcRunningCount = gcRunningCount + 1
+    winLockRelease(geCountLockAddr())
+    abiGcPoll()
+}
+
+/// Count a thread that is about to be created. The spawner calls this before
+/// `CreateThread`, so the child is covered from before its first instruction; a
+/// failed create must call `abiGcThreadExited`.
+fn abiGcThreadStarting() {
+    if (gcParallel == 0) {
+        return
+    }
+    winLockAcquire(geCountLockAddr())
+    gcRunningCount = gcRunningCount + 1
+    winLockRelease(geCountLockAddr())
+}
+
+/// Uncount a thread that has left Pickle code. Called after the last heap
+/// mutation and before the OS thread exits.
+fn abiGcThreadExited() {
+    if (gcParallel == 0) {
+        return
+    }
+    winLockAcquire(geCountLockAddr())
+    gcRunningCount = gcRunningCount - 1
+    winWakeOn(geCollectorCvAddr())
+    winLockRelease(geCountLockAddr())
+}
+
 /// One collection cycle: mark from the port's roots, sweep the unmarked
 /// registered population back to the OS heap (list/map spans included), refresh
 /// the live figure, zero the seam counters, then adapt the threshold unless a
 /// `set_threshold` (or a `PKL_GC_THRESHOLD` override) pinned it. `force` is
 /// accepted and ignored - native v1 always collects.
 fn abiEngineCollect(force: bool) {
-        if (collecting != 0) {
-                return
+    let parallel = gcParallel
+    if (parallel != 0 && gcRequested != 0) {
+        // Another thread owns the collection. A finalizer nested inside it
+        // (state COLLECTING) must not park on the collection it is part of;
+        // the `collecting` guard below is its answer.
+        var self = abiShadowSelfIfRegistered()
+        if (self != 0) {
+            unsafe {
+                if ((self as *int)[SHADOW_W_STATE] == SHADOW_STATE_COLLECTING) {
+                    return
+                }
+            }
+        }
+        abiGcPoll()
+        return
+    }
+    if (collecting != 0) {
+        return
+    }
+    var collectorNode = 0
+    if (parallel != 0) {
+        winLockAcquire(geStartLockAddr())
+        if (gcRequested != 0) {
+            winLockRelease(geStartLockAddr())
+            abiGcPoll()
+            return
+        }
+        gcRequested = 1
+        winLockRelease(geStartLockAddr())
+        collectorNode = abiShadowSelfIfRegistered()
+        if (collectorNode != 0) {
+            unsafe {
+                (collectorNode as *int)[SHADOW_W_STATE] = SHADOW_STATE_COLLECTING
+            }
+        }
+        // Exclude the collector from the barrier, then wait for every other
+        // RUNNING thread to park. A thread that is NATIVE is not counted.
+        winLockAcquire(geCountLockAddr())
+        gcRunningCount = gcRunningCount - 1
+        while (gcRunningCount != 0) {
+            winParkOn(geCountLockAddr(), geCollectorCvAddr())
+        }
+        winLockRelease(geCountLockAddr())
     }
     collecting = 1
     collections = collections + 1
-    var workCount = regCount
+    var workCount = abiEngineRegisteredCount()
     if (workCount < 1) {
         workCount = 1
     }
@@ -1004,46 +1518,37 @@ fn abiEngineCollect(force: bool) {
     var read = 0
     while (read < regCount) {
         var address = abiEngineRegisteredAt(read)
-        if (geMarkedNow(address)) {
-            unsafe {
-                ((address as int) as *int)[0] = 0
-                if (write != read) {
+        if (geSweepCandidate(address) == 1) {
+            if (write != read) {
+                unsafe {
                     (regBase as *int)[write] = address
                 }
             }
             write = write + 1
-        } else {
-            var classId = 0
-            unsafe {
-                classId = (address as *int)[WO_CLASS]
-            }
-            var deferIt = 0
-            if (classId >= 10) {
-                if (abiClassOwnedMaskOf(classId) != 0 || abiClassFinalizerOf(classId) != 0) {
-                    deferIt = 1
-                }
-            }
-            if (deferIt == 1) {
-                defBase = geGrow(defBase, defCap, defCount, DEF_INITIAL)
-                defCap = geCapGrown(defCap, defCount, DEF_INITIAL)
-                unsafe {
-                    (defBase as *int)[defCount] = address
-                }
-                defCount = defCount + 1
-            } else {
-                geReleaseOutOfLine(address)
-                // Read the size before freeing: `free` may overwrite the header.
-                var size = 0
-                unsafe {
-                    size = (address as *int)[2]
-                }
-                regBytes = regBytes - size
-                abiManagedRelease(address)
-            }
         }
         read = read + 1
     }
     regCount = write
+    // Parallel-mode registries: each thread's block is private, so it needs no
+    // lock while it allocates. The sweep is the one place that touches them
+    // from another thread; the shadow registry lock keeps the node list and
+    // the block pointers stable.
+    //
+    // INVARIANT: no function called between this acquire and the release may
+    // own a managed home and be may-GC. Such a function pushes a shadow frame in
+    // its prologue, which re-enters this non-recursive SRW lock and deadlocks
+    // the collector against itself. `geSweepBlock`/`geSweepCandidate` are
+    // deliberately kept free of that shape (the SRW imports are in
+    // `externMayCollect`'s cannot-collect list).
+    shadowRegistryLockAcquire()
+    var tnode = abiShadowRegistryHead()
+    while (tnode != 0) {
+        unsafe {
+            geSweepBlock(tnode as *int)
+            tnode = (tnode as *int)[SHADOW_W_NEXT]
+        }
+    }
+    shadowRegistryLockRelease()
     unsafe {
         free(markPending as *int)
     }
@@ -1095,11 +1600,55 @@ fn abiEngineCollect(force: bool) {
         threshold = geAdaptiveNext(liveBytes)
     }
     collecting = 0
+    if (parallel != 0) {
+        // Release the mutators. The flag is cleared before the walk, so a
+        // thread that reaches the poll now simply returns; a thread already
+        // inside the park protocol is serialised by its own park lock.
+        gcRequested = 0
+        shadowRegistryLockAcquire()
+        var wakeNode = abiShadowRegistryHead()
+        while (wakeNode != 0) {
+            let lockAddr = geNodeWord(wakeNode, SHADOW_W_PARK_LOCK)
+            let cvAddr = geNodeWord(wakeNode, SHADOW_W_PARK)
+            winLockAcquire(lockAddr)
+            winWakeAllOn(cvAddr)
+            winLockRelease(lockAddr)
+            unsafe {
+                wakeNode = (wakeNode as *int)[SHADOW_W_NEXT]
+            }
+        }
+        shadowRegistryLockRelease()
+        winLockAcquire(geCountLockAddr())
+        gcRunningCount = gcRunningCount + 1
+        winLockRelease(geCountLockAddr())
+        if (collectorNode != 0) {
+            unsafe {
+                (collectorNode as *int)[SHADOW_W_STATE] = SHADOW_STATE_RUNNING
+            }
+        }
+    }
 }
 
 // ------------------------------------------------------------- accessors
 fn abiEngineCollectionCount() -> int {
     return collections
+}
+
+/// Threads the collector currently counts as RUNNING, the collector itself
+/// included. In single-thread mode it stays 0 (no thread was ever counted).
+/// Exported for the Phase 3 gate: after any spawn/join/collect cycle it must
+/// return to exactly 1, which is the only cheap way to catch an unbalanced
+/// native/leave-native transition - the failure mode that turns into a hang
+/// much later, under load.
+fn abiEngineRunningCount() -> int {
+    return gcRunningCount
+}
+
+/// Is the process in the multi-thread collection regime? Exported for the gate
+/// so a test can assert it is exercising the STW path rather than the
+/// single-thread one.
+fn abiEngineParallelNow() -> int {
+    return gcParallel
 }
 
 fn abiEngineSetThreshold(bytes: int) {

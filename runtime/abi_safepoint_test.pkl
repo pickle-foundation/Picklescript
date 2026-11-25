@@ -1,0 +1,169 @@
+module runtime.abi_safepoint_test
+
+/// Phase 3 gates for the stop-the-world collector.
+///
+/// The world lock still serializes Pickle execution, so no test here can put
+/// two threads inside the managed heap at once. What they *can* pin down is the
+/// accounting the lock-free Phase 4 relies on, and which a Phase 4 mistake
+/// turns into a hang rather than a wrong answer:
+///
+///   * `gcRunningCount` starts at 0, becomes 1 when the process gains its
+///     second thread, and returns to exactly 1 after every spawn/join and every
+///     blocking-call cycle. An unbalanced native transition shows up here
+///     immediately instead of as a deadlock under load.
+///   * A collection that runs while a peer is blocked on the world lock does
+///     not wait for that peer (it is NATIVE, not counted).
+///   * A collection that runs *on a spawned thread* while the main thread is
+///     parked in a channel completes, and leaves both threads' live sets
+///     intact.
+///
+/// The first test is order-dependent by design: it asserts the single-threaded
+/// starting state, which only exists before any `spawn` in this process.
+///
+/// Run this file twice: once normally, once with `PKL_STRESS_GC=1`.
+
+import { spawn, yieldNow, AtomicInt, Channel, Task } from std.thread
+import { abiGcCollect, abiGcSetThreshold, abiGcRunningCount, abiGcParallelNow } from runtime.abi_gc
+
+/// Build `n` tagged strings, keeping the last 32 so the list has a stable tail
+/// to verify after a collection. `yieldNow` every 32 turns lets a peer run.
+fn buildKeep(n: int, tag: string) -> List<string> {
+    var keep: List<string> = List<string>()
+    var i = 0
+    while (i < n) {
+        keep.push(tag + str(i))
+        if (len(keep) > 32) {
+            keep = List<string>()
+            keep.push(tag + str(i))
+        }
+        if ((i & 31) == 0) {
+            yieldNow()
+        }
+        i = i + 1
+    }
+    keep
+}
+
+/// Every entry still carries `tag`, is longer than it, and differs from its
+/// neighbour: a swept-and-recycled block breaks at least one of those.
+fn verifyKeep(keep: List<string>, tag: string) -> bool {
+    if (len(keep) == 0) {
+        return false
+    }
+    var i = 0
+    while (i < len(keep)) {
+        let s = keep[i]
+        if (len(s) <= len(tag)) {
+            return false
+        }
+        if (!s.contains(tag)) {
+            return false
+        }
+        if (i > 0) {
+            if (s == keep[i - 1]) {
+                return false
+            }
+        }
+        i = i + 1
+    }
+    true
+}
+
+test fn a_a_single_threaded_process_counts_no_running_threads() {
+    // Before the first spawn there is no barrier to maintain: the collector is
+    // the only thread and nothing is counted.
+    expect(abiGcParallelNow()).toBe(0)
+    expect(abiGcRunningCount()).toBe(0)
+}
+
+test fn b_a_join_returns_the_running_count_to_one() {
+    let ok = AtomicInt(0)
+    let t = spawn(() => {
+        let keep = buildKeep(200, "j:")
+        if (verifyKeep(keep, "j:")) {
+            ok.store(1)
+        }
+    })
+    expect(t.join()).toBe(true)
+    expect(ok.load()).toBe(1)
+    expect(abiGcParallelNow()).toBe(1)
+    expect(abiGcRunningCount()).toBe(1)
+}
+
+test fn c_a_collection_does_not_wait_for_a_peer_parked_in_a_channel() {
+    let ready = Channel(1)
+    let go = Channel(1)
+    let ok = AtomicInt(0)
+    let t = spawn(() => {
+        let keep = buildKeep(96, "park:")
+        ready.send(1)
+        // Park with `keep` live in this frame. `recv` releases the world lock,
+        // so this thread is NATIVE and the collector must not count it.
+        let _ = go.recv()
+        if (verifyKeep(keep, "park:")) {
+            ok.store(1)
+        }
+    })
+    let _ = ready.recv()
+    abiGcSetThreshold(4096)
+    abiGcCollect(true)
+    abiGcCollect(true)
+    // The peer is parked, so it is not part of the barrier; only this thread is
+    // counted, and it is the collector.
+    expect(abiGcRunningCount()).toBe(1)
+    go.send(1)
+    expect(t.join()).toBe(true)
+    expect(ok.load()).toBe(1)
+    expect(abiGcRunningCount()).toBe(1)
+}
+
+test fn d_a_spawned_thread_can_be_the_collector() {
+    abiGcSetThreshold(4096)
+    let done = AtomicInt(0)
+    let t = spawn(() => {
+        let keep = buildKeep(96, "mine:")
+        // This thread holds the world lock while the main thread is parked in
+        // `join` (a native wait), so the collection it forces here has exactly
+        // one counted thread: itself.
+        abiGcCollect(true)
+        if (abiGcRunningCount() != 1) {
+            done.store(0 - 1)
+        } else if (verifyKeep(keep, "mine:")) {
+            done.store(1)
+        }
+    })
+    expect(t.join()).toBe(true)
+    expect(done.load()).toBe(1)
+    expect(abiGcRunningCount()).toBe(1)
+}
+
+test fn e_many_collecting_threads_leave_the_barrier_balanced() {
+    abiGcSetThreshold(4096)
+    let bad = AtomicInt(0)
+    var tasks: List<Task> = List<Task>()
+    var i = 0
+    while (i < 4) {
+        let tag = "t" + str(i) + ":"
+        let t = spawn(() => {
+            let keep = buildKeep(64, tag)
+            abiGcCollect(true)
+            if (!verifyKeep(keep, tag)) {
+                let _ = bad.add(1)
+            }
+        })
+        tasks.push(t)
+        i = i + 1
+    }
+    var j = 0
+    while (j < len(tasks)) {
+        let t = tasks[j]
+        expect(t.join()).toBe(true)
+        j = j + 1
+    }
+    expect(bad.load()).toBe(0)
+    // Every worker has released the world lock on exit, so the count is the
+    // main thread alone.
+    expect(abiGcRunningCount()).toBe(1)
+    abiGcCollect(true)
+    expect(abiGcRunningCount()).toBe(1)
+}

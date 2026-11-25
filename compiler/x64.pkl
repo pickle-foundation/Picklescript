@@ -1064,6 +1064,26 @@ fn externMayCollect(sym: string) -> bool {
         || sym == "__imp_GetProcessHeap" || sym == "__imp_ExitProcess"
         || sym == "__imp_TlsAlloc" || sym == "__imp_TlsGetValue"
         || sym == "__imp_TlsSetValue"
+        // Console writes. `abi_panic`/`abi_expect`/the fatal channel write to
+        // stderr through these, and any diagnostic built on them is a leaf: a
+        // WriteFile cannot re-enter PickleScript code, so it cannot reach the
+        // collection trigger.
+        || sym == "__imp_GetStdHandle"
+        || sym == "__imp_WriteFile"
+        // Win32 synchronization primitives. An SRW lock / condition variable
+        // call is a kernel transition; it can never run PickleScript code, so a
+        // function whose only "allocating" call is one of these cannot reach
+        // the collection trigger. They are listed deliberately: the collector's
+        // sweep takes the chunk lock through `abiManagedRelease`, and leaving
+        // the SRW imports unlisted marked the whole sweep may-GC. That put a
+        // shadow frame on `geSweepBlock`, whose prologue then re-entered the
+        // non-recursive registry lock the sweep already holds (self-deadlock).
+        || sym == "__imp_AcquireSRWLockExclusive"
+        || sym == "__imp_TryAcquireSRWLockExclusive"
+        || sym == "__imp_ReleaseSRWLockExclusive"
+        || sym == "__imp_SleepConditionVariableSRW"
+        || sym == "__imp_WakeConditionVariable"
+        || sym == "__imp_WakeAllConditionVariable"
         || sym == "__imp_memcpy" || sym == "__imp_memmove"
         || sym == "__imp_memset" || sym == "__imp_memcmp"
         // Raw heap allocation/free: `pickle_raw_alloc` is the `alloc(int, n)`
@@ -1939,6 +1959,17 @@ class X64Emitter {
     var cb: CB
     var fixes: List<BranchFix>
     var starts: Map<int, int>
+    /// Lazily computed spawn capability of the whole lowered module: -1 before
+    /// the first query, 0 when nothing names `pickle_thread_spawn`, 1 when the
+    /// module defines or calls it. Only a spawn-capable module pays for the
+    /// loop back-edge safepoints; every other module keeps the pre-Phase-3
+    /// bytes exactly.
+    var spawnCapable: int
+    /// Loop-header blocks of the function being emitted, and whether the scan
+    /// that fills it has run. A header is any block some terminator reaches
+    /// with a backward edge; it carries the per-iteration safepoint.
+    var loopHeads: Map<int, bool>
+    var loopHeadsComputed: bool
     /// Temp whose value is currently in rax, and the width that value is valid
     /// at (-1 / 0 when nothing is known). See `loadTmp`/`noteRax`.
     var raxT: int
@@ -2017,6 +2048,10 @@ class X64Emitter {
         this.fixes.pop()
         this.starts = {0: 0}
         this.starts.remove(0)
+        this.spawnCapable = 0 - 1
+        this.loopHeads = {0: true}
+        this.loopHeads.remove(0)
+        this.loopHeadsComputed = false
         this.raxT = 0 - 1
         this.raxW = 0
         this.rcxT = 0 - 1
@@ -2816,11 +2851,193 @@ class X64Emitter {
         v >= 0 - 2147483648 && v <= 2147483647
     }
 
+    /// Does this module define or call `pickle_thread_spawn`? A module that
+    /// never spawns cannot gain a second Pickle thread (the runtime creates one
+    /// only from that entry point), so its loops need no safepoint and keep the
+    /// original code shape. Cached: the scan is a property of the module, not
+    /// of the function.
+    fn moduleMaySpawn() -> bool {
+        if (this.spawnCapable >= 0) {
+            return this.spawnCapable != 0
+        }
+        var found = false
+        var i = 0
+        while (i < len(this.m.externs)) {
+            if (this.m.externs[i].symbol == "pickle_thread_spawn") {
+                found = true
+            }
+            i = i + 1
+        }
+        i = 0
+        while (i < len(this.m.funcs)) {
+            if (this.m.funcs[i].symbol == "pickle_thread_spawn") {
+                found = true
+            }
+            i = i + 1
+        }
+        if (found) {
+            this.spawnCapable = 1
+        } else {
+            this.spawnCapable = 0
+        }
+        return found
+    }
+
+    /// True when some terminator branches to a block that has already been
+    /// emitted, i.e. the function contains a loop. Only used to decide whether
+    /// the prologue must reserve Win64 shadow space for the loop-header poll.
+    fn hasBackEdge() -> bool {
+        var found = false
+        for (b in this.fun.blocks) {
+            if (this.isLoopHeader(b.id)) {
+                found = true
+            }
+        }
+        found
+    }
+
+    /// Can `to` reach `from` through the CFG? Used to distinguish a real loop
+    /// back edge from a backward branch to a join block. An `if` whose join is
+    /// laid out before its body produces an edge `body -> join` that points
+    /// backwards in block order but closes no cycle: the join cannot reach the
+    /// body. Treating that edge as a loop header plants a safepoint at an
+    /// arbitrary join, and a poll executed while a runtime lock is held then
+    /// re-enters that lock (`pickle_shadow_push` -> `shadowInitNode` -> poll ->
+    /// `abiShadowSelf` -> `shadowLock`) and deadlocks the collector.
+    fn closesCycle(src: int, dst: int, pos: Map<int, int>) -> bool {
+        var seen: Map<int, bool> = Map<int, bool>()
+        var work: List<int> = [dst]
+        while (len(work) > 0) {
+            let cur = work.pop()
+            if (cur == src) {
+                return true
+            }
+            if (!seen.has(cur) && pos.has(cur)) {
+                seen[cur] = true
+                match (this.fun.blocks[pos[cur]].term) {
+                    case IrTerm.Branch(target) -> {
+                        work.push(target)
+                    }
+                    case IrTerm.BranchIf(_, tn, el) -> {
+                        work.push(tn)
+                        work.push(el)
+                    }
+                    case _ -> {}
+                }
+            }
+        }
+        return false
+    }
+
+    /// Is `id` a loop header - a block some terminator reaches with a backward
+    /// edge that actually closes a cycle? The safepoint lives here rather than
+    /// at the terminator because at block entry no value is live in a
+    /// caller-saved register: a poll at the terminator could destroy the
+    /// comparison a fused `BranchIf` is about to consume. Computed once per
+    /// function and cached.
+    fn isLoopHeader(id: int) -> bool {
+        if (!this.moduleMaySpawn()) {
+            return false
+        }
+        // The safepoint function itself must never carry a poll. Its own wait
+        // loop is already inside the park protocol; a poll at that header would
+        // re-enter the protocol, decrement `gcRunningCount` a second time, and
+        // deadlock the collector. It is also the recursion edge that turned a
+        // dead-block back edge into an infinite `pickle_gc_poll -> poll` chain.
+        if (this.fun.symbol == "pickle_gc_poll") {
+            return false
+        }
+        if (!this.loopHeadsComputed) {
+            var pos: Map<int, int> = {0: 0}
+            pos.remove(0)
+            var i = 0
+            for (b in this.fun.blocks) {
+                pos[b.id] = i
+                i = i + 1
+            }
+            // Only reachable blocks may declare a loop header. The emitter
+            // leaves dead join blocks behind (an `unsafe` expression's
+            // abandoned merge, for one), and a dead `branch` to an earlier
+            // block would otherwise make a live block look like a loop header.
+            // That is not cosmetic: the extra safepoint poll can land inside
+            // `pickle_gc_poll` itself, and the poll then recurses forever.
+            var reach: Map<int, bool> = {0: true}
+            var work: List<int> = [0]
+            while (len(work) > 0) {
+                let cur = work.pop()
+                if (pos.has(cur)) {
+                    let b = this.fun.blocks[pos[cur]]
+                    match (b.term) {
+                        case IrTerm.Branch(target) -> {
+                            if (!reach.has(target)) {
+                                reach[target] = true
+                                work.push(target)
+                            }
+                        }
+                        case IrTerm.BranchIf(_, tn, el) -> {
+                            if (!reach.has(tn)) {
+                                reach[tn] = true
+                                work.push(tn)
+                            }
+                            if (!reach.has(el)) {
+                                reach[el] = true
+                                work.push(el)
+                            }
+                        }
+                        case _ -> {}
+                    }
+                }
+            }
+            i = 0
+            for (b in this.fun.blocks) {
+                if (reach.has(b.id)) {
+                    match (b.term) {
+                        case IrTerm.Branch(target) -> {
+                            if (pos.has(target) && pos[target] <= i && this.closesCycle(b.id, target, pos)) {
+                                this.loopHeads[target] = true
+                            }
+                        }
+                        case IrTerm.BranchIf(_, tn, el) -> {
+                            if (pos.has(tn) && pos[tn] <= i && this.closesCycle(b.id, tn, pos)) {
+                                this.loopHeads[tn] = true
+                            }
+                            if (pos.has(el) && pos[el] <= i && this.closesCycle(b.id, el, pos)) {
+                                this.loopHeads[el] = true
+                            }
+                        }
+                        case _ -> {}
+                    }
+                }
+                i = i + 1
+            }
+            this.loopHeadsComputed = true
+        }
+        this.loopHeads.has(id)
+    }
+
+    /// `pickle_gc_poll()` at a loop header. Every managed home is already in
+    /// the shadow frame (the frame is the spill area), so nothing has to be
+    /// flushed; the call only destroys the redundant register caches, which are
+    /// dropped first.
+    fn emitGcPoll() {
+        this.raxT = 0 - 1
+        this.raxW = 0
+        this.clobberRcx()
+        this.dropFx()
+        this.cb.movabsReloc(10, "pickle_gc_poll")
+        this.cb.u8(0x41)
+        this.cb.u8(0xFF)
+        this.cb.u8(0xD2)
+    }
+
     /// True when the body can emit a machine `call`. Four-or-fewer-argument
     /// calls emit no `sub rsp` of their own (the args fit the registers), so
     /// only the prologue can reserve the Win64 shadow space they need.
     fn makesCalls() -> bool {
         if (this.plan.shadowed || this.fun.symbol == ENTRY_SYMBOL) {
+            return true
+        }
+        if (this.moduleMaySpawn() && this.hasBackEdge()) {
             return true
         }
         var found = false
@@ -4384,6 +4601,11 @@ class X64Emitter {
         this.inlineLab = this.inlineLab + 1
         let done = 0 - 1 - this.inlineLab
         this.inlineLab = this.inlineLab + 1
+        // Parallel mode costs nothing here. `abiRawSetParallel` zeroes
+        // `managedArenaCap` when the process gains its second thread, so the
+        // capacity test below fails on every request and the call lands in
+        // `abiManagedAlloc`, whose mode branch owns the per-thread arena. The
+        // emitted fast path stays byte-identical to the single-thread shape.
         // rax = max(size, 8), rounded up to a multiple of 8. The clamp is a
         // cmov so the tiny-size case costs no branch of its own.
         this.cb.u8(0x48)
@@ -4478,6 +4700,10 @@ class X64Emitter {
         this.cb.u8(0x85)
         this.cb.u8(0xC9)
         this.emitJcc(0x04, done)
+        // Parallel mode needs no test here either. `abiEngineParallelOn` zeroes
+        // `regCap` at the same moment, so the capacity check below fails and
+        // the append lands in `abiEngineRegister`, whose mode branch owns the
+        // calling thread's private block.
         // `envInited` must be non-zero and `noAutoGc` must be set.
         this.cb.movabsReloc(0, "pkl_global_envInited")
         this.cb.u8(0x48)
@@ -6053,6 +6279,12 @@ class X64Emitter {
             this.rcxW = 0
             this.pendT = 0 - 1
             this.fuseCc = 0 - 1
+            // A loop header carries the per-iteration safepoint. It sits after
+            // `starts[id]` so a back-edge lands on the poll, and before any
+            // instruction so no live value is clobbered.
+            if (this.isLoopHeader(blk.id)) {
+                this.emitGcPoll()
+            }
             let n = len(blk.instrs)
             if (n > 0 && this.planFuse(blk.instrs[n - 1], blk.term)) {
                 // The trailing comparison feeds only this `BranchIf`; its

@@ -65,6 +65,11 @@ import { abiStrFromList, rawByteAt } from runtime.abi_string
 // The wide buffers are raw blocks, so the raw-allocation slots must travel
 // with this module. See `abi_raw.pkl`.
 import { abiRawAlloc } from runtime.abi_raw
+// File I/O can block for a long time (a slow disk, a network share, a pipe).
+// The world lock is released around the syscall so a peer Pickle thread can
+// run; no managed value may be live across that window, which is why the read
+// path accumulates into a raw block and the write path copies `text` first.
+import { worldAcquire, worldRelease } from runtime.abi_world
 
 /// `INVALID_FILE_ATTRIBUTES`. Read back as a 64-bit value; see `dword`.
 const INVALID_FILE_ATTRIBUTES: int = 4294967295
@@ -577,14 +582,23 @@ fn abiCurrentDir() -> string? {
 fn abiReadFile(path: string) -> string? {
     unsafe {
         var w = wideBuf(path)
+        worldRelease()
         let h = win_create_file_w(w, GENERIC_READ, FILE_SHARE_ALL, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0)
+        worldAcquire()
         free(w)
         if (h == INVALID_HANDLE || h == 0) {
             return none
         }
+        // The bytes accumulate in a RAW block, not a `List<byte>`: the world
+        // lock is released around each `ReadFile`, and no managed value may be
+        // live across that window. A `List<byte>` cannot be handed to the
+        // temp-root lease (a managed reference is not castable to `*int`), so
+        // raw storage is both the safe and the cheaper shape.
+        var cap = READ_CHUNK_BYTES
+        var buf = alloc(int, (cap + 7) / 8)
+        var used = 0
         let chunk = alloc(int, READ_CHUNK_WORDS)
         let pN = alloc(int, 1)
-        let out = bytes("")
         var readAny = false
         var done = false
         while (!done) {
@@ -593,7 +607,10 @@ fn abiReadFile(path: string) -> string? {
             // block the syscall only fills the low half of, so the whole word
             // is cleared to keep the high half from reading as part of a count.
             pN[0] = 0
-            if (dword(win_read_file(h, chunk, READ_CHUNK_BYTES, pN, 0)) == 0) {
+            worldRelease()
+            let rc = dword(win_read_file(h, chunk, READ_CHUNK_BYTES, pN, 0))
+            worldAcquire()
+            if (rc == 0) {
                 done = true
             } else {
                 readAny = true
@@ -601,11 +618,29 @@ fn abiReadFile(path: string) -> string? {
                 if (n == 0) {
                     done = true
                 } else {
+                    if (used + n > cap) {
+                        var ncap = cap
+                        while (ncap < used + n) {
+                            ncap = ncap * 2
+                        }
+                        let nbuf = alloc(int, (ncap + 7) / 8)
+                        // Whole-word copy: every byte past `used` is either
+                        // overwritten by the incoming chunk or never read.
+                        var wi = 0
+                        while (wi < (used + 7) / 8) {
+                            nbuf[wi] = buf[wi]
+                            wi = wi + 1
+                        }
+                        free(buf)
+                        buf = nbuf
+                        cap = ncap
+                    }
                     var b = 0
                     while (b < n) {
-                        out.push(rawByteAt(chunk, b) as byte)
+                        putRawByte(buf, used + b, rawByteAt(chunk, b))
                         b = b + 1
                     }
+                    used = used + n
                 }
             }
         }
@@ -613,8 +648,16 @@ fn abiReadFile(path: string) -> string? {
         free(chunk)
         win_close_handle(h)
         if (!readAny) {
+            free(buf)
             return none
         }
+        var out: List<byte> = bytes("")
+        var i = 0
+        while (i < used) {
+            out.push(rawByteAt(buf, i) as byte)
+            i = i + 1
+        }
+        free(buf)
         return str(out)
     }
 }
@@ -637,7 +680,9 @@ fn abiReadFile(path: string) -> string? {
 fn abiWriteFile(path: string, text: string) -> bool {
     unsafe {
         var w = wideBuf(path)
+        worldRelease()
         let h = win_create_file_w(w, GENERIC_WRITE, FILE_SHARE_ALL, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0)
+        worldAcquire()
         free(w)
         if (h == INVALID_HANDLE || h == 0) {
             return false
@@ -645,10 +690,15 @@ fn abiWriteFile(path: string, text: string) -> bool {
         var ok = true
         let n = len(text)
         if (n != 0) {
+            // Copy before releasing: `text` is managed, and the caller's shadow
+            // frame is not live across a raw extern call. The copy is raw and
+            // safe to hold while the lock is gone.
             let buf = rawBuf(text)
             let pW = alloc(int, 1)
             pW[0] = 0
+            worldRelease()
             let r = dword(win_write_file(h, buf, n, pW, 0))
+            worldAcquire()
             ok = r != 0 && dword(pW[0]) == n
             free(pW)
             free(buf)

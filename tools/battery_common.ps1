@@ -60,7 +60,11 @@ function Invoke-NativeTimeout([string]$exe, [string[]]$argv, [string]$outPath, [
     $psi.WorkingDirectory = (Get-Location).Path
     $proc = [System.Diagnostics.Process]::Start($psi)
     $outFs = [System.IO.File]::Create($outPath)
-    $errFs = [System.IO.Stream]::Null
+    # Keep stderr beside the capture. Fatal runtime paths (raw-allocation OOM,
+    # shadow out-of-order pop) write there and then exit 1 with an empty stdout,
+    # which used to be indistinguishable from a lowering failure. Byte-compare
+    # gates still read only $outPath, so the extra file is inert on success.
+    $errFs = [System.IO.File]::Create("$outPath.stderr")
     $copyOut = $proc.StandardOutput.BaseStream.CopyToAsync($outFs)
     $copyErr = $proc.StandardError.BaseStream.CopyToAsync($errFs)
     $timedOut = -not $proc.WaitForExit($timeoutSec * 1000)
@@ -72,6 +76,7 @@ function Invoke-NativeTimeout([string]$exe, [string[]]$argv, [string]$outPath, [
     try { $copyErr.Wait(5000) | Out-Null } catch { }
     $code = if ($timedOut) { $script:NativeTimeoutExit } else { $proc.ExitCode }
     $outFs.Dispose()
+    $errFs.Dispose()
     $proc.Dispose()
     $code
 }
