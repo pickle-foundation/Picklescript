@@ -1,121 +1,158 @@
 module runtime.abi_world
 
-/// The process world lock - the port's GIL - as a PORTABLE contract.
+/// The process execution-mode seam: the optional world lock plus the portable
+/// per-object lock and condition-cell contract every synchronization primitive
+/// is built on.
 ///
-/// WHY IT EXISTS. The port's runtime keeps process-wide mutable state that the
-/// native build protects with a mix of Rust's own thread safety and a registry
-/// mutex: the bump arena and the sweepability registry (`abi_raw`), the
-/// temp-root and mark worklists (`abi_gcengine`), the many `var` singletons in
-/// the ABI modules (interned strings, box tables, WSA scratch), and the
-/// managed-heap mark that walks them. None of that is re-entrant. A second OS
-/// thread running Pickle code concurrently would corrupt it.
+/// TWO MODES. `runtime.abi_gil` answers whether the old process-wide lock still
+/// serializes Pickle execution:
 ///
-/// The cheapest correct model for a runtime of this shape is a single world
-/// lock: exactly one thread executes Pickle code, every other thread is parked
-/// on the lock. It is the same discipline the JIT and the collector already
-/// assume, so no allocator, descriptor, or collector walk has to learn a new
-/// concurrency contract. The cost is parallelism, which this port does not
-/// have today anyway.
+///   - **Parallel (default).** No world lock is taken. Threads run Pickle code
+///     concurrently; allocation, registration and the collector are safe on
+///     their own (Phase 2/3), and each sync object owns a lock cell. Blocking
+///     calls enter a native section instead of releasing a GIL.
+///   - **Serialized (`PKL_GIL=1`).** Every thread runs Pickle code under one
+///     world lock. This is the pre-Phase-4 behaviour, kept as a bisecting aid:
+///     if a race disappears under `PKL_GIL=1`, the bug is in the parallel
+///     contracts, not in the language or the collector.
 ///
-/// THE CONTRACT, IN PLATFORM-NEUTRAL TERMS:
+/// The mode is read once from the environment and never changes, so the branch
+/// in `lockAcquire`/`parkOn` is perfectly predictable.
 ///
-///   worldAcquire()      block until this thread owns the one world lock
-///   worldRelease()      give it up; the caller must own it
-///   worldHeld()         snapshot probe, meaningful only with no peer running
-///   worldPark(cell)     release the lock and sleep on a condition cell;
-///                       reacquire before returning (spurious wakes possible)
-///   worldWake(cell)     wake one thread parked on the cell
-///   worldWakeAll(cell)  wake every thread parked on the cell
+/// THE PORTABLE CONTRACT, IN PLATFORM-NEUTRAL TERMS:
 ///
-///   - flat ownership: a thread never acquires twice without releasing
-///   - blocking, not spinning: the OS parks the waiter
-///   - released around blocking syscalls (recv/send/accept/connect, sleep,
-///     join, yield, and the sync primitives) so the peer can run
-///   - a condition cell is one zero-initialized word owned by the caller; its
-///     encoding is a backend detail, and every wait is a predicate loop
+///   worldAcquire()          enter a native section, take the world lock,
+///                           leave it (no-op lock in parallel mode)
+///   worldRelease()          enter a native section, give the lock up
+///   worldHeld()             snapshot probe (startup only)
+///   lockAcquire(cell)       take a one-word per-object lock, blocking
+///   lockRelease(cell)       release it
+///   parkOn(lockCell, cv)    atomically release `lockCell`, sleep on `cv`,
+///                           reacquire `lockCell`; spurious wakes possible
+///   wakeOn(cv)              wake one sleeper
+///   wakeAllOn(cv)           wake every sleeper
 ///
-/// THIS MODULE IS THE SEAM. Every portable runtime module imports these three
+///   - blocking: the OS parks the waiter, it never spins
+///   - every wait is a predicate loop around `parkOn`
+///   - a lock cell and a condition cell are one zero-initialized word each;
+///     their encoding is a backend detail
+///   - a thread blocked on a lock or a condition cell is in a native section,
+///     so the collector never waits for it
+///
+/// THIS MODULE IS THE SEAM. Every portable runtime module imports these
 /// functions and never names an OS lock. The Win32 implementation lives in
-/// `runtime/abi_world_win.pkl` (SRWLOCK, zero-initialized image data); a POSIX
-/// build supplies `runtime/abi_world_posix.pkl` with the same `winWorld*`
-/// entry points backed by `pthread_mutex_t`/futex and a different owner-word
-/// layout. The build's platform filter selects exactly one backend file, so
-/// the portable modules are unchanged. The same rule applies to every future
-/// parking primitive: the OS call belongs in a `_win`/`_posix` module, the
+/// `runtime/abi_world_win.pkl` (SRWLOCK + CONDITION_VARIABLE, both
+/// zero-initialized image data); a POSIX build supplies
+/// `runtime/abi_world_posix.pkl` with the same `winWorld*`/`winLock*` entry
+/// points backed by `pthread_mutex_t`/futex and a different word layout. The
+/// build's platform filter selects exactly one backend file, so the portable
+/// modules are unchanged. The same rule applies to every future parking
+/// primitive: the OS call belongs in a `_win`/`_posix` module, the
 /// wait/notify contract belongs here or in the module that owns the object.
 ///
 /// WHAT MUST NOT HAPPEN. No `win_acquire_srw_exclusive`, `CRITICAL_SECTION`,
 /// `pthread_mutex_*`, or futex call may appear outside a backend module. A
-/// second hand-rolled spinlock is also forbidden: the shadow registry uses
-/// `abi_world_win`'s lock-cell helper, and `abi_sync`'s waits will use the
-/// same backend seam when they become real parking.
+/// second hand-rolled spinlock is also forbidden.
 
-import { winWorldAcquire, winWorldRelease, winWorldHeld, winWorldPark, winWorldWake, winWorldWakeAll } from runtime.abi_world_win
+import { winWorldAcquire, winWorldRelease, winWorldHeld, winWorldPark, winLockAcquire, winLockRelease, winTryLockAcquire, winParkOn, winWakeOn, winWakeAllOn } from runtime.abi_world_win
+import { abiGilMode } from runtime.abi_gil
 import { abiGcEnterNative, abiGcLeaveNative } from runtime.abi_gcengine
 
-/// Take the world lock, blocking until it is free.
+/// Take the world lock, blocking until it is free; a no-op in parallel mode.
 ///
-/// A blocked acquirer is in a native section: it touches no managed object
+/// The blocked acquirer is in a native section: it touches no managed object
 /// while it waits, so the collector does not count it. `abiGcLeaveNative`
 /// restores the count and runs a safepoint before the caller can use the heap
-/// again. Both are no-ops until the process has a second thread.
+/// again.
 fn worldAcquire() {
     abiGcEnterNative()
-    winWorldAcquire()
+    if (abiGilMode() != 0) {
+        winWorldAcquire()
+    }
     abiGcLeaveNative()
 }
 
-/// Release the world lock. The caller must own it.
-///
-/// The release starts a native section: every caller continues into a blocking
-/// OS call (or a condition wait) that must not hold up a collection, and pairs
-/// this with `worldAcquire` before it touches the heap again.
+/// Release the world lock. The caller must own it. In parallel mode this only
+/// starts a native section, which is what a caller continues into: a blocking
+/// OS call that must not hold up a collection.
 fn worldRelease() {
     abiGcEnterNative()
-    winWorldRelease()
+    if (abiGilMode() != 0) {
+        winWorldRelease()
+    }
 }
 
-/// Non-blocking probe: does the lock look owned right now?
+/// Non-blocking probe: does the world lock look owned right now?
 ///
 /// This is a snapshot, not ownership. The only caller is the startup net in
-/// `pickle_thread_spawn`, which uses it to acquire the lock lazily on an image
-/// whose entry trampoline did not run `pickle_runtime_init` (the JIT lane).
-/// Nothing may use it as an ownership test inside a running runtime body.
+/// `abiThreadSpawn`, which uses it to acquire the lock lazily on an image whose
+/// entry trampoline did not run `pickle_runtime_init` (the JIT lane). It is
+/// only consulted in serialized mode.
 fn worldHeld() -> bool {
     return winWorldHeld()
 }
 
-/// Park the calling thread on the condition cell `cell`, releasing the world
-/// lock while asleep and reacquiring it before returning.
+/// Take the one-word lock at `cell`, blocking until it is free.
 ///
-/// `cell` is the address of one zero-initialized word owned by the caller's
-/// primitive (a sync state block today). Its representation is a backend
-/// detail. Parking can wake spuriously, so the caller must wrap the call in a
-/// predicate loop:
-///
-///     while (!ready()) {
-///         worldPark(cell)
-///     }
-///
-/// The caller must own the world lock. The release/park is atomic with respect
-/// to the waker, which also holds the lock - that is what rules out a lost
-/// wakeup between the predicate check and the sleep.
-///
-/// The sleep is a native section: the world lock is released, so a collection
-/// on another thread must not wait for this one. `abiGcLeaveNative` runs the
-/// safepoint after the lock is reacquired.
-fn worldPark(cell: int) {
+/// Fast path: one non-blocking hardware acquire. A contended acquire is a
+/// native section around the blocking acquire, because the holder may itself be
+/// parked at a safepoint until the collection that is waiting for *this* thread
+/// finishes. Counting a blocked acquirer would deadlock the collector.
+fn lockAcquire(cell: int) {
+    if (abiGilMode() != 0) {
+        return
+    }
+    if (winTryLockAcquire(cell) != 0) {
+        return
+    }
     abiGcEnterNative()
-    winWorldPark(cell)
+    winLockAcquire(cell)
     abiGcLeaveNative()
 }
 
-/// Wake one thread parked on `cell`; a no-op when nobody is waiting.
-fn worldWake(cell: int) {
-    winWorldWake(cell)
+/// Release the lock at `cell`. The caller must own it.
+fn lockRelease(cell: int) {
+    if (abiGilMode() != 0) {
+        return
+    }
+    winLockRelease(cell)
 }
 
-/// Wake every thread parked on `cell`.
-fn worldWakeAll(cell: int) {
-    winWorldWakeAll(cell)
+/// Atomically release `lockCell`, sleep on `cv`, reacquire `lockCell`.
+///
+/// `cv` and `lockCell` are the address of one zero-initialized word each, owned
+/// by the calling primitive. Parking can wake spuriously, so the caller must
+/// wrap the call in a predicate loop:
+///
+///     while (!ready()) {
+///         parkOn(lockCell, cv)
+///     }
+///
+/// The release/park is atomic with respect to the waker, which holds the same
+/// lock cell when it changes the predicate - that is what rules out a lost
+/// wakeup between the check and the sleep.
+///
+/// The sleep is a native section: no other thread waits on this one, and
+/// `abiGcLeaveNative` restores the count and runs a safepoint afterwards. In
+/// serialized mode the object lock is a no-op and the wait releases the world
+/// lock instead, which is the pre-Phase-4 behaviour.
+fn parkOn(lockCell: int, cv: int) {
+    abiGcEnterNative()
+    if (abiGilMode() != 0) {
+        winWorldPark(cv)
+    } else {
+        winParkOn(lockCell, cv)
+    }
+    abiGcLeaveNative()
+}
+
+/// Wake one thread parked on `cv`; a no-op when nobody is waiting. The caller
+/// must hold the lock cell paired with the condition cell.
+fn wakeOn(cv: int) {
+    winWakeOn(cv)
+}
+
+/// Wake every thread parked on `cv`. The caller must hold the paired lock cell.
+fn wakeAllOn(cv: int) {
+    winWakeAllOn(cv)
 }

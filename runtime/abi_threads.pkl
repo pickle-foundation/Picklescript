@@ -8,14 +8,19 @@ module runtime.abi_threads
 ///
 ///   thread(8) spawn join finished panic_message count current sleep_ms yield
 ///
-/// REAL OS THREADS. `pickle_thread_spawn` starts a Windows thread with
-/// `CreateThread`, and that thread runs the body concurrently with the
-/// spawner. The runtime is not internally synchronised, so the port runs the
-/// same shape a GIL gives a scripting runtime: only one thread executes Pickle
-/// code at a time (`runtime.abi_world`). The main thread takes the world lock
-/// in `pickle_runtime_init`; a spawn wrapper takes it before it calls the body,
-/// and every blocking operation (recv/send/accept/connect, sleep, join, yield)
-/// releases it around the OS call so the peer thread can run.
+/// REAL OS THREADS, IN PARALLEL. `pickle_thread_spawn` starts a Windows thread
+/// with `CreateThread`, and that thread runs the body concurrently with the
+/// spawner. Since Phase 4 the body does NOT take a process-wide lock: the
+/// allocator, the object registry and the collector are safe on their own, and
+/// each sync object carries its own lock. A blocking call (sleep, yield, join)
+/// enters a native section instead of releasing a GIL, which is what lets a
+/// collection proceed while a thread waits.
+///
+/// `PKL_GIL=1` restores the old serialized mode: the entry thread takes the
+/// world lock in `pickle_runtime_init`, every spawn wrapper takes it before it
+/// calls the body, and blocking calls release it around the OS call. The two
+/// modes share every body below; only the acquire/release pair at the top of
+/// `abiThreadRun` and the exit decrement differ.
 ///
 /// HOW A BODY BECOMES A START ROUTINE. A compiled Pickle closure is an object
 /// whose slot 0 is a boxed code address, and its code is entered with the
@@ -23,12 +28,7 @@ module runtime.abi_threads
 /// position under the single Win64 calling convention. So spawn builds a
 /// fresh zero-argument entry closure capturing a raw task record, reads the
 /// code word out of its object, and passes `CreateThread(start, closure)`;
-/// the entry body then takes the world lock and calls the user's body.
-///
-/// WHY THE ENTRY CLOSURE IS A WRAPPER. The world lock has to be taken before
-/// any Pickle code in the task runs, and the only code `CreateThread` can
-/// enter is the closure itself. The wrapper is that seam; its first act is
-/// `abiThreadRun`, whose first act is `worldAcquire`.
+/// the entry body calls the user's body.
 ///
 /// THE TASK RECORD is a raw word block from `alloc`, so the collector never
 /// moves or frees it:
@@ -37,7 +37,7 @@ module runtime.abi_threads
 ///   [2] exit code (reserved) [3] body closure object (as int)
 ///   [4] entry closure object (as int)
 ///   [5] task id              [6] failure message (reserved)
-///   [7] joined flag
+///   [7] joined flag          [8] record lock
 ///
 /// Both closures are GC objects that the raw record cannot keep alive by
 /// itself, so spawn takes a temp-root lease on each. The entry's lease is
@@ -45,24 +45,32 @@ module runtime.abi_threads
 /// registered; the body's lease is released after the body returns. This is
 /// the same window native's `TASKS` table closes by being a GC root.
 ///
+/// JOINS. The record lock makes `join`/`finished` safe against each other: the
+/// joiner owns the wait, keeps the OS handle open until the thread has exited,
+/// and clears the handle under the lock before closing it. A second joiner sees
+/// `joined` set and does not wait again (the first joiner already reaped it).
+/// `finished` performs its zero-timeout probe under the same lock, so the
+/// handle cannot be closed while a probe is in flight.
+///
 /// HANDLES. `spawn` returns the 0-based post-push index, the native std
 /// convention (`threads.rs:134`); the index addresses a flat raw table of
 /// record pointers. An unknown handle answers like the native std build:
 /// `join` true, `finished` false, `panic_message` null.
 ///
 /// FAILURES. A Pickle `throw` inside a body is caught by the wrapper, which
-/// marks the task failed and releases the world lock; `join` then answers
-/// false. A native `assert`/`expect` failure is NOT a Pickle throw: the
-/// ported fail channel either records it in task mode or terminates the
-/// process, exactly as it does on the main thread - a per-task unwind is a
-/// divergence this port does not attempt to hide.
+/// marks the task failed and leaves the world lock (serialized mode only);
+/// `join` then answers false. A native `assert`/`expect` failure is NOT a
+/// Pickle throw: the ported fail channel either records it in task mode or
+/// terminates the process, exactly as it does on the main thread - a per-task
+/// unwind is a divergence this port does not attempt to hide.
 
 import { abiEngineTempRoot, abiEngineTempUnroot, abiGcThreadStarting, abiGcThreadExited } from runtime.abi_gcengine
 import { abiObjSlotGet } from runtime.abi_class
 import { abiUnboxI64 } from runtime.abi_box
 import { abiGcRegisterThread } from runtime.abi_shadow
 import { abiRawSetParallel } from runtime.abi_raw
-import { worldAcquire, worldRelease, worldHeld } from runtime.abi_world
+import { worldAcquire, worldRelease, worldHeld, lockAcquire, lockRelease } from runtime.abi_world
+import { abiGilMode } from runtime.abi_gil
 
 /// Task-record word indexes. See the header layout table.
 const TASK_HANDLE: int = 0
@@ -73,7 +81,8 @@ const TASK_ENTRY: int = 4
 const TASK_ID: int = 5
 const TASK_MSG: int = 6
 const TASK_JOINED: int = 7
-const TASK_WORDS: int = 8
+const TASK_LOCK: int = 8
+const TASK_WORDS: int = 9
 
 const TASK_RUNNING: int = 0
 const TASK_DONE: int = 1
@@ -90,11 +99,20 @@ var thrSpawned: int = 0
 var thrTable: int = 0
 var thrTableCap: int = 0
 
+/// Serialises the table append and the handle counter. The table only grows,
+/// so the critical section is a copy of `thrTableCap` words.
+var thrLock: int = 0
+
+/// Byte address of word `idx` in a task record.
+fn taskWord(b: *int, idx: int) -> int {
+    return (b as int) + idx * 8
+}
+
 /// Grow `thrTable` so `idx` is addressable. Raw blocks are never zeroed by the
 /// allocator, so both the fresh capacity and the old prefix are written
 /// explicitly. The old block is abandoned rather than freed: `alloc` blocks are
 /// process-heap allocations with no length header, and the table's growth is
-/// an O(log tasks) event over the life of a process.
+/// an O(log tasks) event over the life of a process. The caller holds `thrLock`.
 fn thrTableReserve(idx: int) {
     if (idx < thrTableCap) {
         return
@@ -133,26 +151,33 @@ fn thrRecord(handle: int) -> *int {
     if (handle < 0) {
         return 0 as *int
     }
-    if (handle >= thrSpawned) {
-        return 0 as *int
-    }
-    if (thrTable == 0) {
-        return 0 as *int
-    }
     unsafe {
-        return ((thrTable as *int)[handle]) as *int
+        lockAcquire((&thrLock) as int)
+        var rec = 0 as *int
+        if (handle < thrSpawned && thrTable != 0) {
+            rec = ((thrTable as *int)[handle]) as *int
+        }
+        lockRelease((&thrLock) as int)
+        return rec
     }
 }
 
 /// The body of a spawned task, run on the new OS thread.
 ///
-/// The world lock is taken first; the wrapper's shadow frame is already
-/// registered by the prologue, so the entry closure's temp-root lease can be
-/// dropped now - `env` holds it from here. The body call is wrapped in
+/// Serialized mode takes the world lock first; the wrapper's shadow frame is
+/// already registered by the prologue, so the entry closure's temp-root lease
+/// can be dropped now - `env` holds it from here. The body call is wrapped in
 /// `try`/`catch`/`finally` so a Pickle throw cannot leave the world lock held,
 /// and so a failed task is observable at `join`.
+///
+/// The thread was counted by `abiGcThreadStarting` before `CreateThread`, so
+/// the exit path must balance it exactly once: `worldRelease` drops the count
+/// through its native-section entry in serialized mode, and `abiGcThreadExited`
+/// does the same decrement explicitly in parallel mode.
 fn abiThreadRun(recAddr: int) {
-    worldAcquire()
+    if (abiGilMode() != 0) {
+        worldAcquire()
+    }
     unsafe {
         let rec = recAddr as *int
         abiEngineTempUnroot(rec[TASK_ENTRY] as *int)
@@ -165,31 +190,32 @@ fn abiThreadRun(recAddr: int) {
             rec[TASK_STATE] = TASK_FAILED
         } finally {
             abiEngineTempUnroot(bodyObj)
-            // Phase 3: the world release is also this thread's exit decrement
-            // (the collector counts the thread until it enters a native
-            // section). Phase 4 removes the lock and calls
-            // `abiGcThreadExited()` here instead.
-            worldRelease()
+            if (abiGilMode() != 0) {
+                worldRelease()
+            } else {
+                abiGcThreadExited()
+            }
         }
     }
 }
 
 /// Run `body` on a new OS thread and return its task handle.
 ///
-/// The runtime-init hook takes the world lock on the main thread before any
-/// Pickle code runs. `worldHeld` is a fallback for an image whose entry
-/// trampoline did not run it (the JIT lane): the first spawner then becomes
-/// the world owner for the rest of the process, which is exactly the
-/// single-threaded shape the JIT already runs.
+/// In serialized mode the runtime-init hook takes the world lock on the main
+/// thread before any Pickle code runs. `worldHeld` is a fallback for an image
+/// whose entry trampoline did not run it (the JIT lane): the first spawner then
+/// becomes the world owner for the rest of the process.
 #[symbol("pickle_thread_spawn")]
 fn abiThreadSpawn(body: fn () -> void) -> int {
-    if (!worldHeld()) {
-        worldAcquire()
+    if (abiGilMode() != 0) {
+        if (!worldHeld()) {
+            worldAcquire()
+        }
     }
     // From here on the process has more than one Pickle thread. The flip is
-    // observed by every thread at a call boundary: the spawner holds the world
-    // lock, so no other thread is mid-allocation. The emitter's inline bump and
-    // registry fast paths check this word and route to the per-thread record.
+    // observed by every thread at a call boundary: before the first spawn there
+    // is exactly one Pickle thread, so no allocation can be in flight in the
+    // other mode. Later flips are idempotent.
     abiRawSetParallel()
     unsafe {
         let rec = alloc(int, TASK_WORDS)
@@ -226,12 +252,14 @@ fn abiThreadSpawn(body: fn () -> void) -> int {
             rec[TASK_STATE] = TASK_FAILED
             return 0 - 1
         }
+        lockAcquire((&thrLock) as int)
         rec[TASK_HANDLE] = h
         let id = thrSpawned
         rec[TASK_ID] = id
         thrSpawned = id + 1
         thrTableReserve(id)
         (thrTable as *int)[id] = rec as int
+        lockRelease((&thrLock) as int)
         return id
     }
 }
@@ -240,10 +268,11 @@ fn abiThreadSpawn(body: fn () -> void) -> int {
 /// a pending throw, 0 when it threw. An unknown handle reports success
 /// (`threads.rs:266`).
 ///
-/// The world lock is released around the wait: the task cannot finish while
-/// the joiner holds it. `WaitForSingleObject` returning means the task's
-/// `finally` already wrote the state word, because the thread only exits after
-/// the record is released.
+/// The wait is a native section: the task cannot finish while this thread is
+/// counted as runnable, because the collector could park the task at a
+/// safepoint. `WaitForSingleObject` returning means the task's `finally`
+/// already wrote the state word, because the thread only exits after the
+/// record is released.
 #[symbol("pickle_thread_join")]
 fn abiThreadJoin(handle: int) -> bool {
     let rec = thrRecord(handle)
@@ -251,15 +280,21 @@ fn abiThreadJoin(handle: int) -> bool {
         return true
     }
     unsafe {
+        lockAcquire(taskWord(rec, TASK_LOCK))
         let h = rec[TASK_HANDLE]
+        var mine = false
         if (h != 0 && rec[TASK_JOINED] == 0) {
-            if (rec[TASK_STATE] == TASK_RUNNING) {
-                worldRelease()
-                let _ = win_wait_single(h, THR_INFINITE)
-                worldAcquire()
-            }
             rec[TASK_JOINED] = 1
+            mine = true
+        }
+        lockRelease(taskWord(rec, TASK_LOCK))
+        if (mine) {
+            worldRelease()
+            let _ = win_wait_single(h, THR_INFINITE)
+            worldAcquire()
+            lockAcquire(taskWord(rec, TASK_LOCK))
             rec[TASK_HANDLE] = 0
+            lockRelease(taskWord(rec, TASK_LOCK))
             let _ = win_close_handle(h)
         }
         if (rec[TASK_STATE] == TASK_FAILED) {
@@ -270,7 +305,9 @@ fn abiThreadJoin(handle: int) -> bool {
 }
 
 /// Whether task `handle` has finished. Never blocks: a zero-timeout wait is
-/// enough because the state word is written before the OS thread exits.
+/// enough because the state word is written before the OS thread exits. The
+/// probe runs under the record lock so a concurrent `join` cannot close the
+/// handle mid-wait.
 #[symbol("pickle_thread_finished")]
 fn abiThreadFinished(handle: int) -> bool {
     let rec = thrRecord(handle)
@@ -278,18 +315,23 @@ fn abiThreadFinished(handle: int) -> bool {
         return false
     }
     unsafe {
+        lockAcquire(taskWord(rec, TASK_LOCK))
         if (rec[TASK_STATE] != TASK_RUNNING) {
+            lockRelease(taskWord(rec, TASK_LOCK))
             return true
         }
         let h = rec[TASK_HANDLE]
         if (h == 0) {
+            lockRelease(taskWord(rec, TASK_LOCK))
             return true
         }
         let rc = win_wait_single(h, 0)
         if (rc == 0) {
             rec[TASK_STATE] = TASK_DONE
+            lockRelease(taskWord(rec, TASK_LOCK))
             return true
         }
+        lockRelease(taskWord(rec, TASK_LOCK))
         return false
     }
 }
@@ -320,8 +362,8 @@ fn abiThreadCurrent() -> int {
 
 /// Pause this task for `ms` milliseconds. The clamp is the same as the native
 /// builds (`threads.rs:354` and `:364`): negative or absurd values become a
-/// bounded wait, never an unbounded one. The world lock is released so a peer
-/// can run during the sleep.
+/// bounded wait, never an unbounded one. The sleep is a native section, so a
+/// collection can proceed while this thread sleeps.
 #[symbol("pickle_thread_sleep_ms")]
 fn abiThreadSleepMs(ms: int) -> int {
     var m = ms
@@ -337,7 +379,7 @@ fn abiThreadSleepMs(ms: int) -> int {
     return 0
 }
 
-/// Hand the world lock to a runnable peer, then take it back.
+/// Hand the CPU to a runnable peer (and, in serialized mode, the world lock).
 #[symbol("pickle_thread_yield")]
 fn abiThreadYield() -> int {
     worldRelease()

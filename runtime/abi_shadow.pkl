@@ -154,6 +154,13 @@ const SHADOW_W_EPOCH: int = 13
 const SHADOW_W_PINNED: int = 14
 const SHADOW_W_FLAGS: int = 15
 const SHADOW_W_PARK_LOCK: int = 16
+/// Depth of runtime-internal critical sections on this thread. A safepoint
+/// poll must not park while it is non-zero: the collector never takes these
+/// locks, but a *second* mutator blocked on one is counted and cannot reach a
+/// safepoint until the holder releases. Parking the holder inside the section
+/// would therefore deadlock the barrier (observed in `abiEngineTempRoot`'s
+/// dedupe loop under `teLock`).
+const SHADOW_W_CRITICAL: int = 17
 const SHADOW_NODE_WORDS: int = 18
 const SHADOW_NODE_BYTES: int = 144
 
@@ -184,6 +191,41 @@ fn abiShadowSelfIfRegistered() -> int {
             return 0
         }
         return win_tls_get(shadowTlsSlot)
+    }
+}
+
+/// Enter a runtime-internal critical section. The safepoint poll returns
+/// without parking while the depth is non-zero, so a thread that holds one of
+/// the runtime's own locks (the temp-root, manual-root and static-root
+/// registries today) can never park there. The collector does not take those
+/// locks, so a holder that parks would still be "safe" from the collector's
+/// point of view - but a peer blocked on the lock is counted and cannot reach
+/// a safepoint, which hangs the barrier. Keeping the holder runnable lets the
+/// peer acquire, release, and park at its next poll.
+///
+/// The depth is per-thread and only the owner writes it, so no atomic is
+/// needed. A thread with no node is not counted and cannot park anyway.
+fn shadowCriticalEnter() {
+    unsafe {
+        let node = abiShadowSelfIfRegistered()
+        if (node != 0) {
+            (node as *int)[SHADOW_W_CRITICAL] = (node as *int)[SHADOW_W_CRITICAL] + 1
+        }
+    }
+}
+
+/// Leave a runtime-internal critical section. Balanced with
+/// `shadowCriticalEnter`; a defensive floor at zero keeps a double release
+/// from turning into a permanent "never park" state.
+fn shadowCriticalExit() {
+    unsafe {
+        let node = abiShadowSelfIfRegistered()
+        if (node != 0) {
+            let depth = (node as *int)[SHADOW_W_CRITICAL]
+            if (depth > 0) {
+                (node as *int)[SHADOW_W_CRITICAL] = depth - 1
+            }
+        }
     }
 }
 

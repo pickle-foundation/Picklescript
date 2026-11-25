@@ -48,6 +48,7 @@ module runtime.abi_tls
 
 import { abiRawAlloc } from runtime.abi_raw
 import { netSend, netRecv } from runtime.abi_net
+import { lockAcquire, lockRelease } from runtime.abi_world
 // The one UTF-8 -> UTF-16 conversion already in the runtime. TLS needs wide
 // strings for the SSPI package name, the SNI target and the hostname policy
 // check; `abi_fs` owns that conversion, and a future platform split should
@@ -198,12 +199,22 @@ var tlsFailStageSlot: int = -1
 var tlsFailStatusSlot: int = -1
 var tlsFailDetailSlot: int = -1
 
+/// Serialises the three-slot allocation below. The check-then-allocate is not
+/// atomic, and two threads racing would each allocate a different slot set -
+/// the loser's globals would be overwritten, so its later `tlsLastStage` would
+/// read a peer's report. Only the first failing connect pays for the lock.
+var tlsSlotLock: int = 0
+
 fn tlsFailSlots() {
     unsafe {
         if (tlsFailStageSlot == -1) {
-            tlsFailStageSlot = win_tls_alloc()
-            tlsFailStatusSlot = win_tls_alloc()
-            tlsFailDetailSlot = win_tls_alloc()
+            lockAcquire((&tlsSlotLock) as int)
+            if (tlsFailStageSlot == -1) {
+                tlsFailStageSlot = win_tls_alloc()
+                tlsFailStatusSlot = win_tls_alloc()
+                tlsFailDetailSlot = win_tls_alloc()
+            }
+            lockRelease((&tlsSlotLock) as int)
         }
     }
 }

@@ -2,7 +2,7 @@ module runtime.abi_string
 
 import { abiBoxI64, abiUnboxI64 } from runtime.abi_box
 import { abiListNew, abiListLen, abiListGet, abiListPush } from runtime.abi_list
-import { abiManagedAlloc, MANAGED_MAX_BUMP, managedArenaBase, managedArenaUsed, managedArenaCap } from runtime.abi_raw
+import { abiManagedAlloc, MANAGED_MAX_BUMP, managedArenaBase, managedArenaUsed, managedArenaCap, abiRawParallelMode } from runtime.abi_raw
 // String payloads come from `alloc(int, n)`, whose symbol lives in `abi_raw.pkl`.
 //
 // NO REGISTRATION. These bodies deliberately do NOT register their blocks in the
@@ -335,6 +335,18 @@ fn shortInternWord(v: int, ln: int) -> *int {
             msk = (1 << (ln * 8)) - 1
         }
         var vv = v & msk
+        // PARALLEL MODE: no shared table. The table is an open-addressing map
+        // with a grow-and-reindex path that re-enters this function; making it
+        // safe would need a re-entrancy-aware lock around the whole probe, and
+        // anything less would race a grow against a probe. Interning is
+        // unobservable (no string operation exposes identity), so the parallel
+        // build simply allocates a fresh equal string per call and pays the
+        // FNV hash that an insert would have computed anyway. Single-threaded
+        // images - every existing program - keep the table and its fast path
+        // byte for byte.
+        if (abiRawParallelMode() != 0) {
+            return shortInternNew(vv, ln, shortInternFnv(vv, ln))
+        }
         var tab = shortInternTab as *int
         if ((tab as int) == 0) {
             tab = shortInternInit()

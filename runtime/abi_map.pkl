@@ -76,7 +76,8 @@ import { abiStrCmp, byteAt, SIZE_WORD, FLAG_HEAP, FLAG_HASH } from runtime.abi_s
 // raw-allocation slots must travel with them. See `abi_raw.pkl`.
 // `abiRegisterObject` records the map *object*; the entries array is raw
 // backing, never registered.
-import { abiRawAlloc, abiManagedAlloc, abiRegisterObject } from runtime.abi_raw
+import { abiRawAlloc, abiManagedAlloc, abiRegisterObject, abiRawParallelMode } from runtime.abi_raw
+import { lockAcquire, lockRelease } from runtime.abi_world
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -829,6 +830,31 @@ var llKey: int = 0
 var llSlot: int = 0
 var llHash: int = 0
 
+/// Serialises version bumps once the process can run more than one thread.
+///
+/// A version must be *unique*, not merely monotone: two sets that both read `V`
+/// and both write `V + 1` would stamp the cache with the same version for two
+/// different mutations, and a get stamped `V + 1` could then validate the wrong
+/// slot. In single-thread mode this is the plain `mapVer + 1` it has always
+/// been - no branch beyond the cached mode word, no lock.
+var mapVerLock: int = 0
+
+fn mapBump() -> int {
+    if (abiRawParallelMode() == 0) {
+        var v = mapVer + 1
+        mapVer = v
+        return v
+    }
+    var v = 0
+    unsafe {
+        lockAcquire((&mapVerLock) as int)
+        v = mapVer + 1
+        mapVer = v
+        lockRelease((&mapVerLock) as int)
+    }
+    return v
+}
+
 /// Zeroed bloom filter + `cap` two-word entry slots in one allocation. The
 /// returned pointer is the entry table; the filter is `BLOOM_BYTES` before it.
 fn mapTableNew(cap: int) -> *int {
@@ -972,7 +998,7 @@ fn mapNew(cap: int) -> *int {
     unsafe {
         // A fresh map can land on an address a freed oversized map used to
         // occupy, so invalidate the last-lookup cache unconditionally.
-        mapVer = mapVer + 1
+        mapVer = mapBump()
         var c = cap
         if (c < INITIAL_CAP) { c = INITIAL_CAP }
         c = nextPow2(c)
@@ -995,7 +1021,7 @@ fn mapNew(cap: int) -> *int {
 /// caller to present one.
 fn mapSet(map: *int, key: *int, value: *int) -> *int {
     unsafe {
-        mapVer = mapVer + 1
+        mapVer = mapBump()
         var k = key as int
         if (k == KEY_EMPTY) { k = KEY_NONE }
         var h = keyHash(k as *int)
@@ -1068,7 +1094,7 @@ fn mapGet(map: *int, key: *int) -> *int {
 /// keeps the probe chains of the entries after it intact.
 fn mapRemove(map: *int, key: *int) -> *int {
     unsafe {
-        mapVer = mapVer + 1
+        mapVer = mapBump()
         var k = key as int
         if (k == KEY_EMPTY) { k = KEY_NONE }
         var h = keyHash(k as *int)
@@ -1163,7 +1189,7 @@ fn abiMapSetSlow(map: *int, key: *int, value: *int) {
         // but tests and future internal callers reach this body directly, so
         // bump again: an extra increment only invalidates a cache entry that
         // the following set would have had to re-probe anyway.
-        mapVer = mapVer + 1
+        mapVer = mapBump()
         var k = key as int
         if (k == KEY_EMPTY) { k = KEY_NONE }
         var kp = k as *int
@@ -1321,7 +1347,7 @@ fn abiMapSet(map: *int, key: *int, value: *int) {
         // the get stamped the version it observed, and any mutation after that
         // point makes this comparison fail.
         var mv = mapVer
-        mapVer = mv + 1
+        mapVer = mapBump()
         if (llVer == mv && llMap == (map as int) && llKey == k && llSlot >= 0) {
             var ce = map[ENTRIES_WORD] as *int
             var cs = llSlot
@@ -1923,7 +1949,7 @@ fn abiMapLen(map: *int) -> int {
 #[symbol("pickle_map_clear")]
 fn abiMapClear(map: *int) {
     unsafe {
-        mapVer = mapVer + 1
+        mapVer = mapBump()
         var cap = map[CAP_WORD]
         var entries = map[ENTRIES_WORD] as *int
         var b = (entries as int - BLOOM_BYTES) as *int

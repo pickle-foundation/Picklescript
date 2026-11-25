@@ -1,0 +1,326 @@
+module runtime.abi_sync_parallel_test
+
+/// Phase 4 gate: the synchronization primitives are real in parallel mode.
+///
+/// Every test here starts 4-8 OS threads that contend on one object, so a lock
+/// that silently degraded to a no-op (the serialized-mode behaviour) or a wake
+/// that got lost shows up as a wrong total or a hang. The suite must pass in
+/// both modes:
+///
+///   default            object locks + condition cells per primitive
+///   PKL_GIL=1          object locks are no-ops, waits park on the world lock
+///
+/// The counts are deliberately small enough that the whole file runs in a few
+/// seconds even on one core; the point is the contract, not throughput.
+
+import { spawn, Task, Mutex, CondVar, Semaphore, Channel, AtomicInt, Once, sleep, yieldNow } from std.thread
+
+const WORKERS: int = 6
+const TURNS: int = 500
+
+/// Add `delta` to `cell` as a non-atomic read-modify-write. Only correct when
+/// the caller holds the mutex, which is exactly what the first test checks.
+fn bumpUnlocked(cell: AtomicInt, delta: int) {
+    let v = cell.load()
+    // Yield half the time while the lock is held: an implementation that let a
+    // peer in here loses an update instead of merely running slowly.
+    if ((v & 1) == 0) {
+        yieldNow()
+    }
+    cell.store(v + delta)
+}
+
+test fn mutex_serializes_increments_across_threads() {
+    let m = Mutex()
+    let cell = AtomicInt(0)
+    var tasks: List<Task> = []
+    var t = 0
+    while (t < WORKERS) {
+        let task = spawn(() => {
+            var i = 0
+            while (i < TURNS) {
+                m.lock()
+                bumpUnlocked(cell, 1)
+                m.unlock()
+                i = i + 1
+            }
+        })
+        tasks.push(task)
+        t = t + 1
+    }
+    var j = 0
+    while (j < len(tasks)) {
+        expect(tasks[j].join()).toBe(true)
+        j = j + 1
+    }
+    expect(cell.load()).toBe(WORKERS * TURNS)
+}
+
+test fn mutex_try_lock_reports_ownership() {
+    let m = Mutex()
+    expect(m.tryLock()).toBe(true)
+    expect(m.tryLock()).toBe(false)
+    m.unlock()
+    expect(m.tryLock()).toBe(true)
+    m.unlock()
+}
+
+test fn condvar_wakes_a_parked_consumer() {
+    let m = Mutex()
+    let cv = CondVar()
+    let ready = AtomicInt(0)
+    let observed = AtomicInt(0)
+
+    let waiter = spawn(() => {
+        m.lock()
+        while (ready.load() == 0) {
+            cv.wait(m)
+        }
+        observed.store(1)
+        let _ = m.unlock()
+        // `unlock` is the block's last statement, and a block's type is its
+        // last statement's type - close with a void call so the lambda infers
+        // `() -> void` instead of `() -> bool`.
+        yieldNow()
+    })
+
+    // Let the consumer reach `wait` so the signal below is a real wake, not a
+    // remembered permit consumed without sleeping.
+    sleep(80)
+    m.lock()
+    ready.store(1)
+    cv.signal()
+    m.unlock()
+
+    expect(waiter.join()).toBe(true)
+    expect(observed.load()).toBe(1)
+}
+
+test fn condvar_remembers_a_signal_with_no_waiter() {
+    let m = Mutex()
+    let cv = CondVar()
+    cv.signal()
+    m.lock()
+    // A pending permit must return immediately; if it slept, the test would
+    // hang instead of failing.
+    cv.wait(m)
+    m.unlock()
+    expect(true).toBe(true)
+}
+
+test fn condvar_broadcast_releases_every_waiter() {
+    let m = Mutex()
+    let cv = CondVar()
+    let go = AtomicInt(0)
+    let awake = AtomicInt(0)
+
+    var tasks: List<Task> = []
+    var t = 0
+    while (t < 4) {
+        let task = spawn(() => {
+            m.lock()
+            while (go.load() == 0) {
+                cv.wait(m)
+            }
+            let _ = awake.add(1)
+            let _ = m.unlock()
+            yieldNow()
+        })
+        tasks.push(task)
+        t = t + 1
+    }
+
+    sleep(120)
+    m.lock()
+    go.store(1)
+    cv.broadcast()
+    m.unlock()
+
+    var j = 0
+    while (j < len(tasks)) {
+        expect(tasks[j].join()).toBe(true)
+        j = j + 1
+    }
+    expect(awake.load()).toBe(4)
+}
+
+test fn semaphore_bounds_concurrent_holders() {
+    let sem = Semaphore(2)
+    let inside = AtomicInt(0)
+    let peak = AtomicInt(0)
+    let finished = AtomicInt(0)
+
+    var tasks: List<Task> = []
+    var t = 0
+    while (t < 4) {
+        let task = spawn(() => {
+            sem.acquire(1)
+            let now = inside.add(1) + 1
+            // Raise `peak` without losing a concurrent raise.
+            var cur = peak.load()
+            var raised = false
+            while (!raised) {
+                if (cur >= now) {
+                    raised = true
+                } else {
+                    raised = peak.cas(cur, now)
+                    cur = peak.load()
+                }
+            }
+            sleep(20)
+            let _ = inside.add(0 - 1)
+            sem.release(1)
+            let _ = finished.add(1)
+            yieldNow()
+        })
+        tasks.push(task)
+        t = t + 1
+    }
+
+    var j = 0
+    while (j < len(tasks)) {
+        expect(tasks[j].join()).toBe(true)
+        j = j + 1
+    }
+    expect(finished.load()).toBe(4)
+    expect(inside.load()).toBe(0)
+    expect(peak.load() <= 2).toBe(true)
+    expect(peak.load() >= 1).toBe(true)
+}
+
+test fn channel_carries_values_between_threads() {
+    let ch = Channel(4)
+    let n = 400
+
+    let producer = spawn(() => {
+        var i = 1
+        while (i <= n) {
+            ch.send(i)
+            i = i + 1
+        }
+        ch.close()
+    })
+
+    let consumer = spawn(() => {
+        var sum = 0
+        var i = 0
+        while (i < n) {
+            sum = sum + ch.recv()
+            i = i + 1
+        }
+        let _ = expect(sum).toBe(n * (n + 1) / 2)
+        yieldNow()
+    })
+
+    expect(producer.join()).toBe(true)
+    expect(consumer.join()).toBe(true)
+    expect(ch.closed()).toBe(true)
+    expect(ch.len()).toBe(0)
+}
+
+test fn once_runs_the_body_exactly_once_across_threads() {
+    let once = Once()
+    let runs = AtomicInt(0)
+    let winners = AtomicInt(0)
+    let lone = AtomicInt(0)
+
+    var tasks: List<Task> = []
+    var t = 0
+    while (t < WORKERS) {
+        let task = spawn(() => {
+            let mine = once.run(() => {
+                let _ = runs.add(1)
+                let _ = sleep(20)
+                yieldNow()
+            })
+            if (mine) {
+                let _ = winners.add(1)
+            }
+            let _ = lone.add(1)
+            yieldNow()
+        })
+        tasks.push(task)
+        t = t + 1
+    }
+
+    var j = 0
+    while (j < len(tasks)) {
+        expect(tasks[j].join()).toBe(true)
+        j = j + 1
+    }
+    expect(lone.load()).toBe(WORKERS)
+    expect(runs.load()).toBe(1)
+    expect(winners.load()).toBe(1)
+    expect(once.done()).toBe(true)
+}
+
+test fn atomic_compare_and_swap_never_loses_a_raise() {
+    let cell = AtomicInt(1)
+    let raises = 200
+
+    var tasks: List<Task> = []
+    var t = 0
+    while (t < 4) {
+        let task = spawn(() => {
+            var done = 0
+            while (done < raises) {
+                let v = cell.load()
+                if (cell.cas(v, v + 1)) {
+                    done = done + 1
+                }
+            }
+        })
+        tasks.push(task)
+        t = t + 1
+    }
+
+    var j = 0
+    while (j < len(tasks)) {
+        expect(tasks[j].join()).toBe(true)
+        j = j + 1
+    }
+    expect(cell.load()).toBe(1 + 4 * raises)
+}
+
+/// String keys are interned through a process-wide table; in parallel mode the
+/// interns take the per-thread fallback, and each worker's private map still
+/// has to find its own keys. A broken hash or a torn table shows up as a
+/// missing key.
+test fn worker_private_string_maps_stay_consistent() {
+    let n = 150
+    var tasks: List<Task> = []
+    var t = 0
+    while (t < 4) {
+        let task = spawn(() => {
+            var m: Map<string, int> = Map<string, int>()
+            var i = 0
+            while (i < n) {
+                m["k{i}"] = i
+                i = i + 1
+            }
+            expect(len(m)).toBe(n)
+            var sum = 0
+            i = 0
+            while (i < n) {
+                if (let some(v) = m.get("k{i}")) {
+                    sum = sum + v
+                }
+                i = i + 1
+            }
+            expect(sum).toBe(n * (n - 1) / 2)
+            i = 0
+            while (i < n) {
+                m.remove("k{i}")
+                i = i + 1
+            }
+            let _ = expect(len(m)).toBe(0)
+        })
+        tasks.push(task)
+        t = t + 1
+    }
+    var j = 0
+    while (j < len(tasks)) {
+        expect(tasks[j].join()).toBe(true)
+        j = j + 1
+    }
+}

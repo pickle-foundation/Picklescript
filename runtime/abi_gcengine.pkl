@@ -51,7 +51,7 @@ module runtime.abi_gcengine
 /// `regCapGrown` vs `abi_gc`'s `blockCapGrown`), so a helper reused across
 /// modules would collide. Public entry points are `abiEngine*`.
 
-import { shadowRegistryLockAcquire, shadowRegistryLockRelease, abiShadowRegistryHead, abiShadowSelf, abiShadowSelfIfRegistered, SHADOW_W_NEXT, SHADOW_W_REG_BASE, SHADOW_W_REG_COUNT, SHADOW_W_REG_CAP, SHADOW_W_ALLOC_BYTES, SHADOW_W_STATE, SHADOW_W_PARK, SHADOW_W_PARK_LOCK, SHADOW_STATE_RUNNING, SHADOW_STATE_PARKED, SHADOW_STATE_NATIVE, SHADOW_STATE_COLLECTING } from runtime.abi_shadow
+import { shadowRegistryLockAcquire, shadowRegistryLockRelease, abiShadowRegistryHead, abiShadowSelf, abiShadowSelfIfRegistered, shadowCriticalEnter, shadowCriticalExit, SHADOW_W_NEXT, SHADOW_W_REG_BASE, SHADOW_W_REG_COUNT, SHADOW_W_REG_CAP, SHADOW_W_ALLOC_BYTES, SHADOW_W_STATE, SHADOW_W_PARK, SHADOW_W_PARK_LOCK, SHADOW_W_CRITICAL, SHADOW_STATE_RUNNING, SHADOW_STATE_PARKED, SHADOW_STATE_NATIVE, SHADOW_STATE_COLLECTING } from runtime.abi_shadow
 import { abiClassOwnedMaskOf, abiClassFinalizerOf } from runtime.abi_classwords
 import { abiManagedRelease, abiRawParallelMode } from runtime.abi_raw
 import { winLockAcquire, winLockRelease, winParkOn, winWakeOn, winWakeAllOn } from runtime.abi_world_win
@@ -194,6 +194,20 @@ var teBase: int = 0
 var teCap: int = 0
 var teCount: int = 0
 const TE_INITIAL: int = 16
+
+/// Serialize the three shared registries below against concurrent mutators.
+///
+/// They are runtime metadata, not user containers: two threads may spawn at the
+/// same time, call `pickle_manual_adopt`, or register a static root, and the
+/// grow-and-append is not atomic. Each list has its own lock so a long walk of
+/// one never blocks the other. The collector reads the lists only while the
+/// world is stopped, so no reader takes these locks.
+///
+/// `teLock` is on the spawn path and is taken twice per task; it is cold enough
+/// that nothing more clever is warranted.
+var teLock: int = 0
+var manLock: int = 0
+var rootsLock: int = 0
 
 /// The sweep's deferred-dead list: flat word block of object addresses whose
 /// death needs post-sweep work before the block is freed. Native sweeps pick
@@ -575,13 +589,13 @@ fn abiEngineInitFromEnv() {
         noAutoGc = 1
     }
     if (noAutoGc != 0) {
-        }
+    }
     var tstart = geEnvFind(block as *int, 1)
-        if (tstart >= 0) {
+    if (tstart >= 0) {
         var n = geEnvIntAt(block as *int, tstart)
         if (n > 0) {
             overrideThreshold = n
-thresholdManual = 1
+            thresholdManual = 1
         }
     }
     if (geEnvFind(block as *int, 2) >= 0) {
@@ -698,7 +712,7 @@ fn abiEngineParallelOn() {
 
 fn abiEngineRegister(objAddr: int) {
     if (objAddr == 0) {
-                return
+        return
     }
     var size = geRegObjSize(objAddr)
     // Read the environment first, and only once. `PKL_NO_AUTO_GC` and
@@ -1338,6 +1352,13 @@ fn abiGcPoll() {
         if (node[SHADOW_W_STATE] == SHADOW_STATE_COLLECTING) {
             return
         }
+        // Runtime-internal critical section: a peer may be blocked on the
+        // lock this thread holds (with `winLockAcquire`, so it is counted and
+        // cannot park). Parking here would stall the collector's barrier
+        // forever. The thread parks at its next poll outside the section.
+        if (node[SHADOW_W_CRITICAL] != 0) {
+            return
+        }
         winLockAcquire(lockAddr)
         if (gcRequested != 0) {
             node[SHADOW_W_STATE] = SHADOW_STATE_PARKED
@@ -1427,6 +1448,17 @@ fn abiGcThreadExited() {
     if (gcParallel == 0) {
         return
     }
+    // A thread that exits while it is still in a native section was already
+    // uncounted by `abiGcEnterNative`; decrementing here would corrupt the
+    // barrier count for every later collection.
+    var self = abiShadowSelfIfRegistered()
+    if (self != 0) {
+        unsafe {
+            if ((self as *int)[SHADOW_W_STATE] == SHADOW_STATE_NATIVE) {
+                return
+            }
+        }
+    }
     winLockAcquire(geCountLockAddr())
     gcRunningCount = gcRunningCount - 1
     winWakeOn(geCollectorCvAddr())
@@ -1455,17 +1487,33 @@ fn abiEngineCollect(force: bool) {
         abiGcPoll()
         return
     }
-    if (collecting != 0) {
+    if (parallel == 0 && collecting != 0) {
         return
     }
     var collectorNode = 0
     if (parallel != 0) {
+        // The collector token is `collecting`, and it is held until the
+        // epilogue has restored this thread's count and state. `gcRequested`
+        // is only the mutator-park flag; the epilogue clears it earlier, to
+        // release the barrier, so it cannot double as the token. Clearing the
+        // token before the restore let a thread entering here claim a second
+        // collection with this one still excluded (count 0), drive the count
+        // negative, and sleep forever on the collector CV because the restore
+        // no longer matched its decrement.
         winLockAcquire(geStartLockAddr())
         if (gcRequested != 0) {
             winLockRelease(geStartLockAddr())
             abiGcPoll()
             return
         }
+        if (collecting != 0) {
+            // Epilogue window: the collection is over, only the bookkeeping
+            // is left. Return without collecting; the caller's next allocation
+            // polls normally.
+            winLockRelease(geStartLockAddr())
+            return
+        }
+        collecting = 1
         gcRequested = 1
         winLockRelease(geStartLockAddr())
         collectorNode = abiShadowSelfIfRegistered()
@@ -1482,8 +1530,9 @@ fn abiEngineCollect(force: bool) {
             winParkOn(geCountLockAddr(), geCollectorCvAddr())
         }
         winLockRelease(geCountLockAddr())
+    } else {
+        collecting = 1
     }
-    collecting = 1
     collections = collections + 1
     var workCount = abiEngineRegisteredCount()
     if (workCount < 1) {
@@ -1599,7 +1648,6 @@ fn abiEngineCollect(force: bool) {
     if (thresholdManual == 0) {
         threshold = geAdaptiveNext(liveBytes)
     }
-    collecting = 0
     if (parallel != 0) {
         // Release the mutators. The flag is cleared before the walk, so a
         // thread that reaches the poll now simply returns; a thread already
@@ -1626,6 +1674,15 @@ fn abiEngineCollect(force: bool) {
                 (collectorNode as *int)[SHADOW_W_STATE] = SHADOW_STATE_RUNNING
             }
         }
+        // Only now, with this thread counted again and its state restored, is
+        // the token free: a new collector that claims it will observe a
+        // consistent count and cannot wait for a barrier this collection has
+        // already satisfied.
+        winLockAcquire(geStartLockAddr())
+        collecting = 0
+        winLockRelease(geStartLockAddr())
+    } else {
+        collecting = 0
     }
 }
 
@@ -1672,15 +1729,39 @@ fn abiEngineManualCount() -> int {
     return manCount
 }
 
+/// Acquire one of the collector's own registry locks (temp roots, manual
+/// roots, static roots). The section is marked critical so a loop-header poll
+/// inside it cannot park the holder: a peer blocked on the same lock is
+/// counted and cannot reach a safepoint, so a parked holder would hang the
+/// collector's barrier. `abiGcPoll` returns early while the depth is non-zero.
+fn geLock(cell: int) {
+    shadowCriticalEnter()
+    winLockAcquire(cell)
+}
+
+/// Release a lock taken by `geLock`, leaving the critical section only after
+/// the lock is free.
+fn geUnlock(cell: int) {
+    winLockRelease(cell)
+    shadowCriticalExit()
+}
+
 /// Register a static root cell (the address of a `*mut PickleObject` slot).
 /// Returns the cell address (emitted callers discard it).
+///
+/// The emitted `pickle_gc_root_add` calls all run in `main`'s entry block, so
+/// contention is theoretical; the lock exists because the append is a
+/// grow-and-store and a second thread calling `pickle_gc_root_add` directly
+/// must not be able to lose an entry.
 fn abiEngineRootAdd(cell: int) -> int {
-    rootsBase = geGrow(rootsBase, rootsCap, rootsCount, ROOTS_INITIAL)
-    rootsCap = geCapGrown(rootsCap, rootsCount, ROOTS_INITIAL)
     unsafe {
+        geLock((&rootsLock) as int)
+        rootsBase = geGrow(rootsBase, rootsCap, rootsCount, ROOTS_INITIAL)
+        rootsCap = geCapGrown(rootsCap, rootsCount, ROOTS_INITIAL)
         (rootsBase as *int)[rootsCount] = cell
+        rootsCount = rootsCount + 1
+        geUnlock((&rootsLock) as int)
     }
-    rootsCount = rootsCount + 1
     return cell
 }
 
@@ -1695,38 +1776,47 @@ fn abiEngineTempRoot(obj: *int) {
     if ((obj as int) == 0) {
         return
     }
-    var i = 0
-    while (i < teCount) {
-        unsafe {
-            if ((teBase as *int)[i] == (obj as int)) {
-                return
-            }
-        }
-        i = i + 1
-    }
-    teBase = geGrow(teBase, teCap, teCount, TE_INITIAL)
-    teCap = geCapGrown(teCap, teCount, TE_INITIAL)
     unsafe {
+        geLock((&teLock) as int)
+        var found = false
+        var i = 0
+        while (i < teCount) {
+            if ((teBase as *int)[i] == (obj as int)) {
+                found = true
+                break
+            }
+            i = i + 1
+        }
+        if (found) {
+            geUnlock((&teLock) as int)
+            return
+        }
+        teBase = geGrow(teBase, teCap, teCount, TE_INITIAL)
+        teCap = geCapGrown(teCap, teCount, TE_INITIAL)
         (teBase as *int)[teCount] = obj as int
+        teCount = teCount + 1
+        geUnlock((&teLock) as int)
     }
-    teCount = teCount + 1
 }
 
 /// Release the liveness lease on `obj` taken by `abiEngineTempRoot`. An
 /// address that holds no lease is ignored - mirrors `gc.rs::temp_unroot`'s
 /// `retain` becoming a no-op for absent entries.
 fn abiEngineTempUnroot(obj: *int) {
-    var i = 0
-    while (i < teCount) {
-        unsafe {
+    unsafe {
+        geLock((&teLock) as int)
+        var i = 0
+        while (i < teCount) {
             if ((teBase as *int)[i] == (obj as int)) {
                 (teBase as *int)[i] = (teBase as *int)[teCount - 1]
                 (teBase as *int)[teCount - 1] = 0
                 teCount = teCount - 1
+                geUnlock((&teLock) as int)
                 return
             }
+            i = i + 1
         }
-        i = i + 1
+        geUnlock((&teLock) as int)
     }
 }
 
@@ -1741,21 +1831,27 @@ fn abiEngineManualAdopt(obj: *int) -> *int {
     if ((obj as int) == 0) {
         return obj
     }
-    var i = 0
-    while (i < manCount) {
-        unsafe {
-            if ((manBase as *int)[i] == (obj as int)) {
-                return obj
-            }
-        }
-        i = i + 1
-    }
-    manBase = geGrow(manBase, manCap, manCount, MAN_INITIAL)
-    manCap = geCapGrown(manCap, manCount, MAN_INITIAL)
     unsafe {
+        geLock((&manLock) as int)
+        var found = false
+        var i = 0
+        while (i < manCount) {
+            if ((manBase as *int)[i] == (obj as int)) {
+                found = true
+                break
+            }
+            i = i + 1
+        }
+        if (found) {
+            geUnlock((&manLock) as int)
+            return obj
+        }
+        manBase = geGrow(manBase, manCap, manCount, MAN_INITIAL)
+        manCap = geCapGrown(manCap, manCount, MAN_INITIAL)
         (manBase as *int)[manCount] = obj as int
+        manCount = manCount + 1
+        geUnlock((&manLock) as int)
     }
-    manCount = manCount + 1
     return obj
 }
 
@@ -1771,22 +1867,26 @@ fn abiEngineManualFree(obj: *int) {
     if ((obj as int) == 0) {
         return
     }
-    var i = 0
-    var found = 0
-    while (i < manCount && found == 0) {
-        unsafe {
+    var found = false
+    unsafe {
+        // Remove from the registry under the lock, then release it before the
+        // teardown below: a finalizer may allocate (and therefore collect), and
+        // the collector must never see this lock held by a parked thread.
+        geLock((&manLock) as int)
+        var i = 0
+        while (i < manCount && !found) {
             if ((manBase as *int)[i] == (obj as int)) {
                 (manBase as *int)[i] = (manBase as *int)[manCount - 1]
                 (manBase as *int)[manCount - 1] = 0
                 manCount = manCount - 1
-                found = 1
+                found = true
+            } else {
+                i = i + 1
             }
         }
-        if (found == 0) {
-            i = i + 1
-        }
+        geUnlock((&manLock) as int)
     }
-    if (found == 0) {
+    if (!found) {
         return
     }
     abiEngineUnregister(obj)
