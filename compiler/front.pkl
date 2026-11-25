@@ -1356,15 +1356,48 @@ fn aliasSuffix(i: int) -> string {
     out
 }
 
+/// Workspace crates bundled next to the compiler binary. The release compiler
+/// points this at its own directory so `std.*` and the runtime sources resolve
+/// from any working directory. Crates found by the normal walk win; the
+/// bundled set only fills names the source tree does not provide.
+var workspaceRoot: string = ""
+
+fn setWorkspaceRoot(root: string) {
+    workspaceRoot = root
+}
+
 fn discoverWorkspace(fileName: string) -> Workspace {
+    var found = emptyWorkspace()
     var start = pathParentP(fileName)
     if (let some(s) = start) {
         if (s == "") {
-            return discoverFrom(".")
+            found = discoverFrom(".")
+        } else {
+            found = discoverFrom(s)
         }
-        return discoverFrom(s)
+    } else {
+        found = discoverFrom(".")
     }
-    discoverFrom(".")
+    if (workspaceRoot != "") {
+        let manifest = pathJoin(workspaceRoot, "picklescript.toml")
+        if (let some(bundled) = readWorkspaceMembers(manifest)) {
+            var merged = Map<string, string>()
+            for (k in found.crates.keys()) {
+                if (let some(v) = found.crates.get(k)) {
+                    merged[k] = v
+                }
+            }
+            for (k in bundled.keys()) {
+                if (!merged.has(k)) {
+                    if (let some(v) = bundled.get(k)) {
+                        merged[k] = v
+                    }
+                }
+            }
+            return Workspace(merged)
+        }
+    }
+    found
 }
 
 fn discoverFrom(start: string) -> Workspace {

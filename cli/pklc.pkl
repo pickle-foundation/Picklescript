@@ -1,0 +1,1479 @@
+module cli.pklc
+
+import { Lexer } from compiler.lexer
+import { LexedToken, canonTok } from compiler.token
+import { DiagnosticSink } from compiler.diag
+import { parse } from compiler.parsercore
+import { Resolver } from compiler.resolvebag
+import { checkProgram } from compiler.checkcore
+import { frontendChecked, setWorkspaceRoot } from compiler.front
+import { emitIr } from compiler.emit
+import { irModuleStr, irxModuleStr } from compiler.ir
+import { recordedDeps, lookup, store } from compiler.cache
+import { catalogue, explainById, normalizeId } from compiler.error
+import { splitLines, subStr } from compiler.front
+import { renderHistory, renderBuilds, renderExplainHistory, gitRoot, historyFor } from cli.history
+import { currentDir } from std.process
+import { newObjs, lowerProgram, loadArchive, linkExe } from cli.buildlib
+import { writeStderr } from runtime.abi_stdio
+import { STR_BYTES_OFF } from runtime.layout
+import { abiStrFromF64 } from runtime.abi_float
+import { abiShadowPush, abiShadowPop } from runtime.abi_shadow
+import { abiClassRegister, abiClassName } from runtime.abi_class_extra
+import { abiRuntimeInit } from runtime.abi_runtime
+import { abiStaticGet, abiStaticSet } from runtime.abi_statics
+import { abiArgs, abiRunCmd } from runtime.abi_process
+import { abiPanicNoMatch } from runtime.abi_panic
+import { abiClassNew, abiObjSlotGet, abiObjSlotSet, abiSizeWords } from runtime.abi_class
+import { abiPrintObj, abiPrintNewline } from runtime.abi_console
+import { abiExit } from runtime.abi_os
+import { abiExcUncaught } from runtime.abi_exception
+import { abiFileExists, abiMkdir, abiCurrentDir, abiReadFile, abiWriteFile, abiListDir, abiDelete } from runtime.abi_fs
+import { abiEnumNew, abiEnumTag, abiEnumField, abiEnumSetField, abiEnumEq } from runtime.abi_enum
+import { abiMapNew, abiMapSet, abiMapGetBoxed, abiMapGet, abiMapHas, abiMapRemove, abiMapLen, abiMapKeys, abiMapValues } from runtime.abi_map
+import { abiTupleNew, abiTupleLen, abiTupleSetField, abiTupleField } from runtime.abi_tuple
+import { resolve } from compiler.resolvecore
+
+fn lex(src: string) -> List<LexedToken> {
+    let lx = Lexer(bytes(src), 0, 0, none, range(0), 0)
+    lx.run()
+}
+
+fn lexSource(src: string) -> string {
+    var out = ""
+    for (t in lex(src)) {
+        out += canonTok(t)
+        out += "\n"
+    }
+    out
+}
+
+fn pathBase(p: string) -> string {
+    let bs = bytes(p)
+    var last = -1
+    var i = 0
+    while (i < len(bs)) {
+        let b = bs[i] as int
+        if (b == 47 || b == 92) {
+            last = i
+        }
+        i = i + 1
+    }
+    if (last == -1) {
+        return p
+    }
+    var out = ""
+    var k = last + 1
+    while (k < len(bs)) {
+        out += "{bs[k] as char}"
+        k = k + 1
+    }
+    out
+}
+
+fn hasSuffix(s: string, suf: string) -> bool {
+    let sb = bytes(suf)
+    let bs = bytes(s)
+    if (len(sb) > len(bs)) {
+        return false
+    }
+    var i = 0
+    var diff = len(bs) - len(sb)
+    while (i < len(sb)) {
+        if (bs[diff + i] != sb[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+fn parseSource(src: string) -> string {
+    let toks = lex(src)
+    let diags = DiagnosticSink()
+    if (let some(_) = parse(toks, diags)) {
+        "ok"
+    } else {
+        "fail"
+    }
+}
+
+fn resolveSource(src: string) -> string {
+    let toks = lex(src)
+    let diags = DiagnosticSink()
+    if (let some(prog) = parse(toks, diags)) {
+        let r = Resolver(diags)
+        let _ = resolve(r, prog)
+        if (diags.anyError()) {
+            "fail"
+        } else {
+            "ok"
+        }
+    } else {
+        "fail"
+    }
+}
+
+fn checkSource(src: string) -> string {
+    let toks = lex(src)
+    let diags = DiagnosticSink()
+    if (let some(prog) = parse(toks, diags)) {
+        let r = Resolver(diags)
+        let resolved = resolve(r, prog)
+        checkProgram(prog, resolved, diags)
+        if (diags.anyError()) {
+            "fail"
+        } else {
+            "ok"
+        }
+    } else {
+        "fail"
+    }
+}
+
+/// Must take the file name, not just the source: the loader needs it to find
+/// the module's own imports and the workspace manifest, so a module with an
+/// `import` cannot be lowered from its text alone.
+fn irSource(fileName: string, src: string) -> string {
+    let diags = DiagnosticSink()
+    if (let some(out) = frontendChecked(fileName, src, diags)) {
+        if (let some(m) = emitIr(out.program, out.resolved, diags)) {
+            irModuleStr(m)
+        } else {
+            report(diags, fileName)
+            "irfail"
+        }
+    } else {
+        report(diags, fileName)
+        "irfail"
+    }
+}
+
+/// Print why a lowering failed. A bare "irfail" sends the reader looking for the
+/// problem instead of at it.
+fn report(diags: DiagnosticSink, fileName: string) {
+    let text = diags.renderAll()
+    if (text == "") {
+        println("error: while lowering " + fileName + " (no diagnostic)")
+    } else {
+        print(text)
+    }
+}
+
+/// Where `irx` keeps its cached modules.
+///
+/// There is no environment intrinsic, so the cache location comes from the
+/// command line: `--no-cache` disables it, `--cache-dir <dir>` moves it.
+class CacheConfig {
+    var dir: string
+
+    constructor(dir: string) {
+        this.dir = dir
+    }
+}
+
+/// Like `irSource`, but emits the lossless IRX text. Like `irSource` it takes
+/// the file name, because the loader needs it to find the module's own imports
+/// and the workspace manifest.
+///
+/// With a cache config, a lowering whose inputs are unchanged is served from
+/// disk instead of re-derived; see `compiler.cache`. The cache is a shortcut
+/// only: a miss falls through to the full lowering below.
+fn irxSource(fileName: string, src: string, cfg: CacheConfig?) -> string {
+    if (let some(c) = cfg) {
+        if (let some(deps) = recordedDeps(c.dir, fileName)) {
+            if (let some(hit) = lookup(c.dir, "irx", deps)) {
+                return hit
+            }
+        }
+    }
+    let diags = DiagnosticSink()
+    if (let some(out) = frontendChecked(fileName, src, diags)) {
+        if (let some(m) = emitIr(out.program, out.resolved, diags)) {
+            let text = irxModuleStr(m)
+            if (let some(c) = cfg) {
+                store(c.dir, "irx", fileName, out.paths, text)
+            }
+            text
+        } else {
+            report(diags, fileName)
+            "irfail"
+        }
+    } else {
+        report(diags, fileName)
+        "irfail"
+    }
+}
+
+fn defaultCacheDir() -> string {
+    "target/pickle-cache/pkl"
+}
+
+fn runIrx(argv: List<string>) {
+    var cfg: CacheConfig? = CacheConfig(defaultCacheDir())
+    var files = List<string>()
+    var i = 1
+    while (i < len(argv)) {
+        let a = argv[i]
+        if (a == "--no-cache") {
+            cfg = none
+            i = i + 1
+        } else if (a == "--cache-dir") {
+            if (i + 1 < len(argv)) {
+                cfg = CacheConfig(argv[i + 1])
+                i = i + 2
+            } else {
+                println("error: --cache-dir needs a directory")
+                exit(1)
+            }
+        } else {
+            files.push(a)
+            i = i + 1
+        }
+    }
+    var k = 0
+    while (k < len(files)) {
+        let f = files[k]
+        match (read_file(f)) {
+            case none -> {
+                println("error: cannot read " + f)
+                exit(1)
+            }
+            case some(src) -> {
+                let out = irxSource(f, src, cfg)
+                if (out == "irfail") {
+                    println("error: while lowering " + f)
+                    exit(1)
+                }
+                print(out)
+            }
+        }
+        k = k + 1
+    }
+}
+
+fn explainText(raw: string) -> string? {
+    let id = normalizeId(raw)
+    if (let some(e) = explainById(id)) {
+        var out = "error[" + id + "] -- " + e.title + "\n\n"
+        out += e.rule + "\n\n"
+        out += "example:\n"
+        for (line in splitLines(e.example)) {
+            out += "    " + line + "\n"
+        }
+        return out
+    }
+    none
+}
+
+fn runExplain(argv: List<string>) {
+    var wantHistory = false
+    var codeArg: string? = none
+    var i = 1
+    while (i < len(argv)) {
+        let a = argv[i]
+        if (a == "--history") {
+            wantHistory = true
+        }
+        match (codeArg) {
+            case none -> codeArg = a
+            case some(_) -> {}
+        }
+        i = i + 1
+    }
+    match (codeArg) {
+        case none -> {
+            for (e in catalogue()) {
+                println("error[" + e.code + "] -- " + e.title)
+            }
+        }
+        case some(raw) -> {
+            let id = normalizeId(raw)
+            if (!wantHistory) {
+                if (let some(txt) = explainText(id)) {
+                    print(txt)
+                } else {
+                    // Straight to the stderr handle - `writeStderr` writes to
+                    // `STD_ERROR_HANDLE`, and this is what the Rust CLI's
+                    // `eprintln!` bottoms out in on the freestanding build
+                    // (`nostd::console_error_write`). Writing through
+                    // `stderr_stream()` would work but would drag
+                    // `pickle_stderr_stream` and `pickle_stream_write` into a
+                    // program whose own source has no reason to need them.
+                    unsafe {
+                        let msg = "error: unknown error code `" + id + "`\n"
+                        var p = &msg
+                        let _ = writeStderr((p as int) + STR_BYTES_OFF, len(msg))
+                    }
+                    exit(1)
+                }
+            } else {
+                if (let some(txt) = explainText(id)) {
+                    print(txt)
+                    println("")
+                } else {
+                    println("(not in the error catalogue -- checking its history anyway)")
+                    println("")
+                }
+                explainHistory(id)
+            }
+        }
+    }
+}
+
+fn explainHistory(id: string) {
+    match (currentDir()) {
+        case none -> { exit(1) }
+        case some(cwd) -> {
+            match (gitRoot(cwd)) {
+                case none -> { exit(1) }
+                case some(root) -> {
+                    match (historyFor(root)) {
+                        case none -> { exit(1) }
+                        case some(all) -> renderExplainHistory(all, id)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn runHistoryCmd(argv: List<string>) {
+    var fileArg: string? = none
+    var limit = 10
+    var i = 1
+    while (i < len(argv)) {
+        let a = argv[i]
+        if (a == "--file") {
+            i = i + 1
+            if (i < len(argv)) {
+                fileArg = argv[i]
+            }
+        } else if (hasPrefixStr(a, "--file=")) {
+            fileArg = subStr(a, 7, len(a) - 7)
+        } else if (a == "--limit") {
+            i = i + 1
+            if (i < len(argv)) {
+                limit = parseIntOf(argv[i])
+            }
+        } else if (hasPrefixStr(a, "--limit=")) {
+            limit = parseIntOf(subStr(a, 8, len(a) - 8))
+        }
+        i = i + 1
+    }
+    match (currentDir()) {
+        case none -> { exit(1) }
+        case some(cwd) -> {
+            match (gitRoot(cwd)) {
+                case none -> { exit(1) }
+                case some(root) -> {
+                    match (historyFor(root)) {
+                        case none -> { exit(1) }
+                        case some(all) -> {
+                            if (len(all) == 0) {
+                                println("no `*.pkl` files in git history yet")
+                            } else {
+                                renderHistory(all, fileArg, limit)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn runBuildsCmd(argv: List<string>) {
+    var limit = 20
+    var i = 1
+    while (i < len(argv)) {
+        let a = argv[i]
+        if (a == "--limit") {
+            i = i + 1
+            if (i < len(argv)) {
+                limit = parseIntOf(argv[i])
+            }
+        } else if (hasPrefixStr(a, "--limit=")) {
+            limit = parseIntOf(subStr(a, 8, len(a) - 8))
+        }
+        i = i + 1
+    }
+    match (currentDir()) {
+        case none -> { exit(1) }
+        case some(cwd) -> {
+            match (gitRoot(cwd)) {
+                case none -> { exit(1) }
+                case some(root) -> {
+                    match (historyFor(root)) {
+                        case none -> { exit(1) }
+                        case some(all) -> {
+                            if (len(all) == 0) {
+                                println("no `*.pkl` files in git history yet")
+                            } else {
+                                renderBuilds(all, limit)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn hasPrefixStr(s: string, p: string) -> bool {
+    let sb = bytes(p)
+    let bs = bytes(s)
+    if (len(sb) > len(bs)) {
+        return false
+    }
+    var i = 0
+    while (i < len(sb)) {
+        if (bs[i] != sb[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+fn parseIntOf(s: string) -> int {
+    let bs = bytes(s)
+    var n = 0
+    var i = 0
+    while (i < len(bs)) {
+        let c = bs[i] as int
+        if (c >= 48 && c <= 57) {
+            n = n * 10 + (c - 48)
+            i = i + 1
+        } else {
+            break
+        }
+    }
+    n
+}
+
+/// `pickle lex <file>`: print the canonical token stream, one token per line.
+/// Uses the same `lexSource` the batch driver writes to its `.lex` artifacts, so
+/// the two agree byte for byte with the Rust compiler's `lex` output.
+fn runLexCmd(argv: List<string>) {
+    if (len(argv) < 2) {
+        println("error: `lex` needs a file")
+        exit(1)
+    }
+    let f = argv[1]
+    match (read_file(f)) {
+        case none -> {
+            println("error: cannot read " + f)
+            exit(1)
+        }
+        case some(src) -> {
+            print(lexSource(src))
+        }
+    }
+}
+
+/// `pickle ir <file>`: lower a checked module to PickleIR and print it. On a
+/// lowering failure the diagnostics go out and the exit code is 1, matching the
+/// Rust CLI (which exits 1 without printing IR).
+fn runIrCmd(argv: List<string>) {
+    if (len(argv) < 2) {
+        println("error: `ir` needs a file")
+        exit(1)
+    }
+    let f = argv[1]
+    match (read_file(f)) {
+        case none -> {
+            println("error: cannot read " + f)
+            exit(1)
+        }
+        case some(src) -> {
+            let diags = DiagnosticSink()
+            if (let some(out) = frontendChecked(f, src, diags)) {
+                if (let some(m) = emitIr(out.program, out.resolved, diags)) {
+                    print(irModuleStr(m))
+                    return
+                }
+            }
+            report(diags, f)
+            exit(1)
+        }
+    }
+}
+
+// ------------------------------------------------------- release compiler/CLI
+
+/// SHA-256 of the runtime archive appended to this executable. The footer is
+/// `[archive][sha256 32][length 8 LE][magic 8]`; the cache filename uses this
+/// constant so a warm cache is found without reading the 16 MB image.
+const RT_ARCHIVE_SHA: string = "f17f7c04c89d26a836be501f797a9cd087b245d09928b498b3090a7a81bb077c"
+const RT_FOOTER_MAGIC: string = "PKLRTAR1"
+const RT_FOOTER_BYTES: int = 48
+
+/// SHA-256 of the bundled stdlib/runtime source blob. It sits between the
+/// compiler image and the runtime archive, with the same 48-byte footer shape,
+/// so the runtime archive keeps its place at the end of the file.
+const SRC_BUNDLE_SHA: string = "079ba91e04d6b71495538df48ff20a03840a7f7df01ece7ff282185e160c808c"
+const SRC_FOOTER_MAGIC: string = "PKLSRC01"
+const SRC_FOOTER_BYTES: int = 48
+const SRC_BUNDLE_MAGIC: string = "PKLSRCB1"
+
+fn pklcDword(v: int) -> int {
+    v & 4294967295
+}
+
+/// Write one line through `WriteConsoleW`. A console that is not in UTF-8
+/// mode renders UTF-8 bytes as mojibake, and code page 65001 still turns a
+/// non-BMP code point into `?`; the Unicode API is the only path that keeps
+/// the pickle intact. Returns false when stdout is not a console, so the
+/// caller can use the ordinary UTF-8 path that pipes and files expect.
+fn pklcSayWideLine(s: string) -> bool {
+    unsafe {
+        var line = s + "\n"
+        let n = len(line)
+        var p = &line
+        let src = (p as int) + STR_BYTES_OFF
+        let need = win_multi_byte_to_wide_char(65001, 0, src, n, 0, 0)
+        if (need <= 0) {
+            return false
+        }
+        let wide = alloc(int, need + 1)
+        if ((wide as int) == 0) {
+            return false
+        }
+        let got = win_multi_byte_to_wide_char(65001, 0, src, n, wide, need)
+        var ok = false
+        if (got == need) {
+            let h = win_get_std_handle(-11)
+            let pW = alloc(int, 1)
+            pW[0] = 0
+            ok = pklcDword(win_write_console_w(h, wide, need, pW, 0)) != 0
+            free(pW)
+        }
+        free(wide)
+        return ok
+    }
+}
+
+fn pklcSayLine(s: string) {
+    if (pklcSayWideLine(s)) {
+        return
+    }
+    println(s)
+}
+
+fn pklcDirOf(p: string) -> string {
+    let bs = bytes(p)
+    var last = -1
+    var i = 0
+    while (i < len(bs)) {
+        let c = bs[i] as int
+        if (c == 92 || c == 47) {
+            last = i
+        }
+        i = i + 1
+    }
+    if (last <= 0) {
+        return ""
+    }
+    subStr(p, 0, last)
+}
+
+fn pklcJoin(a: string, b: string) -> string {
+    if (a == "") {
+        return b
+    }
+    let bs = bytes(a)
+    if (len(bs) > 0) {
+        let c = bs[len(bs) - 1] as int
+        if (c == 92 || c == 47) {
+            return a + b
+        }
+    }
+    a + "\\" + b
+}
+
+fn pklcAbs(base: string, p: string) -> string {
+    let bs = bytes(p)
+    if (len(bs) >= 2 && (bs[1] as int) == 58) {
+        return p
+    }
+    if (len(bs) > 0) {
+        let c = bs[0] as int
+        if (c == 92 || c == 47) {
+            return p
+        }
+    }
+    if (base == "") {
+        return p
+    }
+    pklcJoin(base, p)
+}
+
+fn pklcStartsWith(s: string, pre: string) -> bool {
+    let sb = bytes(s)
+    let pb = bytes(pre)
+    if (len(pb) > len(sb)) {
+        return false
+    }
+    var i = 0
+    while (i < len(pb)) {
+        if (sb[i] != pb[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+fn pklcIdent(s: string) -> bool {
+    let bs = bytes(s)
+    if (len(bs) == 0) {
+        return false
+    }
+    let c0 = bs[0] as int
+    let lead = (c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122) || c0 == 95
+    if (!lead) {
+        return false
+    }
+    var i = 1
+    while (i < len(bs)) {
+        let c = bs[i] as int
+        let ok = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95
+        if (!ok) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+fn pklcHexByte(v: int) -> string {
+    let digits = "0123456789abcdef"
+    let hi = (v / 16) & 15
+    let lo = v & 15
+    subStr(digits, hi, 1) + subStr(digits, lo, 1)
+}
+
+fn pklcHex(bs: List<byte>, start: int, n: int) -> string {
+    var out = ""
+    var i = start
+    let end = start + n
+    while (i < end) {
+        out += pklcHexByte(bs[i] as int)
+        i = i + 1
+    }
+    out
+}
+
+fn pklcStripPkl(p: string) -> string {
+    if (hasSuffix(p, ".pkl")) {
+        return subStr(p, 0, len(p) - 4)
+    }
+    p
+}
+
+fn pklcSafeName(s: string) -> string {
+    let bs = bytes(s)
+    var out = ""
+    var i = 0
+    while (i < len(bs)) {
+        let c = bs[i] as int
+        let ok = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 46 || c == 95 || c == 45
+        if (ok) {
+            out += "{bs[i] as char}"
+        } else {
+            out += "_"
+        }
+        i = i + 1
+    }
+    if (out == "") {
+        return "program"
+    }
+    out
+}
+
+// The runtime's UTF-16 helpers are private to `runtime.abi_fs`; these are the
+// same packing rules, local to the CLI so the self-path and env reads work.
+fn pklcUnitAt(w: *int, i: int) -> int {
+    unsafe {
+        return (w[i >> 2] >> ((i & 3) * 16)) & 65535
+    }
+}
+
+fn pklcWideStep(w: *int, i: int, n: int) -> int {
+    let u = pklcUnitAt(w, i)
+    if (u >= 55296 && u <= 56319 && (i + 1) < n) {
+        let lo = pklcUnitAt(w, i + 1)
+        if (lo >= 56320 && lo <= 57343) {
+            return 2
+        }
+    }
+    1
+}
+
+fn pklcWideCp(w: *int, i: int, n: int) -> int {
+    let u = pklcUnitAt(w, i)
+    if (pklcWideStep(w, i, n) == 2) {
+        let lo = pklcUnitAt(w, i + 1)
+        return 65536 + ((u - 55296) * 1024) + (lo - 56320)
+    }
+    if (u >= 55296 && u <= 57343) {
+        return 65533
+    }
+    u
+}
+
+fn pklcPushCp(out: List<byte>, cp: int) {
+    if (cp < 128) {
+        out.push(cp as byte)
+    } else if (cp < 2048) {
+        out.push((192 + (cp / 64)) as byte)
+        out.push((128 + (cp % 64)) as byte)
+    } else if (cp < 65536) {
+        out.push((224 + (cp / 4096)) as byte)
+        out.push((128 + ((cp / 64) % 64)) as byte)
+        out.push((128 + (cp % 64)) as byte)
+    } else {
+        out.push((240 + (cp / 262144)) as byte)
+        out.push((128 + ((cp / 4096) % 64)) as byte)
+        out.push((128 + ((cp / 64) % 64)) as byte)
+        out.push((128 + (cp % 64)) as byte)
+    }
+}
+
+fn pklcWideSlice(w: *int, start: int, n: int) -> string {
+    let out = bytes("")
+    var i = 0
+    let stop = start + n
+    while (i < n) {
+        pklcPushCp(out, pklcWideCp(w, start + i, stop))
+        i = i + pklcWideStep(w, start + i, stop)
+    }
+    str(out)
+}
+
+fn pklcExePath() -> string {
+    unsafe {
+        let units = 4096
+        let words = units / 4
+        let buf = alloc(int, words)
+        var z = 0
+        while (z < words) {
+            buf[z] = 0
+            z = z + 1
+        }
+        let n = pklcDword(win_get_module_file_name_w(0, buf, units))
+        var out = ""
+        if (n > 0 && n < units) {
+            out = pklcWideSlice(buf, 0, n)
+        }
+        free(buf)
+        out
+    }
+}
+
+fn pklcEnv(key: string) -> string? {
+    unsafe {
+        let w = win_get_environment_strings_w()
+        if (w == 0) {
+            return none
+        }
+        let wp = w as *int
+        let prefix = key + "="
+        var pos = 0
+        var found = ""
+        var have = false
+        while (!have) {
+            var end = pos
+            while (pklcUnitAt(wp, end) != 0) {
+                end = end + 1
+            }
+            if (end == pos) {
+                have = true
+            } else {
+                let entry = pklcWideSlice(wp, pos, end - pos)
+                if (pklcStartsWith(entry, prefix)) {
+                    found = subStr(entry, len(prefix), len(entry) - len(prefix))
+                    have = true
+                } else {
+                    pos = end + 1
+                }
+            }
+        }
+        let _ = win_free_environment_strings_w(w)
+        if (found != "") {
+            return found
+        }
+        none
+    }
+}
+
+/// Create `<base>\PickleScript\runtime`, or none when the base is not
+/// writable. The caller tries the next base in turn.
+fn pklcTryCacheBase(base: string) -> string? {
+    let root = pklcJoin(base, "PickleScript")
+    let dir = pklcJoin(root, "runtime")
+    if (!abiFileExists(root)) {
+        mkdir(root)
+    }
+    if (!abiFileExists(dir)) {
+        mkdir(dir)
+    }
+    if (!abiFileExists(dir)) {
+        return none
+    }
+    dir
+}
+
+fn pklcCacheDir() -> string? {
+    if (let some(v) = pklcEnv("LOCALAPPDATA")) {
+        if (let some(d) = pklcTryCacheBase(v)) {
+            return d
+        }
+    }
+    if (let some(v) = pklcEnv("TEMP")) {
+        if (let some(d) = pklcTryCacheBase(v)) {
+            return d
+        }
+    }
+    let exePath = pklcExePath()
+    if (exePath != "") {
+        if (let some(d) = pklcTryCacheBase(pklcDirOf(exePath))) {
+            return d
+        }
+    }
+    none
+}
+
+fn pklcRuntimePath() -> string? {
+    if (let some(dir) = pklcCacheDir()) {
+        return pklcJoin(dir, "rtlib-" + RT_ARCHIVE_SHA + ".ar")
+    }
+    none
+}
+
+fn pklcExtractRuntime() -> string? {
+    var cache = ""
+    var haveCache = false
+    if (let some(c) = pklcRuntimePath()) {
+        cache = c
+        haveCache = true
+    }
+    if (!haveCache) {
+        return none
+    }
+    if (abiFileExists(cache)) {
+        return cache
+    }
+    let exePath = pklcExePath()
+    if (exePath == "") {
+        return none
+    }
+    if (let some(exe) = read_file(exePath)) {
+        let total = len(exe)
+        if (total > RT_FOOTER_BYTES) {
+            let footer = subStr(exe, total - RT_FOOTER_BYTES, RT_FOOTER_BYTES)
+            let fb = bytes(footer)
+            let magic = subStr(footer, 40, 8)
+            if (magic == RT_FOOTER_MAGIC) {
+                var length = 0
+                var k = 7
+                while (k >= 0) {
+                    length = length * 256 + (fb[32 + k] as int)
+                    k = k - 1
+                }
+                if (length > 0 && length + RT_FOOTER_BYTES <= total) {
+                    let hash = pklcHex(fb, 0, 32)
+                    if (hash != RT_ARCHIVE_SHA) {
+                        println("pklc: embedded runtime hash mismatch")
+                        return none
+                    }
+                    let archive = subStr(exe, total - RT_FOOTER_BYTES - length, length)
+                    if (write_file(cache, archive)) {
+                        return cache
+                    }
+                    println("pklc: cannot write runtime cache " + cache)
+                    return none
+                }
+            }
+        }
+    }
+    println("pklc: cannot extract the embedded runtime")
+    none
+}
+
+// ------------------------------------------------------- bundled source tree
+
+fn pklcU32(bs: List<byte>, off: int) -> int {
+    var v = bs[off] as int
+    v = v + (bs[off + 1] as int) * 256
+    v = v + (bs[off + 2] as int) * 65536
+    v = v + (bs[off + 3] as int) * 16777216
+    v
+}
+
+/// Create `full` and every missing ancestor. `mkdir` makes one level and fails
+/// when the directory already exists, so the caller cannot rely on a sorted
+/// entry list to have created the parents first.
+fn pklcEnsureDir(full: string) -> bool {
+    if (abiFileExists(full)) {
+        return true
+    }
+    let parent = pklcDirOf(full)
+    if (parent != "") {
+        if (!pklcEnsureDir(parent)) {
+            return false
+        }
+    }
+    let _ = mkdir(full)
+    abiFileExists(full)
+}
+
+/// Unpack `PKLSRCB1`: a 12-byte header (`magic`, u32 entry count) followed by
+/// `[u32 pathLen][u32 dataLen][path][data]` entries. Paths are relative and use
+/// backslashes.
+fn pklcUnpackSources(blob: string, root: string) -> bool {
+    let bb = bytes(blob)
+    if (len(bb) < 12) {
+        return false
+    }
+    if (subStr(blob, 0, 8) != SRC_BUNDLE_MAGIC) {
+        return false
+    }
+    let count = pklcU32(bb, 8)
+    var pos = 12
+    var i = 0
+    while (i < count) {
+        if (pos + 8 > len(bb)) {
+            return false
+        }
+        let pathLen = pklcU32(bb, pos)
+        let dataLen = pklcU32(bb, pos + 4)
+        pos = pos + 8
+        if (pathLen == 0 || pos + pathLen + dataLen > len(bb)) {
+            return false
+        }
+        let rel = subStr(blob, pos, pathLen)
+        pos = pos + pathLen
+        let data = subStr(blob, pos, dataLen)
+        pos = pos + dataLen
+        let full = pklcJoin(root, rel)
+        if (!pklcEnsureDir(pklcDirOf(full))) {
+            return false
+        }
+        if (!write_file(full, data)) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+/// Create `<base>\PickleScript\sources`, or none when the base is not writable.
+fn pklcTrySourcesBase(base: string) -> string? {
+    let root = pklcJoin(base, "PickleScript")
+    let dir = pklcJoin(root, "sources")
+    if (!abiFileExists(root)) {
+        mkdir(root)
+    }
+    if (!abiFileExists(dir)) {
+        mkdir(dir)
+    }
+    if (!abiFileExists(dir)) {
+        return none
+    }
+    dir
+}
+
+fn pklcSourcesBase() -> string? {
+    if (let some(v) = pklcEnv("LOCALAPPDATA")) {
+        if (let some(d) = pklcTrySourcesBase(v)) {
+            return d
+        }
+    }
+    if (let some(v) = pklcEnv("TEMP")) {
+        if (let some(d) = pklcTrySourcesBase(v)) {
+            return d
+        }
+    }
+    let exePath = pklcExePath()
+    if (exePath != "") {
+        if (let some(d) = pklcTrySourcesBase(pklcDirOf(exePath))) {
+            return d
+        }
+    }
+    none
+}
+
+fn pklcSourceRoot() -> string? {
+    if (let some(dir) = pklcSourcesBase()) {
+        return pklcJoin(dir, "src-" + SRC_BUNDLE_SHA)
+    }
+    none
+}
+
+/// Extract the bundled stdlib/runtime sources once per bundle hash. The stamp
+/// is written last, so an interrupted extraction is redone in full next time.
+fn pklcExtractSources() -> string? {
+    var root = ""
+    var have = false
+    if (let some(d) = pklcSourceRoot()) {
+        root = d
+        have = true
+    }
+    if (!have) {
+        return none
+    }
+    let stamp = pklcJoin(root, ".complete")
+    if (abiFileExists(stamp)) {
+        return root
+    }
+    let exePath = pklcExePath()
+    if (exePath == "") {
+        return none
+    }
+    if (let some(exe) = read_file(exePath)) {
+        let total = len(exe)
+        if (total > RT_FOOTER_BYTES + SRC_FOOTER_BYTES) {
+            let rtFooter = subStr(exe, total - RT_FOOTER_BYTES, RT_FOOTER_BYTES)
+            if (subStr(rtFooter, 40, 8) == RT_FOOTER_MAGIC) {
+                let rtb = bytes(rtFooter)
+                var rtLen = 0
+                var k = 7
+                while (k >= 0) {
+                    rtLen = rtLen * 256 + (rtb[32 + k] as int)
+                    k = k - 1
+                }
+                let archiveStart = total - RT_FOOTER_BYTES - rtLen
+                if (rtLen > 0 && archiveStart >= SRC_FOOTER_BYTES) {
+                    let srcFooter = subStr(exe, archiveStart - SRC_FOOTER_BYTES, SRC_FOOTER_BYTES)
+                    if (subStr(srcFooter, 40, 8) == SRC_FOOTER_MAGIC) {
+                        let sb = bytes(srcFooter)
+                        var srcLen = 0
+                        var j = 7
+                        while (j >= 0) {
+                            srcLen = srcLen * 256 + (sb[32 + j] as int)
+                            j = j - 1
+                        }
+                        let blobStart = archiveStart - SRC_FOOTER_BYTES - srcLen
+                        if (srcLen > 0 && blobStart >= 0) {
+                            let hash = pklcHex(sb, 0, 32)
+                            if (hash != SRC_BUNDLE_SHA) {
+                                println("pklc: embedded source hash mismatch")
+                                return none
+                            }
+                            let blob = subStr(exe, blobStart, srcLen)
+                            if (!abiFileExists(root)) {
+                                mkdir(root)
+                            }
+                            if (!abiFileExists(root)) {
+                                println("pklc: cannot create source cache " + root)
+                                return none
+                            }
+                            if (pklcUnpackSources(blob, root)) {
+                                let _ = write_file(stamp, SRC_BUNDLE_SHA)
+                                return root
+                            }
+                            println("pklc: cannot extract the bundled sources")
+                            return none
+                        }
+                    }
+                }
+            }
+        }
+    }
+    none
+}
+
+/// Point the frontend at the extracted bundle. A portable tree that still has
+/// `stdlib\` and `runtime\` next to the executable keeps working: when there is
+/// no embedded blob, the exe directory set by `main` stays in effect.
+fn pklcEnsureWorkspace() {
+    if (let some(root) = pklcExtractSources()) {
+        setWorkspaceRoot(root)
+    }
+}
+
+fn pklcPrintDiags(sinks: DiagnosticSink) {
+    let text = sinks.renderAll()
+    if (text != "") {
+        print(text)
+    }
+}
+
+fn pklcCompile(source: string, output: string) -> bool {
+    if (let some(src) = read_file(source)) {
+        let sinks = DiagnosticSink()
+        if (let some(program) = lowerProgram(source, src, sinks)) {
+            var attempt = 0
+            var linkErr = ""
+            while (attempt < 2) {
+                match (pklcExtractRuntime()) {
+                    case none -> { return false }
+                    case some(archive) -> {
+                        match (loadArchive(archive)) {
+                            case none -> {
+                                // A truncated cache is the common cause; drop it
+                                // and let the next pass rebuild from the image.
+                                let _ = abiDelete(archive)
+                                attempt = attempt + 1
+                            }
+                            case some(libs) -> {
+                                var objects = newObjs()
+                                objects.push(program.obj)
+                                var i = 0
+                                while (i < len(libs)) {
+                                    objects.push(libs[i])
+                                    i = i + 1
+                                }
+                                if (let some(err) = linkExe(objects, output, program.overrides)) {
+                                    // The cache may parse yet be corrupt; rebuild
+                                    // it once before reporting the link failure.
+                                    linkErr = err
+                                    let _ = abiDelete(archive)
+                                    attempt = attempt + 1
+                                } else {
+                                    pklcPrintDiags(sinks)
+                                    if (sinks.anyError()) {
+                                        let _ = abiDelete(output)
+                                        return false
+                                    }
+                                    return true
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if (linkErr != "") {
+                println("pklc: " + linkErr)
+            } else {
+                println("pklc: cannot read the runtime archive")
+            }
+            return false
+        }
+        pklcPrintDiags(sinks)
+        return false
+    }
+    println("pklc: cannot read source " + source)
+    false
+}
+
+fn pklcCallerDir() -> string {
+    if (let some(d) = currentDir()) {
+        return d
+    }
+    "."
+}
+
+fn pklcSourcePath(arg: string) -> string? {
+    let full = pklcAbs(pklcCallerDir(), arg)
+    if (!abiFileExists(full)) {
+        println("pklc: source file not found: " + arg)
+        return none
+    }
+    full
+}
+
+/// `pklcSourcePath` for callers that cannot continue without a source.
+fn pklcRequireSource(arg: string) -> string {
+    if (let some(s) = pklcSourcePath(arg)) {
+        return s
+    }
+    exit(1)
+    ""
+}
+
+/// `pklcTempExe` for callers that cannot continue without a scratch path.
+fn pklcRequireTemp(source: string) -> string {
+    if (let some(t) = pklcTempExe(source)) {
+        return t
+    }
+    println("pklc: cannot create a temporary executable")
+    exit(1)
+    ""
+}
+
+fn pklcDefaultOutput(source: string) -> string {
+    pklcStripPkl(source) + ".exe"
+}
+
+fn pklcRunBuild(argv: List<string>) {
+    if (len(argv) < 2) {
+        println("pklc: usage: pklc build <file.pkl> [-o <exe>]")
+        exit(1)
+    }
+    let src = pklcRequireSource(argv[1])
+    var outArg = ""
+    var haveOut = false
+    var i = 2
+    while (i < len(argv)) {
+        let a = argv[i]
+        if (a == "-o" || a == "--out") {
+            if (i + 1 >= len(argv)) {
+                println("pklc: -o needs a path")
+                exit(1)
+            }
+            outArg = argv[i + 1]
+            haveOut = true
+            i = i + 2
+        } else {
+            println("pklc: unknown option: " + a)
+            exit(1)
+        }
+    }
+    var output = ""
+    if (haveOut) {
+        output = pklcAbs(pklcCallerDir(), outArg)
+    } else {
+        output = pklcDefaultOutput(src)
+    }
+    let parent = pklcDirOf(output)
+    if (parent != "" && !abiFileExists(parent)) {
+        println("pklc: output directory does not exist: " + parent)
+        exit(1)
+    }
+    if (!pklcCompile(src, output)) {
+        exit(1)
+    }
+    println("built " + output)
+}
+
+/// Create `<base>\picklescript`, or none when the base is not writable.
+fn pklcTryTempBase(base: string) -> string? {
+    let dir = pklcJoin(base, "picklescript")
+    if (!abiFileExists(dir)) {
+        mkdir(dir)
+    }
+    if (!abiFileExists(dir)) {
+        return none
+    }
+    dir
+}
+
+fn pklcTempExe(source: string) -> string? {
+    var dir = ""
+    var have = false
+    if (let some(t) = pklcEnv("TEMP")) {
+        if (let some(d) = pklcTryTempBase(t)) {
+            dir = d
+            have = true
+        }
+    }
+    if (!have) {
+        if (let some(l) = pklcEnv("LOCALAPPDATA")) {
+            if (let some(d) = pklcTryTempBase(l)) {
+                dir = d
+                have = true
+            }
+        }
+    }
+    if (!have) {
+        let exePath = pklcExePath()
+        if (exePath != "") {
+            if (let some(d) = pklcTryTempBase(pklcDirOf(exePath))) {
+                dir = d
+                have = true
+            }
+        }
+    }
+    if (!have) {
+        return none
+    }
+    let name = pklcStripPkl(pathBase(source))
+    let safe = pklcSafeName(name)
+    let stamp = str(time_monotonic_ns())
+    pklcJoin(dir, safe + "-" + stamp + ".exe")
+}
+
+fn pklcRunProgram(source: string, programArgs: List<string>) {
+    let exe = pklcRequireTemp(source)
+    if (!pklcCompile(source, exe)) {
+        let _ = abiDelete(exe)
+        exit(1)
+    }
+    var argv = List<string>()
+    argv.push(exe)
+    for (a in programArgs) {
+        argv.push(a)
+    }
+    let r = run_cmd(argv, pklcCallerDir(), none, none, none, none, none, true)
+    let _ = abiDelete(exe)
+    if (let some(t) = r) {
+        match (t) {
+            case (code, out, err, timed) -> {
+                if (let some(c) = code) {
+                    exit(c)
+                }
+            }
+            case _ -> {}
+        }
+    }
+    exit(1)
+}
+
+fn pklcRunCheck(argv: List<string>) {
+    if (len(argv) < 2) {
+        println("pklc: usage: pklc check <file.pkl>")
+        exit(1)
+    }
+    let src = pklcRequireSource(argv[1])
+    let exe = pklcRequireTemp(src)
+    let ok = pklcCompile(src, exe)
+    let _ = abiDelete(exe)
+    if (!ok) {
+        exit(1)
+    }
+    println("ok " + src)
+}
+
+fn pklcRunNew(argv: List<string>) {
+    if (len(argv) < 2) {
+        println("pklc: usage: pklc new <name>")
+        exit(1)
+    }
+    let name = argv[1]
+    if (!pklcIdent(name)) {
+        println("pklc: project name must be a valid module identifier")
+        exit(1)
+    }
+    let dir = pklcJoin(pklcCallerDir(), name)
+    if (abiFileExists(dir)) {
+        println("pklc: already exists: " + dir)
+        exit(1)
+    }
+    mkdir(dir)
+    if (!abiFileExists(dir)) {
+        println("pklc: cannot create " + dir)
+        exit(1)
+    }
+    let text = "module " + name + "\r\n\r\nfn main() \{\r\n    println(\"Hello from " + name + "!\")\r\n\}\r\n"
+    let file = pklcJoin(dir, "main.pkl")
+    if (!write_file(file, text)) {
+        println("pklc: cannot write " + file)
+        exit(1)
+    }
+    println("created " + file)
+    println("run it with: pklc run \"" + file + "\"")
+}
+
+fn pklcHelp() {
+    println("PickleScript 0.1.0 (win64)")
+    println("")
+    println("Usage:")
+    println("  pklc run <file.pkl> [args...]      compile and run a program")
+    println("  pklc build <file.pkl> [-o <exe>]   compile a standalone .exe")
+    println("  pklc check <file.pkl>              compile and validate")
+    println("  pklc new <name>                    create <name>\\main.pkl here")
+    println("  pklc jar                           pickle diagnostics")
+    println("  pklc --version                     print the version")
+    println("  pklc help                          show this help")
+    println("")
+    println("Compiler diagnostics:")
+    println("  pklc lex|ir|irx|explain|history|builds ...")
+    println("")
+    println("A bare .pkl path is treated as 'run'.")
+}
+
+fn main() {
+    var exePath = pklcExePath()
+    if (exePath != "") {
+        setWorkspaceRoot(pklcDirOf(exePath))
+    }
+    let argv = args()
+    if (len(argv) == 0) {
+        pklcHelp()
+        return
+    }
+    let cmd = argv[0]
+    if (cmd == "--version" || cmd == "-V" || cmd == "version") {
+        println("pickle 0.1.0")
+        return
+    }
+    if (cmd == "help" || cmd == "--help" || cmd == "-h") {
+        pklcHelp()
+        return
+    }
+    if (cmd == "jar") {
+        // The banner is the one place with non-ASCII output. A console needs
+        // `WriteConsoleW` for the pickle; redirected output keeps the plain
+        // UTF-8 path.
+        pklcSayLine("🥒 Pickle Jar Diagnostics")
+        pklcSayLine("")
+        pklcSayLine("Compiler: healthy")
+        pklcSayLine("Parser: fermented")
+        pklcSayLine("Resolver: brined")
+        pklcSayLine("Emitter: still soaking")
+        pklcSayLine("")
+        pklcSayLine("Vinegar: ██████████ 100%")
+        pklcSayLine("Jar integrity: acceptable")
+        return
+    }
+    pklcEnsureWorkspace()
+    if (cmd == "run") {
+        if (len(argv) < 2) {
+            println("pklc: usage: pklc run <file.pkl> [args...]")
+            exit(1)
+        }
+        let src = pklcRequireSource(argv[1])
+        var rest = List<string>()
+        var i = 2
+        while (i < len(argv)) {
+            rest.push(argv[i])
+            i = i + 1
+        }
+        pklcRunProgram(src, rest)
+        return
+    }
+    if (cmd == "build") {
+        pklcRunBuild(argv)
+        return
+    }
+    if (cmd == "check") {
+        pklcRunCheck(argv)
+        return
+    }
+    if (cmd == "new") {
+        pklcRunNew(argv)
+        return
+    }
+    if (cmd == "explain") {
+        runExplain(argv)
+        return
+    }
+    if (cmd == "history") {
+        runHistoryCmd(argv)
+        return
+    }
+    if (cmd == "builds") {
+        runBuildsCmd(argv)
+        return
+    }
+    if (cmd == "irx") {
+        runIrx(argv)
+        return
+    }
+    if (cmd == "lex") {
+        runLexCmd(argv)
+        return
+    }
+    if (cmd == "ir") {
+        runIrCmd(argv)
+        return
+    }
+    if (hasSuffix(cmd, ".pkl") || abiFileExists(pklcAbs(pklcCallerDir(), cmd))) {
+        let src = pklcRequireSource(cmd)
+        var rest = List<string>()
+        var i = 1
+        while (i < len(argv)) {
+            rest.push(argv[i])
+            i = i + 1
+        }
+        pklcRunProgram(src, rest)
+        return
+    }
+    println("pklc: unknown command: " + cmd)
+    println("")
+    pklcHelp()
+    exit(1)
+}

@@ -531,6 +531,47 @@ fn runCheckCmd(argv: List<string>) {
     }
 }
 
+fn pklcDword(v: int) -> int {
+    v & 4294967295
+}
+
+/// See `cli/pklc.pkl`: `WriteConsoleW` is the only console path that keeps a
+/// non-BMP code point intact, and the fallback keeps pipes and files UTF-8.
+fn pklcSayWideLine(s: string) -> bool {
+    unsafe {
+        var line = s + "\n"
+        let n = len(line)
+        var p = &line
+        let src = (p as int) + STR_BYTES_OFF
+        let need = win_multi_byte_to_wide_char(65001, 0, src, n, 0, 0)
+        if (need <= 0) {
+            return false
+        }
+        let wide = alloc(int, need + 1)
+        if ((wide as int) == 0) {
+            return false
+        }
+        let got = win_multi_byte_to_wide_char(65001, 0, src, n, wide, need)
+        var ok = false
+        if (got == need) {
+            let h = win_get_std_handle(-11)
+            let pW = alloc(int, 1)
+            pW[0] = 0
+            ok = pklcDword(win_write_console_w(h, wide, need, pW, 0)) != 0
+            free(pW)
+        }
+        free(wide)
+        return ok
+    }
+}
+
+fn pklcSayLine(s: string) {
+    if (pklcSayWideLine(s)) {
+        return
+    }
+    println(s)
+}
+
 fn main() {
     let argv = args()
     if (len(argv) >= 1) {
@@ -539,15 +580,15 @@ fn main() {
             return
         }
         if (argv[0] == "jar") {
-            println("🥒 Pickle Jar Diagnostics")
-            println("")
-            println("Compiler: healthy")
-            println("Parser: fermented")
-            println("Resolver: brined")
-            println("Emitter: still soaking")
-            println("")
-            println("Vinegar: ██████████ 100%")
-            println("Jar integrity: acceptable")
+            pklcSayLine("🥒 Pickle Jar Diagnostics")
+            pklcSayLine("")
+            pklcSayLine("Compiler: healthy")
+            pklcSayLine("Parser: fermented")
+            pklcSayLine("Resolver: brined")
+            pklcSayLine("Emitter: still soaking")
+            pklcSayLine("")
+            pklcSayLine("Vinegar: ██████████ 100%")
+            pklcSayLine("Jar integrity: acceptable")
             return
         }
         if (argv[0] == "explain") {
