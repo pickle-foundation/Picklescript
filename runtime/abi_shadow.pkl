@@ -130,7 +130,14 @@ var shadowTlsSlot: int = -1
 ///   4 arenaUsed     5 arenaCap      6 arenaChunk    7 regBase
 ///   8 regCount      9 regCap       10 allocBytes   11 state
 ///  12 parkCv       13 gcEpoch     14 pinned       15 flags
-///  16 parkLock     17 reserved
+///  16 parkLock     17 critical     18 tempBase     19 tempCount
+///  20 tempCap
+///
+/// `tempBase`/`tempCount`/`tempCap` are this thread's temp-root lease array
+/// (the `gc.rs::temp_root` equivalent). Keeping them on the node makes the
+/// collector's existing registry walk visit them, and makes root/unroot
+/// thread-private: no shared lock on the allocation hot path. The array itself
+/// is a raw-heap block (`alloc`), never a managed object.
 ///
 /// `parkCv`/`parkLock` are a condition variable and the lock cell paired with
 /// it for this thread's safepoint. Both are zero-initialized words, which is
@@ -158,11 +165,14 @@ const SHADOW_W_PARK_LOCK: int = 16
 /// poll must not park while it is non-zero: the collector never takes these
 /// locks, but a *second* mutator blocked on one is counted and cannot reach a
 /// safepoint until the holder releases. Parking the holder inside the section
-/// would therefore deadlock the barrier (observed in `abiEngineTempRoot`'s
-/// dedupe loop under `teLock`).
+/// would therefore deadlock the barrier (observed in the old process-global
+/// temp-root dedupe loop under `teLock`).
 const SHADOW_W_CRITICAL: int = 17
-const SHADOW_NODE_WORDS: int = 18
-const SHADOW_NODE_BYTES: int = 144
+const SHADOW_W_TEMP_BASE: int = 18
+const SHADOW_W_TEMP_COUNT: int = 19
+const SHADOW_W_TEMP_CAP: int = 20
+const SHADOW_NODE_WORDS: int = 21
+const SHADOW_NODE_BYTES: int = 168
 
 /// Safepoint states.
 const SHADOW_STATE_RUNNING: int = 0
@@ -271,7 +281,7 @@ fn shadowInitNode(node: int) -> int {
         // emitter places a safepoint poll at every loop header in a
         // spawn-capable module. The poll would take `shadowLock` again
         // (`abiGcPoll` -> `abiShadowSelf`) on a non-reentrant SRW lock and
-        // deadlock the collector. Eighteen stores cost nothing next to the
+        // deadlock the collector. Twenty-one stores cost nothing next to the
         // raw-heap allocation above them.
         (node as *int)[0] = 0
         (node as *int)[1] = 0
@@ -291,6 +301,9 @@ fn shadowInitNode(node: int) -> int {
         (node as *int)[15] = 0
         (node as *int)[16] = 0
         (node as *int)[17] = 0
+        (node as *int)[18] = 0
+        (node as *int)[19] = 0
+        (node as *int)[20] = 0
         (node as *int)[SHADOW_W_ID] = shadowNextId
         shadowNextId = shadowNextId + 1
         (node as *int)[SHADOW_W_NEXT] = shadowRegHead
@@ -479,6 +492,10 @@ fn abiGcUnregisterThread() {
             }
         }
         let _ = win_tls_set(shadowTlsSlot, 0)
+        let tempBase = (node as *int)[SHADOW_W_TEMP_BASE]
+        if (tempBase != 0) {
+            free(tempBase as *int)
+        }
         var heap = win_get_process_heap()
         let _ = win_heap_free(heap, 0, node)
         shadowRegistryLockRelease()

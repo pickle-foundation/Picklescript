@@ -64,7 +64,7 @@ module runtime.abi_threads
 /// terminates the process, exactly as it does on the main thread - a per-task
 /// unwind is a divergence this port does not attempt to hide.
 
-import { abiEngineTempRoot, abiEngineTempUnroot, abiGcThreadStarting, abiGcThreadExited } from runtime.abi_gcengine
+import { abiEngineTempRootShared, abiEngineTempUnrootShared, abiGcThreadStarting, abiGcThreadExited } from runtime.abi_gcengine
 import { abiObjSlotGet } from runtime.abi_class
 import { abiUnboxI64 } from runtime.abi_box
 import { abiGcRegisterThread } from runtime.abi_shadow
@@ -166,9 +166,12 @@ fn thrRecord(handle: int) -> *int {
 ///
 /// Serialized mode takes the world lock first; the wrapper's shadow frame is
 /// already registered by the prologue, so the entry closure's temp-root lease
-/// can be dropped now - `env` holds it from here. The body call is wrapped in
-/// `try`/`catch`/`finally` so a Pickle throw cannot leave the world lock held,
-/// and so a failed task is observable at `join`.
+/// can be dropped now - `env` holds it from here. The lease is on the
+/// process-wide list (`abiEngineTempRootShared`), not the parent's node: the
+/// parent takes it before `CreateThread`, the child releases it after the
+/// prologue, so it has to be visible across threads. The body call is wrapped
+/// in `try`/`catch`/`finally` so a Pickle throw cannot leave the world lock
+/// held, and so a failed task is observable at `join`.
 ///
 /// The thread was counted by `abiGcThreadStarting` before `CreateThread`, so
 /// the exit path must balance it exactly once: `worldRelease` drops the count
@@ -180,7 +183,7 @@ fn abiThreadRun(recAddr: int) {
     }
     unsafe {
         let rec = recAddr as *int
-        abiEngineTempUnroot(rec[TASK_ENTRY] as *int)
+        abiEngineTempUnrootShared(rec[TASK_ENTRY] as *int)
         let bodyObj = rec[TASK_BODY] as *int
         let body = rec[TASK_BODY] as fn () -> void
         try {
@@ -189,7 +192,7 @@ fn abiThreadRun(recAddr: int) {
         } catch (e) {
             rec[TASK_STATE] = TASK_FAILED
         } finally {
-            abiEngineTempUnroot(bodyObj)
+            abiEngineTempUnrootShared(bodyObj)
             if (abiGilMode() != 0) {
                 worldRelease()
             } else {
@@ -227,7 +230,7 @@ fn abiThreadSpawn(body: fn () -> void) -> int {
         rec[TASK_STATE] = TASK_RUNNING
         rec[TASK_BODY] = body as int
         let bodyObj = (body as int) as *int
-        abiEngineTempRoot(bodyObj)
+        abiEngineTempRootShared(bodyObj)
 
         let recAddr = rec as int
         let entry: fn () -> int = () => {
@@ -237,7 +240,7 @@ fn abiThreadSpawn(body: fn () -> void) -> int {
         let entryAddr = entry as int
         let entryObj = entryAddr as *int
         rec[TASK_ENTRY] = entryAddr
-        abiEngineTempRoot(entryObj)
+        abiEngineTempRootShared(entryObj)
 
         let code = abiUnboxI64(abiObjSlotGet(entryObj, 0))
         // Count the child before the OS can run it: the collector must never
@@ -247,8 +250,8 @@ fn abiThreadSpawn(body: fn () -> void) -> int {
         let h = win_create_thread(0, 0, code, entryAddr, 0, 0)
         if (h == 0) {
             abiGcThreadExited()
-            abiEngineTempUnroot(entryObj)
-            abiEngineTempUnroot(bodyObj)
+            abiEngineTempUnrootShared(entryObj)
+            abiEngineTempUnrootShared(bodyObj)
             rec[TASK_STATE] = TASK_FAILED
             return 0 - 1
         }

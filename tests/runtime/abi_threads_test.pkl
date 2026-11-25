@@ -1,6 +1,7 @@
 module runtime.abi_threads_test
 
 import { abiThreadSpawn, abiThreadJoin, abiThreadFinished, abiThreadPanicMessage, abiThreadCount, abiThreadCurrent, abiThreadSleepMs, abiThreadYield } from runtime.abi_threads
+import { abiEngineTempCount } from runtime.abi_gcengine
 
 /// The unit suite for the thread port bodies, written for the real-thread
 /// (non-inline) contract.
@@ -144,6 +145,23 @@ test fn a_throwing_body_is_reported_by_join() {
     expect(abiThreadJoin(h)).toBe(false)
     expect(abiThreadFinished(h)).toBe(true)
     expect(abiThreadPanicMessage(h) == 0 as *int).toBe(true)
+}
+
+/// `spawn` roots the entry and body closures on the process-wide lease list
+/// because the parent takes the lease and the child releases it. Both sides of
+/// that handoff must balance, on the normal and the throwing path.
+test fn spawn_leaves_no_temp_root_leases() {
+    let before = abiEngineTempCount()
+    let h = abiThreadSpawn(fn () {})
+    expect(abiThreadJoin(h)).toBe(true)
+    expect(abiEngineTempCount()).toBe(before)
+}
+
+test fn a_throwing_spawn_leaves_no_temp_root_leases() {
+    let before = abiEngineTempCount()
+    let h = abiThreadSpawn(fn () { throw "lease boom" })
+    expect(abiThreadJoin(h)).toBe(false)
+    expect(abiEngineTempCount()).toBe(before)
 }
 
 test fn a_joined_task_stays_joinable() {

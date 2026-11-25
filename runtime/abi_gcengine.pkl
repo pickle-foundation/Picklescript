@@ -51,7 +51,7 @@ module runtime.abi_gcengine
 /// `regCapGrown` vs `abi_gc`'s `blockCapGrown`), so a helper reused across
 /// modules would collide. Public entry points are `abiEngine*`.
 
-import { shadowRegistryLockAcquire, shadowRegistryLockRelease, abiShadowRegistryHead, abiShadowSelf, abiShadowSelfIfRegistered, shadowCriticalEnter, shadowCriticalExit, SHADOW_W_NEXT, SHADOW_W_REG_BASE, SHADOW_W_REG_COUNT, SHADOW_W_REG_CAP, SHADOW_W_ALLOC_BYTES, SHADOW_W_STATE, SHADOW_W_PARK, SHADOW_W_PARK_LOCK, SHADOW_W_CRITICAL, SHADOW_STATE_RUNNING, SHADOW_STATE_PARKED, SHADOW_STATE_NATIVE, SHADOW_STATE_COLLECTING } from runtime.abi_shadow
+import { shadowRegistryLockAcquire, shadowRegistryLockRelease, abiShadowRegistryHead, abiShadowSelf, abiShadowSelfIfRegistered, shadowCriticalEnter, shadowCriticalExit, SHADOW_W_NEXT, SHADOW_W_REG_BASE, SHADOW_W_REG_COUNT, SHADOW_W_REG_CAP, SHADOW_W_ALLOC_BYTES, SHADOW_W_STATE, SHADOW_W_PARK, SHADOW_W_PARK_LOCK, SHADOW_W_CRITICAL, SHADOW_W_TEMP_BASE, SHADOW_W_TEMP_COUNT, SHADOW_W_TEMP_CAP, SHADOW_STATE_RUNNING, SHADOW_STATE_PARKED, SHADOW_STATE_NATIVE, SHADOW_STATE_COLLECTING } from runtime.abi_shadow
 import { abiClassOwnedMaskOf, abiClassFinalizerOf } from runtime.abi_classwords
 import { abiManagedRelease, abiRawParallelMode } from runtime.abi_raw
 import { winLockAcquire, winLockRelease, winParkOn, winWakeOn, winWakeAllOn } from runtime.abi_world_win
@@ -1069,7 +1069,16 @@ fn geMarkFromRoots() {
     while (threadNode != 0) {
         unsafe {
             geMarkFromShadow((threadNode as *int)[0])
-            threadNode = (threadNode as *int)[2]
+            // Per-thread temp-root leases. The node is parked (or is the
+            // collector) while this runs, so the array cannot be growing.
+            var tb = (threadNode as *int)[SHADOW_W_TEMP_BASE]
+            var tc = (threadNode as *int)[SHADOW_W_TEMP_COUNT]
+            var ti = 0
+            while (ti < tc) {
+                geEnqueue((tb as *int)[ti])
+                ti = ti + 1
+            }
+            threadNode = (threadNode as *int)[SHADOW_W_NEXT]
         }
     }
     shadowRegistryLockRelease()
@@ -1454,6 +1463,10 @@ fn abiGcThreadExited() {
     var self = abiShadowSelfIfRegistered()
     if (self != 0) {
         unsafe {
+            // The thread is gone; its leases are no longer roots. Zeroing here
+            // also keeps a throw that unwound past a helper from retaining
+            // objects forever.
+            (self as *int)[SHADOW_W_TEMP_COUNT] = 0
             if ((self as *int)[SHADOW_W_STATE] == SHADOW_STATE_NATIVE) {
                 return
             }
@@ -1777,6 +1790,60 @@ fn abiEngineTempRoot(obj: *int) {
         return
     }
     unsafe {
+        // Fast path: the lease lives on this thread's shadow node, so root and
+        // unroot need no lock. The collector reaches it through the same
+        // registry walk that already visits the frame chain.
+        let node = abiShadowSelfIfRegistered()
+        if (node != 0) {
+            // No lock, but the append still has to be atomic with respect to a
+            // collection: the object is not reachable from any frame yet, and
+            // the dedupe loop carries a loop-header poll. Parking (or becoming
+            // the collector) between the probe and the store would let sweep
+            // reclaim a live object. The critical section makes `abiGcPoll`
+            // return early until the lease is published.
+            shadowCriticalEnter()
+            var base = (node as *int)[SHADOW_W_TEMP_BASE]
+            var count = (node as *int)[SHADOW_W_TEMP_COUNT]
+            var cap = (node as *int)[SHADOW_W_TEMP_CAP]
+            var i = 0
+            var found = false
+            while (i < count) {
+                if ((base as *int)[i] == (obj as int)) {
+                    found = true
+                    break
+                }
+                i = i + 1
+            }
+            if (!found) {
+                let newCap = geCapGrown(cap, count, TE_INITIAL)
+                if (newCap != cap) {
+                    base = geGrow(base, cap, count, TE_INITIAL)
+                    cap = newCap
+                    (node as *int)[SHADOW_W_TEMP_BASE] = base
+                    (node as *int)[SHADOW_W_TEMP_CAP] = cap
+                }
+                (base as *int)[count] = obj as int
+                (node as *int)[SHADOW_W_TEMP_COUNT] = count + 1
+            }
+            shadowCriticalExit()
+            return
+        }
+        // A thread that has not registered yet (runtime init, the pre-prologue
+        // window of a spawn) falls back to the process list. This is cold.
+        abiEngineTempRootShared(obj)
+    }
+}
+
+/// Root `obj` on the process-wide lease list instead of this thread's node.
+/// The `spawn` handoff needs this shape: the parent roots the entry/body
+/// closures, but the *child* releases them once its prologue has run, so the
+/// lease must be visible across threads. Runtime helpers stay on the lock-free
+/// per-thread path above.
+fn abiEngineTempRootShared(obj: *int) {
+    if ((obj as int) == 0) {
+        return
+    }
+    unsafe {
         geLock((&teLock) as int)
         var found = false
         var i = 0
@@ -1799,10 +1866,9 @@ fn abiEngineTempRoot(obj: *int) {
     }
 }
 
-/// Release the liveness lease on `obj` taken by `abiEngineTempRoot`. An
-/// address that holds no lease is ignored - mirrors `gc.rs::temp_unroot`'s
-/// `retain` becoming a no-op for absent entries.
-fn abiEngineTempUnroot(obj: *int) {
+/// Release a lease taken by `abiEngineTempRootShared`. Cross-thread by design,
+/// so it takes the process list lock even when called from a registered child.
+fn abiEngineTempUnrootShared(obj: *int) {
     unsafe {
         geLock((&teLock) as int)
         var i = 0
@@ -1820,9 +1886,44 @@ fn abiEngineTempUnroot(obj: *int) {
     }
 }
 
+/// Release the liveness lease on `obj` taken by `abiEngineTempRoot`. An
+/// address that holds no lease is ignored - mirrors `gc.rs::temp_unroot`'s
+/// `retain` becoming a no-op for absent entries.
+fn abiEngineTempUnroot(obj: *int) {
+    unsafe {
+        let node = abiShadowSelfIfRegistered()
+        if (node != 0) {
+            let base = (node as *int)[SHADOW_W_TEMP_BASE]
+            let count = (node as *int)[SHADOW_W_TEMP_COUNT]
+            var i = 0
+            while (i < count) {
+                if ((base as *int)[i] == (obj as int)) {
+                    (base as *int)[i] = (base as *int)[count - 1]
+                    (base as *int)[count - 1] = 0
+                    (node as *int)[SHADOW_W_TEMP_COUNT] = count - 1
+                    return
+                }
+                i = i + 1
+            }
+            return
+        }
+        abiEngineTempUnrootShared(obj)
+    }
+}
+
 /// Number of registered temp-root leases - exported for tests.
 fn abiEngineTempCount() -> int {
-    return teCount
+    var total = teCount
+    shadowRegistryLockAcquire()
+    var node = abiShadowRegistryHead()
+    while (node != 0) {
+        unsafe {
+            total = total + (node as *int)[SHADOW_W_TEMP_COUNT]
+            node = (node as *int)[SHADOW_W_NEXT]
+        }
+    }
+    shadowRegistryLockRelease()
+    return total
 }
 
 /// Adopt `obj` as a programmer-owned allocation: register it unless already

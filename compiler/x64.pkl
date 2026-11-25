@@ -357,6 +357,19 @@ class CB {
         this.relocs.push(Reloc(off, sym, 4))
     }
 
+    /// Emit a four-byte REL32 field for a RIP-relative memory operand. The
+    /// linker resolves it as `symbol + addend - (field address + 4)`. When the
+    /// field ends the instruction the addend is 0, exactly what a
+    /// `[rip+disp32]` operand needs. A field followed by immediate bytes needs
+    /// `-trailing`: the linker measures from the field end, the CPU from the
+    /// instruction end. The inline safepoint's `cmp [rip+disp32], imm8` has one
+    /// such byte.
+    fn rel32Data(sym: string, addend: int) {
+        let off = this.size()
+        this.u32le(addend)
+        this.relocs.push(Reloc(off, sym, 4))
+    }
+
     fn rbpMem(reg: int, k: int) -> List<int> {
         let d: List<int> = []
         if (k <= 128) {
@@ -3019,15 +3032,28 @@ class X64Emitter {
     /// the shadow frame (the frame is the spill area), so nothing has to be
     /// flushed; the call only destroys the redundant register caches, which are
     /// dropped first.
+    ///
+    /// The pending flag is tested INLINE. A loop that allocates nothing spends
+    /// almost all its time here, and the out-of-line call (plus its 448-byte
+    /// frame) was 3-4 cycles per iteration - the dominant cost of a tight
+    /// numeric loop and the reason 8-16 such threads lost throughput to the
+    /// call-heavy front end. The inline form is one RIP-relative load and a
+    /// predicted `je`; the call happens only when a collection is pending.
+    /// `gcRequested` is the same `pkl_global_` cell the runtime's poll reads.
     fn emitGcPoll() {
         this.raxT = 0 - 1
         this.raxW = 0
         this.clobberRcx()
         this.dropFx()
-        this.cb.movabsReloc(10, "pickle_gc_poll")
-        this.cb.u8(0x41)
-        this.cb.u8(0xFF)
-        this.cb.u8(0xD2)
+        // cmp dword ptr [rip + pkl_global_gcRequested], 0
+        this.cb.u8(0x83)
+        this.cb.u8(0x3D)
+        this.cb.rel32Data("pkl_global_gcRequested", 0 - 1)
+        this.cb.u8(0x00)
+        // je +5: skip the call below, which is exactly five bytes.
+        this.cb.u8(0x74)
+        this.cb.u8(0x05)
+        this.cb.callRel32("pickle_gc_poll")
     }
 
     /// True when the body can emit a machine `call`. Four-or-fewer-argument

@@ -167,3 +167,33 @@ test fn e_many_collecting_threads_leave_the_barrier_balanced() {
     abiGcCollect(true)
     expect(abiGcRunningCount()).toBe(1)
 }
+
+test fn f_an_allocation_free_loop_parks_at_its_header() {
+    // Every other test allocates inside its loops, so an allocation-entry poll
+    // would notice a collection request even if the loop-header safepoint were
+    // dead. This worker's body only reads and bumps atomics: the header poll is
+    // the one and only place it can observe `gcRequested`. If that poll does
+    // not fire, `abiGcCollect` below waits forever for a peer that can never
+    // park, so a broken gate shows up as a hang here rather than as a silent
+    // missed collection.
+    abiGcSetThreshold(4096)
+    let phase = AtomicInt(0)
+    let ticks = AtomicInt(0)
+    let t = spawn(() => {
+        while (phase.load() == 0) {
+            let _ = ticks.add(1)
+        }
+    })
+    // Let the worker enter the loop; a positive tick count proves it is
+    // spinning rather than still starting up.
+    var spins = 0
+    while (ticks.load() == 0 && spins < 100000) {
+        yieldNow()
+        spins = spins + 1
+    }
+    expect(ticks.load() > 0).toBe(true)
+    abiGcCollect(true)
+    phase.store(1)
+    expect(t.join()).toBe(true)
+    expect(abiGcRunningCount()).toBe(1)
+}

@@ -85,6 +85,7 @@ module runtime.abi_exception
 import { byteAt } from runtime.abi_string
 import { writeStderr } from runtime.abi_stdio
 import { STR_BYTES_OFF } from runtime.layout
+import { winLockAcquire, winLockRelease } from runtime.abi_world_win
 
 /// Word holding a string object's byte length. The header is
 /// [class_id, size, len, bytes...], so the length sits at word 3 and the
@@ -133,13 +134,15 @@ fn writeErrObj(obj: *int) {
 /// nothing — so the reported GC counters (which count exactly
 /// `Gc::alloc`/`abiRegisterObject` calls) would differ from the native
 /// baseline by 2. Plain module-level `var` globals are image data with zero
-/// defaults: the channel keeps the same single-process-wide ownership, costs
-/// no allocations, and the counters match.
+/// defaults: the two slot *indices* are process-wide, but each thread's
+/// `TlsGetValue` cell is private, so the channel costs no allocations and the
+/// counters match.
 ///
 /// The shadow-stack ABI is the one that genuinely cannot make this trade,
 /// because it must read the *previous* top-of-stack, which is per-thread by
-/// definition; the exception channel has no such constraint (see the FILE
-/// header's WHY THIS REPLACES TLS notes).
+/// definition; the exception channel needs per-thread *values* too, which is
+/// what the TLS slots provide (see the FILE header's WHY THIS REPLACES TLS
+/// notes).
 ///
 /// `excPending` and `excPayload` are **per-thread** (native's `thread_local
 /// PENDING`/`PAYLOAD`). They used to be process globals, which is only
@@ -149,21 +152,27 @@ fn writeErrObj(obj: *int) {
 /// no heap block and no collector interaction. `-1` is `TLS_OUT_OF_INDEXES`,
 /// the same unset sentinel `abi_shadow` uses.
 ///
-/// The slots are allocated on first use. That first use cannot race while the
-/// world lock is the execution model: only one thread executes Pickle at a
-/// time. A later multithreaded build needs an atomic or a lock here; the
-/// allocation is once per process, so the cost of hardening it is nil.
+/// The slots are allocated on first use. That first use is now a parallel
+/// window (two tasks can throw before either has initialized the pair), so a
+/// short lock makes the pair publish atomically. The fast path is still two
+/// word compares; only the very first throw on a process pays the lock.
 var excPendingSlot: int = -1
 var excPayloadSlot: int = -1
+var excSlotLock: int = 0
 
 fn excEnsureSlots() {
+    if (excPendingSlot != -1 && excPayloadSlot != -1) {
+        return
+    }
     unsafe {
+        winLockAcquire((&excSlotLock) as int)
         if (excPendingSlot == -1) {
             excPendingSlot = win_tls_alloc()
         }
         if (excPayloadSlot == -1) {
             excPayloadSlot = win_tls_alloc()
         }
+        winLockRelease((&excSlotLock) as int)
     }
 }
 
