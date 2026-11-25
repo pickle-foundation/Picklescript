@@ -137,7 +137,7 @@ enum FnSource {
     // The synthesized static-field initializer: one assignment per static
     // field, evaluated once at program start. `None` means the field had no
     // initializer and is stored as its default (zero/null) value.
-StaticInit(inits: List<StaticInitEntry>)
+    StaticInit(inits: List<StaticInitEntry>)
     GlobalsInit(inits: List<ManagedGlobalInit>)
     // A dynamically-callable forwarder for a top-level function used as a
     // value. Slot 0 is the closure object (ignored; module functions capture
@@ -154,7 +154,7 @@ StaticInit(inits: List<StaticInitEntry>)
     // as a hoisted lambda body, so `fn_value_call` dispatches to it uniformly.
     // When the method is overridden (`branches` non-empty), the body dispatches
     // on the runtime class of the loaded receiver exactly like a virtual call.
-MethodTrampoline(span: Span, target: int, pty: List<Ty>, ret: Ty, branches: List<DispatchBranch>)
+    MethodTrampoline(span: Span, target: int, pty: List<Ty>, ret: Ty, branches: List<DispatchBranch>)
     // A dynamically-callable forwarder for spreading a boxed `List<...>` into a
     // target function's real arguments. Slot 0 is the receiver (instance methods
     // only), slot 1 is the boxed list; the body unboxes each element by its own
@@ -198,15 +198,15 @@ class StaticInitEntry {
 /// One managed top-level `var`: the global id whose slot must be rooted, and the
 /// initializer expression that builds its value at run time.
 class ManagedGlobalInit {
-var gid: int
-        var ty: IrTy
-        var value: Expr
+    var gid: int
+    var ty: IrTy
+    var value: Expr
 
-        constructor(gid: int, ty: IrTy, value: Expr) {
-            this.gid = gid
-            this.ty = ty
-            this.value = value
-        }
+    constructor(gid: int, ty: IrTy, value: Expr) {
+        this.gid = gid
+        this.ty = ty
+        this.value = value
+    }
 }
 
 /// One virtual-dispatch branch: `(descendant class id, its own
@@ -970,19 +970,19 @@ fn globalIrTy(ty: Ty) -> IrTy? {
 fn globalInitBytes(e: Expr, ty: IrTy, name: string) -> GlobalInitResult {
     // The article is part of the type phrase: "an integer" but "a bool".
     var want = match (ty) {
-    case IrTy.Bool -> "a bool"
-    case IrTy.Char -> "a char"
-    case IrTy.Float -> "a float"
-    case _ -> "an integer"
+        case IrTy.Bool -> "a bool"
+        case IrTy.Char -> "a char"
+        case IrTy.Float -> "a float"
+        case _ -> "an integer"
     }
     var mismatch = "the initializer of top-level `var " + name + "` must be " + want + " literal; a scalar global's value is written into the image before `main` runs, so its initializer cannot call, load, or allocate"
     // Negation is the one unary that still yields a static scalar.
     var inner = match (e.kind) {
-    case ExprKind.Unary(op, operand) -> match (op) {
-    case UnOp.Neg -> operand
-    case _ -> none
-    }
-    case _ -> none
+        case ExprKind.Unary(op, operand) -> match (op) {
+            case UnOp.Neg -> operand
+            case _ -> none
+        }
+        case _ -> none
     }
     if (ty == IrTy.Bool) {
         if (let some(b) = matchLitBool(e)) {
@@ -1422,427 +1422,427 @@ class ExpectPeel {
     }
 }
 
-    /// Collect the `#[tag("???????")]` values from an item's attributes. Arguments
-    /// that are not plain string literals are ignored. Mirrors `item_tags`.
+/// Collect the `#[tag("???????")]` values from an item's attributes. Arguments
+/// that are not plain string literals are ignored. Mirrors `item_tags`.
 fn itemTags(attrs: List<Attribute>) -> List<string> {
-        var out = List<string>()
-        for (a in attrs) {
-            if (a.name != "tag") {
-                continue
-            }
-            for (arg in a.args) {
-                match (arg.kind) {
-                    case ExprKind.Lit(Lit.String(parts)) -> {
-                        if (allTextParts(parts)) {
-                            var text = joinText(parts)
-                            if (!(text == "")) {
-                                out.push(text)
-                            }
+    var out = List<string>()
+    for (a in attrs) {
+        if (a.name != "tag") {
+            continue
+        }
+        for (arg in a.args) {
+            match (arg.kind) {
+                case ExprKind.Lit(Lit.String(parts)) -> {
+                    if (allTextParts(parts)) {
+                        var text = joinText(parts)
+                        if (!(text == "")) {
+                            out.push(text)
                         }
                     }
-                    case _ -> {}
                 }
+                case _ -> {}
             }
         }
-        out
     }
+    out
+}
 
-    /// True when `name`'s table declares a method `mname`.
+/// True when `name`'s table declares a method `mname`.
 fn hasMethodName(t: ClassTable, mname: string) -> bool {
-        var i = 0
-        while (i < len(t.methods)) {
-            if (t.methods[i].name == mname) {
-                return true
-            }
-            i = i + 1
-        }
-        false
-    }
-
-    /// The depth of `cname` inside an ancestry chain: rootmost is deepest
-    /// distance, the element itself is 0. Mirrors the Rust position math.
-fn chainDepth(chain: List<string>, cname: string) -> int {
-        var i = 0
-        while (i < len(chain)) {
-            if (chain[i] == cname) {
-                return len(chain) - 1 - i
-            }
-            i = i + 1
-        }
-        0
-    }
-
-    /// Sort dispatch candidates deepest-derived first (stable insertion sort).
-fn sortBranches(branches: List<DispatchBranchDepth>) {
-        var i = 1
-        while (i < len(branches)) {
-            var j = i
-            while (j > 0 && branches[j - 1].depth < branches[j].depth) {
-                var tmp = branches[j - 1]
-                branches[j - 1] = branches[j]
-                branches[j] = tmp
-                j = j - 1
-            }
-            i = i + 1
-        }
-    }
-
-    /// The generic-plan name behind `name`: for a materialized instantiation
-    /// like `Counter<int>` the plan name `Counter` (declarations and
-    /// initializers live under the plan key); otherwise `name` unchanged.
-fn planName(name: string) -> string {
-        var out = ""
-        for (c in name) {
-            if (c == 60) {
-                break
-            }
-            out = out + "{c as char}"
-        }
-        out
-    }
-
-    /// Collect an `#[symbol("...")]` override from an item's attributes, giving a
-    /// top-level function an exact C ABI symbol name instead of the `pkl_<name>`
-    /// default. This is what lets the ported runtime define `pickle_*` ABI
-    /// functions directly in Pickle. Returns none when absent.
-    ///
-    /// Mirrors `emit.rs::item_symbol`: only a single string literal made purely
-    /// of text parts counts. Interpolation parts yield the empty string and are
-    /// rejected, matching Rust's `StrPart::Expr(_) => String::new()`.
-    ///
-    /// This attribute was previously *validated* by `check.pkl` and then silently
-    /// ignored at emit time, so the port emitted `pkl_abiExcUncaught` where Rust
-    /// emits `pickle_exc_uncaught`. That made every ported `#[symbol]` fn unable to
-    /// override the Rust runtime archive at all - see the duplicate-resolution note
-    /// in `linklib.pkl::mergeAll`.
-fn itemSymbol(attrs: List<Attribute>) -> string? {
-        for (a in attrs) {
-            if (a.name != "symbol") {
-                continue
-            }
-            for (arg in a.args) {
-                match (arg.kind) {
-                    case ExprKind.Lit(lit) -> {
-                        match (lit) {
-                            case Lit.String(parts) -> {
-                                var plain = true
-                                var text = ""
-                                for (p in parts) {
-                                    if (let StrPart.Text(t) = p) {
-                                        text += t
-                                        true
-                                    } else {
-                                        plain = false
-                                        false
-                                    }
-                                }
-                                if (plain && text != "") {
-                                    return text
-                                }
-                            }
-                            case _ -> { false }
-                        }
-                    }
-                    case _ -> { false }
-                }
-            }
-        }
-        none
-    }
-
-    /// The runtime symbol for a top-level callable.
-fn symbolFor(name: string, isTest: bool) -> string {
-        if (isTest) {
-            return "pickle_test_" + name
-        }
-        if (name == "main") {
-            return "pickle_main"
-        }
-        "pkl_" + name
-    }
-
-    /// The IR scalar type behind a language scalar type, if any.
-fn scalarIr(t: Ty) -> IrTy? {
-        match (t) {
-            case Ty.Int -> IrTy.Int
-            case Ty.Float -> IrTy.Float
-            case Ty.Bool -> IrTy.Bool
-            case Ty.Char -> IrTy.Char
-            case Ty.Byte -> IrTy.Int
-            case _ -> none
-        }
-    }
-
-    /// The IR shape of a `T&`/`&T` referent type.
-    ///
-    /// A scalar referent (`*int`, `*float`, ...) is lowered to a MANAGED `Ptr`,
-    /// not a raw `Int`. The value is still a bare address and the ABI is
-    /// unchanged, but the home that carries it is now a shadow cell the
-    /// collector scans. That is what keeps a scalar pointer alive across a call
-    /// that may collect: `abi_list_push(list, v)` spills `list` and calls
-    /// `require_capacity`, and with a raw `Int` home the collector could not see
-    /// `list` and freed it out from under the callee (the heap write that
-    /// faulted). Lowering it as unmanaged was the port's divergence; the raw
-    /// buffer contract is unaffected because a `raw_alloc` block is outside the
-    /// registry, so scanning its address is a no-op.
-fn refIrTy(inner: Ty) -> IrTy {
-        IrTy.Ptr
-    }
-
-    /// The zero span the port uses where Rust reports `FileId(0)`.
-fn fnameSpanFallback() -> Span {
-        Span(0, 0)
-    }
-
-    /// Managed (pointer-carrying) IR types need no scalar boxing.
-fn managedIr(it: IrTy) -> bool {
-        match (it) {
-            case IrTy.Str -> true
-            case IrTy.Ptr -> true
-            case IrTy.Unit -> true
-            case _ -> false
-        }
-    }
-
-    /// Whether a match/if/if-let result needs a slot at all: only non-unit,
-    /// present result types do. Mirrors `!matches!(res_ty, Some(IrTy::Unit) |
-    /// None)` in emit.rs.
-fn matchResultNeedsSlot(resTy: IrTy?) -> bool {
-        if (let some(rt) = resTy) {
-            if (irTyTag(rt) == irTyTag(IrTy.Unit)) {
-                return false
-            }
+    var i = 0
+    while (i < len(t.methods)) {
+        if (t.methods[i].name == mname) {
             return true
         }
-        false
+        i = i + 1
     }
+    false
+}
 
-    /// The raw IR domain a non-enum, non-string matched type lives in.
-    /// Mirrors `scalar_ir_of` in emit.rs.
-fn scalarIrOf(st: Ty) -> IrTy? {
-        match (st) {
-            case Ty.Int -> IrTy.Int
-            case Ty.Byte -> IrTy.Int
-            case Ty.Float -> IrTy.Float
-            case Ty.Bool -> IrTy.Bool
-            case Ty.Char -> IrTy.Char
-            case _ -> none
+/// The depth of `cname` inside an ancestry chain: rootmost is deepest
+/// distance, the element itself is 0. Mirrors the Rust position math.
+fn chainDepth(chain: List<string>, cname: string) -> int {
+    var i = 0
+    while (i < len(chain)) {
+        if (chain[i] == cname) {
+            return len(chain) - 1 - i
+        }
+        i = i + 1
+    }
+    0
+}
+
+/// Sort dispatch candidates deepest-derived first (stable insertion sort).
+fn sortBranches(branches: List<DispatchBranchDepth>) {
+    var i = 1
+    while (i < len(branches)) {
+        var j = i
+        while (j > 0 && branches[j - 1].depth < branches[j].depth) {
+            var tmp = branches[j - 1]
+            branches[j - 1] = branches[j]
+            branches[j] = tmp
+            j = j - 1
+        }
+        i = i + 1
+    }
+}
+
+/// The generic-plan name behind `name`: for a materialized instantiation
+/// like `Counter<int>` the plan name `Counter` (declarations and
+/// initializers live under the plan key); otherwise `name` unchanged.
+fn planName(name: string) -> string {
+    var out = ""
+    for (c in name) {
+        if (c == 60) {
+            break
+        }
+        out = out + "{c as char}"
+    }
+    out
+}
+
+/// Collect an `#[symbol("...")]` override from an item's attributes, giving a
+/// top-level function an exact C ABI symbol name instead of the `pkl_<name>`
+/// default. This is what lets the ported runtime define `pickle_*` ABI
+/// functions directly in Pickle. Returns none when absent.
+///
+/// Mirrors `emit.rs::item_symbol`: only a single string literal made purely
+/// of text parts counts. Interpolation parts yield the empty string and are
+/// rejected, matching Rust's `StrPart::Expr(_) => String::new()`.
+///
+/// This attribute was previously *validated* by `check.pkl` and then silently
+/// ignored at emit time, so the port emitted `pkl_abiExcUncaught` where Rust
+/// emits `pickle_exc_uncaught`. That made every ported `#[symbol]` fn unable to
+/// override the Rust runtime archive at all - see the duplicate-resolution note
+/// in `linklib.pkl::mergeAll`.
+fn itemSymbol(attrs: List<Attribute>) -> string? {
+    for (a in attrs) {
+        if (a.name != "symbol") {
+            continue
+        }
+        for (arg in a.args) {
+            match (arg.kind) {
+                case ExprKind.Lit(lit) -> {
+                    match (lit) {
+                        case Lit.String(parts) -> {
+                            var plain = true
+                            var text = ""
+                            for (p in parts) {
+                                if (let StrPart.Text(t) = p) {
+                                    text += t
+                                    true
+                                } else {
+                                    plain = false
+                                    false
+                                }
+                            }
+                            if (plain && text != "") {
+                                return text
+                            }
+                        }
+                        case _ -> { false }
+                    }
+                }
+                case _ -> { false }
+            }
         }
     }
+    none
+}
 
-    /// The tasks and synchronisation builtins, as
-    /// `(runtime symbol, argument IR types, returns, result IR type, argument
-    /// names)`. The result IR type is meaningful only when `returns` is true.
-    /// Mirrors `flat_builtin` in emit.rs.
+/// The runtime symbol for a top-level callable.
+fn symbolFor(name: string, isTest: bool) -> string {
+    if (isTest) {
+        return "pickle_test_" + name
+    }
+    if (name == "main") {
+        return "pickle_main"
+    }
+    "pkl_" + name
+}
+
+/// The IR scalar type behind a language scalar type, if any.
+fn scalarIr(t: Ty) -> IrTy? {
+    match (t) {
+        case Ty.Int -> IrTy.Int
+        case Ty.Float -> IrTy.Float
+        case Ty.Bool -> IrTy.Bool
+        case Ty.Char -> IrTy.Char
+        case Ty.Byte -> IrTy.Int
+        case _ -> none
+    }
+}
+
+/// The IR shape of a `T&`/`&T` referent type.
+///
+/// A scalar referent (`*int`, `*float`, ...) is lowered to a MANAGED `Ptr`,
+/// not a raw `Int`. The value is still a bare address and the ABI is
+/// unchanged, but the home that carries it is now a shadow cell the
+/// collector scans. That is what keeps a scalar pointer alive across a call
+/// that may collect: `abi_list_push(list, v)` spills `list` and calls
+/// `require_capacity`, and with a raw `Int` home the collector could not see
+/// `list` and freed it out from under the callee (the heap write that
+/// faulted). Lowering it as unmanaged was the port's divergence; the raw
+/// buffer contract is unaffected because a `raw_alloc` block is outside the
+/// registry, so scanning its address is a no-op.
+fn refIrTy(inner: Ty) -> IrTy {
+    IrTy.Ptr
+}
+
+/// The zero span the port uses where Rust reports `FileId(0)`.
+fn fnameSpanFallback() -> Span {
+    Span(0, 0)
+}
+
+/// Managed (pointer-carrying) IR types need no scalar boxing.
+fn managedIr(it: IrTy) -> bool {
+    match (it) {
+        case IrTy.Str -> true
+        case IrTy.Ptr -> true
+        case IrTy.Unit -> true
+        case _ -> false
+    }
+}
+
+/// Whether a match/if/if-let result needs a slot at all: only non-unit,
+/// present result types do. Mirrors `!matches!(res_ty, Some(IrTy::Unit) |
+/// None)` in emit.rs.
+fn matchResultNeedsSlot(resTy: IrTy?) -> bool {
+    if (let some(rt) = resTy) {
+        if (irTyTag(rt) == irTyTag(IrTy.Unit)) {
+            return false
+        }
+        return true
+    }
+    false
+}
+
+/// The raw IR domain a non-enum, non-string matched type lives in.
+/// Mirrors `scalar_ir_of` in emit.rs.
+fn scalarIrOf(st: Ty) -> IrTy? {
+    match (st) {
+        case Ty.Int -> IrTy.Int
+        case Ty.Byte -> IrTy.Int
+        case Ty.Float -> IrTy.Float
+        case Ty.Bool -> IrTy.Bool
+        case Ty.Char -> IrTy.Char
+        case _ -> none
+    }
+}
+
+/// The tasks and synchronisation builtins, as
+/// `(runtime symbol, argument IR types, returns, result IR type, argument
+/// names)`. The result IR type is meaningful only when `returns` is true.
+/// Mirrors `flat_builtin` in emit.rs.
 fn flatBuiltin(name: string) -> (string, List<IrTy>, bool, IrTy, List<string>)? {
-        match (name) {
-            case "thread_spawn" -> ("pickle_thread_spawn", [IrTy.Ptr], true, IrTy.Int, ["body"])
-            case "thread_join" -> ("pickle_thread_join", [IrTy.Int], true, IrTy.Bool, ["task"])
-            case "thread_finished" -> ("pickle_thread_finished", [IrTy.Int], true, IrTy.Bool, ["task"])
-            case "thread_message" -> ("pickle_thread_panic_message", [IrTy.Int], true, IrTy.Ptr, ["task"])
-            case "thread_count" -> ("pickle_thread_count", List<IrTy>(), true, IrTy.Int, List<string>())
-            case "thread_current" -> ("pickle_thread_current", List<IrTy>(), true, IrTy.Int, List<string>())
-            case "sleep_ms" -> ("pickle_thread_sleep_ms", [IrTy.Int], false, IrTy.Int, ["ms"])
-            case "thread_yield" -> ("pickle_thread_yield", List<IrTy>(), false, IrTy.Int, List<string>())
-            // Win32 import: `Sleep` (`VOID Sleep(DWORD)`), so a `#[symbol]`
-            // body can occupy `pickle_thread_sleep_ms` with wall-clock sleep
-            // and no Rust shim.
-            case "win_sleep" -> ("__imp_Sleep", [IrTy.Int], false, IrTy.Int, ["ms"])
-            // Real OS threads, so a `#[symbol]` body can own the whole
-            // `pickle_thread_*` family. `CreateThread` takes six machine words
-            // (security attributes, stack size, start routine, parameter,
-            // creation flags, out thread id) and returns the HANDLE; the
-            // start routine follows the single Win64 calling convention, so a
-            // compiled Pickle closure body - which already takes its closure
-            // object in RCX - can be entered directly, with the closure object
-            // as the parameter. `GetExitCodeThread` reads the value the
-            // routine returned (STILL_ACTIVE = 259 while running).
-            case "win_create_thread" -> ("__imp_CreateThread", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["attr", "stack", "start", "param", "flags", "id"])
-            case "win_get_exit_code_thread" -> ("__imp_GetExitCodeThread", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["handle", "code"])
-            case "win_switch_to_thread" -> ("__imp_SwitchToThread", List<IrTy>(), true, IrTy.Int, List<string>())
-            // The world/registry lock primitives. `InterlockedCompareExchange64`
-            // is a compiler intrinsic, not a KERNEL32 export, so the spinlock
-            // spelling of this is not linkable. SRW locks are real exports, a
-            // zero-initialized `SRWLOCK` is a valid unlocked lock (one owner
-            // word, and the runtime's globals are zero image data), and the
-            // acquire/release pair is the OS's own blocking implementation -
-            // no spinning and no lost wakeups. They are not recursive, which
-            // matches the runtime's discipline: a thread only takes the world
-            // lock on entry and after it released it around a blocking call.
-            case "win_acquire_srw_exclusive" -> ("__imp_AcquireSRWLockExclusive", [IrTy.Int], false, IrTy.Int, ["lock"])
-            case "win_release_srw_exclusive" -> ("__imp_ReleaseSRWLockExclusive", [IrTy.Int], false, IrTy.Int, ["lock"])
-            case "win_try_acquire_srw_exclusive" -> ("__imp_TryAcquireSRWLockExclusive", [IrTy.Int], true, IrTy.Int, ["lock"])
-            // The parking half of the world seam. `CONDITION_VARIABLE` is one
-            // zero-initialized pointer word (so a zeroed lock word in a raw
-            // state block is already a valid condition), and
-            // `SleepConditionVariableSRW(cv, &worldLock, INFINITE, 0)` releases
-            // the world SRWLOCK and reacquires it atomically - the classic
-            // condvar lost-wakeup fix. All three names are KERNEL32 exports;
-            // `WaitOnAddress`/`WakeByAddressSingle` are KERNELBASE-only, which
-            // the current single-DLL import path cannot reach.
-            case "win_sleep_condition_variable_srw" -> ("__imp_SleepConditionVariableSRW", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["cv", "lock", "ms", "flags"])
-            case "win_wake_condition_variable" -> ("__imp_WakeConditionVariable", [IrTy.Int], false, IrTy.Int, ["cv"])
-            case "win_wake_all_condition_variable" -> ("__imp_WakeAllConditionVariable", [IrTy.Int], false, IrTy.Int, ["cv"])
-            // Win32 import. `__imp_` is the MSVC import-symbol prefix, and
-            // the backend treats that prefix as "resolve me from a system
-            // DLL" rather than "find me in the runtime archive".
-            case "win_thread_id" -> ("__imp_GetCurrentThreadId", List<IrTy>(), true, IrTy.Int, List<string>())
-            case "win_tls_alloc" -> ("__imp_TlsAlloc", List<IrTy>(), true, IrTy.Int, List<string>())
-            case "win_tls_get" -> ("__imp_TlsGetValue", [IrTy.Int], true, IrTy.Int, ["slot"])
-            case "win_tls_set" -> ("__imp_TlsSetValue", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["slot", "value"])
-            // Process termination, reachable as an import so a `#[symbol]`
-            // body can own the `pickle_exit` slot. No return: the Win32
-            // prototype is `VOID ExitProcess(UINT)`.
-                case "win_exit" -> ("__imp_ExitProcess", [IrTy.Int], false, IrTy.Int, ["code"])
-                // The process heap, reachable as an import triple so a `#[symbol]`
-                // body can own the `pickle_raw_alloc` / `pickle_raw_free` slots.
-                // All three are KERNEL32 exports, and `HeapAlloc` on
-                // `GetProcessHeap()` with zero flags is what Rust's `System`
-                // allocator lowers to on Windows - so a block handed out by one
-                // side and released by the other stays valid even if only one
-                // half of the pair ends up ported.
-                case "win_get_process_heap" -> ("__imp_GetProcessHeap", List<IrTy>(), true, IrTy.Int, List<string>())
-                case "win_heap_alloc" -> ("__imp_HeapAlloc", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["heap", "flags", "size"])
-                // Void rather than the Win32 `BOOL`: the caller has no use for
-                // the answer, and reading a 32-bit `BOOL` back as a 64-bit `Int`
-                // would depend on the upper half happening to be zero.
-                case "win_heap_free" -> ("__imp_HeapFree", [IrTy.Int, IrTy.Int, IrTy.Int], false, IrTy.Int, ["heap", "flags", "ptr"])
-                // The filesystem entry points, so a `#[symbol]` body can own
-                // the whole `fs.rs` surface. All are KERNEL32, which is what
-                // `win_import_addr` and `pelink::isShellImp` already assume for
-                // any `__imp_` other than `CommandLineToArgvW`.
-                case "win_get_file_attributes_w" -> ("__imp_GetFileAttributesW", [IrTy.Int], true, IrTy.Int, ["path"])
-                case "win_delete_file_w" -> ("__imp_DeleteFileW", [IrTy.Int], true, IrTy.Int, ["path"])
-                case "win_remove_directory_w" -> ("__imp_RemoveDirectoryW", [IrTy.Int], true, IrTy.Int, ["path"])
-                case "win_create_directory_w" -> ("__imp_CreateDirectoryW", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["path", "sec"])
-                // `(0, NULL)` is the sizing call: it returns the UTF-16 units a
-                // real call would need, counting the terminator.
-                case "win_get_current_directory_w" -> ("__imp_GetCurrentDirectoryW", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["cap", "buf"])
-                case "win_create_file_w" -> ("__imp_CreateFileW", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["name", "access", "share", "sec", "disp", "flags", "tmpl"])
-                case "win_read_file" -> ("__imp_ReadFile", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["handle", "buf", "n", "pRead", "ov"])
-                case "win_write_file" -> ("__imp_WriteFile", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["handle", "buf", "n", "pWritten", "ov"])
-                case "win_close_handle" -> ("__imp_CloseHandle", [IrTy.Int], true, IrTy.Int, ["handle"])
-                case "win_find_first_file_w" -> ("__imp_FindFirstFileW", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["pattern", "data"])
-                case "win_find_next_file_w" -> ("__imp_FindNextFileW", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["handle", "data"])
-                case "win_find_close" -> ("__imp_FindClose", [IrTy.Int], true, IrTy.Int, ["handle"])
-                case "win_get_std_handle" -> ("__imp_GetStdHandle", [IrTy.Int], true, IrTy.Int, ["which"])
-                // The command line, so a `#[symbol]` body can own the
-                // `pickle_args` slot: `GetCommandLineW` (KERNEL32) hands back
-                // the process's UTF-16 line, `CommandLineToArgvW` (SHELL32 -
-                // the one name `pelink::isShellImp` routes apart from
-                // KERNEL32) splits it into a null-terminated `LPWSTR*`, and
-                // `LocalFree` (KERNEL32) releases that block. The split takes
-                // a second, out argument - a count slot - which it requires
-                // to be a writable address; a program that never reads the
-                // count still has to supply the slot, or the call returns
-                // null as if the parse had failed. Void result so
-                // the answer, which nobody reads, never has to agree with the
-                // upper half of a 64-bit `Int`.
-                case "win_get_command_line_w" -> ("__imp_GetCommandLineW", List<IrTy>(), true, IrTy.Int, List<string>())
-                case "win_command_line_to_argv_w" -> ("__imp_CommandLineToArgvW", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["cmdline", "pargs"])
-                case "win_local_free" -> ("__imp_LocalFree", [IrTy.Int], false, IrTy.Int, ["mem"])
-                // Process spawning for `run_cmd`. Every parameter is a raw
-                // `Int`: pointers, counts, and Win32 `BOOL`s all arrive as
-                // machine words at the `CreateProcessW` boundary, and the
-                // body is the only caller, so it passes 0/1 integers for the
-                // inherit flag. See the comment in `resolve.pkl`.
-                case "win_create_process_w" -> ("__imp_CreateProcessW", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["app", "cmdline", "procAttr", "threadAttr", "inherit", "flags", "env", "cwd", "si", "pi"])
-                case "win_create_pipe" -> ("__imp_CreatePipe", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["pRead", "pWrite", "sec", "size"])
-                case "win_set_handle_information" -> ("__imp_SetHandleInformation", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["handle", "mask", "flags"])
-                case "win_wait_single" -> ("__imp_WaitForSingleObject", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["handle", "ms"])
-                case "win_get_exit_code_process" -> ("__imp_GetExitCodeProcess", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["handle", "pCode"])
-                case "win_terminate_process" -> ("__imp_TerminateProcess", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["handle", "code"])
-                case "win_peek_pipe" -> ("__imp_PeekNamedPipe", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["handle", "buf", "n", "pRead", "pAvail"])
-                case "win_get_environment_strings_w" -> ("__imp_GetEnvironmentStringsW", List<IrTy>(), true, IrTy.Int, List<string>())
-                case "win_free_environment_strings_w" -> ("__imp_FreeEnvironmentStringsW", [IrTy.Int], true, IrTy.Int, ["block"])
-                case "win_get_module_file_name_w" -> ("__imp_GetModuleFileNameW", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["module", "buf", "size"])
-                case "win_get_system_directory_w" -> ("__imp_GetSystemDirectoryW", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["buf", "size"])
-                case "win_get_windows_directory_w" -> ("__imp_GetWindowsDirectoryW", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["buf", "size"])
-                case "win_tick_ms64" -> ("__imp_GetTickCount64", List<IrTy>(), true, IrTy.Int, List<string>())
-            // The clock primitives behind `runtime/abi_time.pkl`. Both
-            // `GetSystemTimeAsFileTime` and the performance-counter pair write
-            // an 8-byte value through a pointer and answer `VOID`/`BOOL`; the
-            // bodies read the buffer back, so the return is not declared.
-            case "time_unix_ms" -> ("pickle_time_unix_ms", List<IrTy>(), true, IrTy.Int, List<string>())
-            case "time_monotonic_ns" -> ("pickle_time_monotonic_ns", List<IrTy>(), true, IrTy.Int, List<string>())
-            case "win_get_system_time_as_file_time" -> ("__imp_GetSystemTimeAsFileTime", [IrTy.Int], false, IrTy.Int, ["ft"])
-            case "win_query_performance_counter" -> ("__imp_QueryPerformanceCounter", [IrTy.Int], false, IrTy.Int, ["out"])
-            case "win_query_performance_frequency" -> ("__imp_QueryPerformanceFrequency", [IrTy.Int], false, IrTy.Int, ["out"])
-            // --- Winsock / TCP networking (WS2_32) ---
-            //
-            // Raw Winsock imports for `runtime/abi_net.pkl`. All pointers,
-            // handles (SOCKET is UINT_PTR on x64), sizes, and counts are passed
-            // as `Int`; the ABI bodies own struct layout and error mapping.
-            // `freeaddrinfo` is void. Grouped into WS2_32.dll by pelink.
-            case "win_wsa_startup" -> ("__imp_WSAStartup", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["ver", "data"])
-            case "win_wsa_cleanup" -> ("__imp_WSACleanup", List<IrTy>(), true, IrTy.Int, List<string>())
-            case "win_wsa_get_last_error" -> ("__imp_WSAGetLastError", List<IrTy>(), true, IrTy.Int, List<string>())
-            case "win_socket" -> ("__imp_socket", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["af", "typ", "proto"])
-            case "win_closesocket" -> ("__imp_closesocket", [IrTy.Int], true, IrTy.Int, ["s"])
-            case "win_bind" -> ("__imp_bind", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["s", "name", "namelen"])
-            case "win_listen" -> ("__imp_listen", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["s", "backlog"])
-            case "win_accept" -> ("__imp_accept", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["s", "addr", "addrlen"])
-            case "win_connect" -> ("__imp_connect", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["s", "name", "namelen"])
-            case "win_send" -> ("__imp_send", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["s", "buf", "len", "flags"])
-            case "win_recv" -> ("__imp_recv", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["s", "buf", "len", "flags"])
-            case "win_sendto" -> ("__imp_sendto", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["s", "buf", "len", "flags", "to", "tolen"])
-            case "win_recvfrom" -> ("__imp_recvfrom", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["s", "buf", "len", "flags", "from", "fromlen"])
-            case "win_shutdown" -> ("__imp_shutdown", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["s", "how"])
-            case "win_setsockopt" -> ("__imp_setsockopt", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["s", "level", "optname", "optval", "optlen"])
-            case "win_getsockopt" -> ("__imp_getsockopt", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["s", "level", "optname", "optval", "optlen"])
-            case "win_getsockname" -> ("__imp_getsockname", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["s", "name", "namelen"])
-            case "win_getpeername" -> ("__imp_getpeername", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["s", "name", "namelen"])
-            case "win_getaddrinfo" -> ("__imp_getaddrinfo", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["nodename", "servname", "hints", "res"])
-            case "win_freeaddrinfo" -> ("__imp_freeaddrinfo", [IrTy.Int], false, IrTy.Int, ["res"])
-            case "win_getnameinfo" -> ("__imp_getnameinfo", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["sa", "salen", "host", "hostlen", "serv", "servlen", "flags"])
-            case "win_htons" -> ("__imp_htons", [IrTy.Int], true, IrTy.Int, ["hostshort"])
-            case "win_htonl" -> ("__imp_htonl", [IrTy.Int], true, IrTy.Int, ["hostlong"])
-            // --- TLS (SECUR32 Schannel/SSPI, CRYPT32 certificates), RNG (BCRYPT), socket readiness ---
-            //
-            // All arguments are machine words. 32-bit SECURITY_STATUS/BOOL/int results are masked
-            // by the runtime bodies; pelink groups these by DLL (see `dllForImp`).
-            case "win_ioctlsocket" -> ("__imp_ioctlsocket", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2"])
-            case "win_wsa_poll" -> ("__imp_WSAPoll", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2"])
-            case "win_acquire_credentials_handle_w" -> ("__imp_AcquireCredentialsHandleW", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8"])
-            case "win_initialize_security_context_w" -> ("__imp_InitializeSecurityContextW", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "a9", "a10", "a11"])
-            case "win_accept_security_context" -> ("__imp_AcceptSecurityContext", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8"])
-            case "win_delete_security_context" -> ("__imp_DeleteSecurityContext", [IrTy.Int], true, IrTy.Int, ["a0"])
-            case "win_free_credentials_handle" -> ("__imp_FreeCredentialsHandle", [IrTy.Int], true, IrTy.Int, ["a0"])
-            case "win_free_context_buffer" -> ("__imp_FreeContextBuffer", [IrTy.Int], true, IrTy.Int, ["a0"])
-            case "win_query_context_attributes_w" -> ("__imp_QueryContextAttributesW", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2"])
-            case "win_encrypt_message" -> ("__imp_EncryptMessage", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2", "a3"])
-            case "win_decrypt_message" -> ("__imp_DecryptMessage", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2", "a3"])
-            case "win_apply_control_token" -> ("__imp_ApplyControlToken", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1"])
-            case "win_pfx_import_cert_store" -> ("__imp_PFXImportCertStore", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2"])
-            case "win_cert_find_certificate_in_store" -> ("__imp_CertFindCertificateInStore", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2", "a3", "a4", "a5"])
-            case "win_cert_free_certificate_context" -> ("__imp_CertFreeCertificateContext", [IrTy.Int], true, IrTy.Int, ["a0"])
-            case "win_cert_close_store" -> ("__imp_CertCloseStore", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1"])
-            case "win_cert_open_store" -> ("__imp_CertOpenStore", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2", "a3", "a4"])
-            case "win_cert_create_certificate_context" -> ("__imp_CertCreateCertificateContext", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2"])
-            case "win_cert_add_certificate_context_to_store" -> ("__imp_CertAddCertificateContextToStore", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2", "a3"])
-            case "win_cert_create_certificate_chain_engine" -> ("__imp_CertCreateCertificateChainEngine", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1"])
-            case "win_cert_free_certificate_chain_engine" -> ("__imp_CertFreeCertificateChainEngine", [IrTy.Int], false, IrTy.Int, ["a0"])
-            case "win_cert_get_certificate_chain" -> ("__imp_CertGetCertificateChain", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7"])
-            case "win_cert_free_certificate_chain" -> ("__imp_CertFreeCertificateChain", [IrTy.Int], false, IrTy.Int, ["a0"])
-            case "win_cert_verify_certificate_chain_policy" -> ("__imp_CertVerifyCertificateChainPolicy", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2", "a3"])
-            case "win_bcrypt_gen_random" -> ("__imp_BCryptGenRandom", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2", "a3"])
-            case "mutex_new" -> ("pickle_mutex_new", List<IrTy>(), true, IrTy.Int, List<string>())
-            case "mutex_lock" -> ("pickle_mutex_lock", [IrTy.Int], false, IrTy.Int, ["m"])
-            case "mutex_trylock" -> ("pickle_mutex_trylock", [IrTy.Int], true, IrTy.Bool, ["m"])
-            case "mutex_unlock" -> ("pickle_mutex_unlock", [IrTy.Int], false, IrTy.Int, ["m"])
-            case "cond_new" -> ("pickle_cond_new", List<IrTy>(), true, IrTy.Int, List<string>())
-            case "cond_signal" -> ("pickle_cond_signal", [IrTy.Int], false, IrTy.Int, ["c"])
-            case "cond_broadcast" -> ("pickle_cond_broadcast", [IrTy.Int], false, IrTy.Int, ["c"])
-            case "cond_wait" -> ("pickle_cond_wait", [IrTy.Int, IrTy.Int], false, IrTy.Int, ["c", "m"])
-            case "sem_new" -> ("pickle_sem_new", [IrTy.Int], true, IrTy.Int, ["permits"])
-            case "sem_acquire" -> ("pickle_sem_acquire", [IrTy.Int, IrTy.Int], false, IrTy.Int, ["s", "n"])
-            case "sem_try_acquire" -> ("pickle_sem_try_acquire", [IrTy.Int, IrTy.Int], true, IrTy.Bool, ["s", "n"])
-            case "sem_release" -> ("pickle_sem_release", [IrTy.Int, IrTy.Int], false, IrTy.Int, ["s", "n"])
-            case "atomic_new" -> ("pickle_atomic_new", [IrTy.Int], true, IrTy.Int, ["value"])
-            case "atomic_load" -> ("pickle_atomic_load", [IrTy.Int], true, IrTy.Int, ["a"])
-            case "atomic_store" -> ("pickle_atomic_store", [IrTy.Int, IrTy.Int], false, IrTy.Int, ["a", "value"])
-            case "atomic_add" -> ("pickle_atomic_add", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["a", "delta"])
-            case "atomic_cas" -> ("pickle_atomic_cas", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Bool, ["a", "expected", "value"])
+    match (name) {
+        case "thread_spawn" -> ("pickle_thread_spawn", [IrTy.Ptr], true, IrTy.Int, ["body"])
+        case "thread_join" -> ("pickle_thread_join", [IrTy.Int], true, IrTy.Bool, ["task"])
+        case "thread_finished" -> ("pickle_thread_finished", [IrTy.Int], true, IrTy.Bool, ["task"])
+        case "thread_message" -> ("pickle_thread_panic_message", [IrTy.Int], true, IrTy.Ptr, ["task"])
+        case "thread_count" -> ("pickle_thread_count", List<IrTy>(), true, IrTy.Int, List<string>())
+        case "thread_current" -> ("pickle_thread_current", List<IrTy>(), true, IrTy.Int, List<string>())
+        case "sleep_ms" -> ("pickle_thread_sleep_ms", [IrTy.Int], false, IrTy.Int, ["ms"])
+        case "thread_yield" -> ("pickle_thread_yield", List<IrTy>(), false, IrTy.Int, List<string>())
+        // Win32 import: `Sleep` (`VOID Sleep(DWORD)`), so a `#[symbol]`
+        // body can occupy `pickle_thread_sleep_ms` with wall-clock sleep
+        // and no Rust shim.
+        case "win_sleep" -> ("__imp_Sleep", [IrTy.Int], false, IrTy.Int, ["ms"])
+        // Real OS threads, so a `#[symbol]` body can own the whole
+        // `pickle_thread_*` family. `CreateThread` takes six machine words
+        // (security attributes, stack size, start routine, parameter,
+        // creation flags, out thread id) and returns the HANDLE; the
+        // start routine follows the single Win64 calling convention, so a
+        // compiled Pickle closure body - which already takes its closure
+        // object in RCX - can be entered directly, with the closure object
+        // as the parameter. `GetExitCodeThread` reads the value the
+        // routine returned (STILL_ACTIVE = 259 while running).
+        case "win_create_thread" -> ("__imp_CreateThread", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["attr", "stack", "start", "param", "flags", "id"])
+        case "win_get_exit_code_thread" -> ("__imp_GetExitCodeThread", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["handle", "code"])
+        case "win_switch_to_thread" -> ("__imp_SwitchToThread", List<IrTy>(), true, IrTy.Int, List<string>())
+        // The world/registry lock primitives. `InterlockedCompareExchange64`
+        // is a compiler intrinsic, not a KERNEL32 export, so the spinlock
+        // spelling of this is not linkable. SRW locks are real exports, a
+        // zero-initialized `SRWLOCK` is a valid unlocked lock (one owner
+        // word, and the runtime's globals are zero image data), and the
+        // acquire/release pair is the OS's own blocking implementation -
+        // no spinning and no lost wakeups. They are not recursive, which
+        // matches the runtime's discipline: a thread only takes the world
+        // lock on entry and after it released it around a blocking call.
+        case "win_acquire_srw_exclusive" -> ("__imp_AcquireSRWLockExclusive", [IrTy.Int], false, IrTy.Int, ["lock"])
+        case "win_release_srw_exclusive" -> ("__imp_ReleaseSRWLockExclusive", [IrTy.Int], false, IrTy.Int, ["lock"])
+        case "win_try_acquire_srw_exclusive" -> ("__imp_TryAcquireSRWLockExclusive", [IrTy.Int], true, IrTy.Int, ["lock"])
+        // The parking half of the world seam. `CONDITION_VARIABLE` is one
+        // zero-initialized pointer word (so a zeroed lock word in a raw
+        // state block is already a valid condition), and
+        // `SleepConditionVariableSRW(cv, &worldLock, INFINITE, 0)` releases
+        // the world SRWLOCK and reacquires it atomically - the classic
+        // condvar lost-wakeup fix. All three names are KERNEL32 exports;
+        // `WaitOnAddress`/`WakeByAddressSingle` are KERNELBASE-only, which
+        // the current single-DLL import path cannot reach.
+        case "win_sleep_condition_variable_srw" -> ("__imp_SleepConditionVariableSRW", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["cv", "lock", "ms", "flags"])
+        case "win_wake_condition_variable" -> ("__imp_WakeConditionVariable", [IrTy.Int], false, IrTy.Int, ["cv"])
+        case "win_wake_all_condition_variable" -> ("__imp_WakeAllConditionVariable", [IrTy.Int], false, IrTy.Int, ["cv"])
+        // Win32 import. `__imp_` is the MSVC import-symbol prefix, and
+        // the backend treats that prefix as "resolve me from a system
+        // DLL" rather than "find me in the runtime archive".
+        case "win_thread_id" -> ("__imp_GetCurrentThreadId", List<IrTy>(), true, IrTy.Int, List<string>())
+        case "win_tls_alloc" -> ("__imp_TlsAlloc", List<IrTy>(), true, IrTy.Int, List<string>())
+        case "win_tls_get" -> ("__imp_TlsGetValue", [IrTy.Int], true, IrTy.Int, ["slot"])
+        case "win_tls_set" -> ("__imp_TlsSetValue", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["slot", "value"])
+        // Process termination, reachable as an import so a `#[symbol]`
+        // body can own the `pickle_exit` slot. No return: the Win32
+        // prototype is `VOID ExitProcess(UINT)`.
+        case "win_exit" -> ("__imp_ExitProcess", [IrTy.Int], false, IrTy.Int, ["code"])
+        // The process heap, reachable as an import triple so a `#[symbol]`
+        // body can own the `pickle_raw_alloc` / `pickle_raw_free` slots.
+        // All three are KERNEL32 exports, and `HeapAlloc` on
+        // `GetProcessHeap()` with zero flags is what Rust's `System`
+        // allocator lowers to on Windows - so a block handed out by one
+        // side and released by the other stays valid even if only one
+        // half of the pair ends up ported.
+        case "win_get_process_heap" -> ("__imp_GetProcessHeap", List<IrTy>(), true, IrTy.Int, List<string>())
+        case "win_heap_alloc" -> ("__imp_HeapAlloc", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["heap", "flags", "size"])
+        // Void rather than the Win32 `BOOL`: the caller has no use for
+        // the answer, and reading a 32-bit `BOOL` back as a 64-bit `Int`
+        // would depend on the upper half happening to be zero.
+        case "win_heap_free" -> ("__imp_HeapFree", [IrTy.Int, IrTy.Int, IrTy.Int], false, IrTy.Int, ["heap", "flags", "ptr"])
+        // The filesystem entry points, so a `#[symbol]` body can own
+        // the whole `fs.rs` surface. All are KERNEL32, which is what
+        // `win_import_addr` and `pelink::isShellImp` already assume for
+        // any `__imp_` other than `CommandLineToArgvW`.
+        case "win_get_file_attributes_w" -> ("__imp_GetFileAttributesW", [IrTy.Int], true, IrTy.Int, ["path"])
+        case "win_delete_file_w" -> ("__imp_DeleteFileW", [IrTy.Int], true, IrTy.Int, ["path"])
+        case "win_remove_directory_w" -> ("__imp_RemoveDirectoryW", [IrTy.Int], true, IrTy.Int, ["path"])
+        case "win_create_directory_w" -> ("__imp_CreateDirectoryW", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["path", "sec"])
+        // `(0, NULL)` is the sizing call: it returns the UTF-16 units a
+        // real call would need, counting the terminator.
+        case "win_get_current_directory_w" -> ("__imp_GetCurrentDirectoryW", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["cap", "buf"])
+        case "win_create_file_w" -> ("__imp_CreateFileW", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["name", "access", "share", "sec", "disp", "flags", "tmpl"])
+        case "win_read_file" -> ("__imp_ReadFile", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["handle", "buf", "n", "pRead", "ov"])
+        case "win_write_file" -> ("__imp_WriteFile", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["handle", "buf", "n", "pWritten", "ov"])
+        case "win_close_handle" -> ("__imp_CloseHandle", [IrTy.Int], true, IrTy.Int, ["handle"])
+        case "win_find_first_file_w" -> ("__imp_FindFirstFileW", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["pattern", "data"])
+        case "win_find_next_file_w" -> ("__imp_FindNextFileW", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["handle", "data"])
+        case "win_find_close" -> ("__imp_FindClose", [IrTy.Int], true, IrTy.Int, ["handle"])
+        case "win_get_std_handle" -> ("__imp_GetStdHandle", [IrTy.Int], true, IrTy.Int, ["which"])
+        // The command line, so a `#[symbol]` body can own the
+        // `pickle_args` slot: `GetCommandLineW` (KERNEL32) hands back
+        // the process's UTF-16 line, `CommandLineToArgvW` (SHELL32 -
+        // the one name `pelink::isShellImp` routes apart from
+        // KERNEL32) splits it into a null-terminated `LPWSTR*`, and
+        // `LocalFree` (KERNEL32) releases that block. The split takes
+        // a second, out argument - a count slot - which it requires
+        // to be a writable address; a program that never reads the
+        // count still has to supply the slot, or the call returns
+        // null as if the parse had failed. Void result so
+        // the answer, which nobody reads, never has to agree with the
+        // upper half of a 64-bit `Int`.
+        case "win_get_command_line_w" -> ("__imp_GetCommandLineW", List<IrTy>(), true, IrTy.Int, List<string>())
+        case "win_command_line_to_argv_w" -> ("__imp_CommandLineToArgvW", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["cmdline", "pargs"])
+        case "win_local_free" -> ("__imp_LocalFree", [IrTy.Int], false, IrTy.Int, ["mem"])
+        // Process spawning for `run_cmd`. Every parameter is a raw
+        // `Int`: pointers, counts, and Win32 `BOOL`s all arrive as
+        // machine words at the `CreateProcessW` boundary, and the
+        // body is the only caller, so it passes 0/1 integers for the
+        // inherit flag. See the comment in `resolve.pkl`.
+        case "win_create_process_w" -> ("__imp_CreateProcessW", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["app", "cmdline", "procAttr", "threadAttr", "inherit", "flags", "env", "cwd", "si", "pi"])
+        case "win_create_pipe" -> ("__imp_CreatePipe", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["pRead", "pWrite", "sec", "size"])
+        case "win_set_handle_information" -> ("__imp_SetHandleInformation", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["handle", "mask", "flags"])
+        case "win_wait_single" -> ("__imp_WaitForSingleObject", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["handle", "ms"])
+        case "win_get_exit_code_process" -> ("__imp_GetExitCodeProcess", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["handle", "pCode"])
+        case "win_terminate_process" -> ("__imp_TerminateProcess", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["handle", "code"])
+        case "win_peek_pipe" -> ("__imp_PeekNamedPipe", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["handle", "buf", "n", "pRead", "pAvail"])
+        case "win_get_environment_strings_w" -> ("__imp_GetEnvironmentStringsW", List<IrTy>(), true, IrTy.Int, List<string>())
+        case "win_free_environment_strings_w" -> ("__imp_FreeEnvironmentStringsW", [IrTy.Int], true, IrTy.Int, ["block"])
+        case "win_get_module_file_name_w" -> ("__imp_GetModuleFileNameW", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["module", "buf", "size"])
+        case "win_get_system_directory_w" -> ("__imp_GetSystemDirectoryW", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["buf", "size"])
+        case "win_get_windows_directory_w" -> ("__imp_GetWindowsDirectoryW", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["buf", "size"])
+        case "win_tick_ms64" -> ("__imp_GetTickCount64", List<IrTy>(), true, IrTy.Int, List<string>())
+        // The clock primitives behind `runtime/abi_time.pkl`. Both
+        // `GetSystemTimeAsFileTime` and the performance-counter pair write
+        // an 8-byte value through a pointer and answer `VOID`/`BOOL`; the
+        // bodies read the buffer back, so the return is not declared.
+        case "time_unix_ms" -> ("pickle_time_unix_ms", List<IrTy>(), true, IrTy.Int, List<string>())
+        case "time_monotonic_ns" -> ("pickle_time_monotonic_ns", List<IrTy>(), true, IrTy.Int, List<string>())
+        case "win_get_system_time_as_file_time" -> ("__imp_GetSystemTimeAsFileTime", [IrTy.Int], false, IrTy.Int, ["ft"])
+        case "win_query_performance_counter" -> ("__imp_QueryPerformanceCounter", [IrTy.Int], false, IrTy.Int, ["out"])
+        case "win_query_performance_frequency" -> ("__imp_QueryPerformanceFrequency", [IrTy.Int], false, IrTy.Int, ["out"])
+        // --- Winsock / TCP networking (WS2_32) ---
+        //
+        // Raw Winsock imports for `runtime/abi_net.pkl`. All pointers,
+        // handles (SOCKET is UINT_PTR on x64), sizes, and counts are passed
+        // as `Int`; the ABI bodies own struct layout and error mapping.
+        // `freeaddrinfo` is void. Grouped into WS2_32.dll by pelink.
+        case "win_wsa_startup" -> ("__imp_WSAStartup", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["ver", "data"])
+        case "win_wsa_cleanup" -> ("__imp_WSACleanup", List<IrTy>(), true, IrTy.Int, List<string>())
+        case "win_wsa_get_last_error" -> ("__imp_WSAGetLastError", List<IrTy>(), true, IrTy.Int, List<string>())
+        case "win_socket" -> ("__imp_socket", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["af", "typ", "proto"])
+        case "win_closesocket" -> ("__imp_closesocket", [IrTy.Int], true, IrTy.Int, ["s"])
+        case "win_bind" -> ("__imp_bind", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["s", "name", "namelen"])
+        case "win_listen" -> ("__imp_listen", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["s", "backlog"])
+        case "win_accept" -> ("__imp_accept", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["s", "addr", "addrlen"])
+        case "win_connect" -> ("__imp_connect", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["s", "name", "namelen"])
+        case "win_send" -> ("__imp_send", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["s", "buf", "len", "flags"])
+        case "win_recv" -> ("__imp_recv", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["s", "buf", "len", "flags"])
+        case "win_sendto" -> ("__imp_sendto", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["s", "buf", "len", "flags", "to", "tolen"])
+        case "win_recvfrom" -> ("__imp_recvfrom", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["s", "buf", "len", "flags", "from", "fromlen"])
+        case "win_shutdown" -> ("__imp_shutdown", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["s", "how"])
+        case "win_setsockopt" -> ("__imp_setsockopt", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["s", "level", "optname", "optval", "optlen"])
+        case "win_getsockopt" -> ("__imp_getsockopt", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["s", "level", "optname", "optval", "optlen"])
+        case "win_getsockname" -> ("__imp_getsockname", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["s", "name", "namelen"])
+        case "win_getpeername" -> ("__imp_getpeername", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["s", "name", "namelen"])
+        case "win_getaddrinfo" -> ("__imp_getaddrinfo", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["nodename", "servname", "hints", "res"])
+        case "win_freeaddrinfo" -> ("__imp_freeaddrinfo", [IrTy.Int], false, IrTy.Int, ["res"])
+        case "win_getnameinfo" -> ("__imp_getnameinfo", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["sa", "salen", "host", "hostlen", "serv", "servlen", "flags"])
+        case "win_htons" -> ("__imp_htons", [IrTy.Int], true, IrTy.Int, ["hostshort"])
+        case "win_htonl" -> ("__imp_htonl", [IrTy.Int], true, IrTy.Int, ["hostlong"])
+        // --- TLS (SECUR32 Schannel/SSPI, CRYPT32 certificates), RNG (BCRYPT), socket readiness ---
+        //
+        // All arguments are machine words. 32-bit SECURITY_STATUS/BOOL/int results are masked
+        // by the runtime bodies; pelink groups these by DLL (see `dllForImp`).
+        case "win_ioctlsocket" -> ("__imp_ioctlsocket", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2"])
+        case "win_wsa_poll" -> ("__imp_WSAPoll", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2"])
+        case "win_acquire_credentials_handle_w" -> ("__imp_AcquireCredentialsHandleW", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8"])
+        case "win_initialize_security_context_w" -> ("__imp_InitializeSecurityContextW", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "a9", "a10", "a11"])
+        case "win_accept_security_context" -> ("__imp_AcceptSecurityContext", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8"])
+        case "win_delete_security_context" -> ("__imp_DeleteSecurityContext", [IrTy.Int], true, IrTy.Int, ["a0"])
+        case "win_free_credentials_handle" -> ("__imp_FreeCredentialsHandle", [IrTy.Int], true, IrTy.Int, ["a0"])
+        case "win_free_context_buffer" -> ("__imp_FreeContextBuffer", [IrTy.Int], true, IrTy.Int, ["a0"])
+        case "win_query_context_attributes_w" -> ("__imp_QueryContextAttributesW", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2"])
+        case "win_encrypt_message" -> ("__imp_EncryptMessage", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2", "a3"])
+        case "win_decrypt_message" -> ("__imp_DecryptMessage", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2", "a3"])
+        case "win_apply_control_token" -> ("__imp_ApplyControlToken", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1"])
+        case "win_pfx_import_cert_store" -> ("__imp_PFXImportCertStore", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2"])
+        case "win_cert_find_certificate_in_store" -> ("__imp_CertFindCertificateInStore", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2", "a3", "a4", "a5"])
+        case "win_cert_free_certificate_context" -> ("__imp_CertFreeCertificateContext", [IrTy.Int], true, IrTy.Int, ["a0"])
+        case "win_cert_close_store" -> ("__imp_CertCloseStore", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1"])
+        case "win_cert_open_store" -> ("__imp_CertOpenStore", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2", "a3", "a4"])
+        case "win_cert_create_certificate_context" -> ("__imp_CertCreateCertificateContext", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2"])
+        case "win_cert_add_certificate_context_to_store" -> ("__imp_CertAddCertificateContextToStore", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2", "a3"])
+        case "win_cert_create_certificate_chain_engine" -> ("__imp_CertCreateCertificateChainEngine", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1"])
+        case "win_cert_free_certificate_chain_engine" -> ("__imp_CertFreeCertificateChainEngine", [IrTy.Int], false, IrTy.Int, ["a0"])
+        case "win_cert_get_certificate_chain" -> ("__imp_CertGetCertificateChain", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7"])
+        case "win_cert_free_certificate_chain" -> ("__imp_CertFreeCertificateChain", [IrTy.Int], false, IrTy.Int, ["a0"])
+        case "win_cert_verify_certificate_chain_policy" -> ("__imp_CertVerifyCertificateChainPolicy", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2", "a3"])
+        case "win_bcrypt_gen_random" -> ("__imp_BCryptGenRandom", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["a0", "a1", "a2", "a3"])
+        case "mutex_new" -> ("pickle_mutex_new", List<IrTy>(), true, IrTy.Int, List<string>())
+        case "mutex_lock" -> ("pickle_mutex_lock", [IrTy.Int], false, IrTy.Int, ["m"])
+        case "mutex_trylock" -> ("pickle_mutex_trylock", [IrTy.Int], true, IrTy.Bool, ["m"])
+        case "mutex_unlock" -> ("pickle_mutex_unlock", [IrTy.Int], false, IrTy.Int, ["m"])
+        case "cond_new" -> ("pickle_cond_new", List<IrTy>(), true, IrTy.Int, List<string>())
+        case "cond_signal" -> ("pickle_cond_signal", [IrTy.Int], false, IrTy.Int, ["c"])
+        case "cond_broadcast" -> ("pickle_cond_broadcast", [IrTy.Int], false, IrTy.Int, ["c"])
+        case "cond_wait" -> ("pickle_cond_wait", [IrTy.Int, IrTy.Int], false, IrTy.Int, ["c", "m"])
+        case "sem_new" -> ("pickle_sem_new", [IrTy.Int], true, IrTy.Int, ["permits"])
+        case "sem_acquire" -> ("pickle_sem_acquire", [IrTy.Int, IrTy.Int], false, IrTy.Int, ["s", "n"])
+        case "sem_try_acquire" -> ("pickle_sem_try_acquire", [IrTy.Int, IrTy.Int], true, IrTy.Bool, ["s", "n"])
+        case "sem_release" -> ("pickle_sem_release", [IrTy.Int, IrTy.Int], false, IrTy.Int, ["s", "n"])
+        case "atomic_new" -> ("pickle_atomic_new", [IrTy.Int], true, IrTy.Int, ["value"])
+        case "atomic_load" -> ("pickle_atomic_load", [IrTy.Int], true, IrTy.Int, ["a"])
+        case "atomic_store" -> ("pickle_atomic_store", [IrTy.Int, IrTy.Int], false, IrTy.Int, ["a", "value"])
+        case "atomic_add" -> ("pickle_atomic_add", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["a", "delta"])
+        case "atomic_cas" -> ("pickle_atomic_cas", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Bool, ["a", "expected", "value"])
         case "once_new" -> ("pickle_once_new", List<IrTy>(), true, IrTy.Int, List<string>())
         case "once_done" -> ("pickle_once_done", [IrTy.Int], true, IrTy.Bool, ["o"])
         case "once_run" -> ("pickle_once_run", [IrTy.Int, IrTy.Ptr], true, IrTy.Bool, ["o", "body"])
@@ -1878,29 +1878,29 @@ fn flatBuiltin(name: string) -> (string, List<IrTy>, bool, IrTy, List<string>)? 
         case "gcBytesSinceGc" -> ("pickle_gc_bytes_since_gc", List<IrTy>(), true, IrTy.Int, List<string>())
         case "gcCollectionCount" -> ("pickle_gc_collection_count", List<IrTy>(), true, IrTy.Int, List<string>())
         case "gcSetThreshold" -> ("pickle_gc_set_threshold", [IrTy.Int], false, IrTy.Int, ["bytes"])
-            case _ -> none
-        }
+        case _ -> none
     }
+}
 
-    /// Sort interface-dispatch candidates deepest-derived first, then by
-    /// ascending class id (stable insertion sort). Mirrors Rust's
-    /// `sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)))`.
+/// Sort interface-dispatch candidates deepest-derived first, then by
+/// ascending class id (stable insertion sort). Mirrors Rust's
+/// `sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)))`.
 fn sortIfaceBranches(branches: List<IfaceDepthBranch>) {
-        var i = 1
-        while (i < len(branches)) {
-            var j = i
-            while (j > 0) {
-                var prev = branches[j - 1]
-                var b = branches[j]
-                var swap = prev.depth < b.depth || (prev.depth == b.depth && prev.cid > b.cid)
-                if (!swap) {
-                    break
-                }
-                branches[j - 1] = b
-                branches[j] = prev
-                j = j - 1
+    var i = 1
+    while (i < len(branches)) {
+        var j = i
+        while (j > 0) {
+            var prev = branches[j - 1]
+            var b = branches[j]
+            var swap = prev.depth < b.depth || (prev.depth == b.depth && prev.cid > b.cid)
+            if (!swap) {
+                break
             }
-            i = i + 1
+            branches[j - 1] = b
+            branches[j] = prev
+            j = j - 1
         }
+        i = i + 1
     }
+}
 
