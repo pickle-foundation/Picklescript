@@ -85,7 +85,11 @@ import { PICKLE_CLASS_BOX_INT, PICKLE_CLASS_BOX_FLOAT, PICKLE_CLASS_BOX_BOOL, PI
 // `abiRegisterObject` rides the same import: every box is a managed object and
 // is recorded in the port's sweepability registry as it is created
 // (`abi_raw`).
-import { abiRawAlloc, abiManagedAlloc, abiRegisterObject } from runtime.abi_raw
+import { abiRawAlloc, abiManagedAlloc, abiRegisterObject, parallelMode } from runtime.abi_raw
+// Per-thread caches: in parallel mode the small-box table lives on the calling
+// thread's shadow node, so the hot `0 .. 4095` slots are no longer a shared
+// cache line. Single-threaded images keep the process-wide table byte for byte.
+import { abiShadowSelfIfRegistered, SHADOW_W_BOX_TAB } from runtime.abi_shadow
 // The boxers below call the engine's register directly instead of going through
 // `abi_raw`'s delegating wrapper: that wrapper is itself a shadowed frame with
 // a `*int` home, so every skipped layer saves a push/pop pair on the hottest
@@ -144,15 +148,44 @@ fn boxBits(obj: *int) -> int {
 const SMALL_BOX_CAP: int = 4096
 var smallBoxTab: int = 0
 
+/// The calling thread's box table, allocating it on first use. `0` when the
+/// thread has no node yet (a box made before its first shadow frame): the
+/// caller then falls back to the process-wide table.
+fn smallBoxTabThread() -> int {
+    var self = abiShadowSelfIfRegistered()
+    if (self == 0) {
+        return 0
+    }
+    unsafe {
+        var tab = (self as *int)[SHADOW_W_BOX_TAB]
+        if (tab == 0) {
+            tab = abiManagedAlloc(SMALL_BOX_CAP * 8)
+            memset(tab as *int, 0, SMALL_BOX_CAP * 8)
+            (self as *int)[SHADOW_W_BOX_TAB] = tab
+        }
+        return tab
+    }
+}
+
 #[symbol("pickle_box_i64")]
 fn abiBoxI64(v: int) -> *int {
     unsafe {
         if (v >= 0 && v < SMALL_BOX_CAP) {
-            var tab = smallBoxTab
+            // Parallel mode: the table is private to this thread, so concurrent
+            // boxes of the same value never contend on one slot. The global
+            // table stays for single-threaded images and for the no-node
+            // fallback.
+            var tab = 0
+            if (parallelMode != 0) {
+                tab = smallBoxTabThread()
+            }
             if (tab == 0) {
-                tab = abiManagedAlloc(SMALL_BOX_CAP * 8)
-                memset(tab as *int, 0, SMALL_BOX_CAP * 8)
-                smallBoxTab = tab
+                tab = smallBoxTab
+                if (tab == 0) {
+                    tab = abiManagedAlloc(SMALL_BOX_CAP * 8)
+                    memset(tab as *int, 0, SMALL_BOX_CAP * 8)
+                    smallBoxTab = tab
+                }
             }
             var hit = (tab as *int)[v]
             if (hit != 0) {

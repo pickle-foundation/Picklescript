@@ -2,7 +2,11 @@ module runtime.abi_string
 
 import { abiBoxI64, abiUnboxI64 } from runtime.abi_box
 import { abiListNew, abiListLen, abiListGet, abiListPush } from runtime.abi_list
-import { abiManagedAlloc, MANAGED_MAX_BUMP, managedArenaBase, managedArenaUsed, managedArenaCap, abiRawParallelMode } from runtime.abi_raw
+import { abiManagedAlloc, MANAGED_MAX_BUMP, managedArenaBase, managedArenaUsed, managedArenaCap, parallelMode } from runtime.abi_raw
+// Per-thread caches: in parallel mode the short-intern and small-`str(int)`
+// tables live on the calling thread's shadow node. The single-threaded path
+// keeps the process-wide tables and is unchanged.
+import { abiShadowSelfIfRegistered, SHADOW_W_SHORT_TAB, SHADOW_W_SHORT_CAP, SHADOW_W_SHORT_COUNT, SHADOW_W_INT_TAB } from runtime.abi_shadow
 // String payloads come from `alloc(int, n)`, whose symbol lives in `abi_raw.pkl`.
 //
 // NO REGISTRATION. These bodies deliberately do NOT register their blocks in the
@@ -85,8 +89,39 @@ const FNV_OFFSET: int = 0 - 0x340D631B7BDDDCDB
 const FNV_PRIME: int = 0x100000001B3
 
 /// Lazily allocated raw table of interned `str(int)` results for
-/// `-999..999`, indexed by `v + 1000`. Zero means "not built yet".
+/// `-999..999`, indexed by `v + 1000`. Zero means "not built yet". This is the
+/// single-threaded table; parallel mode uses the calling node's private copy.
 var internTab: int = 0
+
+/// A fresh zeroed 2000-word table for `str(int)`.
+fn smallIntTabNew() -> int {
+    unsafe {
+        var tab = alloc(int, 2000) as int
+        if (tab != 0) {
+            var z = 0
+            while (z < 2000) {
+                (tab as *int)[z] = 0
+                z = z + 1
+            }
+        }
+        return tab
+    }
+}
+
+/// The calling thread's `str(int)` table, allocating it on first use. The
+/// table is raw heap (never reclaimed) and survives node recycling.
+fn smallIntTabThread(self: int) -> int {
+    unsafe {
+        var tab = (self as *int)[SHADOW_W_INT_TAB]
+        if (tab == 0) {
+            tab = smallIntTabNew()
+            if (tab != 0) {
+                (self as *int)[SHADOW_W_INT_TAB] = tab
+            }
+        }
+        return tab
+    }
+}
 
 fn wordsFor(n: int) -> int {
     return HEADER_WORDS + 1 + (n + 7) / 8
@@ -318,6 +353,86 @@ fn shortInternGrow() {
     }
 }
 
+/// Per-thread short-intern variants. In parallel mode each live thread owns the
+/// table attached to its shadow node, so probe, insert and grow touch only that
+/// thread's memory - no lock and no shared cache line. The table is a
+/// managed-arena block like the global one; node recycling carries it to the
+/// next thread. A grow loop here may carry safepoint polls, which is safe: no
+/// lock is held and the table is not a GC root.
+fn shortInternInitOn(node: int) -> *int {
+    unsafe {
+        var t = shortInternTable(1024)
+        (node as *int)[SHADOW_W_SHORT_TAB] = t as int
+        (node as *int)[SHADOW_W_SHORT_CAP] = 1024
+        (node as *int)[SHADOW_W_SHORT_COUNT] = 0
+        return t
+    }
+}
+
+fn shortInternInsertOn(node: int, tab: *int, vv: int, ln: int, idx: int) -> *int {
+    unsafe {
+        var count = (node as *int)[SHADOW_W_SHORT_COUNT]
+        var cap = (node as *int)[SHADOW_W_SHORT_CAP]
+        if ((count + 1) * 10 >= cap * 7) {
+            shortInternGrowOn(node)
+            return shortInternWordOn(node, vv, ln)
+        }
+        var q = shortInternNew(vv, ln, shortInternFnv(vv, ln))
+        tab[idx] = q as int
+        (node as *int)[SHADOW_W_SHORT_COUNT] = count + 1
+        return q
+    }
+}
+
+fn shortInternGrowOn(node: int) {
+    unsafe {
+        var oldTab = (node as *int)[SHADOW_W_SHORT_TAB] as *int
+        var oldCap = (node as *int)[SHADOW_W_SHORT_CAP]
+        var ncap = oldCap * 2
+        var nmask = ncap - 1
+        var ntab = shortInternTable(ncap)
+        var j = 0
+        while (j < oldCap) {
+            var p = oldTab[j]
+            if (p != 0) {
+                var sp = p as *int
+                var vv = sp[BYTES_WORD]
+                var ni = (((vv ^ (sp[LEN_WORD] * (0 - 0x61C8864680B583EB))) * 0x7FB5D329728EA185) >> 33) & nmask
+                while (ntab[ni] != 0) {
+                    ni = (ni + 1) & nmask
+                }
+                ntab[ni] = p
+            }
+            j = j + 1
+        }
+        (node as *int)[SHADOW_W_SHORT_TAB] = ntab as int
+        (node as *int)[SHADOW_W_SHORT_CAP] = ncap
+    }
+}
+
+fn shortInternWordOn(node: int, vv: int, ln: int) -> *int {
+    unsafe {
+        var tab = (node as *int)[SHADOW_W_SHORT_TAB] as *int
+        if ((tab as int) == 0) {
+            tab = shortInternInitOn(node)
+        }
+        var mask = (node as *int)[SHADOW_W_SHORT_CAP] - 1
+        var idx = (((vv ^ (ln * (0 - 0x61C8864680B583EB))) * 0x7FB5D329728EA185) >> 33) & mask
+        while (true) {
+            var p = tab[idx]
+            if (p == 0) {
+                return shortInternInsertOn(node, tab, vv, ln, idx)
+            }
+            var sp = p as *int
+            if (sp[LEN_WORD] == ln && sp[BYTES_WORD] == vv) {
+                return sp
+            }
+            idx = (idx + 1) & mask
+        }
+        return 0 as *int
+    }
+}
+
 /// Intern the payload `v` masked to `ln` bytes (0..8). The cached hash written
 /// on insert is FNV-1a over exactly those bytes, so an interned object is
 /// interchangeable with any other string carrying the same text: map
@@ -335,16 +450,16 @@ fn shortInternWord(v: int, ln: int) -> *int {
             msk = (1 << (ln * 8)) - 1
         }
         var vv = v & msk
-        // PARALLEL MODE: no shared table. The table is an open-addressing map
-        // with a grow-and-reindex path that re-enters this function; making it
-        // safe would need a re-entrancy-aware lock around the whole probe, and
-        // anything less would race a grow against a probe. Interning is
-        // unobservable (no string operation exposes identity), so the parallel
-        // build simply allocates a fresh equal string per call and pays the
-        // FNV hash that an insert would have computed anyway. Single-threaded
-        // images - every existing program - keep the table and its fast path
-        // byte for byte.
-        if (abiRawParallelMode() != 0) {
+        // PARALLEL MODE: each thread owns its node's table. Equal strings are
+        // still equal values; only pointer identity across threads is lost,
+        // which no string operation exposes and which parallel mode already did
+        // not provide (it bypassed interning entirely). The no-node fallback
+        // keeps the old fresh-allocation behavior.
+        if (parallelMode != 0) {
+            var self = abiShadowSelfIfRegistered()
+            if (self != 0) {
+                return shortInternWordOn(self, vv, ln)
+            }
             return shortInternNew(vv, ln, shortInternFnv(vv, ln))
         }
         var tab = shortInternTab as *int
@@ -1950,17 +2065,23 @@ fn abiStrFromI64(v: int) -> *int {
             // text was previously allocated and rebuilt each time. The cache is
             // a raw never-freed table (strings are unregistered, so it does not
             // move the GC counters), and entries are marked FLAG_SHARED so an
-            // in-place append can never mutate them.
-            var tab = internTab
+            // in-place append can never mutate them. Parallel mode uses the
+            // calling thread's table so concurrent formatting does not share a
+            // cache line; the no-node path falls back to the process table.
+            var tab = 0
+            if (parallelMode != 0) {
+                var self = abiShadowSelfIfRegistered()
+                if (self != 0) {
+                    tab = smallIntTabThread(self)
+                }
+            }
             if (tab == 0) {
-                tab = alloc(int, 2000) as int
-                if (tab != 0) {
-                    var z = 0
-                    while (z < 2000) {
-                        (tab as *int)[z] = 0
-                        z = z + 1
+                tab = internTab
+                if (tab == 0) {
+                    tab = smallIntTabNew()
+                    if (tab != 0) {
+                        internTab = tab
                     }
-                    internTab = tab
                 }
             }
             if (tab != 0) {

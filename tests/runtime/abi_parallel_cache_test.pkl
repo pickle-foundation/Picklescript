@@ -1,0 +1,137 @@
+module runtime.abi_parallel_cache_test
+
+/// The three caches that used to be process-wide - the small-int box table,
+/// the small-`str(int)` table and the short-string intern table - now live on
+/// the calling thread's shadow node in parallel mode. These tests exercise
+/// them from real OS threads and through node recycling (spawn/join waves).
+///
+/// They assert values, not pointer identity: sharing is unobservable through
+/// the value API, and per-thread tables deliberately do not share pointers
+/// across threads.
+
+import { spawn, Task, yieldNow } from std.thread
+import { abiBoxI64, abiUnboxI64 } from runtime.abi_box
+
+fn makeSlots(n: int) -> List<int> {
+    var slots: List<int> = []
+    var i = 0
+    while (i < n) {
+        slots.push(0)
+        i = i + 1
+    }
+    return slots
+}
+
+test fn parallel_box_tables_return_exact_values() {
+    let n = 4
+    let iters = 20000
+    let slots = makeSlots(n)
+    var tasks: List<Task> = []
+    var i = 0
+    while (i < n) {
+        let idx = i
+        tasks.push(spawn(() => {
+            var sum = 0
+            var j = 0
+            while (j < iters) {
+                let v = (j + idx * 17) % 4096
+                sum = (sum + abiUnboxI64(abiBoxI64(v))) % 1000000007
+                j = j + 1
+            }
+            slots[idx] = sum
+            yieldNow()
+        }))
+        i = i + 1
+    }
+    var j = 0
+    while (j < len(tasks)) {
+        let t = tasks[j]
+        let _ = t.join()
+        j = j + 1
+    }
+    i = 0
+    while (i < n) {
+        var expected = 0
+        var k = 0
+        while (k < iters) {
+            expected = (expected + ((k + i * 17) % 4096)) % 1000000007
+            k = k + 1
+        }
+        expect(slots[i]).toBe(expected)
+        i = i + 1
+    }
+}
+
+test fn parallel_short_string_caches_return_exact_text() {
+    let n = 4
+    let slots = makeSlots(n)
+    var tasks: List<Task> = []
+    var i = 0
+    while (i < n) {
+        let idx = i
+        tasks.push(spawn(() => {
+            var sum = 0
+            var j = 0
+            while (j < 1000) {
+                // Small-int table (0..999) plus the one-byte-prefix concat
+                // shape that interns into the short-string table.
+                let s = "w" + str(j)
+                sum = sum + len(s)
+                j = j + 1
+            }
+            slots[idx] = sum
+            yieldNow()
+        }))
+        i = i + 1
+    }
+    var j = 0
+    while (j < len(tasks)) {
+        let t = tasks[j]
+        let _ = t.join()
+        j = j + 1
+    }
+    // "w0".."w9" = 2 chars, "w10".."w99" = 3, "w100".."w999" = 4.
+    let expected = 10 * 2 + 90 * 3 + 900 * 4
+    i = 0
+    while (i < n) {
+        expect(slots[i]).toBe(expected)
+        i = i + 1
+    }
+}
+
+test fn recycled_nodes_keep_working_caches() {
+    // Each wave retires a node at join; the next spawn recycles it, carrying
+    // the three cache tables across `shadowInitNode`. Four waves make a lost
+    // or double-initialised cache word show up as a wrong value or a crash.
+    let waves = 4
+    let slots = makeSlots(waves)
+    var w = 0
+    while (w < waves) {
+        let idx = w
+        let t = spawn(() => {
+            var sum = 0
+            var j = 0
+            while (j < 2000) {
+                let v = (j * 7 + idx) % 4096
+                let s = "w" + str(j % 1000)
+                sum = (sum + abiUnboxI64(abiBoxI64(v)) + len(s)) % 1000000007
+                j = j + 1
+            }
+            slots[idx] = sum
+            yieldNow()
+        })
+        let _ = t.join()
+        w = w + 1
+    }
+    w = 0
+    while (w < waves) {
+        var expected = 0
+        var j = 0
+        while (j < 2000) {
+            expected = (expected + ((j * 7 + w) % 4096) + len("w" + str(j % 1000))) % 1000000007
+            j = j + 1
+        }
+        expect(slots[w]).toBe(expected)
+        w = w + 1
+    }
+}

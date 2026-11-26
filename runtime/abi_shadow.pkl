@@ -132,6 +132,15 @@ var shadowTlsSlot: int = -1
 ///  16 parkLock     17 critical     18 tempBase     19 tempCount
 ///  20 tempCap
 ///  21 allocCount  22 regBytes    23 linked       24 prev
+///  25 boxTab      26 shortTab    27 shortCap     28 shortCount
+///  29 intTab
+///
+/// `boxTab`/`shortTab`/`intTab` are this thread's private caches for the
+/// small-int box table, the short-string intern table and the small-`str(int)`
+/// table. In parallel mode each thread probes only its own table, so the
+/// per-value cache lines are no longer shared. The tables are managed-arena
+/// blocks (never reclaimed) and survive node recycling; the words are preserved
+/// across `shadowInitNode` by `shadowAllocNodeLocked`.
 ///
 /// `allocCount`/`regBytes` are this thread's pending registration statistics:
 /// the collector folds them into the process-wide counters during its registry
@@ -189,8 +198,18 @@ const SHADOW_W_LINKED: int = 23
 /// poll-bearing loop runs under `shadowLock`; while retired, the word is the
 /// free-list link.
 const SHADOW_W_PREV: int = 24
-const SHADOW_NODE_WORDS: int = 25
-const SHADOW_NODE_BYTES: int = 200
+/// Per-thread parallel caches. The box table is `SMALL_BOX_CAP` words, the
+/// short-intern table is an open-addressed word table with `shortCap` slots,
+/// and the `str(int)` table is 2000 words indexed by `v + 1000`. All three are
+/// allocated lazily by their owning module and are private to this thread while
+/// it is live; a recycled node hands them to the next thread.
+const SHADOW_W_BOX_TAB: int = 25
+const SHADOW_W_SHORT_TAB: int = 26
+const SHADOW_W_SHORT_CAP: int = 27
+const SHADOW_W_SHORT_COUNT: int = 28
+const SHADOW_W_INT_TAB: int = 29
+const SHADOW_NODE_WORDS: int = 30
+const SHADOW_NODE_BYTES: int = 240
 
 /// Safepoint states.
 const SHADOW_STATE_RUNNING: int = 0
@@ -304,8 +323,10 @@ fn shadowInitNode(node: int) -> int {
         // emitter places a safepoint poll at every loop header in a
         // spawn-capable module. The poll would take `shadowLock` again
         // (`abiGcPoll` -> `abiShadowSelf`) on a non-reentrant SRW lock and
-        // deadlock the collector. Twenty-five stores cost nothing next to the
-        // raw-heap allocation above them.
+        // deadlock the collector. Thirty stores cost nothing next to the
+        // raw-heap allocation above them. The five cache words are saved and
+        // restored by `shadowAllocNodeLocked`, so a recycled node keeps its
+        // per-thread tables.
         (node as *int)[0] = 0
         (node as *int)[1] = 0
         (node as *int)[2] = 0
@@ -331,6 +352,11 @@ fn shadowInitNode(node: int) -> int {
         (node as *int)[SHADOW_W_REG_BYTES] = 0
         (node as *int)[SHADOW_W_LINKED] = 1
         (node as *int)[SHADOW_W_PREV] = 0
+        (node as *int)[SHADOW_W_BOX_TAB] = 0
+        (node as *int)[SHADOW_W_SHORT_TAB] = 0
+        (node as *int)[SHADOW_W_SHORT_CAP] = 0
+        (node as *int)[SHADOW_W_SHORT_COUNT] = 0
+        (node as *int)[SHADOW_W_INT_TAB] = 0
         (node as *int)[SHADOW_W_ID] = shadowNextId
         shadowNextId = shadowNextId + 1
         (node as *int)[SHADOW_W_NEXT] = shadowRegHead
@@ -344,13 +370,28 @@ fn shadowInitNode(node: int) -> int {
 
 /// Allocate and link a node, assuming `shadowLock` is held. Retired nodes are
 /// recycled through `shadowFreeHead`; only the peak concurrent thread count
-/// ever reaches `win_heap_alloc`. Returns 0 on allocation failure.
+/// ever reaches `win_heap_alloc`. A recycled node keeps its per-thread cache
+/// tables: the five cache words are read before `shadowInitNode` zeroes the
+/// node and written back after. The tables hold immutable values (boxes,
+/// interned strings) and managed-arena blocks are never reused, so a new thread
+/// inheriting them is safe. Returns 0 on allocation failure.
 fn shadowAllocNodeLocked() -> int {
     unsafe {
         var node = shadowFreeHead
         if (node != 0) {
             shadowFreeHead = (node as *int)[SHADOW_W_PREV]
-            return shadowInitNode(node)
+            let boxTab = (node as *int)[SHADOW_W_BOX_TAB]
+            let shortTab = (node as *int)[SHADOW_W_SHORT_TAB]
+            let shortCap = (node as *int)[SHADOW_W_SHORT_CAP]
+            let shortCount = (node as *int)[SHADOW_W_SHORT_COUNT]
+            let intTab = (node as *int)[SHADOW_W_INT_TAB]
+            let fresh = shadowInitNode(node)
+            (fresh as *int)[SHADOW_W_BOX_TAB] = boxTab
+            (fresh as *int)[SHADOW_W_SHORT_TAB] = shortTab
+            (fresh as *int)[SHADOW_W_SHORT_CAP] = shortCap
+            (fresh as *int)[SHADOW_W_SHORT_COUNT] = shortCount
+            (fresh as *int)[SHADOW_W_INT_TAB] = intTab
+            return fresh
         }
         var heap = win_get_process_heap()
         node = win_heap_alloc(heap, 0, SHADOW_NODE_BYTES)
