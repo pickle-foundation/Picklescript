@@ -102,7 +102,8 @@ const SEC_E_OK: int = 0
 const SEC_I_CONTINUE_NEEDED: int = 590610 // 0x00090312
 const SEC_I_CONTEXT_EXPIRED: int = 590615 // 0x00090317
 const SEC_I_RENEGOTIATE: int = 590625 // 0x00090321
-const SEC_E_INCOMPLETE_MESSAGE: int = 2148077336 // 0x80090318
+const SEC_E_INCOMPLETE_MESSAGE: int = 2148074264 // 0x80090318
+const SEC_E_INVALID_TOKEN: int = 2148074248 // 0x80090308
 
 const SCHANNEL_SHUTDOWN: int = 1
 
@@ -597,16 +598,44 @@ fn fillRecv(s: *int) -> int {
     }
 }
 
+/// Whether the buffered bytes can still begin a TLS record. A plaintext peer
+/// (an HTTP request, for example) must be rejected now rather than parking the
+/// handshake until the receive timeout, which is what an unchecked bogus
+/// record length would do.
+fn looksLikeTlsRecord(s: *int) -> bool {
+    unsafe {
+        if (s[ST_RECVLEN] < 5) {
+            return true
+        }
+        let kind = rawByteAt(s[ST_RECVBUF] as *int, 0)
+        if (kind < 20 || kind > 23) {
+            return false
+        }
+        // Every record version this runtime speaks has major version 3
+        // (SSL 3.0 through TLS 1.3, which keeps 0x03 in the legacy field).
+        rawByteAt(s[ST_RECVBUF] as *int, 1) == 3
+    }
+}
+
 /// After a Schannel call, keep only the bytes it did not consume. The EXTRA
-/// pointer always lies inside the record buffer, so moving down is safe.
+/// pointer usually lies inside the record buffer, so moving down is safe.
+///
+/// Schannel reports handshake leftovers in the spare input buffer with
+/// `cbBuffer` set but `pvBuffer` left NULL; the bytes are the tail of the
+/// buffer that was passed in, so derive the address from the receive buffer
+/// when the pointer is absent.
 fn keepExtra(s: *int, arr: *int, count: int) {
     unsafe {
         var i = 0
         while (i < count) {
             if (secBufType(arr, i) == SECBUFFER_EXTRA) {
                 let cb = secBufField(arr, i, 0)
-                if (cb > 0) {
-                    copyRaw(s[ST_RECVBUF], secBufPv(arr, i), cb)
+                if (cb > 0 && cb <= s[ST_RECVLEN]) {
+                    var src = secBufPv(arr, i)
+                    if (src == 0) {
+                        src = s[ST_RECVBUF] + s[ST_RECVLEN] - cb
+                    }
+                    copyRaw(s[ST_RECVBUF], src, cb)
                     s[ST_RECVLEN] = cb
                     return
                 }
@@ -930,6 +959,12 @@ fn serverHandshake(s: *int, pfx: int, pfxLen: int, password: string) -> int {
                     done = 2
                     continue
                 }
+            }
+
+            if (!looksLikeTlsRecord(s)) {
+                setErr(s, TLS_STAGE_HANDSHAKE, SEC_E_INVALID_TOKEN, 0)
+                done = 2
+                continue
             }
 
             secBufSet(inArr, 0, s[ST_RECVLEN], SECBUFFER_TOKEN, s[ST_RECVBUF])

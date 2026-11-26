@@ -616,7 +616,7 @@ class Loader {
         let relFile = rel + ".pkl"
         if (let some(crateDir) = this.workspace.crates.get(segments[0])) {
             if (len(segments) == 1) {
-                var stems = ["lib", "main"]
+                var stems = ["lib", "main", segments[0]]
                 for (stem in stems) {
                     let f = pathJoin(crateDir, stem + ".pkl")
                     if (isFileP(f)) {
@@ -786,6 +786,7 @@ class Rewriter {
                 this.rewriteFn(f)
             }
             case ItemKind.Class(c) -> {
+                c.name = this.renamed(c.name)
                 if (let some(te) = c.extends) {
                     this.rewriteType(te)
                 }
@@ -797,6 +798,7 @@ class Rewriter {
                 }
             }
             case ItemKind.Struct(s) -> {
+                s.name = this.renamed(s.name)
                 for (te in s.implements) {
                     this.rewriteType(te)
                 }
@@ -805,6 +807,7 @@ class Rewriter {
                 }
             }
             case ItemKind.Enum(e) -> {
+                e.name = this.renamed(e.name)
                 for (te in e.implements) {
                     this.rewriteType(te)
                 }
@@ -815,6 +818,7 @@ class Rewriter {
                 }
             }
             case ItemKind.Interface(i) -> {
+                i.name = this.renamed(i.name)
                 for (te in i.extends) {
                     this.rewriteType(te)
                 }
@@ -1406,7 +1410,22 @@ fn discoverFrom(start: string) -> Workspace {
         if (let some(d) = dir) {
             let manifest = pathJoin(d, "picklescript.toml")
             if (isFileP(manifest)) {
-                if (let some(crates) = readWorkspaceMembers(manifest)) {
+                var crates = Map<string, string>()
+                var have = false
+                if (let some(c) = readWorkspaceMembers(manifest)) {
+                    crates = c
+                    have = true
+                }
+                // `pklc install` writes this generated crate map so installed
+                // packages resolve without editing the user's [workspace].
+                let generated = pathJoin(d, ".pickle/workspace.toml")
+                if (isFileP(generated)) {
+                    if (let some(extra) = readWorkspaceMembers(generated)) {
+                        crates = mergeCrates(crates, extra)
+                        have = true
+                    }
+                }
+                if (have) {
                     return Workspace(crates)
                 }
             }
@@ -1416,6 +1435,23 @@ fn discoverFrom(start: string) -> Workspace {
         }
     }
     emptyWorkspace()
+}
+
+fn mergeCrates(base: Map<string, string>, extra: Map<string, string>) -> Map<string, string> {
+    var out = Map<string, string>()
+    for (k in base.keys()) {
+        if (let some(v) = base.get(k)) {
+            out[k] = v
+        }
+    }
+    for (k in extra.keys()) {
+        if (!out.has(k)) {
+            if (let some(v) = extra.get(k)) {
+                out[k] = v
+            }
+        }
+    }
+    out
 }
 
 fn readWorkspaceMembers(manifest: string) -> Map<string, string>? {

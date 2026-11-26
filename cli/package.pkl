@@ -1,0 +1,3044 @@
+module cli.package
+
+// The package manager: manifest and lockfile handling, registry access,
+// dependency resolution, installs, and the `pklc add/install/...` commands.
+//
+// Layout. A project is the nearest directory with a `picklescript.toml`.
+// Installed packages live under `[paths].packages` (default `.pickle/packages`)
+// as `<vendor>/<package>/<version>`. The manager writes two generated files:
+//
+//   picklescript.lock          resolved versions, download URLs, digests
+//   .pickle/workspace.toml     compiler-visible crate map for installed packages
+//
+// The compiler reads the generated workspace map next to the manifest, so an
+// `import { Uuid } from pickle_uuid` resolves to the installed package without
+// editing the user's `[workspace]` table.
+//
+// Version selection deliberately delegates constraint matching to the registry
+// (`/versions?constraint=...`) instead of growing a second semver
+// implementation in the CLI. The resolver intersects the registry's filtered
+// version lists, so it never has to compare version strings itself.
+
+import { currentDir, Proc } from std.process
+import { pathJoin, pathNormalize, pathName, pathDir } from std.fs
+import { parse as jsonParse, field, asStr, asNum, asBool, typeOf, Json } from std.json
+import { encode as urlEncode } from std.encoding.url
+import { sha256 } from std.crypto
+import { Conn, NetError, TcpStream } from std.net
+import { TlsStream } from std.tls
+import { HttpConn, HttpRequest, HttpResponse, hostHeader } from std.net.http
+
+const DEFAULT_REGISTRY: string = "https://picklescript.dpdns.org/api"
+const DEFAULT_PACKAGES: string = ".pickle/packages"
+const DEFAULT_CACHE: string = ".pickle/cache"
+const DEFAULT_REGISTRY_PATH: string = ".pickle/registry"
+const LOCK_VERSION: int = 1
+const MAX_REDIRECTS: int = 8
+const MAX_DOWNLOAD_BYTES: int = 268435456
+const USER_AGENT: string = "pklc/0.1.0"
+
+// ---------------------------------------------------------------------------
+// Small text helpers
+// ---------------------------------------------------------------------------
+
+fn isSpaceByte(c: int) -> bool {
+    c == 32 || c == 9 || c == 10 || c == 13
+}
+
+fn trimText(s: string) -> string {
+    s.trim()
+}
+
+fn startsWithText(s: string, prefix: string) -> bool {
+    s.startsWith(prefix)
+}
+
+fn endsWithText(s: string, suffix: string) -> bool {
+    s.endsWith(suffix)
+}
+
+fn lowerText(s: string) -> string {
+    s.toLower()
+}
+
+fn replaceText(s: string, needle: string, replacement: string) -> string {
+    s.replace(needle, replacement)
+}
+
+fn indexOfText(s: string, needle: string) -> int {
+    match (s.indexOf(needle)) {
+        case some(i) -> i
+        case none -> -1
+    }
+}
+
+fn indexOfFromText(s: string, needle: string, startAt: int) -> int {
+    var start = startAt
+    if (start < 0) {
+        start = 0
+    }
+    if (start > len(s)) {
+        return -1
+    }
+    match (sliceText(s, start, len(s)).indexOf(needle)) {
+        case some(i) -> start + i
+        case none -> -1
+    }
+}
+
+fn sliceText(s: string, lo: int, hi: int) -> string {
+    if (lo < 0) {
+        lo = 0
+    }
+    if (hi < lo) {
+        hi = lo
+    }
+    if (hi > len(s)) {
+        hi = len(s)
+    }
+    s.substring(lo, hi)
+}
+
+/// Split on `\n`, dropping one trailing `\r` per line. Unlike `std.process`'s
+/// helper this keeps a final empty line, so a caller can round-trip a file.
+fn splitTextLines(s: string) -> List<string> {
+    var out = List<string>()
+    var start = 0
+    var i = 0
+    let bs = bytes(s)
+    while (i < len(bs)) {
+        if ((bs[i] as int) == 10) {
+            var end = i
+            if (end > start && (bs[end - 1] as int) == 13) {
+                end = end - 1
+            }
+            out.push(sliceText(s, start, end))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    var end = len(s)
+    if (end > start && (bs[end - 1] as int) == 13) {
+        end = end - 1
+    }
+    out.push(sliceText(s, start, end))
+    out
+}
+
+fn joinTextLines(lines: List<string>, crlf: bool) -> string {
+    var out = ""
+    var i = 0
+    while (i < len(lines)) {
+        if (i > 0) {
+            if (crlf) {
+                out = out + "\r\n"
+            } else {
+                out = out + "\n"
+            }
+        }
+        out = out + lines[i]
+        i = i + 1
+    }
+    out
+}
+
+fn hasCrlf(s: string) -> bool {
+    match (s.indexOf("\r\n")) {
+        case some(_) -> true
+        case none -> false
+    }
+}
+
+/// Strip a TOML `#` comment, respecting single and double quoted strings.
+fn stripComment(line: string) -> string {
+    let bs = bytes(line)
+    var quote = 0
+    var i = 0
+    while (i < len(bs)) {
+        let c = bs[i] as int
+        if (quote != 0) {
+            if (c == 92 && quote == 34) {
+                i = i + 2
+            } else {
+                if (c == quote) {
+                    quote = 0
+                }
+                i = i + 1
+            }
+        } else {
+            if (c == 34 || c == 39) {
+                quote = c
+                i = i + 1
+            } else if (c == 35) {
+                return sliceText(line, 0, i)
+            } else {
+                i = i + 1
+            }
+        }
+    }
+    line
+}
+
+fn unquoteKey(s: string) -> string {
+    var t = trimText(s)
+    if (len(t) >= 2) {
+        let first = t.substring(0, 1)
+        let last = t.substring(len(t) - 1, len(t))
+        if ((first == "\"" && last == "\"") || (first == "'" && last == "'")) {
+            return t.substring(1, len(t) - 1)
+        }
+    }
+    t
+}
+
+/// The quoted string that starts `s`, ignoring whatever follows its closing
+/// quote. Workspace members put `name = "app", path = ...` on one line, so the
+/// value is a prefix of the text after `=`, not the whole remainder.
+fn parseLeadingQuoted(s: string) -> string? {
+    let t = trimText(s)
+    if (len(t) < 2) {
+        return none
+    }
+    let quote = t.substring(0, 1)
+    if (quote != "\"" && quote != "'") {
+        return none
+    }
+    let quoteByte = bytes(quote)[0] as int
+    let bs = bytes(t)
+    var i = 1
+    while (i < len(bs)) {
+        let c = bs[i] as int
+        if (c == 92 && quote == "\"") {
+            i = i + 2
+        } else {
+            if (c == quoteByte) {
+                return parseQuotedString(sliceText(t, 0, i + 1))
+            }
+            i = i + 1
+        }
+    }
+    none
+}
+
+/// A quoted TOML basic string. Returns `none` for an unterminated or malformed
+/// string. Escapes are the small set the manifests use.
+fn parseQuotedString(s: string) -> string? {
+    var t = trimText(s)
+    if (len(t) < 2) {
+        return none
+    }
+    let quote = t.substring(0, 1)
+    if (quote != "\"" && quote != "'") {
+        return none
+    }
+    if (!endsWithText(t, quote)) {
+        return none
+    }
+    var body = t.substring(1, len(t) - 1)
+    if (quote == "'") {
+        return body
+    }
+    var out = ""
+    var i = 0
+    let bs = bytes(body)
+    while (i < len(bs)) {
+        let c = bs[i] as int
+        if (c == 92) {
+            if (i + 1 >= len(bs)) {
+                return none
+            }
+            let e = bs[i + 1] as int
+            if (e == 110) {
+                out = out + "\n"
+            } else if (e == 116) {
+                out = out + "\t"
+            } else if (e == 114) {
+                out = out + "\r"
+            } else if (e == 34) {
+                out = out + "\""
+            } else if (e == 92) {
+                out = out + "\\"
+            } else {
+                return none
+            }
+            i = i + 2
+        } else {
+            out = out + str(c as char)
+            i = i + 1
+        }
+    }
+    out
+}
+
+/// A string value, bare or quoted. Bare values are trimmed as-is.
+fn parseTextValue(s: string) -> string {
+    let t = trimText(s)
+    match (parseQuotedString(t)) {
+        case some(v) -> v
+        case none -> t
+    }
+}
+
+/// Split a `[a, b]` array body into top-level items, respecting quotes.
+fn splitArrayItems(body: string) -> List<string> {
+    var out = List<string>()
+    var start = 0
+    var quote = 0
+    var i = 0
+    let bs = bytes(body)
+    while (i < len(bs)) {
+        let c = bs[i] as int
+        if (quote != 0) {
+            if (c == 92 && quote == 34) {
+                i = i + 2
+            } else {
+                if (c == quote) {
+                    quote = 0
+                }
+                i = i + 1
+            }
+        } else {
+            if (c == 34 || c == 39) {
+                quote = c
+                i = i + 1
+            } else if (c == 44) {
+                out.push(sliceText(body, start, i))
+                start = i + 1
+                i = i + 1
+            } else {
+                i = i + 1
+            }
+        }
+    }
+    if (start < len(body)) {
+        out.push(sliceText(body, start, len(body)))
+    }
+    out
+}
+
+fn parseStringArray(s: string) -> List<string>? {
+    var t = trimText(s)
+    if (len(t) < 2 || !startsWithText(t, "[") || !endsWithText(t, "]")) {
+        return none
+    }
+    var out = List<string>()
+    for (item in splitArrayItems(t.substring(1, len(t) - 1))) {
+        let v = trimText(item)
+        if (v != "") {
+            out.push(parseTextValue(v))
+        }
+    }
+    out
+}
+
+fn sortedList(items: List<string>) -> List<string> {
+    var out = List<string>()
+    for (v in items) {
+        out.push(v)
+    }
+    var i = 1
+    while (i < len(out)) {
+        let v = out[i]
+        var j = i - 1
+        while (j >= 0 && out[j] > v) {
+            out[j + 1] = out[j]
+            j = j - 1
+        }
+        out[j + 1] = v
+        i = i + 1
+    }
+    out
+}
+
+fn sortedKeys(m: Map<string, string>) -> List<string> {
+    var out = List<string>()
+    for (k in m.keys()) {
+        out.push(k)
+    }
+    sortedList(out)
+}
+
+fn sortedKeysOfLists(m: Map<string, List<string>>) -> List<string> {
+    var out = List<string>()
+    for (k in m.keys()) {
+        out.push(k)
+    }
+    sortedList(out)
+}
+
+// ---------------------------------------------------------------------------
+// Paths
+// ---------------------------------------------------------------------------
+
+fn toSlashes(p: string) -> string {
+    replaceText(p, "\\", "/")
+}
+
+fn isAbsolutePath(p: string) -> bool {
+    if (startsWithText(p, "/")) {
+        return true
+    }
+    let bs = bytes(p)
+    if (len(bs) >= 2 && (bs[1] as int) == 58) {
+        return true
+    }
+    false
+}
+
+fn absolutePath(p: string) -> string {
+    if (isAbsolutePath(p)) {
+        return pathNormalize(toSlashes(p))
+    }
+    match (currentDir()) {
+        case some(c) -> pathNormalize(pathJoin(toSlashes(c), toSlashes(p)))
+        case none -> pathNormalize(toSlashes(p))
+    }
+}
+
+fn parentPath(p: string) -> string {
+    let d = pathDir(p)
+    if (d == "") {
+        return "."
+    }
+    d
+}
+
+fn joinPath(a: string, b: string) -> string {
+    pathJoin(toSlashes(a), toSlashes(b))
+}
+
+/// Lexically relative path from `fromDir` to `toPath`, both absolute or both
+/// relative and slash-separated. `..` segments are emitted as needed.
+fn relativePath(fromDir: string, toPath: string) -> string {
+    let a = pathNormalize(toSlashes(fromDir))
+    let b = pathNormalize(toSlashes(toPath))
+    var ap = List<string>()
+    var bp = List<string>()
+    var start = 0
+    var i = 0
+    let ab = bytes(a)
+    while (i <= len(ab)) {
+        if (i == len(ab) || (ab[i] as int) == 47) {
+            if (i > start) {
+                ap.push(sliceText(a, start, i))
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    start = 0
+    i = 0
+    let bb = bytes(b)
+    while (i <= len(bb)) {
+        if (i == len(bb) || (bb[i] as int) == 47) {
+            if (i > start) {
+                bp.push(sliceText(b, start, i))
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    var common = 0
+    while (common < len(ap) && common < len(bp) && ap[common] == bp[common]) {
+        common = common + 1
+    }
+    var out = ""
+    var k = common
+    while (k < len(ap)) {
+        if (out != "") {
+            out = out + "/"
+        }
+        out = out + ".."
+        k = k + 1
+    }
+    k = common
+    while (k < len(bp)) {
+        if (out != "") {
+            out = out + "/"
+        }
+        out = out + bp[k]
+        k = k + 1
+    }
+    if (out == "") {
+        out = "."
+    }
+    out
+}
+
+fn ensureDir(p: string) -> bool {
+    let full = pathNormalize(toSlashes(p))
+    if (full == "" || full == ".") {
+        return true
+    }
+    if (file_exists(full)) {
+        return true
+    }
+    let parent = parentPath(full)
+    if (parent != "." && parent != full) {
+        if (!ensureDir(parent)) {
+            return false
+        }
+    }
+    let _ = mkdir(full)
+    file_exists(full)
+}
+
+fn isDirectory(p: string) -> bool {
+    match (list_dir(p)) {
+        case some(_) -> true
+        case none -> false
+    }
+}
+
+/// Recursively remove a file or directory. Empty directories report `some([])`
+/// from `list_dir`, so the type test is a successful listing.
+fn removeTree(p: string) -> bool {
+    if (!file_exists(p)) {
+        return true
+    }
+    match (list_dir(p)) {
+        case some(children) -> {
+            var ok = true
+            for (c in children) {
+                if (!removeTree(c)) {
+                    ok = false
+                }
+            }
+            if (!ok) {
+                return false
+            }
+            delete(p)
+        }
+        case none -> delete(p)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Manifest
+// ---------------------------------------------------------------------------
+
+class Manifest {
+    var name: string
+    var version: string
+    var repository: string
+    var packages_path: string
+    var cache_path: string
+    var registry_path: string
+    var registry_url: string
+    var deps: Map<string, string>
+    var workspace_names: List<string>
+    var text: string
+
+    constructor(text: string) {
+        this.text = text
+        this.name = ""
+        this.version = ""
+        this.repository = ""
+        this.packages_path = DEFAULT_PACKAGES
+        this.cache_path = DEFAULT_CACHE
+        this.registry_path = DEFAULT_REGISTRY_PATH
+        this.registry_url = DEFAULT_REGISTRY
+        this.deps = Map<string, string>()
+        this.workspace_names = List<string>()
+    }
+}
+
+/// Collect `name = "..."` entries from the `[workspace] members` array,
+/// including a multi-line array. Only names are needed: the package manager
+/// uses them to reject a package module that would shadow a user crate.
+fn workspaceNamesFrom(text: string) -> List<string> {
+    var out = List<string>()
+    let lines = splitTextLines(text)
+    var inWorkspace = false
+    var body = ""
+    for (raw in lines) {
+        let clean = trimText(stripComment(raw))
+        if (startsWithText(clean, "[") && endsWithText(clean, "]")) {
+            inWorkspace = unquoteKey(clean.substring(1, len(clean) - 1)) == "workspace"
+            continue
+        }
+        if (inWorkspace) {
+            body = body + clean + "\n"
+        }
+    }
+    let mpos = indexOfText(body, "members")
+    if (mpos < 0) {
+        return out
+    }
+    let lb = indexOfFromText(body, "[", mpos)
+    if (lb < 0) {
+        return out
+    }
+    var rb = indexOfFromText(body, "]", lb)
+    if (rb < 0) {
+        rb = len(body)
+    }
+    let scan = sliceText(body, lb + 1, rb)
+    var pos = 0
+    while (pos < len(scan)) {
+        let n = indexOfFromText(scan, "name", pos)
+        if (n < 0) {
+            break
+        }
+        let after = sliceText(scan, n + 4, len(scan))
+        let eq = indexOfText(after, "=")
+        if (eq < 0) {
+            break
+        }
+        let rest = trimText(sliceText(after, eq + 1, len(after)))
+        match (parseLeadingQuoted(rest)) {
+            case some(v) -> out.push(v)
+            case none -> {}
+        }
+        pos = n + 4
+    }
+    out
+}
+
+fn parseManifest(text: string) -> Manifest {
+    let m = Manifest(text)
+    var section = ""
+    for (raw in splitTextLines(text)) {
+        let clean = trimText(stripComment(raw))
+        if (clean == "") {
+            continue
+        }
+        if (startsWithText(clean, "[") && endsWithText(clean, "]")) {
+            section = unquoteKey(clean.substring(1, len(clean) - 1))
+            continue
+        }
+        let eq = indexOfText(clean, "=")
+        if (eq < 0) {
+            continue
+        }
+        let key = unquoteKey(sliceText(clean, 0, eq))
+        let rawValue = trimText(sliceText(clean, eq + 1, len(clean)))
+        if (section == "package") {
+            if (key == "name") {
+                m.name = parseTextValue(rawValue)
+            } else if (key == "version") {
+                m.version = parseTextValue(rawValue)
+            } else if (key == "repository") {
+                m.repository = parseTextValue(rawValue)
+            }
+        } else if (section == "paths") {
+            if (key == "packages") {
+                m.packages_path = parseTextValue(rawValue)
+            } else if (key == "cache") {
+                m.cache_path = parseTextValue(rawValue)
+            } else if (key == "registry") {
+                m.registry_path = parseTextValue(rawValue)
+            }
+        } else if (section == "registry") {
+            if (key == "default") {
+                m.registry_url = parseTextValue(rawValue)
+            }
+        } else if (section == "dependencies") {
+            if (startsWithText(rawValue, "[")) {
+                if (let some(parts) = parseStringArray(rawValue)) {
+                    var joined = ""
+                    for (p in parts) {
+                        if (joined != "") {
+                            joined = joined + " || "
+                        }
+                        joined = joined + p
+                    }
+                    if (joined != "") {
+                        m.deps[key] = joined
+                    }
+                }
+            } else {
+                let v = parseTextValue(rawValue)
+                if (v != "") {
+                    m.deps[key] = v
+                }
+            }
+        }
+    }
+    m.workspace_names = workspaceNamesFrom(text)
+    m
+}
+
+fn sectionBounds(lines: List<string>, section: string) -> (int, int) {
+    var header = -1
+    var end = len(lines)
+    var i = 0
+    while (i < len(lines)) {
+        let clean = trimText(stripComment(lines[i]))
+        if (startsWithText(clean, "[") && endsWithText(clean, "]")) {
+            let name = unquoteKey(clean.substring(1, len(clean) - 1))
+            if (header < 0) {
+                if (name == section) {
+                    header = i
+                }
+            } else {
+                end = i
+                break
+            }
+        }
+        i = i + 1
+    }
+    (header, end)
+}
+
+fn dependencyKeyOf(line: string) -> string? {
+    let clean = trimText(stripComment(line))
+    if (clean == "" || startsWithText(clean, "[")) {
+        return none
+    }
+    let eq = indexOfText(clean, "=")
+    if (eq < 0) {
+        return none
+    }
+    let key = unquoteKey(sliceText(clean, 0, eq))
+    if (key == "") {
+        return none
+    }
+    key
+}
+
+/// Set `name = "constraint"` in `[dependencies]`, preserving the rest of the
+/// file and its line endings. Adds the section when it is absent.
+fn manifestSetDependency(text: string, name: string, constraint: string) -> string {
+    let lines = splitTextLines(text)
+    let crlf = hasCrlf(text)
+    let bounds = sectionBounds(lines, "dependencies")
+    let header = bounds[0]
+    let end = bounds[1]
+    let newLine = name + " = \"" + constraint + "\""
+    if (header < 0) {
+        var out = List<string>()
+        for (l in lines) {
+            out.push(l)
+        }
+        if (len(out) > 0 && out[len(out) - 1] == "") {
+            out.pop()
+        }
+        out.push("")
+        out.push("[dependencies]")
+        out.push(newLine)
+        out.push("")
+        return joinTextLines(out, crlf)
+    }
+    var i = header + 1
+    while (i < end) {
+        match (dependencyKeyOf(lines[i])) {
+            case some(k) -> {
+                if (k == name) {
+                    var out = List<string>()
+                    var j = 0
+                    while (j < len(lines)) {
+                        if (j == i) {
+                            out.push(newLine)
+                        } else {
+                            out.push(lines[j])
+                        }
+                        j = j + 1
+                    }
+                    return joinTextLines(out, crlf)
+                }
+            }
+            case none -> {}
+        }
+        i = i + 1
+    }
+    var out = List<string>()
+    var j = 0
+    while (j < len(lines)) {
+        out.push(lines[j])
+        if (j == header) {
+            out.push(newLine)
+        }
+        j = j + 1
+    }
+    joinTextLines(out, crlf)
+}
+
+/// Remove a key from `[dependencies]`, leaving the section in place.
+fn manifestRemoveDependency(text: string, name: string) -> string {
+    let lines = splitTextLines(text)
+    let crlf = hasCrlf(text)
+    let bounds = sectionBounds(lines, "dependencies")
+    let header = bounds[0]
+    let end = bounds[1]
+    if (header < 0) {
+        return text
+    }
+    var out = List<string>()
+    var i = 0
+    while (i < len(lines)) {
+        var drop = false
+        if (i > header && i < end) {
+            match (dependencyKeyOf(lines[i])) {
+                case some(k) -> {
+                    if (k == name) {
+                        drop = true
+                    }
+                }
+                case none -> {}
+            }
+        }
+        if (!drop) {
+            out.push(lines[i])
+        }
+        i = i + 1
+    }
+    joinTextLines(out, crlf)
+}
+
+// ---------------------------------------------------------------------------
+// Project
+// ---------------------------------------------------------------------------
+
+class Project {
+    var root: string
+    var manifest_path: string
+    var manifest: Manifest
+    var packages_dir: string
+    var cache_dir: string
+    var registry_dir: string
+    var lock_path: string
+    var workspace_path: string
+
+    constructor(root: string, manifest: Manifest) {
+        this.root = root
+        this.manifest_path = joinPath(root, "picklescript.toml")
+        this.manifest = manifest
+        this.packages_dir = pathNormalize(joinPath(root, manifest.packages_path))
+        this.cache_dir = pathNormalize(joinPath(root, manifest.cache_path))
+        this.registry_dir = pathNormalize(joinPath(root, manifest.registry_path))
+        this.lock_path = joinPath(root, "picklescript.lock")
+        this.workspace_path = joinPath(root, ".pickle/workspace.toml")
+    }
+}
+
+fn findProjectRoot(start: string) -> string? {
+    var dir = pathNormalize(toSlashes(start))
+    while (true) {
+        if (file_exists(joinPath(dir, "picklescript.toml"))) {
+            return dir
+        }
+        let parent = parentPath(dir)
+        if (parent == dir || parent == ".") {
+            return none
+        }
+        dir = parent
+    }
+}
+
+fn openProjectAt(root: string) -> Project? {
+    let abs = absolutePath(root)
+    let manifest = joinPath(abs, "picklescript.toml")
+    match (read_file(manifest)) {
+        case some(text) -> Project(abs, parseManifest(text))
+        case none -> none
+    }
+}
+
+fn openProjectHere() -> Project? {
+    match (currentDir()) {
+        case some(c) -> {
+            match (findProjectRoot(c)) {
+                case some(root) -> openProjectAt(root)
+                case none -> none
+            }
+        }
+        case none -> none
+    }
+}
+
+fn writeManifest(project: Project, text: string) -> bool {
+    if (!write_file(project.manifest_path, text)) {
+        return false
+    }
+    project.manifest = parseManifest(text)
+    true
+}
+
+// ---------------------------------------------------------------------------
+// Module names and the generated workspace map
+// ---------------------------------------------------------------------------
+
+/// The import name for a registry package: the package segment, lowercased,
+/// with separators folded to `_`. This mirrors the registry's fallback naming
+/// (`http-client` -> `http_client`) and gives the compiler a crate name.
+fn moduleNameFor(packageName: string) -> string {
+    var short = packageName
+    let slash = packageName.indexOf("/")
+    if (let some(i) = slash) {
+        short = packageName.substring(i + 1, len(packageName))
+    }
+    var out = ""
+    let bs = bytes(lowerText(short))
+    var i = 0
+    while (i < len(bs)) {
+        let c = bs[i] as int
+        if ((c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95) {
+            out = out + str(c as char)
+        } else {
+            out = out + "_"
+        }
+        i = i + 1
+    }
+    if (out == "") {
+        out = "package"
+    }
+    let first = out.substring(0, 1)
+    let c0 = bytes(first)[0] as int
+    if (c0 >= 48 && c0 <= 57) {
+        out = "_" + out
+    }
+    out
+}
+
+fn moduleCollides(manifest: Manifest, modName: string) -> bool {
+    for (n in manifest.workspace_names) {
+        if (n == modName) {
+            return true
+        }
+    }
+    false
+}
+
+/// A TOML file the compiler reads for package crates. Paths are relative to
+/// `.pickle/`, where the file lives.
+fn workspaceText(project: Project, entries: List<LockEntry>) -> string {
+    var out = "# Generated by pklc. Do not edit by hand.\n"
+    out = out + "[workspace]\n"
+    out = out + "members = [\n"
+    let base = joinPath(project.root, ".pickle")
+    for (e in entries) {
+        let rel = relativePath(base, joinPath(project.root, e.crate))
+        out = out + "    \{ name = \"" + e.modName + "\", path = \"" + rel + "\" \},\n"
+    }
+    out = out + "]\n"
+    out
+}
+
+fn writeWorkspace(project: Project, entries: List<LockEntry>) -> bool {
+    let dir = joinPath(project.root, ".pickle")
+    if (!ensureDir(dir)) {
+        return false
+    }
+    write_file(project.workspace_path, workspaceText(project, entries))
+}
+
+// ---------------------------------------------------------------------------
+// Lockfile
+// ---------------------------------------------------------------------------
+
+class LockEntry {
+    var name: string
+    var version: string
+    var modName: string
+    var install: string
+    var crate: string
+    var download: string
+    var integrity: string
+    var constraints: List<string>
+    var deps: List<string>
+
+    constructor() {
+        this.name = ""
+        this.version = ""
+        this.modName = ""
+        this.install = ""
+        this.crate = ""
+        this.download = ""
+        this.integrity = ""
+        this.constraints = List<string>()
+        this.deps = List<string>()
+    }
+}
+
+fn sortedEntries(entries: List<LockEntry>) -> List<LockEntry> {
+    var out = List<LockEntry>()
+    for (e in entries) {
+        out.push(e)
+    }
+    var i = 1
+    while (i < len(out)) {
+        let v = out[i]
+        var j = i - 1
+        while (j >= 0 && out[j].name > v.name) {
+            out[j + 1] = out[j]
+            j = j - 1
+        }
+        out[j + 1] = v
+        i = i + 1
+    }
+    out
+}
+
+fn quoteToml(s: string) -> string {
+    var out = "\""
+    for (b in bytes(s)) {
+        let c = b as int
+        if (c == 34) {
+            out = out + "\\\""
+        } else if (c == 92) {
+            out = out + "\\\\"
+        } else if (c == 10) {
+            out = out + "\\n"
+        } else if (c == 13) {
+            out = out + "\\r"
+        } else if (c == 9) {
+            out = out + "\\t"
+        } else {
+            out = out + str(c as char)
+        }
+    }
+    out + "\""
+}
+
+fn quoteArray(items: List<string>) -> string {
+    var out = "["
+    var first = true
+    for (v in items) {
+        if (!first) {
+            out = out + ", "
+        }
+        out = out + quoteToml(v)
+        first = false
+    }
+    out + "]"
+}
+
+fn lockText(entries: List<LockEntry>) -> string {
+    var out = "# Generated by pklc. Do not edit by hand.\n"
+    out = out + "version = " + str(LOCK_VERSION) + "\n"
+    for (e in sortedEntries(entries)) {
+        out = out + "\n[[package]]\n"
+        out = out + "name = " + quoteToml(e.name) + "\n"
+        out = out + "version = " + quoteToml(e.version) + "\n"
+        out = out + "module = " + quoteToml(e.modName) + "\n"
+        out = out + "install = " + quoteToml(e.install) + "\n"
+        out = out + "crate = " + quoteToml(e.crate) + "\n"
+        out = out + "download = " + quoteToml(e.download) + "\n"
+        out = out + "integrity = " + quoteToml(e.integrity) + "\n"
+        out = out + "constraints = " + quoteArray(e.constraints) + "\n"
+        out = out + "dependencies = " + quoteArray(e.deps) + "\n"
+    }
+    out
+}
+
+fn writeLock(project: Project, entries: List<LockEntry>) -> bool {
+    write_file(project.lock_path, lockText(entries))
+}
+
+fn parseLock(text: string) -> List<LockEntry>? {
+    var out = List<LockEntry>()
+    var current: LockEntry? = none
+    for (raw in splitTextLines(text)) {
+        let clean = trimText(stripComment(raw))
+        if (clean == "") {
+            continue
+        }
+        if (clean == "[[package]]") {
+            if (let some(e) = current) {
+                out.push(e)
+            }
+            current = LockEntry()
+            continue
+        }
+        if (startsWithText(clean, "[")) {
+            continue
+        }
+        let eq = indexOfText(clean, "=")
+        if (eq < 0) {
+            continue
+        }
+        let key = trimText(sliceText(clean, 0, eq))
+        let rawValue = trimText(sliceText(clean, eq + 1, len(clean)))
+        match (current) {
+            case some(e) -> {
+                if (key == "name") {
+                    e.name = parseTextValue(rawValue)
+                } else if (key == "version") {
+                    e.version = parseTextValue(rawValue)
+                } else if (key == "module") {
+                    e.modName = parseTextValue(rawValue)
+                } else if (key == "install") {
+                    e.install = parseTextValue(rawValue)
+                } else if (key == "crate") {
+                    e.crate = parseTextValue(rawValue)
+                } else if (key == "download") {
+                    e.download = parseTextValue(rawValue)
+                } else if (key == "integrity") {
+                    e.integrity = parseTextValue(rawValue)
+                } else if (key == "constraints") {
+                    if (let some(items) = parseStringArray(rawValue)) {
+                        e.constraints = items
+                    }
+                } else if (key == "dependencies") {
+                    if (let some(items) = parseStringArray(rawValue)) {
+                        e.deps = items
+                    }
+                }
+            }
+            case none -> {}
+        }
+    }
+    if (let some(e) = current) {
+        out.push(e)
+    }
+    if (len(out) == 0) {
+        return none
+    }
+    out
+}
+
+fn readLock(project: Project) -> List<LockEntry>? {
+    match (read_file(project.lock_path)) {
+        case some(text) -> parseLock(text)
+        case none -> none
+    }
+}
+
+fn findLockEntry(entries: List<LockEntry>, name: string) -> LockEntry? {
+    for (e in entries) {
+        if (e.name == name) {
+            return e
+        }
+    }
+    none
+}
+
+// ---------------------------------------------------------------------------
+// URLs and HTTP
+// ---------------------------------------------------------------------------
+
+class Url {
+    var scheme: string
+    var host: string
+    var port: int
+    var path: string
+
+    constructor(scheme: string, host: string, port: int, path: string) {
+        this.scheme = scheme
+        this.host = host
+        this.port = port
+        this.path = path
+    }
+
+    fn origin() -> string {
+        var p = ""
+        if ((this.scheme == "https" && this.port != 443) || (this.scheme == "http" && this.port != 80)) {
+            p = ":" + str(this.port)
+        }
+        this.scheme + "://" + this.host + p
+    }
+
+    fn text() -> string {
+        this.origin() + this.path
+    }
+}
+
+fn parseUrl(text: string) -> Url? {
+    let t = trimText(text)
+    var scheme = ""
+    var rest = ""
+    if (startsWithText(t, "https://")) {
+        scheme = "https"
+        rest = t.substring(8, len(t))
+    } else if (startsWithText(t, "http://")) {
+        scheme = "http"
+        rest = t.substring(7, len(t))
+    } else {
+        return none
+    }
+    var slash = indexOfText(rest, "/")
+    var authority = rest
+    var path = "/"
+    if (slash >= 0) {
+        authority = sliceText(rest, 0, slash)
+        path = sliceText(rest, slash, len(rest))
+    }
+    if (authority == "") {
+        return none
+    }
+    var host = authority
+    var port = 0
+    if (scheme == "https") {
+        port = 443
+    } else {
+        port = 80
+    }
+    let colon = authority.lastIndexOf(":")
+    if (let some(i) = colon) {
+        let p = authority.substring(i + 1, len(authority))
+        if (p != "") {
+            var n = 0
+            var ok = true
+            for (b in bytes(p)) {
+                let c = b as int
+                if (c < 48 || c > 57) {
+                    ok = false
+                } else {
+                    n = n * 10 + (c - 48)
+                }
+            }
+            if (!ok || n <= 0 || n > 65535) {
+                return none
+            }
+            port = n
+            host = sliceText(authority, 0, i)
+        }
+    }
+    if (host == "") {
+        return none
+    }
+    if (!startsWithText(path, "/")) {
+        path = "/" + path
+    }
+    Url(scheme, host, port, path)
+}
+
+fn pathWithQuery(path: string, query: string) -> string {
+    if (query == "") {
+        path
+    } else {
+        path + "?" + query
+    }
+}
+
+fn resolveLocation(current: Url, location: string) -> Url? {
+    let loc = trimText(location)
+    if (startsWithText(loc, "http://") || startsWithText(loc, "https://")) {
+        return parseUrl(loc)
+    }
+    if (startsWithText(loc, "/")) {
+        return Url(current.scheme, current.host, current.port, loc)
+    }
+    var base = current.path
+    let q = base.indexOf("?")
+    if (let some(i) = q) {
+        base = sliceText(base, 0, i)
+    }
+    let slash = base.lastIndexOf("/")
+    var dir = "/"
+    if (let some(i) = slash) {
+        dir = sliceText(base, 0, i + 1)
+    }
+    Url(current.scheme, current.host, current.port, dir + loc)
+}
+
+class FetchResult {
+    var status: int
+    var body: List<byte>
+    var headers: Map<string, string>
+    var integrity: string
+    var integrity_source: string
+    var final_url: string
+
+    constructor() {
+        this.status = 0
+        this.body = bytes("")
+        this.headers = Map<string, string>()
+        this.integrity = ""
+        this.integrity_source = ""
+        this.final_url = ""
+    }
+}
+
+fn headerValue(headers: Map<string, string>, name: string) -> string {
+    match (headers.get(lowerText(name))) {
+        case some(v) -> v
+        case none -> ""
+    }
+}
+
+fn copyResponseHeaders(res: HttpResponse) -> Map<string, string> {
+    var out = Map<string, string>()
+    var i = 0
+    while (i < res.headers.lenHeaders()) {
+        out[lowerText(res.headers.nameAt(i))] = res.headers.valueAt(i)
+        i = i + 1
+    }
+    out
+}
+
+/// One HTTP exchange over an already-connected transport. `HttpConn` is used
+/// directly (rather than `HttpClient`) so the download body limit is the
+/// package limit, not the 8 MiB message default.
+fn exchange(conn: Conn, host: string, port: int, method: string, target: string, body: List<byte>, headers: Map<string, string>) -> HttpResponse? {
+    let http = HttpConn(conn, 65536, MAX_DOWNLOAD_BYTES, true)
+    let req = HttpRequest(method, target)
+    req.setHeader("Host", hostHeader(host, port))
+    req.setHeader("Connection", "close")
+    req.setHeader("User-Agent", USER_AGENT)
+    req.setHeader("Accept", "*/*")
+    for (k in headers.keys()) {
+        if (let some(v) = headers.get(k)) {
+            req.setHeader(k, v)
+        }
+    }
+    if (len(body) > 0) {
+        req.setBodyBytes(body)
+    }
+    if (!http.writeRequest(req)) {
+        http.close()
+        return none
+    }
+    let res = http.readResponse(method)
+    http.close()
+    res
+}
+
+fn fetchOnce(url: Url, method: string, body: List<byte>, headers: Map<string, string>, timeoutMs: int) -> HttpResponse? {
+    let err = NetError()
+    if (url.scheme == "https") {
+        match (TlsStream.connect(url.host, url.port, timeoutMs, true, err)) {
+            case some(t) -> {
+                let _ = t.setRecvTimeoutMs(timeoutMs)
+                exchange(t, url.host, url.port, method, url.path, body, headers)
+            }
+            case none -> none
+        }
+    } else {
+        match (TcpStream.connect(url.host, url.port, timeoutMs, err)) {
+            case some(t) -> {
+                let _ = t.setRecvTimeoutMs(timeoutMs)
+                exchange(t, url.host, url.port, method, url.path, body, headers)
+            }
+            case none -> none
+        }
+    }
+}
+
+fn fetchFollow(start: Url, method: string, body: List<byte>, headers: Map<string, string>, timeoutMs: int) -> FetchResult? {
+    var current = start
+    var verb = method
+    var payload = body
+    var hops = 0
+    var integrity = ""
+    var integritySource = ""
+    while (hops <= MAX_REDIRECTS) {
+        match (fetchOnce(current, verb, payload, headers, timeoutMs)) {
+            case some(res) -> {
+                let hs = copyResponseHeaders(res)
+                let hInt = headerValue(hs, "x-pickle-integrity")
+                if (hInt != "") {
+                    integrity = hInt
+                    integritySource = headerValue(hs, "x-pickle-integrity-source")
+                }
+                if (res.status == 301 || res.status == 302 || res.status == 303 || res.status == 307 || res.status == 308) {
+                    let loc = headerValue(hs, "location")
+                    if (loc == "") {
+                        return none
+                    }
+                    match (resolveLocation(current, loc)) {
+                        case some(next) -> {
+                            current = next
+                            if (res.status == 303) {
+                                verb = "GET"
+                                payload = bytes("")
+                            }
+                            hops = hops + 1
+                        }
+                        case none -> { return none }
+                    }
+                } else {
+                    let out = FetchResult()
+                    out.status = res.status
+                    out.body = res.body
+                    out.headers = hs
+                    out.integrity = integrity
+                    out.integrity_source = integritySource
+                    out.final_url = current.text()
+                    return out
+                }
+            }
+            case none -> { return none }
+        }
+    }
+    none
+}
+
+fn hexBytes(data: List<byte>) -> string {
+    let digits = "0123456789abcdef"
+    var out = ""
+    for (b in data) {
+        let v = b as int
+        out = out + digits.substring((v >> 4) & 15, ((v >> 4) & 15) + 1)
+        out = out + digits.substring(v & 15, (v & 15) + 1)
+    }
+    out
+}
+
+fn sha256Text(data: List<byte>) -> string {
+    hexBytes(sha256(data))
+}
+
+fn normalizeIntegrity(text: string) -> string {
+    var t = lowerText(trimText(text))
+    if (startsWithText(t, "sha256=")) {
+        t = t.substring(7, len(t))
+    }
+    t
+}
+
+// ---------------------------------------------------------------------------
+// Registry
+// ---------------------------------------------------------------------------
+
+class VersionInfo {
+    var version: string
+    var tag: string
+    var download: string
+    var integrity: string
+    var prerelease: bool
+    var deps: Map<string, string>
+
+    constructor() {
+        this.version = ""
+        this.tag = ""
+        this.download = ""
+        this.integrity = ""
+        this.prerelease = false
+        this.deps = Map<string, string>()
+    }
+}
+
+class Registry {
+    var base: Url
+    var timeout_ms: int
+    var last_error: string
+
+    constructor(base: Url, timeoutMs: int) {
+        this.base = base
+        this.timeout_ms = timeoutMs
+        this.last_error = ""
+    }
+
+    fn apiPath(suffix: string) -> string {
+        var prefix = this.base.path
+        if (endsWithText(prefix, "/")) {
+            prefix = prefix.substring(0, len(prefix) - 1)
+        }
+        prefix + suffix
+    }
+
+    fn urlFor(suffix: string) -> Url {
+        Url(this.base.scheme, this.base.host, this.base.port, this.apiPath(suffix))
+    }
+
+    fn fail(message: string) {
+        this.last_error = message
+    }
+
+    fn versions(vendor: string, packageName: string, constraint: string) -> List<VersionInfo>? {
+        var target = this.apiPath("/packages/" + urlEncode(vendor) + "/" + urlEncode(packageName) + "/versions")
+        var query = "include_prerelease=true"
+        if (constraint != "" && constraint != "*") {
+            query = "constraint=" + urlEncode(constraint) + "&include_prerelease=true"
+        }
+        let url = Url(this.base.scheme, this.base.host, this.base.port, pathWithQuery(target, query))
+        match (fetchFollow(url, "GET", bytes(""), Map<string, string>(), this.timeout_ms)) {
+            case some(res) -> {
+                if (res.status == 404) {
+                    this.fail("package " + vendor + "/" + packageName + " was not found")
+                    return none
+                }
+                if (res.status < 200 || res.status >= 300) {
+                    this.fail("registry returned HTTP " + str(res.status) + " for " + vendor + "/" + packageName)
+                    return none
+                }
+                let text = str(res.body)
+                match (jsonParse(text)) {
+                    case some(root) -> {
+                        match (field(root, "versions")) {
+                            case some(versionsJson) -> {
+                                var out = List<VersionInfo>()
+                                match (versionsJson) {
+                                    case Json.JArr(items) -> {
+                                        for (item in items) {
+                                            let v = parseVersionInfo(item)
+                                            if (v.version != "") {
+                                                out.push(v)
+                                            }
+                                        }
+                                    }
+                                    case _ -> {}
+                                }
+                                return out
+                            }
+                            case none -> {
+                                this.fail("registry response has no versions list")
+                                none
+                            }
+                        }
+                    }
+                    case none -> {
+                        this.fail("registry returned invalid JSON")
+                        none
+                    }
+                }
+            }
+            case none -> {
+                if (this.last_error == "") {
+                    this.fail("could not reach the registry at " + this.base.origin())
+                }
+                none
+            }
+        }
+    }
+
+    fn download(url: string, expectedIntegrity: string) -> List<byte>? {
+        match (parseUrl(url)) {
+            case some(u) -> {
+                match (fetchFollow(u, "GET", bytes(""), Map<string, string>(), this.timeout_ms)) {
+                    case some(res) -> {
+                        if (res.status < 200 || res.status >= 300) {
+                            this.fail("download returned HTTP " + str(res.status))
+                            return none
+                        }
+                        var want = normalizeIntegrity(expectedIntegrity)
+                        if (want == "") {
+                            let advertised = normalizeIntegrity(res.integrity)
+                            if (advertised != "") {
+                                want = advertised
+                            }
+                        }
+                        if (want != "") {
+                            let got = sha256Text(res.body)
+                            if (got != want) {
+                                this.fail("archive integrity mismatch: expected sha256=" + want + ", got sha256=" + got)
+                                return none
+                            }
+                        }
+                        return res.body
+                    }
+                    case none -> {
+                        if (this.last_error == "") {
+                            this.fail("could not download " + url)
+                        }
+                        none
+                    }
+                }
+            }
+            case none -> {
+                this.fail("invalid download URL: " + url)
+                none
+            }
+        }
+    }
+
+    fn show(vendor: string, packageName: string) -> Json? {
+        let target = this.apiPath("/packages/" + urlEncode(vendor) + "/" + urlEncode(packageName))
+        let url = Url(this.base.scheme, this.base.host, this.base.port, target)
+        match (fetchFollow(url, "GET", bytes(""), Map<string, string>(), this.timeout_ms)) {
+            case some(res) -> {
+                if (res.status == 404) {
+                    this.fail("package " + vendor + "/" + packageName + " was not found")
+                    return none
+                }
+                if (res.status < 200 || res.status >= 300) {
+                    this.fail("registry returned HTTP " + str(res.status))
+                    return none
+                }
+                match (jsonParse(str(res.body))) {
+                    case some(v) -> v
+                    case none -> {
+                        this.fail("registry returned invalid JSON")
+                        none
+                    }
+                }
+            }
+            case none -> {
+                if (this.last_error == "") {
+                    this.fail("could not reach the registry")
+                }
+                none
+            }
+        }
+    }
+
+    fn search(query: string, perPage: int) -> Json? {
+        var target = this.apiPath("/packages")
+        var q = "per_page=" + str(perPage)
+        if (query != "") {
+            q = q + "&q=" + urlEncode(query)
+        }
+        let url = Url(this.base.scheme, this.base.host, this.base.port, pathWithQuery(target, q))
+        match (fetchFollow(url, "GET", bytes(""), Map<string, string>(), this.timeout_ms)) {
+            case some(res) -> {
+                if (res.status < 200 || res.status >= 300) {
+                    this.fail("registry returned HTTP " + str(res.status))
+                    return none
+                }
+                match (jsonParse(str(res.body))) {
+                    case some(v) -> v
+                    case none -> {
+                        this.fail("registry returned invalid JSON")
+                        none
+                    }
+                }
+            }
+            case none -> {
+                if (this.last_error == "") {
+                    this.fail("could not reach the registry")
+                }
+                none
+            }
+        }
+    }
+
+    fn publish(repository: string, token: string) -> Json? {
+        let url = this.urlFor("/packages")
+        let body = "\{\"repository\":\"" + jsonEscape(repository) + "\"\}"
+        var headers = Map<string, string>()
+        headers["Content-Type"] = "application/json"
+        headers["Accept"] = "application/json"
+        headers["Authorization"] = "Bearer " + token
+        match (fetchFollow(url, "POST", bytes(body), headers, this.timeout_ms)) {
+            case some(res) -> {
+                if (res.status < 200 || res.status >= 300) {
+                    let msg = jsonErrorMessage(str(res.body))
+                    if (msg != "") {
+                        this.fail(msg)
+                    } else {
+                        this.fail("registry returned HTTP " + str(res.status))
+                    }
+                    return none
+                }
+                match (jsonParse(str(res.body))) {
+                    case some(v) -> v
+                    case none -> {
+                        this.fail("registry returned invalid JSON")
+                        none
+                    }
+                }
+            }
+            case none -> {
+                if (this.last_error == "") {
+                    this.fail("could not reach the registry")
+                }
+                none
+            }
+        }
+    }
+}
+
+fn jsonEscape(s: string) -> string {
+    var out = ""
+    for (b in bytes(s)) {
+        let c = b as int
+        if (c == 34) {
+            out = out + "\\\""
+        } else if (c == 92) {
+            out = out + "\\\\"
+        } else if (c == 10) {
+            out = out + "\\n"
+        } else if (c == 13) {
+            out = out + "\\r"
+        } else if (c == 9) {
+            out = out + "\\t"
+        } else {
+            out = out + str(c as char)
+        }
+    }
+    out
+}
+
+fn jsonErrorMessage(text: string) -> string {
+    match (jsonParse(text)) {
+        case some(v) -> {
+            match (field(v, "error")) {
+                case some(e) -> {
+                    match (asStr(e)) {
+                        case some(s) -> s
+                        case none -> ""
+                    }
+                }
+                case none -> {
+                    match (field(v, "message")) {
+                        case some(m) -> {
+                            match (asStr(m)) {
+                                case some(s) -> s
+                                case none -> ""
+                            }
+                        }
+                        case none -> ""
+                    }
+                }
+            }
+        }
+        case none -> ""
+    }
+}
+
+fn parseVersionInfo(v: Json) -> VersionInfo {
+    let out = VersionInfo()
+    match (field(v, "version")) {
+        case some(x) -> {
+            match (asStr(x)) {
+                case some(s) -> out.version = s
+                case none -> {}
+            }
+        }
+        case none -> {}
+    }
+    match (field(v, "tag")) {
+        case some(x) -> {
+            match (asStr(x)) {
+                case some(s) -> out.tag = s
+                case none -> {}
+            }
+        }
+        case none -> {}
+    }
+    match (field(v, "download_url")) {
+        case some(x) -> {
+            match (asStr(x)) {
+                case some(s) -> out.download = s
+                case none -> {}
+            }
+        }
+        case none -> {}
+    }
+    match (field(v, "is_prerelease")) {
+        case some(x) -> {
+            match (asBool(x)) {
+                case some(b) -> out.prerelease = b
+                case none -> {}
+            }
+        }
+        case none -> {}
+    }
+    match (field(v, "integrity")) {
+        case some(x) -> {
+            match (field(x, "sha256")) {
+                case some(h) -> {
+                    match (asStr(h)) {
+                        case some(s) -> {
+                            if (s != "") {
+                                out.integrity = "sha256=" + s
+                            }
+                        }
+                        case none -> {}
+                    }
+                }
+                case none -> {}
+            }
+        }
+        case none -> {}
+    }
+    match (field(v, "dependencies")) {
+        case some(x) -> {
+            match (x) {
+                case Json.JObj(fields) -> {
+                    for (k in fields.keys()) {
+                        match (fields.get(k)) {
+                            case some(dv) -> {
+                                match (asStr(dv)) {
+                                    case some(s) -> out.deps[k] = s
+                                    case none -> out.deps[k] = "*"
+                                }
+                            }
+                            case none -> {}
+                        }
+                    }
+                }
+                case Json.JArr(items) -> {
+                    // The registry emits `[]` for an empty map; a non-empty
+                    // array is not the dependency shape, so ignore it.
+                }
+                case _ -> {}
+            }
+        }
+        case none -> {}
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Resolution
+// ---------------------------------------------------------------------------
+
+class ConstraintSet {
+    var items: Map<string, List<string>>
+
+    constructor() {
+        this.items = Map<string, List<string>>()
+    }
+
+    fn add(name: string, constraint: string) {
+        var c = trimText(constraint)
+        if (c == "") {
+            c = "*"
+        }
+        match (this.items.get(name)) {
+            case some(list) -> {
+                var found = false
+                for (x in list) {
+                    if (x == c) {
+                        found = true
+                    }
+                }
+                if (!found) {
+                    list.push(c)
+                }
+            }
+            case none -> {
+                var fresh = List<string>()
+                fresh.push(c)
+                this.items[name] = fresh
+            }
+        }
+    }
+
+    fn names() -> List<string> {
+        sortedKeysOfLists(this.items)
+    }
+}
+
+class Selection {
+    var versions: Map<string, VersionInfo>
+
+    constructor() {
+        this.versions = Map<string, VersionInfo>()
+    }
+
+    fn names() -> List<string> {
+        var out = List<string>()
+        for (k in this.versions.keys()) {
+            out.push(k)
+        }
+        sortedList(out)
+    }
+}
+
+fn constraintKey(name: string, constraint: string) -> string {
+    name + "\u{1F}" + constraint
+}
+
+fn constraintHasPre(constraint: string) -> bool {
+    // A prerelease is marked by `-` in the version core. Hyphen ranges also
+    // contain `-`, but requesting prereleases for them is harmless: the
+    // registry still applies the constraint.
+    match (constraint.indexOf("-")) {
+        case some(_) -> true
+        case none -> false
+    }
+}
+
+fn selectVersion(reg: Registry, cache: Map<string, List<VersionInfo>>, name: string, constraints: List<string>, includePre: bool) -> VersionInfo? {
+    let slash = name.indexOf("/")
+    if (let some(i) = slash) {
+        let vendor = name.substring(0, i)
+        let pkg = name.substring(i + 1, len(name))
+        var all: List<VersionInfo>? = none
+        var intersection = Map<string, bool>()
+        var first = true
+        for (c in constraints) {
+            let key = constraintKey(name, c)
+            var list: List<VersionInfo>? = none
+            match (cache.get(key)) {
+                case some(v) -> list = v
+                case none -> {
+                    let fetched = reg.versions(vendor, pkg, c)
+                    match (fetched) {
+                        case some(v) -> {
+                            cache[key] = v
+                            list = v
+                        }
+                        case none -> { return none }
+                    }
+                }
+            }
+            match (list) {
+                case some(items) -> {
+                    if (first) {
+                        for (v in items) {
+                            if (includePre || !v.prerelease || constraintHasPre(c)) {
+                                intersection[v.version] = true
+                            }
+                        }
+                        all = items
+                        first = false
+                    } else {
+                        var keep = Map<string, bool>()
+                        for (v in items) {
+                            if (includePre || !v.prerelease || constraintHasPre(c)) {
+                                if (intersection.has(v.version)) {
+                                    keep[v.version] = true
+                                }
+                            }
+                        }
+                        intersection = keep
+                    }
+                }
+                case none -> { return none }
+            }
+        }
+        match (all) {
+            case some(items) -> {
+                for (v in items) {
+                    if (intersection.has(v.version)) {
+                        return v
+                    }
+                }
+                reg.fail("no version of " + name + " satisfies " + joinConstraints(constraints))
+                none
+            }
+            case none -> {
+                reg.fail("no versions available for " + name)
+                none
+            }
+        }
+    } else {
+        reg.fail("invalid package name `" + name + "`; expected vendor/package")
+        none
+    }
+}
+
+fn joinConstraints(cs: List<string>) -> string {
+    var out = ""
+    for (c in cs) {
+        if (out != "") {
+            out = out + ", "
+        }
+        out = out + c
+    }
+    out
+}
+
+fn constraintsSignature(cs: ConstraintSet) -> string {
+    var out = ""
+    for (name in cs.names()) {
+        out = out + name + "="
+        match (cs.items.get(name)) {
+            case some(list) -> {
+                for (c in sortedList(list)) {
+                    out = out + c + ";"
+                }
+            }
+            case none -> {}
+        }
+        out = out + "\n"
+    }
+    out
+}
+
+fn selectionSignature(sel: Selection) -> string {
+    var out = ""
+    for (name in sel.names()) {
+        match (sel.versions.get(name)) {
+            case some(v) -> out = out + name + "=" + v.version + "\n"
+            case none -> {}
+        }
+    }
+    out
+}
+
+fn buildConstraintSet(rootDeps: Map<string, string>, sel: Selection) -> ConstraintSet {
+    let cs = ConstraintSet()
+    for (name in sortedKeys(rootDeps)) {
+        match (rootDeps.get(name)) {
+            case some(c) -> cs.add(name, c)
+            case none -> {}
+        }
+    }
+    for (name in sel.names()) {
+        match (sel.versions.get(name)) {
+            case some(v) -> {
+                for (dep in sortedKeys(v.deps)) {
+                    match (v.deps.get(dep)) {
+                        case some(c) -> cs.add(dep, c)
+                        case none -> {}
+                    }
+                }
+            }
+            case none -> {}
+        }
+    }
+    cs
+}
+
+fn selectAll(reg: Registry, cache: Map<string, List<VersionInfo>>, cs: ConstraintSet, includePre: bool) -> Selection? {
+    let sel = Selection()
+    for (name in cs.names()) {
+        match (cs.items.get(name)) {
+            case some(constraints) -> {
+                match (selectVersion(reg, cache, name, constraints, includePre)) {
+                    case some(v) -> sel.versions[name] = v
+                    case none -> { return none }
+                }
+            }
+            case none -> {}
+        }
+    }
+    sel
+}
+
+fn resolveDependencies(reg: Registry, rootDeps: Map<string, string>, includePre: bool) -> Selection? {
+    let cache = Map<string, List<VersionInfo>>()
+    var cs = ConstraintSet()
+    for (name in sortedKeys(rootDeps)) {
+        match (rootDeps.get(name)) {
+            case some(c) -> cs.add(name, c)
+            case none -> {}
+        }
+    }
+    var sel = Selection()
+    var seen = Map<string, bool>()
+    var round = 0
+    while (round < 64) {
+        let state = constraintsSignature(cs) + "--" + selectionSignature(sel)
+        if (seen.has(state)) {
+            reg.fail("dependency resolution did not converge; check for conflicting constraints")
+            return none
+        }
+        seen[state] = true
+        match (selectAll(reg, cache, cs, includePre)) {
+            case some(next) -> {
+                let nextCs = buildConstraintSet(rootDeps, next)
+                if (constraintsSignature(nextCs) == constraintsSignature(cs) && selectionSignature(next) == selectionSignature(sel)) {
+                    return next
+                }
+                cs = nextCs
+                sel = next
+            }
+            case none -> { return none }
+        }
+        round = round + 1
+    }
+    reg.fail("dependency resolution exceeded its round limit")
+    none
+}
+
+fn reachableSelection(rootDeps: Map<string, string>, sel: Selection) -> Selection {
+    let out = Selection()
+    var stack = List<string>()
+    for (name in sortedKeys(rootDeps)) {
+        stack.push(name)
+    }
+    while (len(stack) > 0) {
+        let name = stack[len(stack) - 1]
+        stack.pop()
+        if (out.versions.has(name)) {
+            continue
+        }
+        match (sel.versions.get(name)) {
+            case some(v) -> {
+                out.versions[name] = v
+                for (dep in sortedKeys(v.deps)) {
+                    if (!out.versions.has(dep)) {
+                        stack.push(dep)
+                    }
+                }
+            }
+            case none -> {}
+        }
+    }
+    out
+}
+
+fn entryFor(name: string, v: VersionInfo, cs: ConstraintSet, project: Project, modName: string, crateRel: string, installRel: string) -> LockEntry {
+    let e = LockEntry()
+    e.name = name
+    e.version = v.version
+    e.modName = modName
+    e.install = installRel
+    e.crate = crateRel
+    e.download = v.download
+    e.integrity = v.integrity
+    match (cs.items.get(name)) {
+        case some(list) -> e.constraints = sortedList(list)
+        case none -> {}
+    }
+    for (dep in sortedKeys(v.deps)) {
+        match (v.deps.get(dep)) {
+            case some(c) -> e.deps.push(dep + " " + c)
+            case none -> {}
+        }
+    }
+    e
+}
+
+// ---------------------------------------------------------------------------
+// Install
+// ---------------------------------------------------------------------------
+
+fn tarCommand() -> string {
+    if (file_exists("C:/Windows/System32/tar.exe")) {
+        return "C:/Windows/System32/tar.exe"
+    }
+    "tar.exe"
+}
+
+fn extractArchive(archive: string, dest: string) -> bool {
+    if (!ensureDir(dest)) {
+        return false
+    }
+    let tar = tarCommand()
+    var args = List<string>()
+    args.push(tar)
+    args.push("-xf")
+    args.push(archive)
+    args.push("-C")
+    args.push(dest)
+    args.push("--strip-components")
+    args.push("1")
+    let r = Proc(args).run()
+    if (r.ok()) {
+        return true
+    }
+    // A release asset zip may not have the GitHub zipball's single top-level
+    // directory. Retry without stripping into a clean directory.
+    if (!removeTree(dest)) {
+        return false
+    }
+    if (!ensureDir(dest)) {
+        return false
+    }
+    var plain = List<string>()
+    plain.push(tar)
+    plain.push("-xf")
+    plain.push(archive)
+    plain.push("-C")
+    plain.push(dest)
+    let r2 = Proc(plain).run()
+    r2.ok()
+}
+
+fn packageDir(project: Project, vendor: string, pkg: string, version: string) -> string {
+    joinPath(project.packages_dir, vendor + "/" + pkg + "/" + version)
+}
+
+fn archivePath(project: Project, vendor: string, pkg: string, version: string) -> string {
+    joinPath(project.cache_dir, "archives/" + vendor + "/" + pkg + "/" + version + ".zip")
+}
+
+fn markerPath(dir: string) -> string {
+    joinPath(dir, ".pickle-ok")
+}
+
+fn installedCrate(project: Project, entry: LockEntry) -> string? {
+    let dir = joinPath(project.root, entry.install)
+    if (file_exists(joinPath(dir, "lib.pkl"))) {
+        return entry.install
+    }
+    if (file_exists(joinPath(dir, "main.pkl"))) {
+        return entry.install
+    }
+    if (file_exists(joinPath(dir, entry.modName + ".pkl"))) {
+        return entry.install
+    }
+    if (file_exists(joinPath(dir, "src/lib.pkl"))) {
+        return entry.install + "/src"
+    }
+    none
+}
+
+fn installEntry(reg: Registry, project: Project, entry: LockEntry, force: bool) -> bool {
+    let slash = entry.name.indexOf("/")
+    if (let some(i) = slash) {
+        let vendor = entry.name.substring(0, i)
+        let pkg = entry.name.substring(i + 1, len(entry.name))
+        let dir = joinPath(project.root, entry.install)
+        let marker = markerPath(dir)
+        if (!force && file_exists(marker)) {
+            match (read_file(marker)) {
+                case some(text) -> {
+                    if (trimText(text) == entry.version) {
+                        return true
+                    }
+                }
+                case none -> {}
+            }
+        }
+        let archive = archivePath(project, vendor, pkg, entry.version)
+        var data: List<byte>? = none
+        if (!force && file_exists(archive)) {
+            match (read_file(archive)) {
+                case some(text) -> {
+                    let bytesRead = bytes(text)
+                    let want = normalizeIntegrity(entry.integrity)
+                    if (want == "" || sha256Text(bytesRead) == want) {
+                        data = bytesRead
+                    }
+                }
+                case none -> {}
+            }
+        }
+        if (data.isNone()) {
+            match (reg.download(entry.download, entry.integrity)) {
+                case some(blob) -> {
+                    data = blob
+                    if (!ensureDir(parentPath(archive))) {
+                        reg.fail("cannot create cache directory " + parentPath(archive))
+                        return false
+                    }
+                    if (!write_file(archive, str(blob))) {
+                        reg.fail("cannot write archive " + archive)
+                        return false
+                    }
+                }
+                case none -> { return false }
+            }
+        }
+        match (data) {
+            case some(blob) -> {
+                if (!removeTree(dir)) {
+                    reg.fail("cannot remove old install directory " + dir)
+                    return false
+                }
+                if (!ensureDir(dir)) {
+                    reg.fail("cannot create install directory " + dir)
+                    return false
+                }
+                let tmpArchive = archive
+                if (!extractArchive(tmpArchive, dir)) {
+                    reg.fail("cannot extract " + entry.name + " " + entry.version)
+                    return false
+                }
+                match (installedCrate(project, entry)) {
+                    case some(_) -> {}
+                    case none -> {
+                        reg.fail("package " + entry.name + " does not contain " + entry.modName + ".pkl, lib.pkl, main.pkl, or src/lib.pkl")
+                        return false
+                    }
+                }
+                if (!write_file(marker, entry.version + "\n")) {
+                    reg.fail("cannot write install marker in " + dir)
+                    return false
+                }
+                return true
+            }
+            case none -> false
+        }
+    } else {
+        reg.fail("invalid package name `" + entry.name + "`")
+        false
+    }
+}
+
+fn installEntries(reg: Registry, project: Project, entries: List<LockEntry>, force: bool) -> bool {
+    for (e in sortedEntries(entries)) {
+        if (!installEntry(reg, project, e, force)) {
+            return false
+        }
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------
+// Public command layer
+// ---------------------------------------------------------------------------
+
+fn projectOrError() -> Project? {
+    match (openProjectHere()) {
+        case some(p) -> p
+        case none -> {
+            println("error: no picklescript.toml found in this directory or any parent")
+            println("       run `pklc new <name>` or create a manifest first")
+            none
+        }
+    }
+}
+
+fn registryFor(project: Project) -> Registry? {
+    match (parseUrl(project.manifest.registry_url)) {
+        case some(u) -> Registry(u, 30000)
+        case none -> {
+            println("error: invalid registry URL in picklescript.toml: " + project.manifest.registry_url)
+            none
+        }
+    }
+}
+
+fn parsePackageSpec(spec: string) -> (string, string)? {
+    let t = trimText(spec)
+    if (t == "") {
+        return none
+    }
+    let at = t.lastIndexOf("@")
+    if (let some(i) = at) {
+        if (i > 0) {
+            let name = t.substring(0, i)
+            let constraint = t.substring(i + 1, len(t))
+            if (name != "" && constraint != "") {
+                return (name, constraint)
+            }
+        }
+    }
+    (t, "*")
+}
+
+fn printRegistryError(reg: Registry) {
+    if (reg.last_error != "") {
+        println("error: " + reg.last_error)
+    } else {
+        println("error: registry request failed")
+    }
+}
+
+fn resolvedEntries(reg: Registry, project: Project, sel: Selection, cs: ConstraintSet) -> List<LockEntry>? {
+    let reachable = reachableSelection(project.manifest.deps, sel)
+    var entries = List<LockEntry>()
+    var modules = Map<string, bool>()
+    for (name in reachable.names()) {
+        match (reachable.versions.get(name)) {
+            case some(v) -> {
+                let modName = moduleNameFor(name)
+                if (moduleCollides(project.manifest, modName)) {
+                    reg.fail("package " + name + " maps to module `" + modName + "`, which collides with a workspace member")
+                    return none
+                }
+                if (modules.has(modName)) {
+                    reg.fail("packages map to the same module name `" + modName + "`")
+                    return none
+                }
+                modules[modName] = true
+                let slash = name.indexOf("/")
+                if (let some(i) = slash) {
+                    let vendor = name.substring(0, i)
+                    let pkg = name.substring(i + 1, len(name))
+                    let installRel = relativePath(project.root, packageDir(project, vendor, pkg, v.version))
+                    let probe = LockEntry()
+                    probe.name = name
+                    probe.version = v.version
+                    probe.modName = modName
+                    probe.install = installRel
+                    let crateRel = installedCrateRel(project, probe)
+                    let e = entryFor(name, v, cs, project, modName, crateRel, installRel)
+                    entries.push(e)
+                }
+            }
+            case none -> {}
+        }
+    }
+    sortedEntries(entries)
+}
+
+/// The crate path after extraction, as a project-relative path. The caller
+/// probes the extracted layout; this helper only decides the conventional
+/// locations before install. `installedCrate` refines it after extraction.
+fn installedCrateRel(project: Project, entry: LockEntry) -> string {
+    let dir = joinPath(project.root, entry.install)
+    if (file_exists(joinPath(dir, "src/lib.pkl"))) {
+        return entry.install + "/src"
+    }
+    entry.install
+}
+
+fn resolveProject(reg: Registry, project: Project, includePre: bool) -> List<LockEntry>? {
+    match (resolveDependencies(reg, project.manifest.deps, includePre)) {
+        case some(sel) -> {
+            let cs = buildConstraintSet(project.manifest.deps, sel)
+            resolvedEntries(reg, project, sel, cs)
+        }
+        case none -> none
+    }
+}
+
+fn printResolved(entries: List<LockEntry>) {
+    for (e in sortedEntries(entries)) {
+        println("  " + e.name + " " + e.version)
+    }
+}
+
+/// The constraint stored in the manifest after `add`. An explicit constraint is
+/// kept; a bare `add` resolves with `*` and is pinned to `^<version>` so the
+/// lock and the manifest agree when `install` reads them back.
+fn pinAddedConstraint(entries: List<LockEntry>, name: string, constraint: string) -> string {
+    if (constraint != "*") {
+        return constraint
+    }
+    match (findLockEntry(entries, name)) {
+        case some(e) -> {
+            let stored = "^" + e.version
+            e.constraints = [stored]
+            stored
+        }
+        case none -> "*"
+    }
+}
+
+fn runAdd(argv: List<string>) -> int {
+    if (len(argv) < 2) {
+        println("usage: pklc add <vendor/package>[@constraint] [--pre] [--force]")
+        return 1
+    }
+    var includePre = false
+    var force = false
+    var spec = ""
+    var i = 1
+    while (i < len(argv)) {
+        let a = argv[i]
+        if (a == "--pre") {
+            includePre = true
+        } else if (a == "--force") {
+            force = true
+        } else if (spec == "") {
+            spec = a
+        } else {
+            println("error: unexpected argument: " + a)
+            return 1
+        }
+        i = i + 1
+    }
+    match (parsePackageSpec(spec)) {
+        case some(pair) -> {
+            let name = pair[0]
+            let constraint = pair[1]
+            match (projectOrError()) {
+                case some(project) -> {
+                    match (registryFor(project)) {
+                        case some(reg) -> {
+                            // A new dependency is resolved together with the
+                            // existing graph, so a conflict is reported before
+                            // the manifest is touched.
+                            let old = project.manifest.deps.get(name)
+                            project.manifest.deps[name] = constraint
+                            match (resolveProject(reg, project, includePre)) {
+                                case some(entries) -> {
+                                    if (!installEntries(reg, project, entries, force)) {
+                                        printRegistryError(reg)
+                                        return 1
+                                    }
+                                    let stored = pinAddedConstraint(entries, name, constraint)
+                                    if (!writeLock(project, entries)) {
+                                        println("error: cannot write " + project.lock_path)
+                                        return 1
+                                    }
+                                    if (!writeWorkspace(project, entries)) {
+                                        println("error: cannot write " + project.workspace_path)
+                                        return 1
+                                    }
+                                    let newText = manifestSetDependency(project.manifest.text, name, stored)
+                                    if (!writeManifest(project, newText)) {
+                                        println("error: cannot write " + project.manifest_path)
+                                        return 1
+                                    }
+                                    println("added " + name + " " + stored)
+                                    printResolved(entries)
+                                    return 0
+                                }
+                                case none -> {
+                                    match (old) {
+                                        case some(c) -> project.manifest.deps[name] = c
+                                        case none -> project.manifest.deps.remove(name)
+                                    }
+                                    printRegistryError(reg)
+                                    return 1
+                                }
+                            }
+                        }
+                        case none -> 1
+                    }
+                }
+                case none -> 1
+            }
+        }
+        case none -> {
+            println("error: expected <vendor/package>[@constraint]")
+            1
+        }
+    }
+}
+
+fn runInstall(argv: List<string>) -> int {
+    var force = false
+    var i = 1
+    while (i < len(argv)) {
+        if (argv[i] == "--force") {
+            force = true
+        } else {
+            println("error: unexpected argument: " + argv[i])
+            return 1
+        }
+        i = i + 1
+    }
+    match (projectOrError()) {
+        case some(project) -> {
+            match (registryFor(project)) {
+                case some(reg) -> {
+                    match (readLock(project)) {
+                        case some(entries) -> {
+                            // A changed direct constraint means the lock is
+                            // stale. Without a local semver implementation the
+                            // safe answer is to ask for an update rather than
+                            // silently install a version the manifest no longer
+                            // allows.
+                            var stale = false
+                            for (name in sortedKeys(project.manifest.deps)) {
+                                match (project.manifest.deps.get(name)) {
+                                    case some(c) -> {
+                                        match (findLockEntry(entries, name)) {
+                                            case some(e) -> {
+                                                var found = false
+                                                for (lc in e.constraints) {
+                                                    if (lc == c || c == "*") {
+                                                        found = true
+                                                    }
+                                                }
+                                                if (!found) {
+                                                    println("error: " + name + " changed in picklescript.toml; run `pklc update`")
+                                                    stale = true
+                                                }
+                                            }
+                                            case none -> {
+                                                println("error: " + name + " is missing from picklescript.lock; run `pklc update`")
+                                                stale = true
+                                            }
+                                        }
+                                    }
+                                    case none -> {}
+                                }
+                            }
+                            if (stale) {
+                                return 1
+                            }
+                            if (!installEntries(reg, project, entries, force)) {
+                                printRegistryError(reg)
+                                return 1
+                            }
+                            if (!writeWorkspace(project, entries)) {
+                                println("error: cannot write " + project.workspace_path)
+                                return 1
+                            }
+                            println("installed " + str(len(entries)) + " package(s)")
+                            return 0
+                        }
+                        case none -> {
+                            match (resolveProject(reg, project, false)) {
+                                case some(entries) -> {
+                                    if (!installEntries(reg, project, entries, force)) {
+                                        printRegistryError(reg)
+                                        return 1
+                                    }
+                                    if (!writeLock(project, entries)) {
+                                        println("error: cannot write " + project.lock_path)
+                                        return 1
+                                    }
+                                    if (!writeWorkspace(project, entries)) {
+                                        println("error: cannot write " + project.workspace_path)
+                                        return 1
+                                    }
+                                    println("installed " + str(len(entries)) + " package(s)")
+                                    return 0
+                                }
+                                case none -> {
+                                    printRegistryError(reg)
+                                    1
+                                }
+                            }
+                        }
+                    }
+                }
+                case none -> 1
+            }
+        }
+        case none -> 1
+    }
+}
+
+fn runUpdate(argv: List<string>) -> int {
+    var includePre = false
+    var force = false
+    var i = 1
+    while (i < len(argv)) {
+        if (argv[i] == "--pre") {
+            includePre = true
+        } else if (argv[i] == "--force") {
+            force = true
+        } else if (startsWithText(argv[i], "-")) {
+            println("error: unexpected argument: " + argv[i])
+            return 1
+        }
+        i = i + 1
+    }
+    match (projectOrError()) {
+        case some(project) -> {
+            match (registryFor(project)) {
+                case some(reg) -> {
+                    match (resolveProject(reg, project, includePre)) {
+                        case some(entries) -> {
+                            if (!installEntries(reg, project, entries, force)) {
+                                printRegistryError(reg)
+                                return 1
+                            }
+                            if (!writeLock(project, entries)) {
+                                println("error: cannot write " + project.lock_path)
+                                return 1
+                            }
+                            if (!writeWorkspace(project, entries)) {
+                                println("error: cannot write " + project.workspace_path)
+                                return 1
+                            }
+                            println("updated " + str(len(entries)) + " package(s)")
+                            printResolved(entries)
+                            return 0
+                        }
+                        case none -> {
+                            printRegistryError(reg)
+                            1
+                        }
+                    }
+                }
+                case none -> 1
+            }
+        }
+        case none -> 1
+    }
+}
+
+fn runRemove(argv: List<string>) -> int {
+    if (len(argv) < 2) {
+        println("usage: pklc remove <vendor/package>")
+        return 1
+    }
+    let name = trimText(argv[1])
+    match (projectOrError()) {
+        case some(project) -> {
+            if (!project.manifest.deps.has(name)) {
+                println("error: " + name + " is not a dependency")
+                return 1
+            }
+            let oldLock = readLock(project)
+            project.manifest.deps.remove(name)
+            let newText = manifestRemoveDependency(project.manifest.text, name)
+            if (!writeManifest(project, newText)) {
+                println("error: cannot write " + project.manifest_path)
+                return 1
+            }
+            match (registryFor(project)) {
+                case some(reg) -> {
+                    match (resolveProject(reg, project, false)) {
+                        case some(entries) -> {
+                            if (!installEntries(reg, project, entries, false)) {
+                                printRegistryError(reg)
+                                return 1
+                            }
+                            if (!writeLock(project, entries)) {
+                                println("error: cannot write " + project.lock_path)
+                                return 1
+                            }
+                            if (!writeWorkspace(project, entries)) {
+                                println("error: cannot write " + project.workspace_path)
+                                return 1
+                            }
+                            // Prune install directories that are no longer in
+                            // the lock. Only versions recorded by this project
+                            // are touched.
+                            match (oldLock) {
+                                case some(old) -> {
+                                    for (e in old) {
+                                        match (findLockEntry(entries, e.name)) {
+                                            case some(_) -> {}
+                                            case none -> {
+                                                let _ = removeTree(joinPath(project.root, e.install))
+                                            }
+                                        }
+                                    }
+                                }
+                                case none -> {}
+                            }
+                            println("removed " + name)
+                            return 0
+                        }
+                        case none -> {
+                            printRegistryError(reg)
+                            1
+                        }
+                    }
+                }
+                case none -> 1
+            }
+        }
+        case none -> 1
+    }
+}
+
+fn runList(argv: List<string>) -> int {
+    match (projectOrError()) {
+        case some(project) -> {
+            match (readLock(project)) {
+                case some(entries) -> {
+                    if (len(entries) == 0) {
+                        println("no packages installed")
+                        return 0
+                    }
+                    for (e in sortedEntries(entries)) {
+                        var line = e.name + " " + e.version
+                        if (e.integrity != "") {
+                            line = line + " (" + e.integrity + ")"
+                        }
+                        println(line)
+                    }
+                    0
+                }
+                case none -> {
+                    if (len(project.manifest.deps.keys()) == 0) {
+                        println("no packages installed")
+                    } else {
+                        println("no picklescript.lock; run `pklc install`")
+                    }
+                    0
+                }
+            }
+        }
+        case none -> 1
+    }
+}
+
+fn runInfo(argv: List<string>) -> int {
+    if (len(argv) < 2) {
+        println("usage: pklc info <vendor/package>")
+        return 1
+    }
+    let spec = trimText(argv[1])
+    let slash = spec.indexOf("/")
+    if (let some(i) = slash) {
+        let vendor = spec.substring(0, i)
+        let pkg = spec.substring(i + 1, len(spec))
+        match (projectOrError()) {
+            case some(project) -> {
+                match (registryFor(project)) {
+                    case some(reg) -> {
+                        match (reg.show(vendor, pkg)) {
+                            case some(root) -> {
+                                printJsonString(root, "name", "package")
+                                printJsonString(root, "description", "description")
+                                printJsonString(root, "latest_version", "latest")
+                                printJsonString(root, "license", "license")
+                                printJsonString(root, "repository", "repository")
+                                printJsonString(root, "install", "install")
+                                0
+                            }
+                            case none -> {
+                                printRegistryError(reg)
+                                1
+                            }
+                        }
+                    }
+                    case none -> 1
+                }
+            }
+            case none -> 1
+        }
+    } else {
+        println("error: expected <vendor/package>")
+        1
+    }
+}
+
+fn printJsonString(root: Json, key: string, label: string) {
+    match (field(root, key)) {
+        case some(v) -> {
+            match (asStr(v)) {
+                case some(s) -> {
+                    if (s != "") {
+                        println(label + ": " + s)
+                    }
+                }
+                case none -> {}
+            }
+        }
+        case none -> {}
+    }
+}
+
+fn runSearch(argv: List<string>) -> int {
+    if (len(argv) < 2) {
+        println("usage: pklc search <query>")
+        return 1
+    }
+    let query = trimText(argv[1])
+    match (projectOrError()) {
+        case some(project) -> {
+            match (registryFor(project)) {
+                case some(reg) -> {
+                    match (reg.search(query, 20)) {
+                        case some(root) -> {
+                            match (field(root, "results")) {
+                                case some(v) -> {
+                                    match (v) {
+                                        case Json.JArr(items) -> {
+                                            if (len(items) == 0) {
+                                                println("no packages found")
+                                            }
+                                            for (item in items) {
+                                                let name = jsonString(item, "name")
+                                                let version = jsonString(item, "latest_version")
+                                                let desc = jsonString(item, "description")
+                                                var line = name
+                                                if (version != "") {
+                                                    line = line + " " + version
+                                                }
+                                                if (desc != "") {
+                                                    line = line + " - " + desc
+                                                }
+                                                println(line)
+                                            }
+                                        }
+                                        case _ -> {}
+                                    }
+                                }
+                                case none -> {}
+                            }
+                            0
+                        }
+                        case none -> {
+                            printRegistryError(reg)
+                            1
+                        }
+                    }
+                }
+                case none -> 1
+            }
+        }
+        case none -> 1
+    }
+}
+
+fn jsonString(v: Json, key: string) -> string {
+    match (field(v, key)) {
+        case some(x) -> {
+            match (asStr(x)) {
+                case some(s) -> s
+                case none -> ""
+            }
+        }
+        case none -> ""
+    }
+}
+
+fn runPublish(argv: List<string>) -> int {
+    var repo = ""
+    var i = 1
+    while (i < len(argv)) {
+        if (argv[i] == "--repo" && i + 1 < len(argv)) {
+            repo = argv[i + 1]
+            i = i + 2
+        } else {
+            println("error: unexpected argument: " + argv[i])
+            return 1
+        }
+    }
+    match (projectOrError()) {
+        case some(project) -> {
+            if (repo == "") {
+                repo = project.manifest.repository
+            }
+            if (repo == "") {
+                repo = gitOrigin(project.root)
+            }
+            if (repo == "") {
+                println("error: no repository URL; set [package].repository or pass --repo")
+                return 1
+            }
+            let token = publishToken(project)
+            if (token == "") {
+                println("Publishing is repository-based and reviewed by the registry.")
+                println("Open https://picklescript.dpdns.org/packages/submit and submit:")
+                println("  " + repo)
+                println("")
+                println("For a non-interactive submission, write an API token with the")
+                println("`publish` ability to .pickle/token or set PICKLE_TOKEN.")
+                return 1
+            }
+            match (registryFor(project)) {
+                case some(reg) -> {
+                    match (reg.publish(repo, token)) {
+                        case some(root) -> {
+                            let status = jsonString(root, "status")
+                            let pkg = jsonString(root, "package")
+                            let url = jsonString(root, "url")
+                            println("submitted: " + status)
+                            if (pkg != "") {
+                                println("package: " + pkg)
+                            }
+                            if (url != "") {
+                                println("url: " + url)
+                            }
+                            0
+                        }
+                        case none -> {
+                            printRegistryError(reg)
+                            1
+                        }
+                    }
+                }
+                case none -> 1
+            }
+        }
+        case none -> 1
+    }
+}
+
+fn runPackageCommand(argv: List<string>) -> int {
+    if (len(argv) == 0) {
+        packageHelp()
+        return 1
+    }
+    let cmd = argv[0]
+    if (cmd == "add") {
+        return runAdd(argv)
+    }
+    if (cmd == "install" || cmd == "i") {
+        return runInstall(argv)
+    }
+    if (cmd == "update" || cmd == "upgrade") {
+        return runUpdate(argv)
+    }
+    if (cmd == "remove" || cmd == "rm" || cmd == "uninstall") {
+        return runRemove(argv)
+    }
+    if (cmd == "list" || cmd == "ls") {
+        return runList(argv)
+    }
+    if (cmd == "info" || cmd == "show") {
+        return runInfo(argv)
+    }
+    if (cmd == "search" || cmd == "find") {
+        return runSearch(argv)
+    }
+    if (cmd == "publish") {
+        return runPublish(argv)
+    }
+    packageHelp()
+    1
+}
+
+fn packageHelp() {
+    println("PickleScript package manager")
+    println("")
+    println("Usage:")
+    println("  pklc add <vendor/package>[@constraint] [--pre] [--force]")
+    println("  pklc install [--force]")
+    println("  pklc update [--pre] [--force]")
+    println("  pklc remove <vendor/package>")
+    println("  pklc list")
+    println("  pklc info <vendor/package>")
+    println("  pklc search [query]")
+    println("  pklc publish [--repo <url>]")
+    println("")
+    println("A project is the nearest directory with picklescript.toml.")
+    println("Default registry: " + DEFAULT_REGISTRY)
+}
+
+fn gitOrigin(root: string) -> string {
+    let r = Proc(["git", "remote", "get-url", "origin"]).setCwd(root).run()
+    if (!r.ok()) {
+        return ""
+    }
+    let text = trimText(r.stdout())
+    if (startsWithText(text, "https://github.com/") || startsWithText(text, "http://github.com/")) {
+        return text
+    }
+    if (startsWithText(text, "git@github.com:")) {
+        return "https://github.com/" + text.substring(15, len(text))
+    }
+    text
+}
+
+fn publishToken(project: Project) -> string {
+    let env = getEnvText("PICKLE_TOKEN")
+    if (env != "") {
+        return env
+    }
+    match (read_file(joinPath(project.root, ".pickle/token"))) {
+        case some(text) -> trimText(text)
+        case none -> ""
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Environment (the CLI already has this private helper; keep a copy here so
+// `cli.package` does not depend on `cli.pklc` and create an import cycle).
+// ---------------------------------------------------------------------------
+
+fn wideUnitAt(w: *int, i: int) -> int {
+    unsafe {
+        return (w[i >> 2] >> ((i & 3) * 16)) & 65535
+    }
+}
+
+fn wideStep(w: *int, i: int, n: int) -> int {
+    let u = wideUnitAt(w, i)
+    if (u >= 55296 && u <= 56319 && (i + 1) < n) {
+        let lo = wideUnitAt(w, i + 1)
+        if (lo >= 56320 && lo <= 57343) {
+            return 2
+        }
+    }
+    1
+}
+
+fn wideCp(w: *int, i: int, n: int) -> int {
+    let u = wideUnitAt(w, i)
+    if (wideStep(w, i, n) == 2) {
+        let lo = wideUnitAt(w, i + 1)
+        return 65536 + ((u - 55296) * 1024) + (lo - 56320)
+    }
+    if (u >= 55296 && u <= 57343) {
+        return 65533
+    }
+    u
+}
+
+fn pushCp(out: List<byte>, cp: int) {
+    if (cp < 128) {
+        out.push(cp as byte)
+    } else if (cp < 2048) {
+        out.push((192 + (cp / 64)) as byte)
+        out.push((128 + (cp % 64)) as byte)
+    } else if (cp < 65536) {
+        out.push((224 + (cp / 4096)) as byte)
+        out.push((128 + ((cp / 64) % 64)) as byte)
+        out.push((128 + (cp % 64)) as byte)
+    } else {
+        out.push((240 + (cp / 262144)) as byte)
+        out.push((128 + ((cp / 4096) % 64)) as byte)
+        out.push((128 + ((cp / 64) % 64)) as byte)
+        out.push((128 + (cp % 64)) as byte)
+    }
+}
+
+fn wideSlice(w: *int, start: int, n: int) -> string {
+    let out = bytes("")
+    var i = 0
+    let stop = start + n
+    while (i < n) {
+        pushCp(out, wideCp(w, start + i, stop))
+        i = i + wideStep(w, start + i, stop)
+    }
+    str(out)
+}
+
+fn getEnvText(key: string) -> string {
+    unsafe {
+        let w = win_get_environment_strings_w()
+        if (w == 0) {
+            return ""
+        }
+        let wp = w as *int
+        let prefix = key + "="
+        var pos = 0
+        var found = ""
+        var have = false
+        while (!have) {
+            var end = pos
+            while (wideUnitAt(wp, end) != 0) {
+                end = end + 1
+            }
+            if (end == pos) {
+                have = true
+            } else {
+                let entry = wideSlice(wp, pos, end - pos)
+                if (startsWithText(entry, prefix)) {
+                    found = entry.substring(len(prefix), len(entry))
+                    have = true
+                } else {
+                    pos = end + 1
+                }
+            }
+        }
+        let _ = win_free_environment_strings_w(w)
+        found
+    }
+}

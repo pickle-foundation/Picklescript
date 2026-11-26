@@ -1,0 +1,628 @@
+module compiler.package_test
+
+// Coverage for the package manager in `cli.package`. The first half is pure
+// text work (manifest/lock round-trips, module names, URLs, digests); the
+// second half drives real HTTP over an ephemeral loopback port so redirects,
+// integrity headers, resolver intersections, and archive installation are
+// exercised without touching the live registry.
+//
+// The loopback handlers are stateless functions of the request target. Tests
+// that need several connections spawn one worker that accepts exactly the
+// number of requests the client is expected to make, which keeps the test
+// deterministic: an extra request would leave a worker waiting, and a missing
+// one would surface as a short read.
+
+import { LockEntry, Project, Registry, Selection, Url, VersionInfo, ConstraintSet, absolutePath, buildConstraintSet, constraintHasPre, constraintKey, constraintsSignature, ensureDir, fetchFollow, hexBytes, indexOfText, installEntry, installedCrate, joinConstraints, joinPath, lockText, manifestRemoveDependency, manifestSetDependency, moduleCollides, moduleNameFor, normalizeIntegrity, parseLock, parseManifest, parseUrl, pathWithQuery, pinAddedConstraint, removeTree, resolveDependencies, resolveLocation, selectVersion, sha256Text, tarCommand, trimText, workspaceText } from cli.package
+import { TcpListener } from std.net
+import { HttpRequest, HttpResponse, HttpServer } from std.net.http
+import { Proc } from std.process
+import { Task, spawn } from std.thread
+
+// ---------------------------------------------------------------------------
+// Fixtures and helpers
+// ---------------------------------------------------------------------------
+
+/// A directory only this test file uses. `ensureDir` creates the whole chain,
+/// which `write_file` does not.
+fn scratch(name: string) -> string {
+    let dir = "target/pickle-test-package/" + name
+    let _ = ensureDir(dir)
+    absolutePath(dir)
+}
+
+fn manifestText() -> string {
+    var s = ""
+    s = s + "[package]\n"
+    s = s + "name = \"demo\"\n"
+    s = s + "version = \"0.1.0\"\n"
+    s = s + "repository = \"https://github.com/acme/demo\"\n"
+    s = s + "\n"
+    s = s + "[paths]\n"
+    s = s + "packages = \"vendor\"\n"
+    s = s + "cache = \"build/cache\"\n"
+    s = s + "registry = \"build/registry\"\n"
+    s = s + "\n"
+    s = s + "[registry]\n"
+    s = s + "default = \"https://registry.example/api\"\n"
+    s = s + "\n"
+    s = s + "[workspace]\n"
+    s = s + "members = [\n"
+    s = s + "    \{ name = \"app\", path = \"app\" \},\n"
+    s = s + "    \{ name = \"core\", path = \"core\" \},\n"
+    s = s + "]\n"
+    s = s + "\n"
+    s = s + "[dependencies]\n"
+    s = s + "acme/base = \"^1.0.0\"\n"
+    s = s + "acme/multi = [\"^1.0.0\", \"~1.2.0\"]\n"
+    s
+}
+
+fn serveSome(srv: HttpServer, count: int) {
+    var i = 0
+    while (i < count) {
+        let _ = srv.serveOnceTimeout(5000)
+        i = i + 1
+    }
+}
+
+fn serveAsyncN(srv: HttpServer, count: int) -> Task {
+    spawn(fn () {
+        serveSome(srv, count)
+    })
+}
+
+fn jsonVersion(version: string, prerelease: bool, deps: string) -> string {
+    var s = "\{\"version\":\"" + version + "\",\"tag\":\"v" + version + "\","
+    s = s + "\"download_url\":\"http://127.0.0.1/pkg.zip\","
+    if (prerelease) {
+        s = s + "\"is_prerelease\":true,"
+    } else {
+        s = s + "\"is_prerelease\":false,"
+    }
+    s = s + "\"dependencies\":" + deps
+    s = s + ",\"integrity\":\{\"sha256\":null\}\}"
+    s
+}
+
+fn jsonVersions(list: List<string>) -> string {
+    var body = ""
+    for (v in list) {
+        if (body != "") {
+            body = body + ","
+        }
+        body = body + v
+    }
+    "\{\"package\":\"acme\",\"versions\":[" + body + "]\}"
+}
+
+/// The registry-shaped answers the resolver test expects. `any` means "every
+/// stable version"; `narrow` and `otheronly` are opaque tokens the client
+/// forwards to the server, exactly as it forwards real semver constraints.
+fn resolverBody(target: string) -> string {
+    if (indexOfText(target, "/packages/acme/base/") >= 0) {
+        if (indexOfText(target, "constraint=narrow") >= 0) {
+            return jsonVersions([jsonVersion("1.0.0", false, "[]")])
+        }
+        if (indexOfText(target, "constraint=otheronly") >= 0) {
+            return jsonVersions([jsonVersion("2.0.0", false, "[]")])
+        }
+        return jsonVersions([
+            jsonVersion("1.1.0", false, "[]"),
+            jsonVersion("1.0.0", false, "[]")
+        ])
+    }
+    if (indexOfText(target, "/packages/acme/other/") >= 0) {
+        return jsonVersions([
+            jsonVersion("1.0.0", false, "\{\"acme/base\":\"narrow\"\}")
+        ])
+    }
+    if (indexOfText(target, "/packages/acme/pre/") >= 0) {
+        return jsonVersions([
+            jsonVersion("2.0.0-beta.1", true, "[]"),
+            jsonVersion("1.9.0", false, "[]")
+        ])
+    }
+    jsonVersions([])
+}
+
+fn selectedVersion(sel: Selection, name: string) -> string {
+    match (sel.versions.get(name)) {
+        case some(v) -> v.version
+        case none -> "<missing>"
+    }
+}
+
+fn zeroDigest() -> string {
+    var s = ""
+    var i = 0
+    while (i < 64) {
+        s = s + "0"
+        i = i + 1
+    }
+    s
+}
+
+// ---------------------------------------------------------------------------
+// Manifest and module names
+// ---------------------------------------------------------------------------
+
+test fn manifest_parses_package_paths_registry_and_dependencies() {
+    let m = parseManifest(manifestText())
+    expect(m.name).toBe("demo")
+    expect(m.version).toBe("0.1.0")
+    expect(m.repository).toBe("https://github.com/acme/demo")
+    expect(m.packages_path).toBe("vendor")
+    expect(m.cache_path).toBe("build/cache")
+    expect(m.registry_path).toBe("build/registry")
+    expect(m.registry_url).toBe("https://registry.example/api")
+    expect(m.deps.get("acme/base").unwrapOr("")).toBe("^1.0.0")
+    // An array is the manifest spelling of an intersection; it is joined with
+    // the same separator `ConstraintSet` uses when it prints a conflict.
+    expect(m.deps.get("acme/multi").unwrapOr("")).toBe("^1.0.0 || ~1.2.0")
+    expect(len(m.workspace_names)).toBe(2)
+    expect(m.workspace_names[0]).toBe("app")
+    expect(m.workspace_names[1]).toBe("core")
+}
+
+test fn manifest_defaults_when_sections_are_absent() {
+    let m = parseManifest("[package]\nname = \"tiny\"\n")
+    expect(m.name).toBe("tiny")
+    expect(m.version).toBe("")
+    expect(m.packages_path).toBe(".pickle/packages")
+    expect(m.cache_path).toBe(".pickle/cache")
+    expect(m.registry_path).toBe(".pickle/registry")
+    expect(m.registry_url).toBe("https://picklescript.dpdns.org/api")
+    expect(m.deps.get("acme/base").isNone()).toBe(true)
+}
+
+test fn dependency_edits_preserve_the_rest_of_the_manifest() {
+    let base = "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n"
+    let added = manifestSetDependency(base, "acme/base", "^1.0.0")
+    expect(added).toContain("[dependencies]")
+    expect(added).toContain("acme/base = \"^1.0.0\"")
+    expect(parseManifest(added).deps.get("acme/base").unwrapOr("")).toBe("^1.0.0")
+
+    let replaced = manifestSetDependency(added, "acme/base", "~1.2.0")
+    expect(parseManifest(replaced).deps.get("acme/base").unwrapOr("")).toBe("~1.2.0")
+    expect(indexOfText(replaced, "acme/base = \"^1.0.0\"")).toBe(-1)
+
+    let removed = manifestRemoveDependency(replaced, "acme/base")
+    expect(parseManifest(removed).deps.get("acme/base").isNone()).toBe(true)
+    expect(removed).toContain("[dependencies]")
+    expect(removed).toContain("[package]")
+}
+
+test fn module_names_follow_the_package_segment() {
+    expect(moduleNameFor("vilnisgrinbergs2000/pickle-uuid")).toBe("pickle_uuid")
+    expect(moduleNameFor("Acme/HTTP.Client")).toBe("http_client")
+    expect(moduleNameFor("acme/2fast")).toBe("_2fast")
+    expect(moduleNameFor("acme/")).toBe("package")
+    expect(moduleNameFor("acme/___")).toBe("___")
+
+    let m = parseManifest(manifestText())
+    expect(moduleCollides(m, "app")).toBe(true)
+    expect(moduleCollides(m, "pickle_uuid")).toBe(false)
+}
+
+test fn workspace_map_paths_are_relative_to_dot_pickle() {
+    let root = scratch("workspace")
+    let project = Project(root, parseManifest("[package]\nname = \"demo\"\nversion = \"0.1.0\"\n"))
+    let e = LockEntry()
+    e.name = "acme/base"
+    e.version = "1.2.3"
+    e.modName = "base"
+    e.install = ".pickle/packages/acme/base/1.2.3"
+    e.crate = e.install
+    let text = workspaceText(project, [e])
+    expect(text).toContain("name = \"base\"")
+    expect(text).toContain("path = \"packages/acme/base/1.2.3\"")
+    expect(text).toContain("[workspace]")
+}
+
+// ---------------------------------------------------------------------------
+// Lockfile
+// ---------------------------------------------------------------------------
+
+test fn lockfile_round_trips_and_sorts_by_name() {
+    let zeta = LockEntry()
+    zeta.name = "acme/zeta"
+    zeta.version = "2.0.0"
+    zeta.modName = "zeta"
+    zeta.install = ".pickle/packages/acme/zeta/2.0.0"
+    zeta.crate = zeta.install
+    zeta.download = "https://registry.example/api/packages/acme/zeta/download/2.0.0?x=1&y=\"two\""
+    zeta.integrity = "sha256=deadbeef"
+    zeta.constraints = ["*"]
+    zeta.deps = []
+
+    let base = LockEntry()
+    base.name = "acme/base"
+    base.version = "1.2.3"
+    base.modName = "base"
+    base.install = ".pickle/packages/acme/base/1.2.3"
+    base.crate = base.install
+    base.download = "https://registry.example/api/packages/acme/base/download/1.2.3"
+    base.integrity = "sha256=abc123"
+    base.constraints = ["^1.0.0", "~1.2.0"]
+    base.deps = ["acme/leaf *"]
+
+    let text = lockText([zeta, base])
+    expect(indexOfText(text, "name = \"acme/base\"") < indexOfText(text, "name = \"acme/zeta\"")).toBe(true)
+
+    match (parseLock(text)) {
+        case some(entries) -> {
+            expect(len(entries)).toBe(2)
+            let first = entries[0]
+            expect(first.name).toBe("acme/base")
+            expect(first.version).toBe("1.2.3")
+            expect(first.modName).toBe("base")
+            expect(first.install).toBe(".pickle/packages/acme/base/1.2.3")
+            expect(first.crate).toBe(base.install)
+            expect(first.integrity).toBe("sha256=abc123")
+            expect(len(first.constraints)).toBe(2)
+            expect(first.constraints[1]).toBe("~1.2.0")
+            expect(len(first.deps)).toBe(1)
+            expect(first.deps[0]).toBe("acme/leaf *")
+            // Quotes and ampersands survive the TOML escape/unescape pair.
+            expect(entries[1].download).toBe(zeta.download)
+        }
+        case none -> assert(false, "lock did not parse")
+    }
+}
+
+test fn lockfile_without_packages_is_none() {
+    expect(parseLock("version = 1\n").isNone()).toBe(true)
+    expect(parseLock("").isNone()).toBe(true)
+}
+
+// ---------------------------------------------------------------------------
+// URLs and redirects
+// ---------------------------------------------------------------------------
+
+test fn urls_parse_defaults_and_reject_bad_authorities() {
+    match (parseUrl("https://example.com")) {
+        case some(u) -> {
+            expect(u.scheme).toBe("https")
+            expect(u.host).toBe("example.com")
+            expect(u.port).toBe(443)
+            expect(u.path).toBe("/")
+            expect(u.origin()).toBe("https://example.com")
+            expect(u.text()).toBe("https://example.com/")
+        }
+        case none -> assert(false, "https URL did not parse")
+    }
+    match (parseUrl("http://127.0.0.1:8080/api/packages?q=x")) {
+        case some(u) -> {
+            expect(u.host).toBe("127.0.0.1")
+            expect(u.port).toBe(8080)
+            expect(u.path).toBe("/api/packages?q=x")
+            expect(u.origin()).toBe("http://127.0.0.1:8080")
+        }
+        case none -> assert(false, "http URL did not parse")
+    }
+    match (parseUrl("http://example.com:80/x")) {
+        case some(u) -> expect(u.origin()).toBe("http://example.com")
+        case none -> assert(false, "explicit default port did not parse")
+    }
+
+    expect(parseUrl("ftp://example.com/x").isNone()).toBe(true)
+    expect(parseUrl("https:///x").isNone()).toBe(true)
+    expect(parseUrl("https://host:0/x").isNone()).toBe(true)
+    expect(parseUrl("https://host:65536/x").isNone()).toBe(true)
+    expect(parseUrl("https://host:abc/x").isNone()).toBe(true)
+    expect(parseUrl("https://host:-1/x").isNone()).toBe(true)
+}
+
+test fn redirect_locations_resolve_absolute_root_and_relative() {
+    match (parseUrl("https://h/api/packages/x/download/1.0.0?token=1")) {
+        case some(base) -> {
+            match (resolveLocation(base, "https://cdn.example.com/f.zip")) {
+                case some(u) -> {
+                    expect(u.host).toBe("cdn.example.com")
+                    expect(u.path).toBe("/f.zip")
+                }
+                case none -> assert(false, "absolute location did not resolve")
+            }
+            match (resolveLocation(base, "/other")) {
+                case some(u) -> {
+                    expect(u.host).toBe("h")
+                    expect(u.path).toBe("/other")
+                }
+                case none -> assert(false, "root-relative location did not resolve")
+            }
+            match (resolveLocation(base, "next")) {
+                case some(u) -> expect(u.path).toBe("/api/packages/x/download/next")
+                case none -> assert(false, "relative location did not resolve")
+            }
+            match (resolveLocation(base, "../v2")) {
+                case some(u) -> expect(u.path).toBe("/api/packages/x/download/../v2")
+                case none -> assert(false, "parent-relative location did not resolve")
+            }
+        }
+        case none -> assert(false, "base URL did not parse")
+    }
+    expect(pathWithQuery("/a", "")).toBe("/a")
+    expect(pathWithQuery("/a", "q=1")).toBe("/a?q=1")
+}
+
+// ---------------------------------------------------------------------------
+// Digests and integrity
+// ---------------------------------------------------------------------------
+
+test fn sha256_matches_known_answer_vectors() {
+    expect(sha256Text(bytes(""))).toBe("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    expect(sha256Text(bytes("abc"))).toBe("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+
+    var raw = bytes("")
+    raw.push(0 as byte)
+    raw.push(15 as byte)
+    raw.push(16 as byte)
+    raw.push(255 as byte)
+    expect(hexBytes(raw)).toBe("000f10ff")
+}
+
+test fn integrity_normalization_accepts_header_and_plain_forms() {
+    expect(normalizeIntegrity(" SHA256=ABC ")).toBe("abc")
+    expect(normalizeIntegrity("abc123")).toBe("abc123")
+    expect(normalizeIntegrity("")).toBe("")
+    // Only the documented `sha256=` prefix is stripped; anything else is
+    // treated as a digest and will fail the comparison rather than silently
+    // matching.
+    expect(normalizeIntegrity("sha256:abc")).toBe("sha256:abc")
+}
+
+// ---------------------------------------------------------------------------
+// Constraint bookkeeping
+// ---------------------------------------------------------------------------
+
+test fn constraint_sets_intersect_without_duplicates() {
+    let cs = ConstraintSet()
+    cs.add("b/pkg", "")
+    cs.add("a/pkg", "^1.0.0")
+    cs.add("a/pkg", "^1.0.0")
+    cs.add("a/pkg", "~1.2.0")
+    expect(cs.names()[0]).toBe("a/pkg")
+    expect(cs.names()[1]).toBe("b/pkg")
+    let list = cs.items.get("a/pkg").unwrapOr(List<string>())
+    expect(len(list)).toBe(2)
+    expect(constraintsSignature(cs)).toBe("a/pkg=^1.0.0;~1.2.0;\nb/pkg=*;\n")
+    expect(joinConstraints(["^1.0.0", "~1.2.0"])).toBe("^1.0.0, ~1.2.0")
+    expect(constraintKey("a/pkg", "^1.0.0") == constraintKey("a/pkg", "~1.2.0")).toBe(false)
+}
+
+test fn prerelease_constraints_are_detected_by_a_hyphen() {
+    expect(constraintHasPre("^1.0.0-beta.1")).toBe(true)
+    expect(constraintHasPre("^1.0.0")).toBe(false)
+    // Hyphen ranges also contain `-`; asking the registry for prereleases is
+    // harmless because the registry still applies the range.
+    expect(constraintHasPre("1.0.0 - 2.0.0")).toBe(true)
+}
+
+test fn build_constraint_set_adds_selected_dependencies() {
+    let root = Map<string, string>()
+    root["acme/base"] = "^1.0.0"
+    let sel = Selection()
+    let v = VersionInfo()
+    v.version = "1.0.0"
+    v.deps["acme/leaf"] = "~2.0.0"
+    sel.versions["acme/base"] = v
+    let cs = buildConstraintSet(root, sel)
+    expect(cs.names()[0]).toBe("acme/base")
+    expect(cs.names()[1]).toBe("acme/leaf")
+    expect(cs.items.get("acme/base").unwrapOr(List<string>())[0]).toBe("^1.0.0")
+    expect(cs.items.get("acme/leaf").unwrapOr(List<string>())[0]).toBe("~2.0.0")
+}
+
+test fn add_pins_a_default_constraint_into_the_lock() {
+    let e = LockEntry()
+    e.name = "acme/base"
+    e.version = "1.2.3"
+    e.constraints = ["*"]
+    let entries = [e]
+    // A bare `add` resolves with `*`, then stores `^<version>` in both the
+    // manifest and the lock so the next `install` does not see a stale lock.
+    expect(pinAddedConstraint(entries, "acme/base", "*")).toBe("^1.2.3")
+    expect(entries[0].constraints[0]).toBe("^1.2.3")
+    // An explicit constraint is kept and does not rewrite the lock entry.
+    expect(pinAddedConstraint(entries, "acme/base", "~1.2.0")).toBe("~1.2.0")
+    expect(entries[0].constraints[0]).toBe("^1.2.3")
+}
+
+// ---------------------------------------------------------------------------
+// Loopback registry
+// ---------------------------------------------------------------------------
+
+test fn resolver_intersects_registry_filters_and_reports_conflicts() {
+    match (TcpListener.bind("127.0.0.1", 0)) {
+        case some(l) -> {
+            let srv = HttpServer(l, fn (req: HttpRequest) {
+                let res = HttpResponse(200)
+                res.setHeader("Content-Type", "application/json")
+                res.setBodyText(resolverBody(req.target))
+                res
+            })
+            let port = srv.localPort()
+            // 3 requests for the successful intersection, 3 for the conflict.
+            let t = serveAsyncN(srv, 6)
+            let reg = Registry(Url("http", "127.0.0.1", port, "/api"), 5000)
+
+            var root = Map<string, string>()
+            root["acme/base"] = "any"
+            root["acme/other"] = "any"
+            match (resolveDependencies(reg, root, false)) {
+                case some(sel) -> {
+                    // `other` narrows `base` to 1.0.0, so the resolver must
+                    // prefer it over the 1.1.0 selected in the first round.
+                    expect(selectedVersion(sel, "acme/base")).toBe("1.0.0")
+                    expect(selectedVersion(sel, "acme/other")).toBe("1.0.0")
+                }
+                case none -> assert(false, "resolution failed: " + reg.last_error)
+            }
+
+            var conflict = Map<string, string>()
+            conflict["acme/base"] = "otheronly"
+            conflict["acme/other"] = "any"
+            match (resolveDependencies(reg, conflict, false)) {
+                case some(_) -> assert(false, "conflicting constraints unexpectedly resolved")
+                case none -> expect(reg.last_error).toContain("no version of acme/base satisfies")
+            }
+
+            expect(t.join()).toBe(true)
+            srv.close()
+        }
+        case none -> assert(false, "loopback listener could not bind")
+    }
+}
+
+test fn select_version_skips_prereleases_unless_requested() {
+    match (TcpListener.bind("127.0.0.1", 0)) {
+        case some(l) -> {
+            let srv = HttpServer(l, fn (req: HttpRequest) {
+                let res = HttpResponse(200)
+                res.setHeader("Content-Type", "application/json")
+                res.setBodyText(resolverBody(req.target))
+                res
+            })
+            let port = srv.localPort()
+            // The second call reuses the constraint cache, so one connection.
+            let t = serveAsyncN(srv, 1)
+            let reg = Registry(Url("http", "127.0.0.1", port, "/api"), 5000)
+            let cache = Map<string, List<VersionInfo>>()
+
+            match (selectVersion(reg, cache, "acme/pre", ["any"], false)) {
+                case some(v) -> expect(v.version).toBe("1.9.0")
+                case none -> assert(false, "stable selection failed: " + reg.last_error)
+            }
+            match (selectVersion(reg, cache, "acme/pre", ["any"], true)) {
+                case some(v) -> expect(v.version).toBe("2.0.0-beta.1")
+                case none -> assert(false, "prerelease selection failed: " + reg.last_error)
+            }
+
+            expect(t.join()).toBe(true)
+            srv.close()
+        }
+        case none -> assert(false, "loopback listener could not bind")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Downloads over loopback
+// ---------------------------------------------------------------------------
+
+test fn fetch_follows_redirect_and_captures_integrity() {
+    let payload = bytes("package-bytes")
+    let digest = sha256Text(payload)
+    match (TcpListener.bind("127.0.0.1", 0)) {
+        case some(l) -> {
+            let srv = HttpServer(l, fn (req: HttpRequest) {
+                if (req.target == "/start") {
+                    let res = HttpResponse(302)
+                    res.setHeader("Location", "/final")
+                    res
+                } else {
+                    let res = HttpResponse(200)
+                    res.setHeader("X-Pickle-Integrity", "sha256=" + digest)
+                    res.setBodyBytes(payload)
+                    res
+                }
+            })
+            let port = srv.localPort()
+            // One redirect pair plus three direct downloads below.
+            let t = serveAsyncN(srv, 5)
+            let start = Url("http", "127.0.0.1", port, "/start")
+            match (fetchFollow(start, "GET", bytes(""), Map<string, string>(), 5000)) {
+                case some(res) -> {
+                    expect(res.status).toBe(200)
+                    expect(str(res.body)).toBe("package-bytes")
+                    expect(normalizeIntegrity(res.integrity)).toBe(digest)
+                    expect(res.final_url).toBe("http://127.0.0.1:" + str(port) + "/final")
+                }
+                case none -> assert(false, "redirected fetch failed")
+            }
+
+            let reg = Registry(Url("http", "127.0.0.1", port, "/api"), 5000)
+            let url = "http://127.0.0.1:" + str(port) + "/final"
+            match (reg.download(url, "")) {
+                case some(body) -> expect(str(body)).toBe("package-bytes")
+                case none -> assert(false, "advertised-integrity download failed: " + reg.last_error)
+            }
+            match (reg.download(url, "sha256=" + digest)) {
+                case some(body) -> expect(str(body)).toBe("package-bytes")
+                case none -> assert(false, "matching-integrity download failed: " + reg.last_error)
+            }
+            match (reg.download(url, "sha256=" + zeroDigest())) {
+                case some(_) -> assert(false, "download with the wrong digest succeeded")
+                case none -> expect(reg.last_error).toContain("archive integrity mismatch")
+            }
+
+            expect(t.join()).toBe(true)
+            srv.close()
+        }
+        case none -> assert(false, "loopback listener could not bind")
+    }
+}
+
+test fn install_entry_downloads_extracts_and_reuses_the_cache() {
+    let root = scratch("install")
+    let _ = removeTree(root)
+    let _ = ensureDir(root)
+    let manifest = joinPath(root, "picklescript.toml")
+    let _ = write_file(manifest, "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n")
+    let project = Project(root, parseManifest("[package]\nname = \"demo\"\nversion = \"0.1.0\"\n"))
+
+    // Build a GitHub-style archive with one top-level directory; extraction
+    // strips that component, leaving `pickle_uuid.pkl` at the install root.
+    let src = scratch("install-src")
+    let _ = removeTree(src)
+    let _ = ensureDir(joinPath(src, "rootdir"))
+    let _ = write_file(joinPath(src, "rootdir/pickle_uuid.pkl"), "fn hello() -> int { 1 }\n")
+    let zipPath = joinPath(scratch("install-archive"), "pkg.zip")
+    let tar = tarCommand()
+    let r = Proc([tar, "-a", "-c", "-f", zipPath, "-C", src, "rootdir"]).run()
+    assert(r.ok(), "tar could not create the test archive: " + r.stderr())
+    let blob = bytes(read_file(zipPath) ?? "")
+    let digest = sha256Text(blob)
+
+    match (TcpListener.bind("127.0.0.1", 0)) {
+        case some(l) -> {
+            let srv = HttpServer(l, fn (req: HttpRequest) {
+                let res = HttpResponse(200)
+                res.setHeader("X-Pickle-Integrity", "sha256=" + digest)
+                res.setBodyBytes(blob)
+                res
+            })
+            let port = srv.localPort()
+            let t = serveAsyncN(srv, 1)
+            let reg = Registry(Url("http", "127.0.0.1", port, "/api"), 5000)
+
+            let e = LockEntry()
+            e.name = "acme/zip"
+            e.version = "1.0.0"
+            e.modName = "pickle_uuid"
+            e.install = ".pickle/packages/acme/zip/1.0.0"
+            e.crate = e.install
+            e.download = "http://127.0.0.1:" + str(port) + "/pkg.zip"
+            e.integrity = "sha256=" + digest
+
+            let installed = installEntry(reg, project, e, false)
+            assert(installed, "install failed: " + reg.last_error)
+            let dir = joinPath(root, e.install)
+            expect(file_exists(joinPath(dir, "pickle_uuid.pkl"))).toBe(true)
+            expect(installedCrate(project, e).isSome()).toBe(true)
+            expect(trimText(read_file(joinPath(dir, ".pickle-ok")) ?? "")).toBe("1.0.0")
+
+            // The cached archive is enough for a reinstall: the marker is
+            // removed and the server is already gone.
+            expect(delete(joinPath(dir, ".pickle-ok"))).toBe(true)
+            expect(file_exists(joinPath(dir, ".pickle-ok"))).toBe(false)
+            let again = installEntry(reg, project, e, false)
+            assert(again, "cached install failed: " + reg.last_error)
+            expect(file_exists(joinPath(dir, "pickle_uuid.pkl"))).toBe(true)
+            expect(trimText(read_file(joinPath(dir, ".pickle-ok")) ?? "")).toBe("1.0.0")
+
+            expect(t.join()).toBe(true)
+            srv.close()
+        }
+        case none -> assert(false, "loopback listener could not bind")
+    }
+}
