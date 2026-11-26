@@ -4169,11 +4169,21 @@ fn methodCallFits(em: Emitter, fid: int, args: List<CallArg>, isStatic: bool) ->
     if (!haveSource) {
         // No source declaration (an abstract stub, for instance): fall back
         // to the ABI arity. Instance methods carry the receiver as slot 0.
+        // A spread defers its count to the runtime, so it cannot be judged
+        // here; keep the pre-existing method-first behavior for it.
         var n = len(em.irModule.funcs[fid].params)
         if (!isStatic) {
             n = n - 1
         }
-        return len(args) <= n
+        if (len(args) <= n) {
+            return true
+        }
+        for (a in args) {
+            if (a.spread) {
+                return true
+            }
+        }
+        return false
     }
     var fixed = 0
     var rest = false
@@ -4185,19 +4195,23 @@ fn methodCallFits(em: Emitter, fid: int, args: List<CallArg>, isStatic: bool) ->
         }
     }
     var positional = 0
+    var sawSpread = false
     for (a in args) {
         if (a.spread) {
-            if (!rest) {
-                return false
-            }
+            // The spread's element count is only known at runtime, so the
+            // arity and per-slot types below cannot decide this call. The
+            // spread lowering checks the count when it runs.
+            sawSpread = true
         } else if (let some(_) = a.name) {
             return false
         } else {
-            if (let some(stys) = em.srcParamTys.get(fid)) {
-                if (positional < len(stys)) {
-                    if (let some(gt) = tyOf(em, a.value.span)) {
-                        if (primitiveArgMismatch(stys[positional], gt)) {
-                            return false
+            if (!sawSpread) {
+                if (let some(stys) = em.srcParamTys.get(fid)) {
+                    if (positional < len(stys)) {
+                        if (let some(gt) = tyOf(em, a.value.span)) {
+                            if (primitiveArgMismatch(stys[positional], gt)) {
+                                return false
+                            }
                         }
                     }
                 }
@@ -4205,16 +4219,18 @@ fn methodCallFits(em: Emitter, fid: int, args: List<CallArg>, isStatic: bool) ->
             positional = positional + 1
         }
     }
-    if (positional > fixed && !rest) {
-        return false
-    }
-    if (positional < fixed) {
-        var i = positional
-        while (i < fixed) {
-            if (let none = params[i].default) {
-                return false
+    if (!sawSpread) {
+        if (positional > fixed && !rest) {
+            return false
+        }
+        if (positional < fixed) {
+            var i = positional
+            while (i < fixed) {
+                if (let none = params[i].default) {
+                    return false
+                }
+                i = i + 1
             }
-            i = i + 1
         }
     }
     true

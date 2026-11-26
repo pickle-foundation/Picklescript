@@ -50,6 +50,21 @@ fn shadowSource() -> string {
     s
 }
 
+/// A spread call's element count is only known at runtime, so it must still
+/// reach the implicit method. Before the fit gate learned this case, the
+/// emitter fell through and reported `sum` as a value.
+fn spreadSource() -> string {
+    var s = "class SpreadCalc " + obrace() + "\n"
+    s = s + "    fn sum(a: int, b: int) -> int " + obrace() + "\n"
+    s = s + "        a + b\n"
+    s = s + "    " + cbrace() + "\n"
+    s = s + "    fn viaSpread(xs: List<int>) -> int " + obrace() + "\n"
+    s = s + "        sum(...xs)\n"
+    s = s + "    " + cbrace() + "\n"
+    s = s + cbrace() + "\n"
+    s
+}
+
 fn emitSource(src: string) -> IrModule? {
     let toks = Lexer(bytes(src), 0, 0, none, range(0), 0).run()
     let diags = DiagnosticSink()
@@ -124,6 +139,15 @@ test fn bare_bytes_inside_a_bytes_method_lowers_to_the_builtin() {
     if (let some(m) = modO) {
         expect(countMismatchedCalls(m)).toBe(0)
         expect(countExternCalls(m, "pickle_str_to_bytes")).toBe(2)
+    } else {
+        expect(false).toBe(true)
+    }
+}
+
+test fn spread_call_still_reaches_an_implicit_method() {
+    let modO = emitSource(spreadSource())
+    if (let some(m) = modO) {
+        expect(countMismatchedCalls(m)).toBe(0)
     } else {
         expect(false).toBe(true)
     }
