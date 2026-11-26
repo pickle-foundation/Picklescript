@@ -142,13 +142,13 @@ var managedArenaUsed: int = 0
 var managedArenaCap: int = 0
 var managedArenaChunk: int = 0
 
-/// Last chunk range matched by `abiManagedRelease`. The sweep frees in registry
+/// Last chunk matched by `abiManagedRelease`. The sweep frees in registry
 /// order, which is allocation order, so consecutive releases usually land in
-/// the same 1 MiB chunk; this turns the list walk into two compares. Guarded by
-/// `managedChunkLock` like the list itself, and never invalidated because a
-/// chunk is never freed.
-var managedLastChunkBase: int = 0
-var managedLastChunkEnd: int = 0
+/// the same 1 MiB chunk; this turns the list walk into a read of the chunk's
+/// immutable size word. A single word is read without the lock: the value is
+/// always a valid chunk base, and the chunk header never changes. Chunks are
+/// never freed, so a hit cannot go stale.
+var managedLastChunk: int = 0
 
 /// Zero until a second thread exists. The emitter's inline allocation and
 /// registration fast paths check this word first: zero keeps the original
@@ -262,21 +262,26 @@ fn abiManagedRelease(addr: int) {
     if (addr == 0) {
         return
     }
+    // Fast path, no lock: the cached chunk is a single word and its header is
+    // immutable, so the range check cannot tear. The sweep usually releases
+    // many objects from the same chunk in a row.
+    let cached = managedLastChunk
+    if (cached != 0) {
+        var csize = 0
+        unsafe {
+            csize = (cached as *int)[1]
+        }
+        if (addr >= cached && addr < cached + csize) {
+            return
+        }
+    }
     // Chunk allocation can prepend to the list from another thread, so the
-    // walk and the append share one lock. This runs only from the sweep, never
-    // from the allocation path.
+    // walk and the append share one lock. This runs only on a cache miss.
     var lockAddr = 0
     unsafe {
         lockAddr = (&managedChunkLock) as int
     }
     winLockAcquire(lockAddr)
-    // Sweep-order locality: the previous release's chunk is usually this one's
-    // too, so two compares replace a walk over every chunk the process ever
-    // allocated.
-    if (addr >= managedLastChunkBase && addr < managedLastChunkEnd) {
-        winLockRelease(lockAddr)
-        return
-    }
     var chunk = managedArenaChunk
     while (chunk != 0) {
         var next = 0
@@ -286,8 +291,7 @@ fn abiManagedRelease(addr: int) {
             size = (chunk as *int)[1]
         }
         if (addr >= chunk && addr < chunk + size) {
-            managedLastChunkBase = chunk
-            managedLastChunkEnd = chunk + size
+            managedLastChunk = chunk
             winLockRelease(lockAddr)
             return
         }

@@ -38,6 +38,7 @@ module runtime.abi_threads
 ///   [4] entry closure object (as int)
 ///   [5] task id              [6] failure message (reserved)
 ///   [7] joined flag          [8] record lock
+///   [9] shadow registry node (retired by the first reaper)
 ///
 /// Both closures are GC objects that the raw record cannot keep alive by
 /// itself, so spawn takes a temp-root lease on each. The entry's lease is
@@ -50,7 +51,10 @@ module runtime.abi_threads
 /// and clears the handle under the lock before closing it. A second joiner sees
 /// `joined` set and does not wait again (the first joiner already reaped it).
 /// `finished` performs its zero-timeout probe under the same lock, so the
-/// handle cannot be closed while a probe is in flight.
+/// handle cannot be closed while a probe is in flight. Whoever observes the OS
+/// thread exit also retires its shadow-registry node: the first reaper clears
+/// `TASK_NODE` under the record lock and recycles the node, so a second
+/// join/finished cannot double-unlink it.
 ///
 /// HANDLES. `spawn` returns the 0-based post-push index, the native std
 /// convention (`threads.rs:134`); the index addresses a flat raw table of
@@ -67,7 +71,7 @@ module runtime.abi_threads
 import { abiEngineTempRootShared, abiEngineTempUnrootShared, abiGcThreadStarting, abiGcThreadExited } from runtime.abi_gcengine
 import { abiObjSlotGet } from runtime.abi_class
 import { abiUnboxI64 } from runtime.abi_box
-import { abiGcRegisterThread } from runtime.abi_shadow
+import { abiGcRegisterThread, abiShadowRetireNode, abiShadowSelfIfRegistered } from runtime.abi_shadow
 import { abiRawSetParallel } from runtime.abi_raw
 import { worldAcquire, worldRelease, worldHeld, lockAcquire, lockRelease } from runtime.abi_world
 import { abiGilMode } from runtime.abi_gil
@@ -82,7 +86,8 @@ const TASK_ID: int = 5
 const TASK_MSG: int = 6
 const TASK_JOINED: int = 7
 const TASK_LOCK: int = 8
-const TASK_WORDS: int = 9
+const TASK_NODE: int = 9
+const TASK_WORDS: int = 10
 
 const TASK_RUNNING: int = 0
 const TASK_DONE: int = 1
@@ -176,7 +181,9 @@ fn thrRecord(handle: int) -> *int {
 /// The thread was counted by `abiGcThreadStarting` before `CreateThread`, so
 /// the exit path must balance it exactly once: `worldRelease` drops the count
 /// through its native-section entry in serialized mode, and `abiGcThreadExited`
-/// does the same decrement explicitly in parallel mode.
+/// does the same decrement explicitly in parallel mode. The wrapper publishes
+/// its registry node in `TASK_NODE` before that exit; it cannot unregister
+/// itself because its own frame is still on the chain.
 fn abiThreadRun(recAddr: int) {
     if (abiGilMode() != 0) {
         worldAcquire()
@@ -193,6 +200,14 @@ fn abiThreadRun(recAddr: int) {
             rec[TASK_STATE] = TASK_FAILED
         } finally {
             abiEngineTempUnrootShared(bodyObj)
+            // Publish the node for the joiner. The thread is still alive here,
+            // so it must not unregister itself: its wrapper frame is still on
+            // the chain. The first reaper (join or a signaled finished probe)
+            // unlinks it after the OS thread has exited.
+            let node = abiShadowSelfIfRegistered()
+            if (node != 0) {
+                rec[TASK_NODE] = node
+            }
             if (abiGilMode() != 0) {
                 worldRelease()
             } else {
@@ -297,7 +312,12 @@ fn abiThreadJoin(handle: int) -> bool {
             worldAcquire()
             lockAcquire(taskWord(rec, TASK_LOCK))
             rec[TASK_HANDLE] = 0
+            let node = rec[TASK_NODE]
+            rec[TASK_NODE] = 0
             lockRelease(taskWord(rec, TASK_LOCK))
+            if (node != 0) {
+                abiShadowRetireNode(node)
+            }
             let _ = win_close_handle(h)
         }
         if (rec[TASK_STATE] == TASK_FAILED) {
@@ -310,7 +330,8 @@ fn abiThreadJoin(handle: int) -> bool {
 /// Whether task `handle` has finished. Never blocks: a zero-timeout wait is
 /// enough because the state word is written before the OS thread exits. The
 /// probe runs under the record lock so a concurrent `join` cannot close the
-/// handle mid-wait.
+/// handle mid-wait. When the wait proves the thread has exited, the probe also
+/// retires its registry node; a later `join` then only closes the handle.
 #[symbol("pickle_thread_finished")]
 fn abiThreadFinished(handle: int) -> bool {
     let rec = thrRecord(handle)
@@ -320,7 +341,20 @@ fn abiThreadFinished(handle: int) -> bool {
     unsafe {
         lockAcquire(taskWord(rec, TASK_LOCK))
         if (rec[TASK_STATE] != TASK_RUNNING) {
+            // The body is done, but the OS thread may still be in its exit
+            // path (the state word is written before the thread exits). Try a
+            // non-blocking reap: the node can only be retired after the thread
+            // is gone. The handle stays open for `join` to close.
+            var node = 0
+            let h = rec[TASK_HANDLE]
+            if (h != 0 && win_wait_single(h, 0) == 0) {
+                node = rec[TASK_NODE]
+                rec[TASK_NODE] = 0
+            }
             lockRelease(taskWord(rec, TASK_LOCK))
+            if (node != 0) {
+                abiShadowRetireNode(node)
+            }
             return true
         }
         let h = rec[TASK_HANDLE]
@@ -330,8 +364,17 @@ fn abiThreadFinished(handle: int) -> bool {
         }
         let rc = win_wait_single(h, 0)
         if (rc == 0) {
-            rec[TASK_STATE] = TASK_DONE
+            // The OS thread has exited, so its node can be unlinked. Keep a
+            // failed body's state: only a still-RUNNING task becomes DONE.
+            if (rec[TASK_STATE] == TASK_RUNNING) {
+                rec[TASK_STATE] = TASK_DONE
+            }
+            let node = rec[TASK_NODE]
+            rec[TASK_NODE] = 0
             lockRelease(taskWord(rec, TASK_LOCK))
+            if (node != 0) {
+                abiShadowRetireNode(node)
+            }
             return true
         }
         lockRelease(taskWord(rec, TASK_LOCK))

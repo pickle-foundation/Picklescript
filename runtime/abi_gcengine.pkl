@@ -51,7 +51,7 @@ module runtime.abi_gcengine
 /// `regCapGrown` vs `abi_gc`'s `blockCapGrown`), so a helper reused across
 /// modules would collide. Public entry points are `abiEngine*`.
 
-import { shadowRegistryLockAcquire, shadowRegistryLockRelease, abiShadowRegistryHead, abiShadowSelf, abiShadowSelfIfRegistered, shadowCriticalEnter, shadowCriticalExit, SHADOW_W_NEXT, SHADOW_W_REG_BASE, SHADOW_W_REG_COUNT, SHADOW_W_REG_CAP, SHADOW_W_ALLOC_BYTES, SHADOW_W_ALLOC_COUNT, SHADOW_W_REG_BYTES, SHADOW_W_STATE, SHADOW_W_PARK, SHADOW_W_PARK_LOCK, SHADOW_W_CRITICAL, SHADOW_W_TEMP_BASE, SHADOW_W_TEMP_COUNT, SHADOW_W_TEMP_CAP, SHADOW_STATE_RUNNING, SHADOW_STATE_PARKED, SHADOW_STATE_NATIVE, SHADOW_STATE_COLLECTING } from runtime.abi_shadow
+import { shadowRegistryLockAcquire, shadowRegistryLockRelease, abiShadowRegistryHead, abiShadowSelf, abiShadowSelfIfRegistered, abiShadowReapDeadLocked, shadowCriticalEnter, shadowCriticalExit, SHADOW_W_NEXT, SHADOW_W_REG_BASE, SHADOW_W_REG_COUNT, SHADOW_W_REG_CAP, SHADOW_W_ALLOC_BYTES, SHADOW_W_ALLOC_COUNT, SHADOW_W_REG_BYTES, SHADOW_W_STATE, SHADOW_W_PARK, SHADOW_W_PARK_LOCK, SHADOW_W_CRITICAL, SHADOW_W_TEMP_BASE, SHADOW_W_TEMP_COUNT, SHADOW_W_TEMP_CAP, SHADOW_STATE_RUNNING, SHADOW_STATE_PARKED, SHADOW_STATE_NATIVE, SHADOW_STATE_COLLECTING } from runtime.abi_shadow
 import { abiClassOwnedMaskOf, abiClassFinalizerOf } from runtime.abi_classwords
 import { abiManagedRelease, abiRawParallelMode } from runtime.abi_raw
 import { winLockAcquire, winLockRelease, winParkOn, winWakeOn, winWakeAllOn } from runtime.abi_world_win
@@ -1704,6 +1704,10 @@ fn abiEngineCollect(force: bool) {
             tnode = (tnode as *int)[SHADOW_W_NEXT]
         }
     }
+    // Reap dead nodes whose blocks just emptied. This runs under the lock and
+    // loops with safepoint polls; safe only because the caller is the
+    // collector (abiGcPoll returns early in the COLLECTING state).
+    abiShadowReapDeadLocked()
     shadowRegistryLockRelease()
     unsafe {
         free(markPending as *int)
@@ -2006,11 +2010,12 @@ fn abiEngineTempUnroot(obj: *int) {
 }
 
 /// Number of registered temp-root leases - exported for tests.
-/// Total temp-root leases across every registered thread. Nodes are never
-/// retired today, so the walk is lock-free: the collector only mutates counts
-/// with word-sized stores, and a node is zeroed before it is linked. Taking
-/// `shadowRegistryLock` here would put this poll-bearing loop under the lock,
-/// letting a collection park the walker with the lock held.
+/// Total temp-root leases across every registered thread. Retired nodes are
+/// recycled, never freed, and the counts are word-sized stores, so the walk
+/// stays lock-free: a walker that already holds a node pointer always reads
+/// live process memory. Taking `shadowRegistryLock` here would put this
+/// poll-bearing loop under the lock, letting a collection park the walker with
+/// the lock held.
 fn abiEngineTempCount() -> int {
     var total = teCount
     var node = abiShadowRegistryHead()

@@ -17,9 +17,10 @@ module runtime.abi_shadow
 /// list head. `shadowNextId` is native `THREAD_COUNT` (ids from 1; a fresh
 /// registration after an unregister gets the next value, monotonic forever).
 /// Nodes are raw-heap blocks, so the Pickle collector can never reclaim them
-/// - the exact position of native's `Box::into_raw` - and unregistering
-/// (`pickle_gc_unregister_thread`) releases the block the way native's
-/// `Box::from_raw` does.
+/// - the exact position of native's `Box::into_raw`. Unregistering
+/// (`pickle_gc_unregister_thread`) unlinks the node and returns it to a free
+/// list; nodes are recycled rather than `Box::from_raw`d because lock-free
+/// diagnostic walks can still hold the pointer when a join retires it.
 ///
 /// THE LOCK. `shadowLock` (an SRWLOCK) serialises `shadowRegHead`, node
 /// creation/unregistration, and the collector's registry walk. Frame push and
@@ -41,10 +42,10 @@ module runtime.abi_shadow
 /// which has a same-thread consequence the plain ABI does not show: after
 /// `pickle_gc_unregister_thread` the next push/pop on the SAME thread
 /// creates a FRESH node (a new id - `shadowNextId` keeps advancing) with an
-/// empty frame list. `win_heap_alloc` may hand back the exact block the
-/// unregister freed, so a pointer-identity probe after such a sequence can
-/// read the new node as if the old one survived; probes and suites must
-/// discriminate through ids and registry walks, never through addresses.
+/// empty frame list. The free list may hand back the exact block the unregister
+/// retired, so a pointer-identity probe after such a sequence can read the new
+/// node as if the old one survived; probes and suites must discriminate through
+/// ids and registry walks, never through addresses.
 /// And because each node carries the thread's LIVE frame list, unregistering
 /// a thread whose frames are still in use tears the whole chain away - the
 /// next pop trips the out-of-order check (native: panic; here: silent
@@ -130,7 +131,7 @@ var shadowTlsSlot: int = -1
 ///  12 parkCv       13 gcEpoch     14 pinned       15 flags
 ///  16 parkLock     17 critical     18 tempBase     19 tempCount
 ///  20 tempCap
-///  21 allocCount  22 regBytes
+///  21 allocCount  22 regBytes    23 linked       24 prev
 ///
 /// `allocCount`/`regBytes` are this thread's pending registration statistics:
 /// the collector folds them into the process-wide counters during its registry
@@ -180,8 +181,16 @@ const SHADOW_W_TEMP_CAP: int = 20
 /// collector's `geSweepBlock`; read directly by the statistics accessors.
 const SHADOW_W_ALLOC_COUNT: int = 21
 const SHADOW_W_REG_BYTES: int = 22
-const SHADOW_NODE_WORDS: int = 23
-const SHADOW_NODE_BYTES: int = 184
+/// Registry state: 1 = linked and owned by a live thread, 2 = linked but the
+/// thread is gone (its registry block still holds live objects the sweep must
+/// reach), 0 = on the free list. Doubles as the double-retire guard.
+const SHADOW_W_LINKED: int = 23
+/// Registry predecessor. A doubly linked list makes unlink O(1), so no
+/// poll-bearing loop runs under `shadowLock`; while retired, the word is the
+/// free-list link.
+const SHADOW_W_PREV: int = 24
+const SHADOW_NODE_WORDS: int = 25
+const SHADOW_NODE_BYTES: int = 200
 
 /// Safepoint states.
 const SHADOW_STATE_RUNNING: int = 0
@@ -257,6 +266,11 @@ var shadowRegHead: int = 0
 /// observed in the registry are exactly 1, 2, 3, ... in registration order.
 var shadowNextId: int = 1
 
+/// Retired nodes, linked through `SHADOW_W_PREV`. Recycling instead of freeing
+/// keeps a lock-free diagnostic walk valid if it already holds the pointer;
+/// the list is bounded by peak concurrent threads, not by spawn count.
+var shadowFreeHead: int = 0
+
 /// Registry owner word (native `REGISTRY` Mutex): 1 = an acquirer holds the
 /// exclusive lock, 0 = unlocked.
 var shadowLock: int = 0
@@ -290,7 +304,7 @@ fn shadowInitNode(node: int) -> int {
         // emitter places a safepoint poll at every loop header in a
         // spawn-capable module. The poll would take `shadowLock` again
         // (`abiGcPoll` -> `abiShadowSelf`) on a non-reentrant SRW lock and
-        // deadlock the collector. Twenty-three stores cost nothing next to the
+        // deadlock the collector. Twenty-five stores cost nothing next to the
         // raw-heap allocation above them.
         (node as *int)[0] = 0
         (node as *int)[1] = 0
@@ -315,11 +329,35 @@ fn shadowInitNode(node: int) -> int {
         (node as *int)[20] = 0
         (node as *int)[SHADOW_W_ALLOC_COUNT] = 0
         (node as *int)[SHADOW_W_REG_BYTES] = 0
+        (node as *int)[SHADOW_W_LINKED] = 1
+        (node as *int)[SHADOW_W_PREV] = 0
         (node as *int)[SHADOW_W_ID] = shadowNextId
         shadowNextId = shadowNextId + 1
         (node as *int)[SHADOW_W_NEXT] = shadowRegHead
+        if (shadowRegHead != 0) {
+            (shadowRegHead as *int)[SHADOW_W_PREV] = node
+        }
         shadowRegHead = node
         return node
+    }
+}
+
+/// Allocate and link a node, assuming `shadowLock` is held. Retired nodes are
+/// recycled through `shadowFreeHead`; only the peak concurrent thread count
+/// ever reaches `win_heap_alloc`. Returns 0 on allocation failure.
+fn shadowAllocNodeLocked() -> int {
+    unsafe {
+        var node = shadowFreeHead
+        if (node != 0) {
+            shadowFreeHead = (node as *int)[SHADOW_W_PREV]
+            return shadowInitNode(node)
+        }
+        var heap = win_get_process_heap()
+        node = win_heap_alloc(heap, 0, SHADOW_NODE_BYTES)
+        if (node == 0) {
+            return 0
+        }
+        return shadowInitNode(node)
     }
 }
 
@@ -338,13 +376,11 @@ fn shadowEnsureRegisteredLocked() -> int {
         }
         var node = win_tls_get(shadowTlsSlot)
         if (node == 0) {
-            var heap = win_get_process_heap()
-            node = win_heap_alloc(heap, 0, SHADOW_NODE_BYTES)
+            node = shadowAllocNodeLocked()
             if (node == 0) {
                 shadowRegistryLockRelease()
                 win_exit(1)
             }
-            let _ = shadowInitNode(node)
             let _ = win_tls_set(shadowTlsSlot, node)
         }
         return node
@@ -379,13 +415,11 @@ fn abiShadowPush(frame: *int) {
         }
         var node = win_tls_get(shadowTlsSlot)
         if (node == 0) {
-            var heap = win_get_process_heap()
-            node = win_heap_alloc(heap, 0, SHADOW_NODE_BYTES)
+            node = shadowAllocNodeLocked()
             if (node == 0) {
                 winLockRelease(lockAddr)
                 win_exit(1)
             }
-            let _ = shadowInitNode(node)
             let _ = win_tls_set(shadowTlsSlot, node)
         }
         frame[0] = (node as *int)[0]
@@ -419,13 +453,11 @@ fn abiShadowPop(frame: *int) {
             winLockAcquire(lockAddr)
             var node = win_tls_get(shadowTlsSlot)
             if (node == 0) {
-                var heap = win_get_process_heap()
-                node = win_heap_alloc(heap, 0, SHADOW_NODE_BYTES)
+                node = shadowAllocNodeLocked()
                 if (node == 0) {
                     winLockRelease(lockAddr)
                     win_exit(1)
                 }
-                let _ = shadowInitNode(node)
                 let _ = win_tls_set(shadowTlsSlot, node)
             }
             if ((node as *int)[0] != (frame as int)) {
@@ -462,8 +494,10 @@ fn abiShadowRegistryHead() -> int {
     return shadowRegHead
 }
 
-/// Lookup: the number of registered thread nodes (counted by walking the
-/// chain the way native's `all_threads()` walk would). Diagnostic/test seam.
+/// Lookup: the number of linked thread nodes (counted by walking the chain the
+/// way native's `all_threads()` walk would). Includes dead nodes whose registry
+/// block has not emptied yet; those are reaped by the next collection.
+/// Diagnostic/test seam.
 fn abiShadowRegistryCount() -> int {
     var count = 0
     var node = shadowRegHead
@@ -489,44 +523,142 @@ fn abiGcRegisterThread() -> int {
     }
 }
 
+/// Retire a thread's registry node at end of life. Three outcomes, all under
+/// `shadowLock`:
+///
+///   * the node still owns frames (a thread that unregistered itself while
+///     running) - leave it linked and live; its frames must stay walkable;
+///   * the node has no frames but its private registry block still holds live
+///     objects - free the temp-root array, mark the node dead (`LINKED = 2`)
+///     and leave it linked. The collector keeps sweeping the block, and
+///     `abiShadowReapDeadLocked` recycles the node once the block empties.
+///     Unlinking here would lose every object the thread allocated and that
+///     outlived it, which the sweep could then never free;
+///   * no frames, no registrations - unlink, free both arrays, recycle.
+///
+/// The doubly linked list makes the unlink straight-line, so no
+/// safepoint-bearing loop ever runs under `shadowLock` (the deadlock this
+/// function exists to remove). Nodes are recycled rather than
+/// `win_heap_free`d: a lock-free diagnostic walk can still hold the pointer,
+/// and recycling keeps that read inside live process memory.
+fn abiShadowRetireNode(node: int) {
+    if (node == 0) {
+        return
+    }
+    var tempBase = 0
+    var regBase = 0
+    unsafe {
+        shadowRegistryLockAcquire()
+        let linked = (node as *int)[SHADOW_W_LINKED]
+        if (linked == 0 || linked == 2) {
+            shadowRegistryLockRelease()
+            return
+        }
+        if ((node as *int)[SHADOW_W_FRAMES] != 0) {
+            // Live thread: its chain is still in use. Detaching TLS is the
+            // caller's business; the node itself must stay linked.
+            shadowRegistryLockRelease()
+            return
+        }
+        tempBase = (node as *int)[SHADOW_W_TEMP_BASE]
+        (node as *int)[SHADOW_W_TEMP_BASE] = 0
+        (node as *int)[SHADOW_W_TEMP_COUNT] = 0
+        (node as *int)[SHADOW_W_TEMP_CAP] = 0
+        if ((node as *int)[SHADOW_W_REG_COUNT] != 0) {
+            (node as *int)[SHADOW_W_LINKED] = 2
+            shadowRegistryLockRelease()
+            if (tempBase != 0) {
+                free(tempBase as *int)
+            }
+            return
+        }
+        (node as *int)[SHADOW_W_LINKED] = 0
+        let prev = (node as *int)[SHADOW_W_PREV]
+        let next = (node as *int)[SHADOW_W_NEXT]
+        if (prev == 0) {
+            shadowRegHead = next
+        } else {
+            (prev as *int)[SHADOW_W_NEXT] = next
+        }
+        if (next != 0) {
+            (next as *int)[SHADOW_W_PREV] = prev
+        }
+        regBase = (node as *int)[SHADOW_W_REG_BASE]
+        (node as *int)[SHADOW_W_REG_BASE] = 0
+        (node as *int)[SHADOW_W_REG_COUNT] = 0
+        (node as *int)[SHADOW_W_REG_CAP] = 0
+        (node as *int)[SHADOW_W_NEXT] = 0
+        (node as *int)[SHADOW_W_PREV] = shadowFreeHead
+        shadowFreeHead = node
+        shadowRegistryLockRelease()
+    }
+    unsafe {
+        if (tempBase != 0) {
+            free(tempBase as *int)
+        }
+        if (regBase != 0) {
+            free(regBase as *int)
+        }
+    }
+}
+
+/// Recycle every dead node whose registry block the sweep has emptied. The
+/// collector calls this with `shadowLock` held, immediately after the per-node
+/// sweep, so each candidate's block is already compacted and its counters
+/// folded. The loop carries safepoint polls; that is safe only because the
+/// caller is the collector (`abiGcPoll` returns early in the COLLECTING
+/// state). A mutator must never call this.
+fn abiShadowReapDeadLocked() {
+    var prev = 0
+    var node = shadowRegHead
+    while (node != 0) {
+        unsafe {
+            let next = (node as *int)[SHADOW_W_NEXT]
+            if ((node as *int)[SHADOW_W_LINKED] == 2 && (node as *int)[SHADOW_W_FRAMES] == 0 && (node as *int)[SHADOW_W_REG_COUNT] == 0) {
+                if (prev == 0) {
+                    shadowRegHead = next
+                } else {
+                    (prev as *int)[SHADOW_W_NEXT] = next
+                }
+                if (next != 0) {
+                    (next as *int)[SHADOW_W_PREV] = prev
+                }
+                let regBase = (node as *int)[SHADOW_W_REG_BASE]
+                (node as *int)[SHADOW_W_REG_BASE] = 0
+                (node as *int)[SHADOW_W_REG_CAP] = 0
+                (node as *int)[SHADOW_W_LINKED] = 0
+                (node as *int)[SHADOW_W_NEXT] = 0
+                (node as *int)[SHADOW_W_PREV] = shadowFreeHead
+                shadowFreeHead = node
+                if (regBase != 0) {
+                    free(regBase as *int)
+                }
+            } else {
+                prev = node
+            }
+            node = next
+        }
+    }
+}
+
 /// ABI: unregister the calling OS thread from the collector (native
-/// `pickle_gc_unregister_thread`): unlink the node from the registry, detach
-/// the TLS handle, then release the raw-heap block - native's
-/// `unregister_thread` takes the registry lock for exactly this sequence and
-/// drops the Box under it. A never-registered thread is a no-op like the
-/// reference (node null check).
+/// `pickle_gc_unregister_thread`): detach the TLS handle, then retire the node.
+/// A never-registered thread is a no-op like the reference (node null check).
+/// End-of-life only: a node that still owns frames stays linked (its chain must
+/// stay walkable); a node with live registrations is marked dead so the sweep
+/// can still reach them.
 #[symbol("pickle_gc_unregister_thread")]
 fn abiGcUnregisterThread() {
     unsafe {
         if (shadowTlsSlot == -1) {
             return
         }
-        var node = win_tls_get(shadowTlsSlot)
+        let node = win_tls_get(shadowTlsSlot)
         if (node == 0) {
             return
         }
-        shadowRegistryLockAcquire()
-        var cur = shadowRegHead
-        var prev = 0
-        while (cur != 0 && cur != node) {
-            prev = cur
-            cur = (cur as *int)[2]
-        }
-        if (cur == node) {
-            if (prev == 0) {
-                shadowRegHead = (node as *int)[2]
-            } else {
-                (prev as *int)[2] = (node as *int)[2]
-            }
-        }
         let _ = win_tls_set(shadowTlsSlot, 0)
-        let tempBase = (node as *int)[SHADOW_W_TEMP_BASE]
-        if (tempBase != 0) {
-            free(tempBase as *int)
-        }
-        var heap = win_get_process_heap()
-        let _ = win_heap_free(heap, 0, node)
-        shadowRegistryLockRelease()
+        abiShadowRetireNode(node)
     }
 }
 

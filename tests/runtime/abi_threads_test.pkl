@@ -1,7 +1,8 @@
 module runtime.abi_threads_test
 
 import { abiThreadSpawn, abiThreadJoin, abiThreadFinished, abiThreadPanicMessage, abiThreadCount, abiThreadCurrent, abiThreadSleepMs, abiThreadYield } from runtime.abi_threads
-import { abiEngineTempCount } from runtime.abi_gcengine
+import { abiEngineTempCount, abiEngineCollect } from runtime.abi_gcengine
+import { abiShadowRegistryCount } from runtime.abi_shadow
 
 /// The unit suite for the thread port bodies, written for the real-thread
 /// (non-inline) contract.
@@ -162,6 +163,39 @@ test fn a_throwing_spawn_leaves_no_temp_root_leases() {
     let h = abiThreadSpawn(fn () { throw "lease boom" })
     expect(abiThreadJoin(h)).toBe(false)
     expect(abiEngineTempCount()).toBe(before)
+}
+
+/// `join` retires the child's shadow-registry node. A sequential spawn/join
+/// loop must therefore keep the registry at its baseline size instead of
+/// growing one node per task.
+test fn joined_tasks_retire_their_registry_nodes() {
+    let before = abiShadowRegistryCount()
+    var i = 0
+    while (i < 8) {
+        let h = abiThreadSpawn(fn () {})
+        expect(abiThreadJoin(h)).toBe(true)
+        i = i + 1
+    }
+    expect(abiShadowRegistryCount()).toBe(before)
+}
+
+/// A worker that allocated leaves its node linked (dead) so the sweep can still
+/// reach its private registry block. Once that block empties, the collector
+/// reaps the node instead of letting the registry grow by one per task.
+test fn an_allocating_task_reaps_its_node_after_a_collection() {
+    // Drain any dead node an earlier suite left behind, then measure.
+    abiEngineCollect(true)
+    let before = abiShadowRegistryCount()
+    let h = abiThreadSpawn(fn () {
+        let xs = [1, 2, 3]
+        expect(xs[1]).toBe(2)
+    })
+    expect(abiThreadJoin(h)).toBe(true)
+    // The worker registered a live object, so its node is dead but still
+    // linked until the sweep empties the block.
+    expect(abiShadowRegistryCount()).toBe(before + 1)
+    abiEngineCollect(true)
+    expect(abiShadowRegistryCount() <= before).toBe(true)
 }
 
 test fn a_joined_task_stays_joinable() {
