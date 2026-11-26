@@ -35,4 +35,11 @@ tools\diff\port\pklc_test.exe tests\compiler\x64_test.pkl tools\diff\rtlib.ar
 exit 0 = pass
 ```
 
+## Run a test suite
+
+The single-file `pklc` release wraps the same harness as `pklc test [file|dir]`.
+With no argument it discovers `tests/**/*_test.pkl` (or the caller directory),
+runs each suite against the embedded runtime archive, caches harnesses under
+`.pickle/test`, and exits nonzero if any suite fails.
+
 
