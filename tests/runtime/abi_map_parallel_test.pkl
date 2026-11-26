@@ -1,0 +1,149 @@
+module runtime.abi_map_parallel_test
+
+/// Parallel maps. Every worker owns a private `Map`, so the only shared state
+/// is the runtime's map version and the get->set last-lookup cache. That cache
+/// is process-wide and single-threaded only: two threads stamping it could pair
+/// one thread's map/key with another thread's slot, which intermittently
+/// corrupted a private map's entry table (`0xC0000005`, ~20-30% of runs) when
+/// the keys were generated short strings. These tests are the shape that used
+/// to crash; they assert exact counts, not identity.
+
+import { spawn, Task, yieldNow } from std.thread
+
+fn makeSlots(n: int) -> List<int> {
+    var slots: List<int> = []
+    var i = 0
+    while (i < n) {
+        slots.push(0)
+        i = i + 1
+    }
+    return slots
+}
+
+test fn private_string_maps_keep_exact_counts_under_parallel_churn() {
+    let n = 4
+    let iters = 20000
+    let keys = 1000
+    let lens = makeSlots(n)
+    let sums = makeSlots(n)
+    var tasks: List<Task> = []
+    var i = 0
+    while (i < n) {
+        let idx = i
+        tasks.push(spawn(() => {
+            var m: Map<string, int> = Map<string, int>()
+            var sum = 0
+            var j = 0
+            while (j < iters) {
+                let k = "w" + str((j * 31 + idx * 17) % keys)
+                let next = m.get(k).unwrapOr(0) + 1
+                m[k] = next
+                sum = sum + next
+                j = j + 1
+            }
+            lens[idx] = len(m)
+            sums[idx] = sum
+            yieldNow()
+        }))
+        i = i + 1
+    }
+    var j = 0
+    while (j < len(tasks)) {
+        let t = tasks[j]
+        let _ = t.join()
+        j = j + 1
+    }
+    // 31 is coprime to 1000, so every key is touched exactly iters/keys times
+    // and the per-key increments telescope to 1 + 2 + ... + (iters/keys).
+    let perKey = iters / keys
+    let expectedSum = keys * perKey * (perKey + 1) / 2
+    i = 0
+    while (i < n) {
+        expect(lens[i]).toBe(keys)
+        expect(sums[i]).toBe(expectedSum)
+        i = i + 1
+    }
+}
+
+test fn private_int_maps_keep_exact_counts_under_parallel_churn() {
+    let n = 4
+    let iters = 20000
+    let keys = 4096
+    let lens = makeSlots(n)
+    let sums = makeSlots(n)
+    var tasks: List<Task> = []
+    var i = 0
+    while (i < n) {
+        let idx = i
+        tasks.push(spawn(() => {
+            var m: Map<int, int> = Map<int, int>()
+            var sum = 0
+            var j = 0
+            while (j < iters) {
+                let k = (j * 31 + idx * 17) % keys
+                let next = m.get(k).unwrapOr(0) + 1
+                m[k] = next
+                sum = sum + next
+                j = j + 1
+            }
+            lens[idx] = len(m)
+            sums[idx] = sum
+            yieldNow()
+        }))
+        i = i + 1
+    }
+    var j = 0
+    while (j < len(tasks)) {
+        let t = tasks[j]
+        let _ = t.join()
+        j = j + 1
+    }
+    // 31 is coprime to 4096, so `iters % keys` keys are touched full+1 times
+    // and the rest full times; each key's increments telescope to a triangle.
+    let full = iters / keys
+    let rem = iters % keys
+    let expectedSum = rem * (full + 1) * (full + 2) / 2 + (keys - rem) * full * (full + 1) / 2
+    i = 0
+    while (i < n) {
+        expect(lens[i]).toBe(keys)
+        expect(sums[i]).toBe(expectedSum)
+        i = i + 1
+    }
+}
+
+test fn a_literal_key_map_stays_exact_under_parallel_churn() {
+    let n = 4
+    let iters = 20000
+    let lens = makeSlots(n)
+    let last = makeSlots(n)
+    var tasks: List<Task> = []
+    var i = 0
+    while (i < n) {
+        let idx = i
+        tasks.push(spawn(() => {
+            var m: Map<string, int> = Map<string, int>()
+            var j = 0
+            while (j < iters) {
+                let k = "constant-key"
+                m[k] = m.get(k).unwrapOr(0) + 1
+                j = j + 1
+            }
+            lens[idx] = len(m)
+            last[idx] = m.get("constant-key").unwrapOr(0)
+            yieldNow()
+        }))
+        i = i + 1
+    }
+    var j = 0
+    while (j < len(tasks)) {
+        let t = tasks[j]
+        let _ = t.join()
+        j = j + 1
+    }
+    i = 0
+    while (i < n) {
+        expect(lens[i]).toBe(1)
+        expect(last[i]).toBe(iters)
+        i = i + 1
+    }
+}

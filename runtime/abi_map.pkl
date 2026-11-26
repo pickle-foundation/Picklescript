@@ -76,8 +76,7 @@ import { abiStrCmp, byteAt, SIZE_WORD, FLAG_HEAP, FLAG_HASH } from runtime.abi_s
 // raw-allocation slots must travel with them. See `abi_raw.pkl`.
 // `abiRegisterObject` records the map *object*; the entries array is raw
 // backing, never registered.
-import { abiRawAlloc, abiManagedAlloc, abiRegisterObject, abiRawParallelMode } from runtime.abi_raw
-import { lockAcquire, lockRelease } from runtime.abi_world
+import { abiRawAlloc, abiManagedAlloc, abiRegisterObject, parallelMode } from runtime.abi_raw
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -816,13 +815,24 @@ const BLOOM_BYTES: int = MAP_BLOOM_OFF
 /// miss - the first tombstone, else the empty slot); `abiMapSet` revalidates
 /// that slot with one version compare and skips hashing and probing entirely.
 ///
-/// Correctness comes from the version, not from the slot: every mutating entry
-/// point bumps `mapVer`, and a set only trusts the cache when the version it
-/// read at entry equals the version the get stamped. Any interleaved mutation
-/// (including table growth, which reallocates `entries`) invalidates it. The
-/// slot word is re-checked anyway (it must still hold the same key pointer, or
-/// an empty/tombstone sentinel), so a corrupted cache degrades to the ordinary
-/// probe instead of writing a wrong slot.
+/// Correctness comes from the version, not from the slot: in single-threaded
+/// mode every mutating entry point bumps `mapVer`, and a set only trusts the
+/// cache when the version it read at entry equals the version the get stamped.
+/// Any interleaved mutation (including table growth, which reallocates
+/// `entries`) invalidates it. The slot word is re-checked anyway (it must still
+/// hold the same key pointer, or an empty/tombstone sentinel), so a corrupted
+/// cache degrades to the ordinary probe instead of writing a wrong slot.
+///
+/// PARALLEL MODE: the cache words are process-wide, and two threads can stamp
+/// them in an order that pairs one thread's map/key with another thread's slot
+/// (the five stores are not one atomic tuple). That is unobservable in a
+/// single-threaded image, but under `spawn` it intermittently corrupted a
+/// private map's entry table - two threads building generated string-key maps
+/// crashed with `0xC0000005` in ~20-30% of runs. The fused path is therefore
+/// single-threaded only: parallel gets skip the stamp and parallel sets take
+/// the ordinary probe. `mapVer` is dead there too, so `mapBump` does nothing -
+/// no shared version write and no lock on a private map's mutation path. A
+/// per-thread copy of these words can restore the fusion later.
 var mapVer: int = 1
 var llVer: int = 0
 var llMap: int = 0
@@ -830,29 +840,9 @@ var llKey: int = 0
 var llSlot: int = 0
 var llHash: int = 0
 
-/// Serialises version bumps once the process can run more than one thread.
-///
-/// A version must be *unique*, not merely monotone: two sets that both read `V`
-/// and both write `V + 1` would stamp the cache with the same version for two
-/// different mutations, and a get stamped `V + 1` could then validate the wrong
-/// slot. In single-thread mode this is the plain `mapVer + 1` it has always
-/// been - no branch beyond the cached mode word, no lock.
-var mapVerLock: int = 0
-
-fn mapBump() -> int {
-    if (abiRawParallelMode() == 0) {
-        var v = mapVer + 1
-        mapVer = v
-        return v
-    }
-    var v = 0
-    unsafe {
-        lockAcquire((&mapVerLock) as int)
-        v = mapVer + 1
-        mapVer = v
-        lockRelease((&mapVerLock) as int)
-    }
-    return v
+fn mapBump() {
+    if (parallelMode != 0) { return }
+    mapVer = mapVer + 1
 }
 
 /// Zeroed bloom filter + `cap` two-word entry slots in one allocation. The
@@ -998,7 +988,7 @@ fn mapNew(cap: int) -> *int {
     unsafe {
         // A fresh map can land on an address a freed oversized map used to
         // occupy, so invalidate the last-lookup cache unconditionally.
-        mapVer = mapBump()
+        mapBump()
         var c = cap
         if (c < INITIAL_CAP) { c = INITIAL_CAP }
         c = nextPow2(c)
@@ -1021,7 +1011,7 @@ fn mapNew(cap: int) -> *int {
 /// caller to present one.
 fn mapSet(map: *int, key: *int, value: *int) -> *int {
     unsafe {
-        mapVer = mapBump()
+        mapBump()
         var k = key as int
         if (k == KEY_EMPTY) { k = KEY_NONE }
         var h = keyHash(k as *int)
@@ -1094,7 +1084,7 @@ fn mapGet(map: *int, key: *int) -> *int {
 /// keeps the probe chains of the entries after it intact.
 fn mapRemove(map: *int, key: *int) -> *int {
     unsafe {
-        mapVer = mapBump()
+        mapBump()
         var k = key as int
         if (k == KEY_EMPTY) { k = KEY_NONE }
         var h = keyHash(k as *int)
@@ -1189,7 +1179,7 @@ fn abiMapSetSlow(map: *int, key: *int, value: *int) {
         // but tests and future internal callers reach this body directly, so
         // bump again: an extra increment only invalidates a cache entry that
         // the following set would have had to re-probe anyway.
-        mapVer = mapBump()
+        mapBump()
         var k = key as int
         if (k == KEY_EMPTY) { k = KEY_NONE }
         var kp = k as *int
@@ -1347,8 +1337,8 @@ fn abiMapSet(map: *int, key: *int, value: *int) {
         // the get stamped the version it observed, and any mutation after that
         // point makes this comparison fail.
         var mv = mapVer
-        mapVer = mapBump()
-        if (llVer == mv && llMap == (map as int) && llKey == k && llSlot >= 0) {
+        mapBump()
+        if (parallelMode == 0 && llVer == mv && llMap == (map as int) && llKey == k && llSlot >= 0) {
             var ce = map[ENTRIES_WORD] as *int
             var cs = llSlot
             var ck = ce[cs]
@@ -1602,14 +1592,17 @@ fn abiMapGetBoxed(map: *int, key: *int, default: *int) -> *int {
             if (sk == KEY_EMPTY) {
                 // Compound map assignments lower to get_boxed followed by set
                 // with this same key object. Preserve the probe result so that
-                // set can update/insert without re-hashing or re-probing.
-                var tgt = slot
-                if (firstTomb >= 0) { tgt = firstTomb }
-                llVer = mapVer
-                llMap = map as int
-                llKey = k
-                llSlot = tgt
-                llHash = h
+                // set can update/insert without re-hashing or re-probing. The
+                // cache is single-threaded only; see the block comment above.
+                if (parallelMode == 0) {
+                    var tgt = slot
+                    if (firstTomb >= 0) { tgt = firstTomb }
+                    llVer = mapVer
+                    llMap = map as int
+                    llKey = k
+                    llSlot = tgt
+                    llHash = h
+                }
                 return default
             }
             if (sk != KEY_TOMBSTONE) {
@@ -1645,11 +1638,13 @@ fn abiMapGetBoxed(map: *int, key: *int, default: *int) -> *int {
                     same = keyEq(sk as *int, kp)
                 }
                 if (same) {
-                    llVer = mapVer
-                    llMap = map as int
-                    llKey = k
-                    llSlot = slot
-                    llHash = h
+                    if (parallelMode == 0) {
+                        llVer = mapVer
+                        llMap = map as int
+                        llKey = k
+                        llSlot = slot
+                        llHash = h
+                    }
                     return entries[slot + 1] as *int
                 }
             }
@@ -1862,22 +1857,27 @@ fn abiMapGet(map: *int, key: *int) -> *int {
             if (sk == KEY_EMPTY) {
                 // Miss: remember the slot the paired set would insert into
                 // (first tombstone on the probe chain, else this empty slot).
-                var tgt = slot
-                if (firstTomb >= 0) { tgt = firstTomb }
-                llVer = mapVer
-                llMap = map as int
-                llKey = k
-                llSlot = tgt
-                llHash = h
+                // Single-threaded only; see the cache comment above.
+                if (parallelMode == 0) {
+                    var tgt = slot
+                    if (firstTomb >= 0) { tgt = firstTomb }
+                    llVer = mapVer
+                    llMap = map as int
+                    llKey = k
+                    llSlot = tgt
+                    llHash = h
+                }
                 return 0 as *int
             }
             if (sk != KEY_TOMBSTONE) {
                 if (sk == k) {
-                    llVer = mapVer
-                    llMap = map as int
-                    llKey = k
-                    llSlot = slot
-                    llHash = h
+                    if (parallelMode == 0) {
+                        llVer = mapVer
+                        llMap = map as int
+                        llKey = k
+                        llSlot = slot
+                        llHash = h
+                    }
                     return entries[slot + 1] as *int
                 }
                 var skp = sk as *int
@@ -1904,11 +1904,13 @@ fn abiMapGet(map: *int, key: *int) -> *int {
                         }
                     }
                     if (eq) {
-                        llVer = mapVer
-                        llMap = map as int
-                        llKey = k
-                        llSlot = slot
-                        llHash = h
+                        if (parallelMode == 0) {
+                            llVer = mapVer
+                            llMap = map as int
+                            llKey = k
+                            llSlot = slot
+                            llHash = h
+                        }
                         return entries[slot + 1] as *int
                     }
                 }
@@ -1949,7 +1951,7 @@ fn abiMapLen(map: *int) -> int {
 #[symbol("pickle_map_clear")]
 fn abiMapClear(map: *int) {
     unsafe {
-        mapVer = mapBump()
+        mapBump()
         var cap = map[CAP_WORD]
         var entries = map[ENTRIES_WORD] as *int
         var b = (entries as int - BLOOM_BYTES) as *int
