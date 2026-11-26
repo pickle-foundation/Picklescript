@@ -9,7 +9,7 @@ import { checkProgram } from compiler.checkcore
 import { frontendChecked, setWorkspaceRoot } from compiler.front
 import { emitIr } from compiler.emit
 import { irModuleStr, irxModuleStr } from compiler.ir
-import { recordedDeps, lookup, store } from compiler.cache
+import { recordedDeps, lookup, store, sortStrings } from compiler.cache
 import { catalogue, explainById, normalizeId } from compiler.error
 import { splitLines, subStr } from compiler.front
 import { renderHistory, renderBuilds, renderExplainHistory, gitRoot, historyFor } from cli.history
@@ -34,6 +34,7 @@ import { abiMapNew, abiMapSet, abiMapGetBoxed, abiMapGet, abiMapHas, abiMapRemov
 import { abiTupleNew, abiTupleLen, abiTupleSetField, abiTupleField } from runtime.abi_tuple
 import { resolve } from compiler.resolvecore
 import { runPackageCommand } from cli.package
+import { runTestFile } from cli.testlib
 
 fn lex(src: string) -> List<LexedToken> {
     let lx = Lexer(bytes(src), 0, 0, none, range(0), 0)
@@ -513,7 +514,7 @@ const RT_FOOTER_BYTES: int = 48
 /// SHA-256 of the bundled stdlib/runtime source blob. It sits between the
 /// compiler image and the runtime archive, with the same 48-byte footer shape,
 /// so the runtime archive keeps its place at the end of the file.
-const SRC_BUNDLE_SHA: string = "079ba91e04d6b71495538df48ff20a03840a7f7df01ece7ff282185e160c808c"
+const SRC_BUNDLE_SHA: string = "8e5eb287428f0540c1c81edfd85efb9eecf1c807bace8717f741c16773e07fb8"
 const SRC_FOOTER_MAGIC: string = "PKLSRC01"
 const SRC_FOOTER_BYTES: int = 48
 const SRC_BUNDLE_MAGIC: string = "PKLSRCB1"
@@ -1358,6 +1359,197 @@ fn pklcRunNew(argv: List<string>) {
     println("run it with: pklc run \"" + file + "\"")
 }
 
+/// The nearest ancestor with a `picklescript.toml`, else the caller directory.
+/// `pklc test` keeps its harness cache under `<root>/.pickle/test`.
+fn pklcProjectRoot() -> string {
+    var dir = pklcCallerDir()
+    while (dir != "") {
+        if (abiFileExists(pklcJoin(dir, "picklescript.toml"))) {
+            return dir
+        }
+        let parent = pklcDirOf(dir)
+        if (parent == dir || parent == "") {
+            break
+        }
+        dir = parent
+    }
+    pklcCallerDir()
+}
+
+fn pklcHasSuffix(s: string, suf: string) -> bool {
+    let sb = bytes(s)
+    let fb = bytes(suf)
+    if (len(fb) > len(sb)) {
+        return false
+    }
+    var i = 0
+    while (i < len(fb)) {
+        if (sb[len(sb) - len(fb) + i] != fb[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+/// The last path component, unlike `cli.testlib.baseName`, which also drops a
+/// trailing `.pkl` and is meant for harness names.
+fn pklcPathBase(p: string) -> string {
+    let bs = bytes(p)
+    var k = len(bs) - 1
+    while (k >= 0) {
+        let c = bs[k] as int
+        if (c == 92 || c == 47) {
+            break
+        }
+        k = k - 1
+    }
+    var out = ""
+    var j = k + 1
+    while (j < len(bs)) {
+        out = out + "{bs[j] as char}"
+        j = j + 1
+    }
+    out
+}
+
+fn pklcIsDir(p: string) -> bool {
+    match (list_dir(p)) {
+        case some(_) -> true
+        case none -> false
+    }
+}
+
+fn pklcSkipTestDir(name: string) -> bool {
+    name == ".git" || name == ".pickle" || name == "target" || name == "tools" || name == "node_modules" || name == "bin" || name == "obj"
+}
+
+/// Recursively collect `*_test.pkl` under `dir`. `list_dir` returns full paths,
+/// so the caller gets paths it can feed straight back to `runTestFile`.
+fn pklcCollectTests(dir: string, out: List<string>) {
+    if (let some(entries) = list_dir(dir)) {
+        for (e in entries) {
+            let name = pklcPathBase(e)
+            if (pklcHasSuffix(name, "_test.pkl")) {
+                out.push(e)
+            } else {
+                if (pklcIsDir(e)) {
+                    if (!pklcSkipTestDir(name)) {
+                        pklcCollectTests(e, out)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Make `p` relative to `base` when it is inside it, for readable harness
+/// output. Paths outside `base` (an absolute test argument) are left alone.
+fn pklcRelPath(base: string, p: string) -> string {
+    if (pklcStartsWith(p, base + "\\")) {
+        return subStr(p, len(base) + 1, len(p) - len(base) - 1)
+    }
+    p
+}
+
+/// `pklc test [file|dir]`. With no argument it runs every `*_test.pkl` under
+/// `tests\` (or the caller directory when there is no `tests\`), each through
+/// the same harness the battery's `pklc_test` driver uses. Files are run in
+/// sorted order; one failure makes the command exit nonzero after the rest of
+/// the suite has run.
+fn pklcRunTest(argv: List<string>) {
+    var explicit = ""
+    var haveExplicit = false
+    var i = 1
+    while (i < len(argv)) {
+        let a = argv[i]
+        if (a == "-h" || a == "--help") {
+            println("pklc: usage: pklc test [file|dir]")
+            return
+        }
+        if (haveExplicit) {
+            println("pklc: unexpected argument: " + a)
+            exit(1)
+        }
+        explicit = a
+        haveExplicit = true
+        i = i + 1
+    }
+    let caller = pklcCallerDir()
+    var targets = List<string>()
+    if (haveExplicit) {
+        let full = pklcAbs(caller, explicit)
+        if (!abiFileExists(full)) {
+            println("pklc: test path not found: " + explicit)
+            exit(1)
+        }
+        if (pklcIsDir(full)) {
+            pklcCollectTests(full, targets)
+        } else {
+            targets.push(pklcRelPath(caller, full))
+        }
+    } else {
+        let testsDir = pklcJoin(caller, "tests")
+        if (abiFileExists(testsDir) && pklcIsDir(testsDir)) {
+            pklcCollectTests(testsDir, targets)
+        } else {
+            pklcCollectTests(caller, targets)
+        }
+    }
+    if (len(targets) == 0) {
+        println("pklc: no test files found")
+        exit(1)
+    }
+    var k = 0
+    while (k < len(targets)) {
+        targets[k] = pklcRelPath(caller, targets[k])
+        k = k + 1
+    }
+    sortStrings(targets)
+    var archive = ""
+    var haveArchive = false
+    if (let some(a) = pklcExtractRuntime()) {
+        archive = a
+        haveArchive = true
+    }
+    if (!haveArchive) {
+        exit(1)
+    }
+    let root = pklcProjectRoot()
+    let cacheRoot = pklcJoin(root, ".pickle")
+    if (!abiFileExists(cacheRoot)) {
+        let _ = mkdir(cacheRoot)
+    }
+    let outDir = pklcJoin(cacheRoot, "test")
+    if (!abiFileExists(outDir)) {
+        let _ = mkdir(outDir)
+    }
+    if (!abiFileExists(outDir)) {
+        println("pklc: cannot create test output directory " + outDir)
+        exit(1)
+    }
+    var passed = 0
+    var failed = 0
+    var idx = 0
+    while (idx < len(targets)) {
+        if (idx > 0) {
+            println("")
+        }
+        let code = runTestFile(targets[idx], archive, outDir)
+        if (code == 0) {
+            passed = passed + 1
+        } else {
+            failed = failed + 1
+        }
+        idx = idx + 1
+    }
+    println("")
+    println("pklc test: " + str(passed) + " file(s) passed; " + str(failed) + " failed")
+    if (failed > 0) {
+        exit(1)
+    }
+}
+
 fn pklcHelp() {
     println("PickleScript 0.1.0 (win64)")
     println("")
@@ -1365,6 +1557,7 @@ fn pklcHelp() {
     println("  pklc run <file.pkl> [args...]      compile and run a program")
     println("  pklc build <file.pkl> [-o <exe>]   compile a standalone .exe")
     println("  pklc check <file.pkl>              compile and validate")
+    println("  pklc test [file|dir]               run test fn suites (default: tests\\**\\*_test.pkl)")
     println("  pklc new <name>                    create <name>\\main.pkl here")
     println("  pklc add <vendor/package>          add a dependency and install it")
     println("  pklc install                       install picklescript.lock")
@@ -1447,6 +1640,10 @@ fn main() {
     }
     if (cmd == "new") {
         pklcRunNew(argv)
+        return
+    }
+    if (cmd == "test") {
+        pklcRunTest(argv)
         return
     }
     if (cmd == "explain") {
