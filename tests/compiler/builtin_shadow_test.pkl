@@ -1,0 +1,130 @@
+module compiler.builtin_shadow_test
+
+import { checkProgram } from compiler.checkcore
+import { DiagnosticSink } from compiler.diag
+import { Lexer } from compiler.lexer
+import { parse } from compiler.parsercore
+import { Resolver } from compiler.resolvebag
+import { resolve } from compiler.resolvecore
+import { emitIr } from compiler.emit
+import { IrInstr, Callee, IrModule } from compiler.ir
+
+// Pickle has no `\"` escape and `{` opens an interpolation, so a source
+// snippet containing a brace or a quote is assembled from chars.
+fn obrace() -> string {
+    "{(123 as char)}"
+}
+
+fn cbrace() -> string {
+    "{(125 as char)}"
+}
+
+fn quote() -> string {
+    "{(34 as char)}"
+}
+
+/// A class whose `bytes()` method must not capture the builtin `bytes(s)`
+/// call in a sibling method. `own()` keeps the method itself reachable
+/// through the explicit `this.bytes()` form. `TypedShadow` covers the
+/// same-arity case: `bytes(n: int)` must not capture `bytes("")` either.
+fn shadowSource() -> string {
+    var s = "class Shadow " + obrace() + "\n"
+    s = s + "    fn bytes() -> List<byte> " + obrace() + "\n"
+    s = s + "        List<byte>()\n"
+    s = s + "    " + cbrace() + "\n"
+    s = s + "    fn builtin() -> List<byte> " + obrace() + "\n"
+    s = s + "        bytes(" + quote() + quote() + ")\n"
+    s = s + "    " + cbrace() + "\n"
+    s = s + "    fn own() -> List<byte> " + obrace() + "\n"
+    s = s + "        this.bytes()\n"
+    s = s + "    " + cbrace() + "\n"
+    s = s + cbrace() + "\n"
+    s = s + "class TypedShadow " + obrace() + "\n"
+    s = s + "    fn bytes(n: int) -> List<byte> " + obrace() + "\n"
+    s = s + "        List<byte>()\n"
+    s = s + "    " + cbrace() + "\n"
+    s = s + "    fn builtin() -> List<byte> " + obrace() + "\n"
+    s = s + "        bytes(" + quote() + quote() + ")\n"
+    s = s + "    " + cbrace() + "\n"
+    s = s + cbrace() + "\n"
+    s
+}
+
+fn emitSource(src: string) -> IrModule? {
+    let toks = Lexer(bytes(src), 0, 0, none, range(0), 0).run()
+    let diags = DiagnosticSink()
+    var out: IrModule? = none
+    if (let some(prog) = parse(toks, diags)) {
+        let r = Resolver(diags)
+        let resolved = resolve(r, prog)
+        checkProgram(prog, resolved, diags)
+        if (!diags.anyError()) {
+            out = emitIr(prog, resolved, diags)
+        }
+    }
+    out
+}
+
+/// Every direct call must pass exactly the callee's parameter count. An extra
+/// argument is what made the backend index past the parameter list.
+fn countMismatchedCalls(m: IrModule) -> int {
+    var n = 0
+    for (f in m.funcs) {
+        for (b in f.blocks) {
+            for (ins in b.instrs) {
+                match (ins) {
+                    case IrInstr.Call(_, callee, args) -> {
+                        match (callee) {
+                            case Callee.Func(id) -> {
+                                if (len(args) != len(m.funcs[id].params)) {
+                                    n = n + 1
+                                }
+                            }
+                            case Callee.Extern(id) -> {
+                                if (len(args) != len(m.externs[id].params)) {
+                                    n = n + 1
+                                }
+                            }
+                        }
+                    }
+                    case _ -> {}
+                }
+            }
+        }
+    }
+    n
+}
+
+fn countExternCalls(m: IrModule, symbol: string) -> int {
+    var n = 0
+    for (f in m.funcs) {
+        for (b in f.blocks) {
+            for (ins in b.instrs) {
+                match (ins) {
+                    case IrInstr.Call(_, callee, _) -> {
+                        match (callee) {
+                            case Callee.Extern(id) -> {
+                                if (m.externs[id].symbol == symbol) {
+                                    n = n + 1
+                                }
+                            }
+                            case Callee.Func(_) -> {}
+                        }
+                    }
+                    case _ -> {}
+                }
+            }
+        }
+    }
+    n
+}
+
+test fn bare_bytes_inside_a_bytes_method_lowers_to_the_builtin() {
+    let modO = emitSource(shadowSource())
+    if (let some(m) = modO) {
+        expect(countMismatchedCalls(m)).toBe(0)
+        expect(countExternCalls(m, "pickle_str_to_bytes")).toBe(2)
+    } else {
+        expect(false).toBe(true)
+    }
+}

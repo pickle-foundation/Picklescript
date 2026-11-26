@@ -5672,6 +5672,13 @@ class X64Emitter {
     }
 
     fn emitCall(sum: string, ptys: List<IrTy>, ret: IrTy, d: int?, args: List<int>, direct: bool) {
+        // A call with more arguments than the callee has parameters is an
+        // emitter bug: the argument loop below indexes `ptys` by argument
+        // position. Report it instead of reading past the list.
+        if (len(args) > len(ptys)) {
+            this.fail("call to `" + sum + "` has " + str(len(args)) + " argument(s), but the callee takes " + str(len(ptys)))
+            return
+        }
         // Backend-only inlining of the hottest leaf helpers. Each is a single
         // bounds-tested load, so the call frame cost more than the body. The
         // emitted IR is unchanged; only the x64 spelling differs.
@@ -6117,6 +6124,10 @@ class X64Emitter {
             }
             case IrInstr.CallInd(d, fnAddr, params, ret, args) -> {
                 let ptys = params
+                if (len(args) > len(ptys)) {
+                    this.fail("indirect call has " + str(len(args)) + " argument(s), but the signature takes " + str(len(ptys)))
+                    return
+                }
                 let n = len(args)
                 var i = 0
                 while (i < n && i < 4) {

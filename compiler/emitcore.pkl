@@ -4107,6 +4107,119 @@ fn fillDefaultArgs(em: Emitter, span: Span, fid: int, args: List<CallArg>) -> Li
     out
 }
 
+/// True when a primitive parameter and a primitive argument are definitely
+/// different types. No implicit scalar coercion exists, so a same-arity method
+/// whose parameter is a different primitive must not capture the call.
+fn primitiveArgMismatch(want: Ty, got: Ty) -> bool {
+    var wp = false
+    match (want) {
+        case Ty.Bool -> wp = true
+        case Ty.Char -> wp = true
+        case Ty.Byte -> wp = true
+        case Ty.Int -> wp = true
+        case Ty.Float -> wp = true
+        case Ty.String -> wp = true
+        case _ -> {}
+    }
+    var gp = false
+    match (got) {
+        case Ty.Bool -> gp = true
+        case Ty.Char -> gp = true
+        case Ty.Byte -> gp = true
+        case Ty.Int -> gp = true
+        case Ty.Float -> gp = true
+        case Ty.String -> gp = true
+        case _ -> {}
+    }
+    wp && gp && !tyEq(want, got)
+}
+
+/// Whether a bare method name inside a class body actually accepts this call.
+///
+/// A same-named method only shadows a builtin when the supplied arguments fit
+/// its parameters. Without this check `bytes("")` inside a class that declares
+/// `bytes()` marshals an extra argument into a zero-parameter method, and the
+/// backend indexes past the parameter list while emitting the call.
+fn methodCallFits(em: Emitter, fid: int, args: List<CallArg>, isStatic: bool) -> bool {
+    var params = List<Param>()
+    var haveSource = false
+    if (let some(src) = em.fsource.get(fid)) {
+        match (src) {
+            case FnSource.Method(table, md) -> {
+                params = md.params
+                haveSource = true
+            }
+            case FnSource.NamedCtor(table, ctor) -> {
+                params = ctor.params
+                haveSource = true
+            }
+            case FnSource.Ctor(table, inits, blocks, ctor) -> {
+                if (let some(cd) = ctor) {
+                    params = cd.params
+                }
+                haveSource = true
+            }
+            case FnSource.TopLevel(f) -> {
+                params = f.params
+                haveSource = true
+            }
+            case _ -> {}
+        }
+    }
+    if (!haveSource) {
+        // No source declaration (an abstract stub, for instance): fall back
+        // to the ABI arity. Instance methods carry the receiver as slot 0.
+        var n = len(em.irModule.funcs[fid].params)
+        if (!isStatic) {
+            n = n - 1
+        }
+        return len(args) <= n
+    }
+    var fixed = 0
+    var rest = false
+    for (p in params) {
+        if (p.rest) {
+            rest = true
+        } else {
+            fixed = fixed + 1
+        }
+    }
+    var positional = 0
+    for (a in args) {
+        if (a.spread) {
+            if (!rest) {
+                return false
+            }
+        } else if (let some(_) = a.name) {
+            return false
+        } else {
+            if (let some(stys) = em.srcParamTys.get(fid)) {
+                if (positional < len(stys)) {
+                    if (let some(gt) = tyOf(em, a.value.span)) {
+                        if (primitiveArgMismatch(stys[positional], gt)) {
+                            return false
+                        }
+                    }
+                }
+            }
+            positional = positional + 1
+        }
+    }
+    if (positional > fixed && !rest) {
+        return false
+    }
+    if (positional < fixed) {
+        var i = positional
+        while (i < fixed) {
+            if (let none = params[i].default) {
+                return false
+            }
+            i = i + 1
+        }
+    }
+    true
+}
+
 fn call1(em: Emitter, e: Expr, callee: Expr, args: List<CallArg>) -> int? {
     if (!icePoke(em, "call1")) {
         return none
@@ -4175,24 +4288,26 @@ fn call1(em: Emitter, e: Expr, callee: Expr, args: List<CallArg>) -> int? {
         if (let some(mname) = enM) {
             var mvO = em.methodIds.get(pairKey(str(cid), mname))
             if (let some(mv) = mvO) {
-                if (mv.isStatic) {
-                    return callMethod(em, e, mv.fid, args, none)
-                }
-                var th = thisValue(em, e)
-                if (let none = th) {
-                    return none
-                }
-                var thV = 0
-                if (let some(t) = th) {
-                    thV = t
-                }
-                var vb = em.virtualDispatch.get(pairKey(str(cid), mname))
-                if (let some(branches) = vb) {
-                    if (!(len(branches) == 0)) {
-                        return virtualMethodCall(em, e, mv.fid, args, thV, branches)
+                if (methodCallFits(em, mv.fid, args, mv.isStatic)) {
+                    if (mv.isStatic) {
+                        return callMethod(em, e, mv.fid, args, none)
                     }
+                    var th = thisValue(em, e)
+                    if (let none = th) {
+                        return none
+                    }
+                    var thV = 0
+                    if (let some(t) = th) {
+                        thV = t
+                    }
+                    var vb = em.virtualDispatch.get(pairKey(str(cid), mname))
+                    if (let some(branches) = vb) {
+                        if (!(len(branches) == 0)) {
+                            return virtualMethodCall(em, e, mv.fid, args, thV, branches)
+                        }
+                    }
+                    return callMethod(em, e, mv.fid, args, thV)
                 }
-                return callMethod(em, e, mv.fid, args, thV)
             }
         }
     }
