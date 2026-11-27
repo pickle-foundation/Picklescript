@@ -22,6 +22,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The runtime archive is being retired. Programs are lowered with their import
   closure into one object, so `pklc build` links a program itself.
 
+### Security
+
+- The package manager no longer trusts the lockfile for install locations.
+  Entries must name a package, version and module that match the registry
+  response, and their paths are re-derived from that identity and confined to
+  `.pickle/packages`; absolute paths, `..` segments and renamed modules are
+  rejected.
+
+- Downloads require a caller-supplied SHA-256 pin and an HTTPS URL (plain
+  HTTP only on loopback). Redirects to another origin drop `Authorization`,
+  `Cookie` and `Proxy-Authorization`, and response headers are never used as
+  an integrity source.
+
+- Manifest and lockfile names, versions and dependency edges are validated
+  before use: reserved runtime module names are refused, generated TOML is
+  escaped, bundled crates take precedence over generated maps, and every
+  dependency must be reachable at a version satisfying both its recorded
+  constraint and the manifest's.
+
 ## [0.1.0] - 2026-11-27
 
 ### Added
