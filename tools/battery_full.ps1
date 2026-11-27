@@ -536,8 +536,9 @@ if (-not (Invoke-BuildDriver "cli\run.pkl" $pklcRun)) {
 }
 
 # ---- CLI personality: the ported driver reproduces the toolchain's fixed-output
-# commands byte-for-byte (`-V`/`--version`, and the `jar` easter egg) against the
-# frozen goldens. `history`/`builds` are not captured — their output tracks the live
+# commands byte-for-byte. `-V`/`--version` are checked against the single version
+# source (`compiler\version.pkl`); the `jar` easter egg is checked against its frozen
+# golden. `history`/`builds` are not captured — their output tracks the live
 # git log, so there is no stable golden for them. ----
 $pklcMain = "tools\diff\port\pklc_cli.exe"
 if (-not (Invoke-BuildDriver "cli\main.pkl" $pklcMain)) {
@@ -546,10 +547,12 @@ if (-not (Invoke-BuildDriver "cli\main.pkl" $pklcMain)) {
     $g13dir = "tools\diff\g13"
     New-Item -ItemType Directory -Path $g13dir -Force | Out-Null
     $g13ok = 0; $g13fail = 0
+    $versionExpected = "$g13dir\expected_version.out"
+    Set-Content -LiteralPath $versionExpected -Value ("pickle " + (Get-PickleVersion) + "`n") -NoNewline -Encoding ascii
     foreach ($c in @(@("-V", "V"), @("--version", "version"), @("jar", "jar"))) {
         $argStr = $c[0]; $name = $c[1]
         $ic = Invoke-NativeTimeout $pklcMain @($argStr) "$g13dir\port.txt" 60
-        $goldOut = "$goldenDir\cli\$name.out"
+        $goldOut = if ($name -eq "jar") { "$goldenDir\cli\jar.out" } else { $versionExpected }
         $goldExit = "$goldenDir\cli\$name.exit"
         $rc = [int](Get-Content -LiteralPath $goldExit -Raw)
         if ($rc -eq $ic -and (ByteEq "$g13dir\port.txt" $goldOut)) { $g13ok++ }

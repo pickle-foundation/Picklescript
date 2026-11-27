@@ -6,10 +6,10 @@
 # itself) with ZERO members and ZERO unresolved symbols. All runtime `#[symbol]`
 # bodies the build image needs arrive through cli/main.pkl's own `runtime.*`
 # imports (import-activation coverage); no Rust archive and no residual member
-# is required. Then proves the exe is FUNCTIONAL and byte-equivalent to the FROZEN
-# Rust goldens (tools\diff\golden\cli\V.out and the abi_box_main lex oracle):
+# is required. Then proves the exe is FUNCTIONAL: the lex artifact is byte-identical
+# to the frozen Rust oracle, and `-V` reports the version from compiler\version.pkl:
 #   1. The empty-dir selflink resolves with objects=1 and zero unresolved.
-#   2. The exe runs `-V` -> "pickle 0.1.0", exit 0.
+#   2. The exe runs `-V` -> "pickle <VERSION>", exit 0.
 #   3. The exe runs one compiler pipeline (lex on a copy of the abi_box_main
 #      fixture) and its artifact is byte-identical to the frozen `pickle-cli lex`
 #      oracle (tools\diff\oracle\abi_box_main.pkl.lex).
@@ -69,10 +69,12 @@ $hasFail = @($linkOut | Select-String -Pattern "SELFLINK FAIL").Count
 Cert "selflink-resolved (objects=1, unresolved=0)" ($unresolved -eq 0 -and $okLine -eq 1 -and $hasFail -eq 0) (($linkOut | Select-String -Pattern "SELFLINK" | ForEach-Object { $_.Line }) -join "; ")
 if (-not (Test-Path -LiteralPath $exe)) { Write-Output "FAIL selflink exe missing"; exit 1 }
 
-# ---- 2. fast path: -V (vs frozen golden cli/V.out) ----
+# ---- 2. fast path: -V (against the single version source of truth) ----
 $portV = Join-Path $work "portV.out"
 $vrc = Invoke-NativeTimeout $exe @("-V") $portV 60
-Cert "selflink-exe -V" ($vrc -eq 0 -and (ByteEq $portV "$goldenDir\cli\V.out")) "exit=$vrc"
+$expectedV = Join-Path $work "expectedV.out"
+Set-Content -LiteralPath $expectedV -Value ("pickle " + (Get-PickleVersion) + "`n") -NoNewline -Encoding ascii
+Cert "selflink-exe -V" ($vrc -eq 0 -and (ByteEq $portV $expectedV)) "exit=$vrc"
 
 # ---- 3. compiler pipeline parity: lex a copy, byte-compare vs frozen lex oracle ----
 $fixture = Join-Path $work "fixture.pkl"

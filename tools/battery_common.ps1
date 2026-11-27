@@ -92,6 +92,18 @@ function ByteEq([string]$a, [string]$b) {
     (Get-FileHash -LiteralPath $a -Algorithm SHA256).Hash -ieq (Get-FileHash -LiteralPath $b -Algorithm SHA256).Hash
 }
 
+# The toolchain version has exactly one source of truth: compiler\version.pkl.
+# Gates that check `-V` build their expected bytes from it instead of pinning a
+# second copy of the version in PowerShell.
+function Get-PickleVersion {
+    $path = Join-Path (Split-Path -Parent $PSScriptRoot) "compiler\version.pkl"
+    $src = Get-Content -LiteralPath $path -Raw
+    if ($src -notmatch 'const\s+VERSION:\s*string\s*=\s*"([^"]+)"') {
+        throw "cannot read VERSION from $path"
+    }
+    $Matches[1]
+}
+
 # Incremental SHA256 over a set of files, sorted by relative path so the result
 # is stable across runs on the same tree content. The Rust cli is deliberately NOT
 # folded in: these hashes gate driver/artifact rebuilds and must be identical whether
