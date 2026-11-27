@@ -9,9 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Linux x86-64 port work on the 0.2 line: an ELF64 relocatable-object writer,
-  the SysV x86-64 calling convention, and POSIX runtime backends. This is not
-  yet a released or verified Linux target.
+- Linux x86-64 self-hosted toolchain on the 0.2 line: a freestanding ELF
+  writer and linker, SysV x86-64 lowering, POSIX runtime backends over raw
+  syscalls, and cross-building from Windows. Verified on Ubuntu 26.04 with no
+  C toolchain or libc; not yet released or tagged.
+
+- A POSIX stream backend (`abi_stream_posix`) mirroring the Windows stream
+  symbols, so `std.fs` append/read works on Linux.
 
 ### Changed
 
