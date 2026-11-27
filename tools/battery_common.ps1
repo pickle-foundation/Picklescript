@@ -10,16 +10,19 @@ $batteryCommonCli = "target\debug\pickle-cli.exe"
 if (Test-Path -LiteralPath $batteryCommonCli) { $batteryCommonCli = (Resolve-Path $batteryCommonCli).Path }
 
 # Pickle self-host seed: a pickled `build` driver (cli\build.pkl compiled by
-# the pickle toolchain, linked against the pickle runtime archive, so it runs on the
-# PICKLE runtime). When the seed and the archive it links against both exist, every
-# AOT driver below is built by the seed instead of the Rust cli, so Rust leaves the
-# driver loop. Create the pair once with `tools\selfhost.ps1` (genesis); delete the
-# seed to fall back to the Rust cli. Absence of the seed keeps the old behaviour.
+# the pickle toolchain, so it runs on the PICKLE runtime). Every program object
+# already carries its whole import closure, including the runtime prelude, so
+# there is no runtime archive to build or link. When the seed exists, every AOT
+# driver below is built by the seed instead of the Rust cli, so Rust leaves the
+# driver loop. Create the seed once with `tools\selfhost.ps1` (genesis); delete
+# it to fall back to the Rust cli. Absence of the seed keeps the old behaviour.
 $selfhostSeed = "tools\diff\selfhost\seed.exe"
-$selfhostArchive = "tools\diff\rtlib.ar"
+# The drivers keep the historical second argv slot for the gate scripts, but
+# the runtime prelude is embedded now, so the value is never read.
+$ignoredRuntimeArg = "none"
 
 function Test-SelfHostSeed {
-    (Test-Path -LiteralPath $selfhostSeed) -and (Test-Path -LiteralPath $selfhostArchive)
+    Test-Path -LiteralPath $selfhostSeed
 }
 
 # Run a native command with its output discarded, leaving the caller's
@@ -198,12 +201,9 @@ $portOnlyStdlibKeys = @(
 function Invoke-BuildDriver([string]$src, [string]$out) {
     $stamp = "$out.hash"
     if (Test-SelfHostSeed) {
-        # The seed links the driver against the runtime archive, so its bytes are
-        # an input too: a runtime edit changes the archive without touching any
-        # `$batteryDriverDirs` source, and omitting it here pinned drivers built
-        # against the previous runtime.
+        # The seed's own bytes are an input too: a compiler change rebuilds the
+        # seed, and omitting it here would pin drivers built by the previous one.
         $want = (Get-DriverHash) + "|selfhost:" + (Get-FileHash -LiteralPath $selfhostSeed -Algorithm SHA256).Hash
-        $want = $want + "|rtlib:" + (Get-FileHash -LiteralPath $selfhostArchive -Algorithm SHA256).Hash
     } else {
         $provider = ""
         if (Test-Path -LiteralPath $batteryCommonCli) { $provider = "|rust:" + (Get-FileHash -LiteralPath $batteryCommonCli -Algorithm SHA256).Hash }
@@ -218,7 +218,7 @@ function Invoke-BuildDriver([string]$src, [string]$out) {
     # gone a failed build returns $false and is retried instead of masked.
     if (Test-Path -LiteralPath $out) { Remove-Item -LiteralPath $out -Force }
     if (Test-SelfHostSeed) {
-        $null = Invoke-NativeQuiet $selfhostSeed @($src, $selfhostArchive, $out)
+        $null = Invoke-NativeQuiet $selfhostSeed @($src, $ignoredRuntimeArg, $out)
     } else {
         $null = Invoke-NativeQuiet $batteryCommonCli @("build", $src, "-o", $out)
     }
@@ -258,42 +258,11 @@ function Invoke-Artifact([string]$builder, [string]$source, [string]$lib, [strin
     return $false
 }
 
-# Pickle-built runtime archive in place of the Rust combined.lib (built by the
-# Rust side with cargo). cli/rtlib.pkl is AOT-built to a
-# driver, then lowers every runtime member to COFF and packs them into one
-# GNU .ar (tools\diff\rtlib.ar) — the exact archive build.pkl/run.pkl link against.
-# It is stamp-gated on the driver tree (compiler+cli+stdlib) plus the runtime
-# member sources, so it only rebuilds when any input changed. Returns the archive
-# path, or $null when the driver build or the archive write fails.
-$rtlibArchive = "tools\diff\rtlib.ar"
-$rtlibDriver = "tools\diff\port\pklc_rtlib.exe"
-$rtlibRuntimeDir = "runtime"
-
+# The runtime prelude is embedded in every program object, so there is no
+# archive to build. The drivers keep the historical second argv slot for the
+# gate scripts, but it is never read. Returning an existing file keeps the
+# battery's `Abs` calls and artifact stamps working without inventing a
+# zero-byte artefact.
 function Get-RtlibArchive([string]$Platform = "win") {
-    if ($Platform -ne "win" -and $Platform -ne "posix" -and $Platform -ne "all") {
-        Write-Host "RTLIB-ARCHIVE: bad platform $Platform (expected win, posix, or all)"
-        return $null
-    }
-    if (-not (Invoke-BuildDriver "cli\rtlib.pkl" $rtlibDriver)) {
-        Write-Host "RTLIB-ARCHIVE: driver build failed"
-        return $null
-    }
-    $stamp = "$rtlibArchive.hash"
-    $want = (Get-DriverHash) + "|" + (Get-TreeHash @("$rtlibRuntimeDir")) + "|" + $Platform
-    if ((Test-Path -LiteralPath $rtlibArchive) -and (Test-Path -LiteralPath $stamp) -and ((Get-Content -LiteralPath $stamp -Raw).Trim() -eq $want)) {
-        return $rtlibArchive
-    }
-    Write-Host "RTLIB-ARCHIVE: rebuilding $rtlibArchive ($($rtlibDriver) $rtlibRuntimeDir platform=$Platform)"
-    # Delete the previous archive first. The driver can die before writing
-    # anything (a stale driver whose embedded runtime cannot sweep does exactly
-    # that), and leaving the old file in place used to stamp it as current and
-    # hide the failed build from every later gate.
-    if (Test-Path -LiteralPath $rtlibArchive) { Remove-Item -LiteralPath $rtlibArchive -Force }
-    $code = Invoke-NativeQuiet $rtlibDriver @($rtlibRuntimeDir, $rtlibArchive, $Platform)
-    if ($code -eq 0 -and (Test-Path -LiteralPath $rtlibArchive)) {
-        Set-Content -LiteralPath $stamp -Value $want -NoNewline
-        return $rtlibArchive
-    }
-    Write-Host "RTLIB-ARCHIVE: write failed (exit $code)"
-    return $null
+    "picklescript.toml"
 }
