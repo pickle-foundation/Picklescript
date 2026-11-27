@@ -1,0 +1,116 @@
+module compiler.a64_test
+
+import { A64Buf, COND_EQ, REL_ABS64, REL_CALL26 } from compiler.a64
+import { hex2 } from compiler.x64
+
+/// The expected bytes below are the encodings GNU as 2.46 produces for the
+/// same instructions on aarch64-linux-gnu. Keeping them literal means the
+/// encoder is checked against the real architecture, not against itself.
+
+/// Format the buffer as instruction words in the order objdump prints them,
+/// not as raw little-endian bytes. A word `0xA9BF7BFD` is stored FD 7B BF A9,
+/// so comparing raw bytes with an objdump listing would fail on every
+/// multi-byte instruction.
+fn hexOf(b: A64Buf) -> string {
+    var acc = ""
+    var i = 0
+    while (i + 3 < len(b.bytes)) {
+        acc = acc + hex2(b.bytes[i + 3]) + hex2(b.bytes[i + 2]) + hex2(b.bytes[i + 1]) + hex2(b.bytes[i])
+        i = i + 4
+    }
+    while (i < len(b.bytes)) {
+        acc = acc + hex2(b.bytes[i])
+        i = i + 1
+    }
+    acc
+}
+
+test fn movz_movk_and_mov_match_gnu_as() {
+    let b = A64Buf()
+    b.movz(29, 0, 0)
+    b.movz(30, 0, 0)
+    b.movz(8, 94, 0)
+    b.movz(1, 1, 16)
+    b.movk(2, 0x1234, 32)
+    b.movReg(8, 0)
+    expect(hexOf(b)).toBe("d280001dd280001ed2800bc8d2a00021f2c24682aa0003e8")
+}
+
+test fn arithmetic_matches_gnu_as() {
+    let b = A64Buf()
+    b.addImm(0, 1, 12)
+    b.subImm(2, 3, 1)
+    b.cmpReg(0, 1)
+    b.cmpImm(2, 0)
+    expect(hexOf(b)).toBe("91003020d1000462eb01001ff100005f")
+}
+
+test fn loads_and_stores_match_gnu_as() {
+    let b = A64Buf()
+    b.strX(1, 2, 24)
+    b.ldrX(1, 2, 24)
+    b.ldrbPost(10, 1, 1)
+    b.strbPost(10, 0, 1)
+    b.ldaxr(0, 9)
+    b.stlxr(10, 2, 9)
+    expect(hexOf(b)).toBe("f9000c41f9400c413840142a3800140ac85ffd20c80afd22")
+}
+
+test fn frame_pair_matches_gnu_as() {
+    let b = A64Buf()
+    b.stpPre(29, 30, 31, -16)
+    b.ldpPost(29, 30, 31, 16)
+    expect(hexOf(b)).toBe("a9bf7bfda8c17bfd")
+}
+
+test fn calls_and_traps_match_gnu_as() {
+    let b = A64Buf()
+    b.ret()
+    b.blr(9)
+    b.br(9)
+    b.svc(0)
+    b.brk(0)
+    expect(hexOf(b)).toBe("d65f03c0d63f0120d61f0120d4000001d4200000")
+}
+
+test fn literal_load_patch_uses_scaled_offset() {
+    let b = A64Buf()
+    let at = b.ldrLiteral(1)
+    b.word(0)
+    b.patchLdrLit(at, 8)
+    expect(at).toBe(0)
+    expect(hexOf(b)).toBe("5800004100000000")
+}
+
+test fn local_branches_patch_only_the_immediate() {
+    let b = A64Buf()
+    let beq = b.bCond(COND_EQ)
+    let bz = b.cbz(2)
+    let bnz = b.cbnz(2)
+    let j = b.b()
+    b.patchBCond(beq, 16)
+    b.patchCbz(bz, 16)
+    b.patchCbz(bnz, 16)
+    b.patchB(j, 16)
+    expect(hexOf(b)).toBe("54000080b4000062b500004214000001")
+}
+
+test fn call_relocation_names_the_bl_field() {
+    let b = A64Buf()
+    b.callSym("pickle_main")
+    expect(len(b.relocs)).toBe(1)
+    expect(b.relocs[0].off).toBe(0)
+    expect(b.relocs[0].sym).toBe("pickle_main")
+    expect(b.relocs[0].type).toBe(REL_CALL26)
+    expect(hexOf(b)).toBe("94000000")
+}
+
+test fn abs64_relocation_names_an_eight_byte_field() {
+    let b = A64Buf()
+    b.word(0xD65F03C0)
+    b.abs64("pickle_main")
+    expect(len(b.relocs)).toBe(1)
+    expect(b.relocs[0].off).toBe(4)
+    expect(b.relocs[0].type).toBe(REL_ABS64)
+    expect(hexOf(b)).toBe("d65f03c00000000000000000")
+}
