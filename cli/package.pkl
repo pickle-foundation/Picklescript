@@ -407,6 +407,59 @@ fn joinPath(a: string, b: string) -> string {
     pathJoin(toSlashes(a), toSlashes(b))
 }
 
+/// A single path segment with no syntax of its own. Used for the pieces of a
+/// package identity (`vendor`, `package`, `version`) so a name can never widen
+/// into a path.
+fn safeSegment(p: string) -> bool {
+    if (p == "" || p == "." || p == "..") {
+        return false
+    }
+    for (b in bytes(p)) {
+        let c = b as int
+        if (c == 0 || c == 47 || c == 92 || c == 58) {
+            return false
+        }
+    }
+    true
+}
+
+/// A project-relative path that cannot leave the project. Absolute and rooted
+/// forms are refused outright; `..` is refused even though `pathNormalize`
+/// would collapse it, because the lockfile must never name a parent.
+fn safeRelativePath(p: string) -> bool {
+    let t = toSlashes(trimText(p))
+    if (t == "" || isAbsolutePath(t) || indexOfText(t, ":") >= 0) {
+        return false
+    }
+    if (t == ".." || startsWithText(t, "../") || endsWithText(t, "/..") || indexOfText(t, "/../") >= 0) {
+        return false
+    }
+    if (indexOfText(t, "//") >= 0) {
+        return false
+    }
+    true
+}
+
+/// The lowercased lexical form used for containment checks. Lowering both
+/// sides is conservative: a case-insensitive filesystem cannot turn a
+/// contained path into an escape by changing case.
+fn foldPath(p: string) -> string {
+    lowerText(pathNormalize(toSlashes(p)))
+}
+
+/// True when `candidate` is `root` itself or a separator-bounded child.
+fn underRoot(root: string, candidate: string) -> bool {
+    let r = foldPath(root)
+    let c = foldPath(candidate)
+    if (c == r) {
+        return true
+    }
+    if (endsWithText(r, "/")) {
+        return startsWithText(c, r)
+    }
+    startsWithText(c, r + "/")
+}
+
 /// Lexically relative path from `fromDir` to `toPath`, both absolute or both
 /// relative and slash-separated. `..` segments are emitted as needed.
 fn relativePath(fromDir: string, toPath: string) -> string {
@@ -639,7 +692,7 @@ fn parseManifest(text: string) -> Manifest {
                     var joined = ""
                     for (p in parts) {
                         if (joined != "") {
-                            joined = joined + " || "
+                            joined = joined + ", "
                         }
                         joined = joined + p
                     }
@@ -705,7 +758,7 @@ fn manifestSetDependency(text: string, name: string, constraint: string) -> stri
     let bounds = sectionBounds(lines, "dependencies")
     let header = bounds[0]
     let end = bounds[1]
-    let newLine = name + " = \"" + constraint + "\""
+    let newLine = name + " = " + quoteToml(constraint)
     if (header < 0) {
         var out = List<string>()
         for (l in lines) {
@@ -812,6 +865,20 @@ class Project {
     }
 }
 
+/// Resolve a project-relative path and require it to stay under the project
+/// root. Every lockfile-controlled path goes through here before it reaches
+/// `removeTree`, `ensureDir` or an extractor.
+fn projectPath(project: Project, rel: string) -> string? {
+    if (!safeRelativePath(rel)) {
+        return none
+    }
+    let full = joinPath(project.root, trimText(rel))
+    if (!underRoot(project.root, full)) {
+        return none
+    }
+    full
+}
+
 fn findProjectRoot(start: string) -> string? {
     var dir = pathNormalize(toSlashes(start))
     while (true) {
@@ -859,6 +926,146 @@ fn writeManifest(project: Project, text: string) -> bool {
 // Module names and the generated workspace map
 // ---------------------------------------------------------------------------
 
+/// Bundled crates the compiler ships. A registry package must never map onto
+/// one of these: the generated workspace map is compiled input, so shadowing
+/// `std` is source substitution.
+fn reservedModule(name: string) -> bool {
+    name == "std" || name == "compiler" || name == "cli" || name == "runtime"
+}
+
+/// One half of a package name. Registry names are lowercase by convention but
+/// existing packages may carry case, so both cases are accepted; what matters
+/// is that the segment cannot become a path component.
+fn namePartOk(s: string) -> bool {
+    if (!safeSegment(s)) {
+        return false
+    }
+    let bs = bytes(s)
+    let c0 = bs[0] as int
+    if (c0 == 46 || c0 == 45) {
+        return false
+    }
+    for (b in bs) {
+        let c = b as int
+        let ok = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 45 || c == 46 || c == 95
+        if (!ok) {
+            return false
+        }
+    }
+    true
+}
+
+/// `vendor/package`, exactly one separator, both halves name-safe.
+fn validPackageName(name: string) -> bool {
+    let slash = name.indexOf("/")
+    match (slash) {
+        case some(i) -> {
+            if (i <= 0 || i + 1 >= len(name)) {
+                return false
+            }
+            let vendor = name.substring(0, i)
+            let pkg = name.substring(i + 1, len(name))
+            if (indexOfText(pkg, "/") >= 0) {
+                return false
+            }
+            namePartOk(vendor) && namePartOk(pkg)
+        }
+        case none -> false
+    }
+}
+
+/// SemVer shape only: three numeric parts plus an optional `-pre`/`+build`
+/// tail drawn from the SemVer alphabet. This is the gate that keeps a version
+/// from carrying path syntax; constraint satisfaction is checked separately.
+fn validVersion(s: string) -> bool {
+    let t = trimText(s)
+    if (t == "" || len(t) > 128) {
+        return false
+    }
+    var core = t
+    let plus = core.indexOf("+")
+    if (let some(i) = plus) {
+        core = core.substring(0, i)
+    }
+    let dash = core.indexOf("-")
+    if (let some(i) = dash) {
+        core = core.substring(0, i)
+    }
+    var parts = 0
+    var start = 0
+    var i = 0
+    let bs = bytes(core)
+    while (i <= len(bs)) {
+        if (i == len(bs) || (bs[i] as int) == 46) {
+            if (i == start) {
+                return false
+            }
+            var j = start
+            while (j < i) {
+                let c = bs[j] as int
+                if (c < 48 || c > 57) {
+                    return false
+                }
+                j = j + 1
+            }
+            parts = parts + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if (parts != 3) {
+        return false
+    }
+    for (b in bytes(t)) {
+        let c = b as int
+        let ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 46 || c == 45 || c == 43
+        if (!ok) {
+            return false
+        }
+    }
+    true
+}
+
+/// The constraint syntax the manifest can store. This is deliberately a
+/// character allowlist: a constraint is written into TOML, so quotes, newlines
+/// and backslashes must never reach the file.
+fn validConstraintText(s: string) -> bool {
+    let t = trimText(s)
+    if (t == "" || len(t) > 256) {
+        return false
+    }
+    for (b in bytes(t)) {
+        let c = b as int
+        let digit = c >= 48 && c <= 57
+        let alpha = (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+        let op = c == 46 || c == 45 || c == 43 || c == 94 || c == 126 || c == 60 || c == 62 || c == 61 || c == 42 || c == 124 || c == 44 || c == 32 || c == 9
+        if (!(digit || alpha || op)) {
+            return false
+        }
+    }
+    true
+}
+
+/// A module name the compiler can import: a plain identifier, never reserved.
+fn validModuleName(s: string) -> bool {
+    if (s == "" || reservedModule(s)) {
+        return false
+    }
+    let bs = bytes(s)
+    let c0 = bs[0] as int
+    if (!((c0 >= 97 && c0 <= 122) || (c0 >= 65 && c0 <= 90) || c0 == 95)) {
+        return false
+    }
+    for (b in bs) {
+        let c = b as int
+        let ok = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95
+        if (!ok) {
+            return false
+        }
+    }
+    true
+}
+
 /// The import name for a registry package: the package segment, lowercased,
 /// with separators folded to `_`. This mirrors the registry's fallback naming
 /// (`http-client` -> `http_client`) and gives the compiler a crate name.
@@ -892,6 +1099,9 @@ fn moduleNameFor(packageName: string) -> string {
 }
 
 fn moduleCollides(manifest: Manifest, modName: string) -> bool {
+    if (reservedModule(modName)) {
+        return true
+    }
     for (n in manifest.workspace_names) {
         if (n == modName) {
             return true
@@ -908,8 +1118,21 @@ fn workspaceText(project: Project, entries: List<LockEntry>) -> string {
     out = out + "members = [\n"
     let base = joinPath(project.root, ".pickle")
     for (e in entries) {
-        let rel = relativePath(base, joinPath(project.root, e.crate))
-        out = out + "    \{ name = \"" + e.modName + "\", path = \"" + rel + "\" \},\n"
+        // The map is compiled input, so both the name and the path are
+        // re-derived from the package identity and quoted as TOML strings.
+        // A lockfile cannot inject a second member or escape the project.
+        match (installDirRel(project, e.name, e.version)) {
+            case some(rel) -> {
+                match (crateRelFor(project, rel)) {
+                    case some(crateRel) -> {
+                        let relToBase = relativePath(base, joinPath(project.root, crateRel))
+                        out = out + "    \{ name = " + quoteToml(moduleNameFor(e.name)) + ", path = " + quoteToml(relToBase) + " \},\n"
+                    }
+                    case none -> {}
+                }
+            }
+            case none -> {}
+        }
     }
     out = out + "]\n"
     out
@@ -1026,61 +1249,463 @@ fn writeLock(project: Project, entries: List<LockEntry>) -> bool {
     write_file(project.lock_path, lockText(entries))
 }
 
+/// Set by `parseLock` when the lockfile exists but is not trustworthy. The
+/// callers distinguish "no lock" (resolve fresh) from "bad lock" (refuse).
+var lockInvalid: bool = false
+
+fn depNameOf(spec: string) -> string {
+    let t = trimText(spec)
+    let sp = indexOfText(t, " ")
+    if (sp >= 0) {
+        return t.substring(0, sp)
+    }
+    t
+}
+
+/// The constraint half of a lock dependency string (`name constraint`).
+fn depConstraintOf(spec: string) -> string {
+    let t = trimText(spec)
+    let sp = indexOfText(t, " ")
+    if (sp >= 0) {
+        return trimText(t.substring(sp + 1, len(t)))
+    }
+    "*"
+}
+
+// ---------------------------------------------------------------------------
+// Local SemVer checks for lockfile validation
+// ---------------------------------------------------------------------------
+
+/// Resolution still delegates range matching to the registry. This tiny
+/// comparator exists only to re-check that a version already pinned in the
+/// lockfile still satisfies the manifest; unsupported syntax fails closed.
+class SemVer {
+    var major: int
+    var minor: int
+    var patch: int
+    var pre: string
+
+    constructor(major: int, minor: int, patch: int, pre: string) {
+        this.major = major
+        this.minor = minor
+        this.patch = patch
+        this.pre = pre
+    }
+}
+
+fn digitsOnly(s: string) -> bool {
+    if (s == "") {
+        return false
+    }
+    for (b in bytes(s)) {
+        let c = b as int
+        if (c < 48 || c > 57) {
+            return false
+        }
+    }
+    true
+}
+
+fn digitsToInt(s: string) -> int {
+    var n = 0
+    for (b in bytes(s)) {
+        n = n * 10 + ((b as int) - 48)
+    }
+    n
+}
+
+fn parseSemVer(text: string) -> SemVer? {
+    let t = trimText(text)
+    if (t == "" || len(t) > 128) {
+        return none
+    }
+    var core = t
+    var pre = ""
+    let plus = core.indexOf("+")
+    if (let some(i) = plus) {
+        core = core.substring(0, i)
+    }
+    let dash = core.indexOf("-")
+    if (let some(i) = dash) {
+        pre = core.substring(i + 1, len(core))
+        core = core.substring(0, i)
+    }
+    var nums = [0, 0, 0]
+    var count = 0
+    var start = 0
+    var i = 0
+    let bs = bytes(core)
+    while (i <= len(bs)) {
+        if (i == len(bs) || (bs[i] as int) == 46) {
+            if (i == start) {
+                return none
+            }
+            let part = sliceText(core, start, i)
+            if (!digitsOnly(part)) {
+                return none
+            }
+            if (count < 3) {
+                nums[count] = digitsToInt(part)
+            }
+            count = count + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if (count < 1 || count > 3) {
+        return none
+    }
+    SemVer(nums[0], nums[1], nums[2], pre)
+}
+
+/// SemVer prerelease precedence: numeric identifiers sort below alphanumeric
+/// ones, and a release sorts above any prerelease of the same tuple.
+fn preCmp(a: string, b: string) -> int {
+    if (a == b) {
+        return 0
+    }
+    if (a == "") {
+        return 1
+    }
+    if (b == "") {
+        return -1
+    }
+    let ab = bytes(a)
+    let bb = bytes(b)
+    var ai = 0
+    var bi = 0
+    while (ai < len(ab) || bi < len(bb)) {
+        var ae = ai
+        while (ae < len(ab) && (ab[ae] as int) != 46) {
+            ae = ae + 1
+        }
+        var be = bi
+        while (be < len(bb) && (bb[be] as int) != 46) {
+            be = be + 1
+        }
+        let apart = sliceText(a, ai, ae)
+        let bpart = sliceText(b, bi, be)
+        let an = digitsOnly(apart)
+        let bn = digitsOnly(bpart)
+        if (an && bn) {
+            let av = digitsToInt(apart)
+            let bv = digitsToInt(bpart)
+            if (av < bv) {
+                return -1
+            }
+            if (av > bv) {
+                return 1
+            }
+        } else if (an) {
+            return -1
+        } else if (bn) {
+            return 1
+        } else {
+            if (apart < bpart) {
+                return -1
+            }
+            if (apart > bpart) {
+                return 1
+            }
+        }
+        ai = ae + 1
+        bi = be + 1
+    }
+    0
+}
+
+fn cmpSemVer(a: SemVer, b: SemVer) -> int {
+    if (a.major != b.major) {
+        if (a.major < b.major) {
+            return -1
+        }
+        return 1
+    }
+    if (a.minor != b.minor) {
+        if (a.minor < b.minor) {
+            return -1
+        }
+        return 1
+    }
+    if (a.patch != b.patch) {
+        if (a.patch < b.patch) {
+            return -1
+        }
+        return 1
+    }
+    preCmp(a.pre, b.pre)
+}
+
+fn constraintTerm(v: SemVer, rawTerm: string) -> bool {
+    var t = trimText(rawTerm)
+    if (t == "" || t == "*") {
+        return true
+    }
+    var op = ""
+    if (startsWithText(t, ">=")) {
+        op = ">="
+        t = t.substring(2, len(t))
+    } else if (startsWithText(t, "<=")) {
+        op = "<="
+        t = t.substring(2, len(t))
+    } else if (startsWithText(t, ">")) {
+        op = ">"
+        t = t.substring(1, len(t))
+    } else if (startsWithText(t, "<")) {
+        op = "<"
+        t = t.substring(1, len(t))
+    } else if (startsWithText(t, "^")) {
+        op = "^"
+        t = t.substring(1, len(t))
+    } else if (startsWithText(t, "~")) {
+        op = "~"
+        t = t.substring(1, len(t))
+    } else if (startsWithText(t, "=")) {
+        op = "="
+        t = t.substring(1, len(t))
+    }
+    match (parseSemVer(t)) {
+        case some(b) -> {
+            let c = cmpSemVer(v, b)
+            if (op == ">=") {
+                return c >= 0
+            }
+            if (op == "<=") {
+                return c <= 0
+            }
+            if (op == ">") {
+                return c > 0
+            }
+            if (op == "<") {
+                return c < 0
+            }
+            if (op == "=") {
+                return c == 0
+            }
+            // A prerelease never satisfies a range whose comparator is a
+            // release, even when the tuple matches.
+            if (v.pre != "" && b.pre == "") {
+                return false
+            }
+            if (op == "^") {
+                if (c < 0) {
+                    return false
+                }
+                if (b.major > 0) {
+                    return v.major == b.major
+                }
+                if (b.minor > 0) {
+                    return v.major == 0 && v.minor == b.minor
+                }
+                return v.major == 0 && v.minor == 0 && v.patch == b.patch
+            }
+            if (op == "~") {
+                if (c < 0) {
+                    return false
+                }
+                return v.major == b.major && v.minor == b.minor
+            }
+            c == 0
+        }
+        case none -> false
+    }
+}
+
+fn versionSatisfies(version: string, constraint: string) -> bool {
+    let c = trimText(constraint)
+    if (c == "" || c == "*") {
+        return true
+    }
+    match (parseSemVer(version)) {
+        case some(v) -> {
+            var start = 0
+            var i = 0
+            let bs = bytes(c)
+            while (i <= len(bs)) {
+                if (i == len(bs) || (bs[i] as int) == 44 || (bs[i] as int) == 32 || (bs[i] as int) == 9) {
+                    if (i > start) {
+                        let term = sliceText(c, start, i)
+                        if (!constraintTerm(v, term)) {
+                            return false
+                        }
+                    }
+                    start = i + 1
+                }
+                i = i + 1
+            }
+            true
+        }
+        case none -> false
+    }
+}
+
+/// Structural validation of one lock entry. Every field is attacker-controlled
+/// once the lockfile is, so none of it reaches a filesystem or HTTP sink before
+/// passing here.
+fn lockEntryOk(e: LockEntry) -> bool {
+    if (!validPackageName(e.name) || !validVersion(e.version) || !validModuleName(e.modName)) {
+        return false
+    }
+    // The module name is derived, not chosen: a lock entry cannot map a
+    // package onto another crate's import path.
+    if (e.modName != moduleNameFor(e.name)) {
+        return false
+    }
+    if (!safeRelativePath(e.install) || !safeRelativePath(e.crate)) {
+        return false
+    }
+    if (e.crate != e.install && e.crate != e.install + "/src") {
+        return false
+    }
+    if (e.download == "" || !validIntegrity(e.integrity)) {
+        return false
+    }
+    match (parseUrl(e.download)) {
+        case some(u) -> {
+            if (!secureUrl(u)) {
+                return false
+            }
+        }
+        case none -> {
+            return false
+        }
+    }
+    for (c in e.constraints) {
+        if (trimText(c) == "" || !versionSatisfies(e.version, c)) {
+            return false
+        }
+    }
+    for (d in e.deps) {
+        if (!validPackageName(depNameOf(d))) {
+            return false
+        }
+    }
+    true
+}
+
+/// Apply one `key = value` line to a lock entry. Unknown keys and malformed
+/// arrays return false so the caller can reject the whole lockfile.
+fn applyLockKey(e: LockEntry, key: string, rawValue: string) -> bool {
+    if (key == "name") {
+        e.name = parseTextValue(rawValue)
+        return true
+    }
+    if (key == "version") {
+        e.version = parseTextValue(rawValue)
+        return true
+    }
+    if (key == "module") {
+        e.modName = parseTextValue(rawValue)
+        return true
+    }
+    if (key == "install") {
+        e.install = parseTextValue(rawValue)
+        return true
+    }
+    if (key == "crate") {
+        e.crate = parseTextValue(rawValue)
+        return true
+    }
+    if (key == "download") {
+        e.download = parseTextValue(rawValue)
+        return true
+    }
+    if (key == "integrity") {
+        e.integrity = parseTextValue(rawValue)
+        return true
+    }
+    if (key == "constraints") {
+        match (parseStringArray(rawValue)) {
+            case some(items) -> {
+                e.constraints = items
+                return true
+            }
+            case none -> { return false }
+        }
+    }
+    if (key == "dependencies") {
+        match (parseStringArray(rawValue)) {
+            case some(items) -> {
+                e.deps = items
+                return true
+            }
+            case none -> { return false }
+        }
+    }
+    false
+}
+
 fn parseLock(text: string) -> List<LockEntry>? {
+    lockInvalid = false
     var out = List<LockEntry>()
     var current: LockEntry? = none
+    var names = Map<string, bool>()
+    var sawVersion = false
     for (raw in splitTextLines(text)) {
         let clean = trimText(stripComment(raw))
         if (clean == "") {
             continue
         }
         if (clean == "[[package]]") {
-            if (let some(e) = current) {
-                out.push(e)
+            match (current) {
+                case some(e) -> {
+                    if (!lockEntryOk(e) || names.has(e.name)) {
+                        lockInvalid = true
+                        return none
+                    }
+                    names[e.name] = true
+                    out.push(e)
+                }
+                case none -> {}
             }
             current = LockEntry()
             continue
         }
         if (startsWithText(clean, "[")) {
-            continue
+            lockInvalid = true
+            return none
         }
         let eq = indexOfText(clean, "=")
         if (eq < 0) {
-            continue
+            lockInvalid = true
+            return none
         }
         let key = trimText(sliceText(clean, 0, eq))
         let rawValue = trimText(sliceText(clean, eq + 1, len(clean)))
         match (current) {
             case some(e) -> {
-                if (key == "name") {
-                    e.name = parseTextValue(rawValue)
-                } else if (key == "version") {
-                    e.version = parseTextValue(rawValue)
-                } else if (key == "module") {
-                    e.modName = parseTextValue(rawValue)
-                } else if (key == "install") {
-                    e.install = parseTextValue(rawValue)
-                } else if (key == "crate") {
-                    e.crate = parseTextValue(rawValue)
-                } else if (key == "download") {
-                    e.download = parseTextValue(rawValue)
-                } else if (key == "integrity") {
-                    e.integrity = parseTextValue(rawValue)
-                } else if (key == "constraints") {
-                    if (let some(items) = parseStringArray(rawValue)) {
-                        e.constraints = items
-                    }
-                } else if (key == "dependencies") {
-                    if (let some(items) = parseStringArray(rawValue)) {
-                        e.deps = items
-                    }
+                if (!applyLockKey(e, key, rawValue)) {
+                    lockInvalid = true
+                    return none
                 }
             }
-            case none -> {}
+            case none -> {
+                if (key != "version" || sawVersion) {
+                    lockInvalid = true
+                    return none
+                }
+                if (parseTextValue(rawValue) != str(LOCK_VERSION)) {
+                    lockInvalid = true
+                    return none
+                }
+                sawVersion = true
+            }
         }
     }
-    if (let some(e) = current) {
-        out.push(e)
+    match (current) {
+        case some(e) -> {
+            if (!lockEntryOk(e) || names.has(e.name)) {
+                lockInvalid = true
+                return none
+            }
+            names[e.name] = true
+            out.push(e)
+        }
+        case none -> {}
+    }
+    if (len(out) > 0 && !sawVersion) {
+        lockInvalid = true
+        return none
     }
     if (len(out) == 0) {
         return none
@@ -1089,6 +1714,7 @@ fn parseLock(text: string) -> List<LockEntry>? {
 }
 
 fn readLock(project: Project) -> List<LockEntry>? {
+    lockInvalid = false
     match (read_file(project.lock_path)) {
         case some(text) -> parseLock(text)
         case none -> none
@@ -1223,20 +1849,58 @@ fn resolveLocation(current: Url, location: string) -> Url? {
     Url(current.scheme, current.host, current.port, dir + loc)
 }
 
+/// Loopback is the one place plaintext HTTP is acceptable: the tests use it,
+/// and no network attacker sits between two sockets on the same host.
+fn isLoopbackHost(host: string) -> bool {
+    let h = lowerText(host)
+    h == "127.0.0.1" || h == "localhost" || h == "::1" || h == "[::1]"
+}
+
+/// Registry and download traffic must be encrypted, except over loopback.
+/// The scheme still has to be HTTP(S): the loopback exception is about
+/// plaintext, not about accepting arbitrary URL schemes.
+fn secureUrl(u: Url) -> bool {
+    if (u.scheme == "https") {
+        return true
+    }
+    u.scheme == "http" && isLoopbackHost(u.host)
+}
+
+/// A redirect may not downgrade from TLS, and its destination must itself be
+/// secure. Returning false aborts the fetch rather than sending the next hop.
+fn redirectAllowed(cur: Url, dst: Url) -> bool {
+    if (cur.scheme == "https" && dst.scheme != "https") {
+        return false
+    }
+    secureUrl(dst)
+}
+
+/// Drop credentials before following a redirect to another origin. Same-origin
+/// redirects keep them, which is the behaviour registries rely on.
+fn stripCredentials(headers: Map<string, string>) -> Map<string, string> {
+    var out = Map<string, string>()
+    for (k in headers.keys()) {
+        let lk = lowerText(k)
+        if (lk == "authorization" || lk == "cookie" || lk == "proxy-authorization") {
+            continue
+        }
+        if (let some(v) = headers.get(k)) {
+            out[k] = v
+        }
+    }
+    out
+}
+
 class FetchResult {
     var status: int
     var body: List<byte>
     var headers: Map<string, string>
-    var integrity: string
-    var integrity_source: string
     var final_url: string
 
     constructor() {
         this.status = 0
         this.body = bytes("")
         this.headers = Map<string, string>()
-        this.integrity = ""
-        this.integrity_source = ""
         this.final_url = ""
     }
 }
@@ -1308,20 +1972,19 @@ fn fetchOnce(url: Url, method: string, body: List<byte>, headers: Map<string, st
 
 fn fetchFollow(start: Url, method: string, body: List<byte>, headers: Map<string, string>, timeoutMs: int) -> FetchResult? {
     var current = start
+    var hopHeaders = headers
     var verb = method
     var payload = body
     var hops = 0
-    var integrity = ""
-    var integritySource = ""
     while (hops <= MAX_REDIRECTS) {
-        match (fetchOnce(current, verb, payload, headers, timeoutMs)) {
+        // Enforced on every hop, not just the first: a redirect cannot smuggle
+        // the client onto plaintext or a non-HTTP scheme.
+        if (!secureUrl(current)) {
+            return none
+        }
+        match (fetchOnce(current, verb, payload, hopHeaders, timeoutMs)) {
             case some(res) -> {
                 let hs = copyResponseHeaders(res)
-                let hInt = headerValue(hs, "x-pickle-integrity")
-                if (hInt != "") {
-                    integrity = hInt
-                    integritySource = headerValue(hs, "x-pickle-integrity-source")
-                }
                 if (res.status == 301 || res.status == 302 || res.status == 303 || res.status == 307 || res.status == 308) {
                     let loc = headerValue(hs, "location")
                     if (loc == "") {
@@ -1329,6 +1992,12 @@ fn fetchFollow(start: Url, method: string, body: List<byte>, headers: Map<string
                     }
                     match (resolveLocation(current, loc)) {
                         case some(next) -> {
+                            if (!redirectAllowed(current, next)) {
+                                return none
+                            }
+                            if (lowerText(current.origin()) != lowerText(next.origin())) {
+                                hopHeaders = stripCredentials(hopHeaders)
+                            }
                             current = next
                             if (res.status == 303) {
                                 verb = "GET"
@@ -1343,8 +2012,6 @@ fn fetchFollow(start: Url, method: string, body: List<byte>, headers: Map<string
                     out.status = res.status
                     out.body = res.body
                     out.headers = hs
-                    out.integrity = integrity
-                    out.integrity_source = integritySource
                     out.final_url = current.text()
                     return out
                 }
@@ -1376,6 +2043,23 @@ fn normalizeIntegrity(text: string) -> string {
         t = t.substring(7, len(t))
     }
     t
+}
+
+/// A trusted SHA-256 pin: exactly 64 lowercase hex characters after the
+/// optional `sha256=` prefix. Anything else (empty, short, a digest from a
+/// response header) is not a pin.
+fn validIntegrity(text: string) -> bool {
+    let t = normalizeIntegrity(text)
+    if (len(t) != 64) {
+        return false
+    }
+    for (b in bytes(t)) {
+        let c = b as int
+        if (!((c >= 48 && c <= 57) || (c >= 97 && c <= 102))) {
+            return false
+        }
+    }
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -1485,27 +2169,31 @@ class Registry {
     }
 
     fn download(url: string, expectedIntegrity: string) -> List<byte>? {
+        // The expected digest must come from the lockfile or from registry
+        // metadata over a trusted channel. A digest advertised by the same
+        // response that carries the bytes proves nothing, so there is no
+        // fallback to `X-Pickle-Integrity`.
+        let want = normalizeIntegrity(expectedIntegrity)
+        if (!validIntegrity(want)) {
+            this.fail("refusing to download " + url + " without a pinned sha256")
+            return none
+        }
         match (parseUrl(url)) {
             case some(u) -> {
+                if (!secureUrl(u)) {
+                    this.fail("refusing to download over plaintext http: " + url)
+                    return none
+                }
                 match (fetchFollow(u, "GET", bytes(""), Map<string, string>(), this.timeout_ms)) {
                     case some(res) -> {
                         if (res.status < 200 || res.status >= 300) {
                             this.fail("download returned HTTP " + str(res.status))
                             return none
                         }
-                        var want = normalizeIntegrity(expectedIntegrity)
-                        if (want == "") {
-                            let advertised = normalizeIntegrity(res.integrity)
-                            if (advertised != "") {
-                                want = advertised
-                            }
-                        }
-                        if (want != "") {
-                            let got = sha256Text(res.body)
-                            if (got != want) {
-                                this.fail("archive integrity mismatch: expected sha256=" + want + ", got sha256=" + got)
-                                return none
-                            }
+                        let got = sha256Text(res.body)
+                        if (got != want) {
+                            this.fail("archive integrity mismatch: expected sha256=" + want + ", got sha256=" + got)
+                            return none
                         }
                         return res.body
                     }
@@ -2107,116 +2795,266 @@ fn packageDir(project: Project, vendor: string, pkg: string, version: string) ->
     joinPath(project.packages_dir, vendor + "/" + pkg + "/" + version)
 }
 
-fn archivePath(project: Project, vendor: string, pkg: string, version: string) -> string {
-    joinPath(project.cache_dir, "archives/" + vendor + "/" + pkg + "/" + version + ".zip")
+fn archivePath(project: Project, vendor: string, pkg: string, version: string) -> string? {
+    let p = joinPath(project.cache_dir, "archives/" + vendor + "/" + pkg + "/" + version + ".zip")
+    if (!underRoot(project.root, p)) {
+        return none
+    }
+    p
 }
 
 fn markerPath(dir: string) -> string {
     joinPath(dir, ".pickle-ok")
 }
 
+/// The project-relative directory an entry installs into, re-derived from the
+/// package identity. The lockfile's `install` string is never the destination.
+fn installDirRel(project: Project, name: string, version: string) -> string? {
+    if (!validPackageName(name) || !validVersion(version)) {
+        return none
+    }
+    match (name.indexOf("/")) {
+        case some(i) -> {
+            let vendor = name.substring(0, i)
+            let pkg = name.substring(i + 1, len(name))
+            let dir = packageDir(project, vendor, pkg, version)
+            if (!underRoot(project.root, dir)) {
+                return none
+            }
+            relativePath(project.root, dir)
+        }
+        case none -> none
+    }
+}
+
+/// The crate path after extraction, relative to the project. `src/lib.pkl`
+/// keeps its historical `.../src` crate root.
+fn crateRelFor(project: Project, installRel: string) -> string? {
+    match (projectPath(project, installRel)) {
+        case some(dir) -> {
+            if (file_exists(joinPath(dir, "src/lib.pkl"))) {
+                return installRel + "/src"
+            }
+            installRel
+        }
+        case none -> none
+    }
+}
+
 fn installedCrate(project: Project, entry: LockEntry) -> string? {
-    let dir = joinPath(project.root, entry.install)
-    if (file_exists(joinPath(dir, "lib.pkl"))) {
-        return entry.install
+    match (installDirRel(project, entry.name, entry.version)) {
+        case some(rel) -> {
+            let dir = joinPath(project.root, rel)
+            if (file_exists(joinPath(dir, "lib.pkl"))) {
+                return rel
+            }
+            if (file_exists(joinPath(dir, "main.pkl"))) {
+                return rel
+            }
+            if (file_exists(joinPath(dir, entry.modName + ".pkl"))) {
+                return rel
+            }
+            if (file_exists(joinPath(dir, "src/lib.pkl"))) {
+                return rel + "/src"
+            }
+            none
+        }
+        case none -> none
     }
-    if (file_exists(joinPath(dir, "main.pkl"))) {
-        return entry.install
-    }
-    if (file_exists(joinPath(dir, entry.modName + ".pkl"))) {
-        return entry.install
-    }
-    if (file_exists(joinPath(dir, "src/lib.pkl"))) {
-        return entry.install + "/src"
-    }
-    none
 }
 
 fn installEntry(reg: Registry, project: Project, entry: LockEntry, force: bool) -> bool {
-    let slash = entry.name.indexOf("/")
-    if (let some(i) = slash) {
-        let vendor = entry.name.substring(0, i)
-        let pkg = entry.name.substring(i + 1, len(entry.name))
-        let dir = joinPath(project.root, entry.install)
-        let marker = markerPath(dir)
-        if (!force && file_exists(marker)) {
-            match (read_file(marker)) {
-                case some(text) -> {
-                    if (trimText(text) == entry.version) {
-                        return true
+    if (!lockEntryOk(entry)) {
+        reg.fail("invalid lock entry for `" + entry.name + "`")
+        return false
+    }
+    match (installDirRel(project, entry.name, entry.version)) {
+        case some(installRel) -> {
+            var slashAt = 0
+            if (let some(i) = entry.name.indexOf("/")) {
+                slashAt = i
+            }
+            let vendor = entry.name.substring(0, slashAt)
+            let pkg = entry.name.substring(slashAt + 1, len(entry.name))
+            let dir = joinPath(project.root, installRel)
+            let marker = markerPath(dir)
+            if (!force && file_exists(marker)) {
+                match (read_file(marker)) {
+                    case some(text) -> {
+                        if (trimText(text) == entry.version) {
+                            return true
+                        }
+                    }
+                    case none -> {}
+                }
+            }
+            match (archivePath(project, vendor, pkg, entry.version)) {
+                case some(archive) -> {
+                    var data: List<byte>? = none
+                    if (!force && file_exists(archive)) {
+                        match (read_file(archive)) {
+                            case some(text) -> {
+                                let bytesRead = bytes(text)
+                                if (sha256Text(bytesRead) == normalizeIntegrity(entry.integrity)) {
+                                    data = bytesRead
+                                }
+                            }
+                            case none -> {}
+                        }
+                    }
+                    if (data.isNone()) {
+                        match (reg.download(entry.download, entry.integrity)) {
+                            case some(blob) -> {
+                                data = blob
+                                if (!ensureDir(parentPath(archive))) {
+                                    reg.fail("cannot create cache directory " + parentPath(archive))
+                                    return false
+                                }
+                                if (!write_file(archive, str(blob))) {
+                                    reg.fail("cannot write archive " + archive)
+                                    return false
+                                }
+                            }
+                            case none -> { return false }
+                        }
+                    }
+                    match (data) {
+                        case some(blob) -> {
+                            if (!removeTree(dir)) {
+                                reg.fail("cannot remove old install directory " + dir)
+                                return false
+                            }
+                            if (!ensureDir(dir)) {
+                                reg.fail("cannot create install directory " + dir)
+                                return false
+                            }
+                            if (!extractArchive(archive, dir)) {
+                                reg.fail("cannot extract " + entry.name + " " + entry.version)
+                                return false
+                            }
+                            match (installedCrate(project, entry)) {
+                                case some(_) -> {}
+                                case none -> {
+                                    reg.fail("package " + entry.name + " does not contain " + entry.modName + ".pkl, lib.pkl, main.pkl, or src/lib.pkl")
+                                    return false
+                                }
+                            }
+                            if (!write_file(marker, entry.version + "\n")) {
+                                reg.fail("cannot write install marker in " + dir)
+                                return false
+                            }
+                            return true
+                        }
+                        case none -> false
                     }
                 }
-                case none -> {}
+                case none -> {
+                    reg.fail("package cache path escapes the project")
+                    false
+                }
             }
         }
-        let archive = archivePath(project, vendor, pkg, entry.version)
-        var data: List<byte>? = none
-        if (!force && file_exists(archive)) {
-            match (read_file(archive)) {
-                case some(text) -> {
-                    let bytesRead = bytes(text)
-                    let want = normalizeIntegrity(entry.integrity)
-                    if (want == "" || sha256Text(bytesRead) == want) {
-                        data = bytesRead
-                    }
-                }
-                case none -> {}
-            }
+        case none -> {
+            reg.fail("package install path escapes the project: " + entry.name)
+            false
         }
-        if (data.isNone()) {
-            match (reg.download(entry.download, entry.integrity)) {
-                case some(blob) -> {
-                    data = blob
-                    if (!ensureDir(parentPath(archive))) {
-                        reg.fail("cannot create cache directory " + parentPath(archive))
-                        return false
-                    }
-                    if (!write_file(archive, str(blob))) {
-                        reg.fail("cannot write archive " + archive)
-                        return false
-                    }
-                }
-                case none -> { return false }
-            }
-        }
-        match (data) {
-            case some(blob) -> {
-                if (!removeTree(dir)) {
-                    reg.fail("cannot remove old install directory " + dir)
-                    return false
-                }
-                if (!ensureDir(dir)) {
-                    reg.fail("cannot create install directory " + dir)
-                    return false
-                }
-                let tmpArchive = archive
-                if (!extractArchive(tmpArchive, dir)) {
-                    reg.fail("cannot extract " + entry.name + " " + entry.version)
-                    return false
-                }
-                match (installedCrate(project, entry)) {
-                    case some(_) -> {}
-                    case none -> {
-                        reg.fail("package " + entry.name + " does not contain " + entry.modName + ".pkl, lib.pkl, main.pkl, or src/lib.pkl")
-                        return false
-                    }
-                }
-                if (!write_file(marker, entry.version + "\n")) {
-                    reg.fail("cannot write install marker in " + dir)
-                    return false
-                }
-                return true
-            }
-            case none -> false
-        }
-    } else {
-        reg.fail("invalid package name `" + entry.name + "`")
-        false
     }
 }
 
+/// Names reachable from the manifest through the lock's own dependency graph.
+/// Anything else in the lockfile was injected and must not be installed or
+/// written into the generated workspace.
+fn lockReachable(manifest: Manifest, entries: List<LockEntry>) -> Map<string, bool> {
+    var byName = Map<string, LockEntry>()
+    for (e in entries) {
+        byName[e.name] = e
+    }
+    var seen = Map<string, bool>()
+    var stack = List<string>()
+    for (name in manifest.deps.keys()) {
+        stack.push(name)
+    }
+    while (len(stack) > 0) {
+        let n = stack[len(stack) - 1]
+        stack.pop()
+        if (seen.has(n)) {
+            continue
+        }
+        seen[n] = true
+        match (byName.get(n)) {
+            case some(e) -> {
+                for (d in e.deps) {
+                    let dn = depNameOf(d)
+                    if (!seen.has(dn)) {
+                        stack.push(dn)
+                    }
+                }
+            }
+            case none -> {}
+        }
+    }
+    seen
+}
+
+/// Cross-entry validation: every manifest dependency and every dependency edge
+/// must be satisfied by the version pinned in the lock. Self-consistent fields
+/// are not enough, because both sides of a `deps` string are attacker input.
+fn lockGraphOk(manifest: Manifest, entries: List<LockEntry>) -> bool {
+    var byName = Map<string, LockEntry>()
+    for (e in entries) {
+        byName[e.name] = e
+    }
+    for (name in manifest.deps.keys()) {
+        match (manifest.deps.get(name)) {
+            case some(c) -> {
+                match (byName.get(name)) {
+                    case some(e) -> {
+                        if (!versionSatisfies(e.version, c)) {
+                            return false
+                        }
+                    }
+                    case none -> {
+                        return false
+                    }
+                }
+            }
+            case none -> {}
+        }
+    }
+    for (e in entries) {
+        for (spec in e.deps) {
+            let dn = depNameOf(spec)
+            let dc = depConstraintOf(spec)
+            match (byName.get(dn)) {
+                case some(child) -> {
+                    if (!versionSatisfies(child.version, dc)) {
+                        return false
+                    }
+                }
+                case none -> {
+                    return false
+                }
+            }
+        }
+    }
+    true
+}
+
 fn installEntries(reg: Registry, project: Project, entries: List<LockEntry>, force: bool) -> bool {
+    let reachable = lockReachable(project.manifest, entries)
+    if (!lockGraphOk(project.manifest, entries)) {
+        reg.fail("lockfile versions do not satisfy picklescript.toml and its dependency constraints")
+        return false
+    }
     for (e in sortedEntries(entries)) {
+        if (!lockEntryOk(e)) {
+            reg.fail("invalid lock entry for `" + e.name + "`")
+            return false
+        }
+        if (!reachable.has(e.name)) {
+            reg.fail("lock entry " + e.name + " is not reachable from picklescript.toml")
+            return false
+        }
         if (!installEntry(reg, project, e, force)) {
             return false
         }
@@ -2228,9 +3066,22 @@ fn installEntries(reg: Registry, project: Project, entries: List<LockEntry>, for
 // Public command layer
 // ---------------------------------------------------------------------------
 
+fn projectPathsOk(p: Project) -> bool {
+    underRoot(p.root, p.packages_dir) && underRoot(p.root, p.cache_dir) && underRoot(p.root, p.registry_dir)
+}
+
 fn projectOrError() -> Project? {
     match (openProjectHere()) {
-        case some(p) -> p
+        case some(p) -> {
+            // A manifest can point its package/cache/registry directories
+            // anywhere; a package manager must not write or delete outside the
+            // project it was started in.
+            if (!projectPathsOk(p)) {
+                println("error: package paths in picklescript.toml must stay inside the project")
+                return none
+            }
+            p
+        }
         case none -> {
             println("error: no picklescript.toml found in this directory or any parent")
             println("       run `pklc new <name>` or create a manifest first")
@@ -2241,7 +3092,13 @@ fn projectOrError() -> Project? {
 
 fn registryFor(project: Project) -> Registry? {
     match (parseUrl(project.manifest.registry_url)) {
-        case some(u) -> Registry(u, 30000)
+        case some(u) -> {
+            if (!secureUrl(u)) {
+                println("error: registry must use https: " + project.manifest.registry_url)
+                return none
+            }
+            Registry(u, 30000)
+        }
         case none -> {
             println("error: invalid registry URL in picklescript.toml: " + project.manifest.registry_url)
             none
@@ -2282,7 +3139,33 @@ fn resolvedEntries(reg: Registry, project: Project, sel: Selection, cs: Constrai
     for (name in reachable.names()) {
         match (reachable.versions.get(name)) {
             case some(v) -> {
+                // Registry metadata is remote input. A bad identity must fail
+                // here, before it can name a directory or a lock entry.
+                if (!validPackageName(name) || !validVersion(v.version)) {
+                    reg.fail("registry returned an invalid package identity: " + name + " " + v.version)
+                    return none
+                }
+                if (!validIntegrity(v.integrity)) {
+                    reg.fail("registry has no sha256 pin for " + name + " " + v.version)
+                    return none
+                }
+                match (parseUrl(v.download)) {
+                    case some(dl) -> {
+                        if (!secureUrl(dl)) {
+                            reg.fail("registry advertises a plaintext download for " + name + " " + v.version)
+                            return none
+                        }
+                    }
+                    case none -> {
+                        reg.fail("registry advertises an invalid download URL for " + name + " " + v.version)
+                        return none
+                    }
+                }
                 let modName = moduleNameFor(name)
+                if (!validModuleName(modName)) {
+                    reg.fail("package " + name + " does not map to a valid module name")
+                    return none
+                }
                 if (moduleCollides(project.manifest, modName)) {
                     reg.fail("package " + name + " maps to module `" + modName + "`, which collides with a workspace member")
                     return none
@@ -2384,6 +3267,14 @@ fn runAdd(argv: List<string>) -> int {
         case some(pair) -> {
             let name = pair[0]
             let constraint = pair[1]
+            if (!validPackageName(name)) {
+                println("error: invalid package name `" + name + "`")
+                return 1
+            }
+            if (!validConstraintText(constraint)) {
+                println("error: invalid version constraint `" + constraint + "`")
+                return 1
+            }
             match (projectOrError()) {
                 case some(project) -> {
                     match (registryFor(project)) {
@@ -2456,27 +3347,24 @@ fn runInstall(argv: List<string>) -> int {
         case some(project) -> {
             match (registryFor(project)) {
                 case some(reg) -> {
-                    match (readLock(project)) {
+                    let locked = readLock(project)
+                    if (lockInvalid) {
+                        println("error: " + project.lock_path + " is invalid; run `pklc update` to regenerate it")
+                        return 1
+                    }
+                    match (locked) {
                         case some(entries) -> {
-                            // A changed direct constraint means the lock is
-                            // stale. Without a local semver implementation the
-                            // safe answer is to ask for an update rather than
-                            // silently install a version the manifest no longer
-                            // allows.
+                            // A direct constraint must still be satisfied by the
+                            // pinned version. This uses the local comparator
+                            // only; range selection stays with the registry.
                             var stale = false
                             for (name in sortedKeys(project.manifest.deps)) {
                                 match (project.manifest.deps.get(name)) {
                                     case some(c) -> {
                                         match (findLockEntry(entries, name)) {
                                             case some(e) -> {
-                                                var found = false
-                                                for (lc in e.constraints) {
-                                                    if (lc == c || c == "*") {
-                                                        found = true
-                                                    }
-                                                }
-                                                if (!found) {
-                                                    println("error: " + name + " changed in picklescript.toml; run `pklc update`")
+                                                if (!versionSatisfies(e.version, c)) {
+                                                    println("error: " + name + " " + e.version + " does not satisfy " + c + " in picklescript.toml; run `pklc update`")
                                                     stale = true
                                                 }
                                             }
@@ -2599,6 +3487,10 @@ fn runRemove(argv: List<string>) -> int {
                 return 1
             }
             let oldLock = readLock(project)
+            if (lockInvalid) {
+                println("error: " + project.lock_path + " is invalid; run `pklc update` to regenerate it")
+                return 1
+            }
             project.manifest.deps.remove(name)
             let newText = manifestRemoveDependency(project.manifest.text, name)
             if (!writeManifest(project, newText)) {
@@ -2630,7 +3522,12 @@ fn runRemove(argv: List<string>) -> int {
                                         match (findLockEntry(entries, e.name)) {
                                             case some(_) -> {}
                                             case none -> {
-                                                let _ = removeTree(joinPath(project.root, e.install))
+                                                match (installDirRel(project, e.name, e.version)) {
+                                                    case some(rel) -> {
+                                                        let _ = removeTree(joinPath(project.root, rel))
+                                                    }
+                                                    case none -> {}
+                                                }
                                             }
                                         }
                                     }
@@ -2656,7 +3553,12 @@ fn runRemove(argv: List<string>) -> int {
 fn runList(argv: List<string>) -> int {
     match (projectOrError()) {
         case some(project) -> {
-            match (readLock(project)) {
+            let locked = readLock(project)
+            if (lockInvalid) {
+                println("error: " + project.lock_path + " is invalid; run `pklc update` to regenerate it")
+                return 1
+            }
+            match (locked) {
                 case some(entries) -> {
                     if (len(entries) == 0) {
                         println("no packages installed")
