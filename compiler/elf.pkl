@@ -41,6 +41,17 @@ class ElfRel {
     }
 }
 
+/// ELF has no import-address-table prefix. Win64 lowers a CRT import to
+/// `__imp_Name`; the SysV call is direct (see `x64.emitCall`) and the object
+/// names the same external `Name`, so no IAT slot is emitted or referenced.
+/// Keeping the strip here, at the target boundary, leaves the IR target-neutral.
+fn elfSymName(name: string) -> string {
+    if (len(name) >= 6 && sliceRange(name, 0, 6) == "__imp_") {
+        return sliceRange(name, 6, len(name))
+    }
+    return name
+}
+
 /// Fixed section indices for the object this writer emits. Keeping them fixed
 /// makes the symbol and relocation tables independent of whether a section is
 /// empty; empty `.rdata`/`.data` sections are legal.
@@ -214,7 +225,7 @@ fn elfObjFor(m: IrModule, out: X64Out) -> List<int> {
             } else {
                 zeroAt(text, off, 8)
             }
-            rels.push(ElfRel(off, rel.sym, rel.type, addend))
+            rels.push(ElfRel(off, elfSymName(rel.sym), rel.type, addend))
             r = r + 1
         }
         i = i + 1
