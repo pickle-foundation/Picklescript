@@ -15,7 +15,9 @@ import { catalogue, explainById, normalizeId } from compiler.error
 import { splitLines, subStr } from compiler.front
 import { renderHistory, renderBuilds, renderExplainHistory, gitRoot, historyFor } from cli.history
 import { currentDir } from std.process
-import { newObjs, lowerProgram, loadArchive, linkExe } from cli.buildlib
+import { newObjs, lowerProgram, linkExe } from cli.buildlib
+import { parseBuildOptions } from cli.buildcmd
+import { buildLinux } from cli.linuxbuild
 import { writeStderr } from runtime.abi_stdio
 import { STR_BYTES_OFF } from runtime.layout
 import { abiStrFromF64 } from runtime.abi_float
@@ -505,16 +507,9 @@ fn runIrCmd(argv: List<string>) {
 
 // ------------------------------------------------------- release compiler/CLI
 
-/// SHA-256 of the runtime archive appended to this executable. The footer is
-/// `[archive][sha256 32][length 8 LE][magic 8]`; the cache filename uses this
-/// constant so a warm cache is found without reading the 16 MB image.
-const RT_ARCHIVE_SHA: string = "9d43698c7c753eed69a9559c7467ac91ba377108a22dca2548f48b639cbfc985"
-const RT_FOOTER_MAGIC: string = "PKLRTAR1"
-const RT_FOOTER_BYTES: int = 48
-
-/// SHA-256 of the bundled stdlib/runtime source blob. It sits between the
-/// compiler image and the runtime archive, with the same 48-byte footer shape,
-/// so the runtime archive keeps its place at the end of the file.
+/// SHA-256 of the bundled stdlib/runtime source blob. It is appended after the
+/// compiler image as `[blob][sha256 32][length 8 LE][magic 8]`; the cache
+/// directory is keyed by this constant so a warm cache needs no image read.
 const SRC_BUNDLE_SHA: string = "12af7c4d242a05b047569ea9026af7cec07212a7bb39e74a6e8c17e94c4d86d6"
 const SRC_FOOTER_MAGIC: string = "PKLSRC01"
 const SRC_FOOTER_BYTES: int = 48
@@ -848,63 +843,6 @@ fn pklcCacheDir() -> string? {
     none
 }
 
-fn pklcRuntimePath() -> string? {
-    if (let some(dir) = pklcCacheDir()) {
-        return pklcJoin(dir, "rtlib-" + RT_ARCHIVE_SHA + ".ar")
-    }
-    none
-}
-
-fn pklcExtractRuntime() -> string? {
-    var cache = ""
-    var haveCache = false
-    if (let some(c) = pklcRuntimePath()) {
-        cache = c
-        haveCache = true
-    }
-    if (!haveCache) {
-        return none
-    }
-    if (abiFileExists(cache)) {
-        return cache
-    }
-    let exePath = pklcExePath()
-    if (exePath == "") {
-        return none
-    }
-    if (let some(exe) = read_file(exePath)) {
-        let total = len(exe)
-        if (total > RT_FOOTER_BYTES) {
-            let footer = subStr(exe, total - RT_FOOTER_BYTES, RT_FOOTER_BYTES)
-            let fb = bytes(footer)
-            let magic = subStr(footer, 40, 8)
-            if (magic == RT_FOOTER_MAGIC) {
-                var length = 0
-                var k = 7
-                while (k >= 0) {
-                    length = length * 256 + (fb[32 + k] as int)
-                    k = k - 1
-                }
-                if (length > 0 && length + RT_FOOTER_BYTES <= total) {
-                    let hash = pklcHex(fb, 0, 32)
-                    if (hash != RT_ARCHIVE_SHA) {
-                        println("pklc: embedded runtime hash mismatch")
-                        return none
-                    }
-                    let archive = subStr(exe, total - RT_FOOTER_BYTES - length, length)
-                    if (write_file(cache, archive)) {
-                        return cache
-                    }
-                    println("pklc: cannot write runtime cache " + cache)
-                    return none
-                }
-            }
-        }
-    }
-    println("pklc: cannot extract the embedded runtime")
-    none
-}
-
 // ------------------------------------------------------- bundled source tree
 
 fn pklcU32(bs: List<byte>, off: int) -> int {
@@ -1037,50 +975,37 @@ fn pklcExtractSources() -> string? {
     }
     if (let some(exe) = read_file(exePath)) {
         let total = len(exe)
-        if (total > RT_FOOTER_BYTES + SRC_FOOTER_BYTES) {
-            let rtFooter = subStr(exe, total - RT_FOOTER_BYTES, RT_FOOTER_BYTES)
-            if (subStr(rtFooter, 40, 8) == RT_FOOTER_MAGIC) {
-                let rtb = bytes(rtFooter)
-                var rtLen = 0
-                var k = 7
-                while (k >= 0) {
-                    rtLen = rtLen * 256 + (rtb[32 + k] as int)
-                    k = k - 1
+        if (total > SRC_FOOTER_BYTES) {
+            let srcFooter = subStr(exe, total - SRC_FOOTER_BYTES, SRC_FOOTER_BYTES)
+            if (subStr(srcFooter, 40, 8) == SRC_FOOTER_MAGIC) {
+                let sb = bytes(srcFooter)
+                var srcLen = 0
+                var j = 7
+                while (j >= 0) {
+                    srcLen = srcLen * 256 + (sb[32 + j] as int)
+                    j = j - 1
                 }
-                let archiveStart = total - RT_FOOTER_BYTES - rtLen
-                if (rtLen > 0 && archiveStart >= SRC_FOOTER_BYTES) {
-                    let srcFooter = subStr(exe, archiveStart - SRC_FOOTER_BYTES, SRC_FOOTER_BYTES)
-                    if (subStr(srcFooter, 40, 8) == SRC_FOOTER_MAGIC) {
-                        let sb = bytes(srcFooter)
-                        var srcLen = 0
-                        var j = 7
-                        while (j >= 0) {
-                            srcLen = srcLen * 256 + (sb[32 + j] as int)
-                            j = j - 1
-                        }
-                        let blobStart = archiveStart - SRC_FOOTER_BYTES - srcLen
-                        if (srcLen > 0 && blobStart >= 0) {
-                            let hash = pklcHex(sb, 0, 32)
-                            if (hash != SRC_BUNDLE_SHA) {
-                                println("pklc: embedded source hash mismatch")
-                                return none
-                            }
-                            let blob = subStr(exe, blobStart, srcLen)
-                            if (!abiFileExists(root)) {
-                                mkdir(root)
-                            }
-                            if (!abiFileExists(root)) {
-                                println("pklc: cannot create source cache " + root)
-                                return none
-                            }
-                            if (pklcUnpackSources(blob, root)) {
-                                let _ = write_file(stamp, SRC_BUNDLE_SHA)
-                                return root
-                            }
-                            println("pklc: cannot extract the bundled sources")
-                            return none
-                        }
+                let blobStart = total - SRC_FOOTER_BYTES - srcLen
+                if (srcLen > 0 && blobStart >= 0) {
+                    let hash = pklcHex(sb, 0, 32)
+                    if (hash != SRC_BUNDLE_SHA) {
+                        println("pklc: embedded source hash mismatch")
+                        return none
                     }
+                    let blob = subStr(exe, blobStart, srcLen)
+                    if (!abiFileExists(root)) {
+                        mkdir(root)
+                    }
+                    if (!abiFileExists(root)) {
+                        println("pklc: cannot create source cache " + root)
+                        return none
+                    }
+                    if (pklcUnpackSources(blob, root)) {
+                        let _ = write_file(stamp, SRC_BUNDLE_SHA)
+                        return root
+                    }
+                    println("pklc: cannot extract the bundled sources")
+                    return none
                 }
             }
         }
@@ -1108,52 +1033,21 @@ fn pklcCompile(source: string, output: string) -> bool {
     if (let some(src) = read_file(source)) {
         let sinks = DiagnosticSink()
         if (let some(program) = lowerProgram(source, src, sinks)) {
-            var attempt = 0
-            var linkErr = ""
-            while (attempt < 2) {
-                match (pklcExtractRuntime()) {
-                    case none -> { return false }
-                    case some(archive) -> {
-                        match (loadArchive(archive)) {
-                            case none -> {
-                                // A truncated cache is the common cause; drop it
-                                // and let the next pass rebuild from the image.
-                                let _ = abiDelete(archive)
-                                attempt = attempt + 1
-                            }
-                            case some(libs) -> {
-                                var objects = newObjs()
-                                objects.push(program.obj)
-                                var i = 0
-                                while (i < len(libs)) {
-                                    objects.push(libs[i])
-                                    i = i + 1
-                                }
-                                if (let some(err) = linkExe(objects, output, program.overrides)) {
-                                    // The cache may parse yet be corrupt; rebuild
-                                    // it once before reporting the link failure.
-                                    linkErr = err
-                                    let _ = abiDelete(archive)
-                                    attempt = attempt + 1
-                                } else {
-                                    pklcPrintDiags(sinks)
-                                    if (sinks.anyError()) {
-                                        let _ = abiDelete(output)
-                                        return false
-                                    }
-                                    return true
-                                }
-                            }
-                        }
-                    }
-                }
+            // The program object already carries its whole import closure,
+            // including the runtime prelude. There is no archive to extract or
+            // select over: one object, one link.
+            var objects = newObjs()
+            objects.push(program.obj)
+            if (let some(err) = linkExe(objects, output, program.overrides)) {
+                println("pklc: " + err)
+                return false
             }
-            if (linkErr != "") {
-                println("pklc: " + linkErr)
-            } else {
-                println("pklc: cannot read the runtime archive")
+            pklcPrintDiags(sinks)
+            if (sinks.anyError()) {
+                let _ = abiDelete(output)
+                return false
             }
-            return false
+            return true
         }
         pklcPrintDiags(sinks)
         return false
@@ -1202,44 +1096,28 @@ fn pklcDefaultOutput(source: string) -> string {
 }
 
 fn pklcRunBuild(argv: List<string>) {
-    if (len(argv) < 2) {
-        println("pklc: usage: pklc build <file.pkl> [-o <exe>]")
-        exit(1)
-    }
-    let src = pklcRequireSource(argv[1])
-    var outArg = ""
-    var haveOut = false
-    var i = 2
-    while (i < len(argv)) {
-        let a = argv[i]
-        if (a == "-o" || a == "--out") {
-            if (i + 1 >= len(argv)) {
-                println("pklc: -o needs a path")
-                exit(1)
-            }
-            outArg = argv[i + 1]
-            haveOut = true
-            i = i + 2
-        } else {
-            println("pklc: unknown option: " + a)
+    if (let some(opts) = parseBuildOptions(argv)) {
+        let parent = pklcDirOf(opts.output)
+        if (parent != "" && !abiFileExists(parent)) {
+            println("pklc: output directory does not exist: " + parent)
             exit(1)
         }
+        if (opts.target == "linux") {
+            if (!buildLinux(opts.source, opts.output, opts.rtDir, opts.link, opts.keepObject)) {
+                exit(1)
+            }
+            println("built " + opts.output)
+            return
+        }
+        let src = pklcRequireSource(opts.source)
+        let output = pklcAbs(pklcCallerDir(), opts.output)
+        if (!pklcCompile(src, output)) {
+            exit(1)
+        }
+        println("built " + output)
+        return
     }
-    var output = ""
-    if (haveOut) {
-        output = pklcAbs(pklcCallerDir(), outArg)
-    } else {
-        output = pklcDefaultOutput(src)
-    }
-    let parent = pklcDirOf(output)
-    if (parent != "" && !abiFileExists(parent)) {
-        println("pklc: output directory does not exist: " + parent)
-        exit(1)
-    }
-    if (!pklcCompile(src, output)) {
-        exit(1)
-    }
-    println("built " + output)
+    exit(1)
 }
 
 /// Create `<base>\picklescript`, or none when the base is not writable.
@@ -1507,16 +1385,6 @@ fn pklcRunTest(argv: List<string>) {
         k = k + 1
     }
     sortStrings(targets)
-    var archive = ""
-    var haveArchive = false
-    if (let some(a) = pklcExtractRuntime()) {
-        archive = a
-        haveArchive = true
-    }
-    if (!haveArchive) {
-        println("pklc: this binary has no embedded runtime archive; use the release build")
-        exit(1)
-    }
     let root = pklcProjectRoot()
     let cacheRoot = pklcJoin(root, ".pickle")
     if (!abiFileExists(cacheRoot)) {
@@ -1537,7 +1405,7 @@ fn pklcRunTest(argv: List<string>) {
         if (idx > 0) {
             println("")
         }
-        let code = runTestFile(targets[idx], archive, outDir)
+        let code = runTestFile(targets[idx], outDir)
         if (code == 0) {
             passed = passed + 1
         } else {

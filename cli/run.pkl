@@ -2,7 +2,7 @@ module cli.run
 
 import { DiagnosticSink } from compiler.diag
 import { CoffObj } from compiler.objread
-import { newObjs, lowerProgram, loadArchive, linkExe } from cli.buildlib
+import { newObjs, lowerProgram, linkExe } from cli.buildlib
 
 fn newArgs() -> List<string> {
     var argv = [""]
@@ -52,7 +52,6 @@ fn main() {
         return
     }
     let target = argv[0]
-    let runtimeLib = argv[1]
     var programArgs = newArgs()
     var i = 2
     while (i < len(argv)) {
@@ -66,40 +65,30 @@ fn main() {
     if (let some(src) = read_file(target)) {
         let sinks = DiagnosticSink()
         if (let some(program) = lowerProgram(target, src, sinks)) {
-            let programObj = program.obj
-            if (let some(libObjects) = loadArchive(runtimeLib)) {
-                var objects = newObjs()
-                objects.push(programObj)
-                var objIndex = 0
-                while (objIndex < len(libObjects)) {
-                    objects.push(libObjects[objIndex])
-                    objIndex = objIndex + 1
-                }
-                if (let some(errorText) = linkExe(objects, exePath, program.overrides)) {
-                    println("RUN BUILD FAIL: " + errorText)
-                    exit(1)
-                }
-                var childArgv = newArgs()
-                childArgv.push(exePath)
-                var a = 0
-                while (a < len(programArgs)) {
-                    childArgv.push(programArgs[a])
-                    a = a + 1
-                }
-                let exitOut = run_cmd(childArgv, none, none, none, none, none, none, true)
-                if (let some(outcome) = exitOut) {
-                    match (outcome) {
-                        case (code, out, err, timed) -> {
-                            if (let some(c) = code) {
-                                exit(c)
-                            }
-                        }
-                        case _ -> {}
-                    }
-                }
+            var objects = newObjs()
+            objects.push(program.obj)
+            if (let some(errorText) = linkExe(objects, exePath, program.overrides)) {
+                println("RUN BUILD FAIL: " + errorText)
                 exit(1)
             }
-            println("RUN FAIL: cannot read runtime lib " + runtimeLib)
+            var childArgv = newArgs()
+            childArgv.push(exePath)
+            var a = 0
+            while (a < len(programArgs)) {
+                childArgv.push(programArgs[a])
+                a = a + 1
+            }
+            let exitOut = run_cmd(childArgv, none, none, none, none, none, none, true)
+            if (let some(outcome) = exitOut) {
+                match (outcome) {
+                    case (code, out, err, timed) -> {
+                        if (let some(c) = code) {
+                            exit(c)
+                        }
+                    }
+                    case _ -> {}
+                }
+            }
             exit(1)
         }
         println("RUN FAIL: source " + target + " did not lower to COFF")

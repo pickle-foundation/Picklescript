@@ -2,11 +2,12 @@ module cli.buildlib
 
 import { DiagnosticSink, Diagnostic } from compiler.diag
 import { IrModule } from compiler.ir
-import { frontend } from compiler.front
+import { frontend, setBuildPlatform } from compiler.front
 import { emitIrEx, EmitOut } from compiler.emit
 import { x64LowerModule } from compiler.x64
 import { coffObjFor } from compiler.coff
-import { CoffObj, coffRead, arRead, blobFrom } from compiler.objread
+import { elfObjFor } from compiler.elf
+import { CoffObj } from compiler.objread
 import { scanDefs, select, mergeAll, strFrom } from compiler.linklib
 import { buildExe, FailBox } from compiler.pelink
 import { OrderedMap } from std.collections.orderedmap
@@ -101,6 +102,55 @@ fn lowerModuleObjBytes(target: string, src: string, sinks: DiagnosticSink) -> Lo
     none
 }
 
+/// ELF form of `lowerModuleObjBytes`: SysV argument registers and direct
+/// `E8` calls, written by `compiler.elf` instead of `compiler.coff`.
+///
+/// This is the object form a Linux build starts from. The module closure,
+/// class salt and setup policy are identical to the COFF form; only the ABI
+/// and the container change.
+fn lowerModuleObjBytesElf(target: string, src: string, sinks: DiagnosticSink) -> LoweredBytes? {
+    if (let some(loaded) = frontend(target, src, sinks)) {
+        if (let some(emitted) = emitIrEx(loaded.program, loaded.resolved, sinks, 0, "", List<string>())) {
+            if (let some(xout) = x64LowerModule(emitted.ir, sinks, true)) {
+                return LoweredBytes(elfObjFor(emitted.ir, xout), emitted.classCount)
+            }
+        }
+    }
+    none
+}
+
+/// The ELF program object: the same entry-point check and lowering as
+/// `lowerProgram`, but written by `compiler.elf`.
+///
+/// `compiler.elflink` turns this object into a freestanding `ET_EXEC`: it
+/// prepends `_start` and the syscall/atomic/thread/memory stubs, resolves
+/// every `#[symbol]` definition and import inside the object, and writes the
+/// program headers. No C compiler, no system linker, no libc.
+fn lowerProgramElf(target: string, src: string, sinks: DiagnosticSink) -> LoweredBytes? {
+    setBuildPlatform("posix")
+    if (let some(loaded) = frontend(target, src, sinks)) {
+        if (let some(emitted) = emitIrEx(loaded.program, loaded.resolved, sinks, 0, "", List<string>())) {
+            if (!hasMain(emitted.ir)) {
+                sinks.emit(Diagnostic.error("no `main` in this module; nothing to build"))
+                return none
+            }
+            if (let some(xout) = x64LowerModule(emitted.ir, sinks, true)) {
+                return LoweredBytes(elfObjFor(emitted.ir, xout), emitted.classCount)
+            }
+        }
+    }
+    none
+}
+
+/// Pick the object writer from the archive's platform. `posix` is the only
+/// target that uses ELF today; `win` and the diagnostic `all` keep COFF.
+fn lowerModuleBytesFor(platform: string, target: string, src: string, sinks: DiagnosticSink) -> LoweredBytes? {
+    if (platform == "posix") {
+        return lowerModuleObjBytesElf(target, src, sinks)
+    }
+    return lowerModuleObjBytes(target, src, sinks)
+}
+
 /// `lowerModuleObjEx` that also hands back the object's bytes, for a caller that
 /// caches the salted/setup form. Same lowering, same result. A class-free
 /// member's bytes are independent of `cidSalt` (nothing bakes a class id), which
@@ -124,6 +174,7 @@ fn lowerProgram(target: string, src: string, sinks: DiagnosticSink) -> LoweredPr
 /// called from this program's preamble after its globals are rooted and
 /// before its static initializers run.
 fn lowerProgramEx(target: string, src: string, sinks: DiagnosticSink, extraSetups: List<string>) -> LoweredProgram? {
+    setBuildPlatform("win")
     if (let some(loaded) = frontend(target, src, sinks)) {
         if (let some(emitted) = emitIrEx(loaded.program, loaded.resolved, sinks, 0, "", extraSetups)) {
             // Mirrors the Rust AOT driver (`cli/src/main.rs`): a module with no
@@ -135,21 +186,6 @@ fn lowerProgramEx(target: string, src: string, sinks: DiagnosticSink, extraSetup
             }
             return finishLower(target, emitted, sinks)
         }
-    }
-    none
-}
-
-fn loadArchive(path: string) -> List<CoffObj>? {
-    if (let some(bytes) = read_file(path)) {
-        let archive = arRead(blobFrom(bytes))
-        var objects = newObjs()
-        var memberIndex = 0
-        while (memberIndex < len(archive.members)) {
-            let member = archive.members[memberIndex]
-            objects.push(coffRead(member.name, member.data))
-            memberIndex = memberIndex + 1
-        }
-        return objects
     }
     none
 }

@@ -1,0 +1,176 @@
+module cli.linuxbuild
+
+import { DiagnosticSink } from compiler.diag
+import { lowerProgramElf } from cli.buildlib
+import { linkElfExe } from compiler.elflink
+import { strFrom } from compiler.linklib
+import { abiFileExists, abiMkdir } from runtime.abi_fs
+
+/// Build one program as a freestanding Linux ELF executable.
+///
+/// The program object carries its whole import closure, including the runtime
+/// prelude `compiler.front` injects, so there is no runtime archive to build,
+/// cache or refresh. `compiler.elflink` supplies `_start` and the `pkl_syscall`
+/// bridge and writes the final `ET_EXEC`; there is no C startup file, no C
+/// shim, no libc and no target-side `cc`.
+///
+/// `rtDir` is accepted for CLI compatibility and ignored. A native or
+/// cross-build takes the same path: the linker runs in-process, so a Windows
+/// host can emit a runnable Linux image.
+fn buildLinux(source: string, output: string, rtDir: string, linkIt: bool, keepObject: bool) -> bool {
+    if (let some(src) = read_file(source)) {
+        let sinks = DiagnosticSink()
+        if (let some(prog) = lowerProgramElf(source, src, sinks)) {
+            let objPath = linuxObjectPath(source)
+            let parent = dirOf(objPath)
+            if (parent != "" && !abiFileExists(parent)) {
+                let _ = abiMkdir(parent)
+            }
+            if (keepObject) {
+                if (!write_file(objPath, strFrom(prog.bytes))) {
+                    println("pklc: cannot write " + objPath)
+                    return false
+                }
+            }
+            if (!linkIt) {
+                if (!keepObject) {
+                    if (!write_file(objPath, strFrom(prog.bytes))) {
+                        println("pklc: cannot write " + objPath)
+                        return false
+                    }
+                }
+                println("pklc: wrote " + objPath)
+                return true
+            }
+            let linked = linkElfExe(prog.bytes)
+            if (linked.error != "") {
+                println("pklc: " + linked.error)
+                if (len(linked.unresolved) > 0) {
+                    println("pklc: the freestanding runtime still needs: " + joinList(linked.unresolved))
+                }
+                return false
+            }
+            if (!write_file(output, strFrom(linked.bytes))) {
+                println("pklc: cannot write " + output)
+                return false
+            }
+            if (keepObject) {
+                println("pklc: kept " + objPath)
+            }
+            return true
+        }
+        printDiags(sinks)
+        println("pklc: " + source + " did not lower to ELF")
+        return false
+    }
+    println("pklc: cannot read " + source)
+    false
+}
+
+fn joinList(items: List<string>) -> string {
+    var out = ""
+    var i = 0
+    while (i < len(items)) {
+        if (i > 0) {
+            out += ", "
+        }
+        out += items[i]
+        i = i + 1
+    }
+    out
+}
+
+/// `target/<name>.o`, so the object does not clutter the source tree and the
+/// printed cross-link command has a stable path.
+fn linuxObjectPath(source: string) -> string {
+    let base = stripPkl(baseName(source))
+    "target/" + safeName(base) + ".o"
+}
+
+fn baseName(p: string) -> string {
+    let bs = bytes(p)
+    var last = -1
+    var i = 0
+    while (i < len(bs)) {
+        let c = bs[i] as int
+        if (c == 92 || c == 47) {
+            last = i
+        }
+        i = i + 1
+    }
+    if (last < 0) {
+        return p
+    }
+    subStr(p, last + 1, len(p) - last - 1)
+}
+
+fn dirOf(p: string) -> string {
+    let bs = bytes(p)
+    var last = -1
+    var i = 0
+    while (i < len(bs)) {
+        let c = bs[i] as int
+        if (c == 92 || c == 47) {
+            last = i
+        }
+        i = i + 1
+    }
+    if (last <= 0) {
+        return ""
+    }
+    subStr(p, 0, last)
+}
+
+fn stripPkl(p: string) -> string {
+    if (hasSuffix(p, ".pkl")) {
+        return subStr(p, 0, len(p) - 4)
+    }
+    p
+}
+
+fn safeName(s: string) -> string {
+    let bs = bytes(s)
+    var out = ""
+    var i = 0
+    while (i < len(bs)) {
+        let c = bs[i] as int
+        let ok = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 46 || c == 95 || c == 45
+        if (ok) {
+            out += "{bs[i] as char}"
+        } else {
+            out += "_"
+        }
+        i = i + 1
+    }
+    out
+}
+
+fn hasSuffix(s: string, suf: string) -> bool {
+    let sb = bytes(s)
+    let fb = bytes(suf)
+    if (len(fb) > len(sb)) {
+        return false
+    }
+    var i = 0
+    while (i < len(fb)) {
+        if (sb[len(sb) - len(fb) + i] != fb[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+fn printDiags(diags: DiagnosticSink) {
+    let ds = diags.diagnostics
+    var i = 0
+    while (i < len(ds)) {
+        let d = ds[i]
+        var sp = "none"
+        if (let some(s0) = d.span) {
+            sp = "(" + str(s0.start) + "," + str(s0.end) + ")"
+        }
+        println("DIAG " + d.message + " span=" + sp)
+        i = i + 1
+    }
+}

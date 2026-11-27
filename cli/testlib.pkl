@@ -4,7 +4,7 @@ import { DiagnosticSink } from compiler.diag
 import { Loader, Rewriter, renderPath } from compiler.front
 import { Resolver } from compiler.resolvebag
 import { emitIrEx } from compiler.emit
-import { finishLower, newObjs, loadArchive, linkExe } from cli.buildlib
+import { finishLower, newObjs, linkExe } from cli.buildlib
 import { ItemKind, Item } from compiler.ast
 import { resolve } from compiler.resolvecore
 
@@ -365,7 +365,7 @@ fn renameTests(items: List<Item>) {
 /// it with inherited stdio, and return its exit code (1 for a driver failure).
 /// `outDir` must exist; the harness is written as
 /// `<outDir>/<source basename>_harness.exe`. The caller owns the process exit.
-fn runTestFile(target: string, runtimeLib: string, outDir: string) -> int {
+fn runTestFile(target: string, outDir: string) -> int {
     if (let some(src) = read_file(target)) {
         let diags = DiagnosticSink()
         if (let some(h) = genHarness(target, src, diags)) {
@@ -380,44 +380,33 @@ fn runTestFile(target: string, runtimeLib: string, outDir: string) -> int {
                 }
                 let res = Resolver(diags)
                 let resolved = resolve(res, loaded.merged)
-                // Native test lane: lower the transformed harness to COFF, link it
-                // against the pickle runtime archive, and spawn it with inherited
-                // stdio, propagating its exit code. This replaces the old
-                // "emit IRX, execute it under Rust irx-run" path so the whole
-                // ported test stack runs with no Rust compiler in the loop.
+                // Native test lane: lower the transformed harness to COFF and
+                // spawn it with inherited stdio, propagating its exit code. The
+                // object carries the runtime prelude, so the link needs no
+                // archive and no Rust compiler sits in the loop.
                 if (let some(emitted) = emitIrEx(loaded.merged, resolved, diags, 0, "", createStrs())) {
                     if (let some(program) = finishLower(target, emitted, diags)) {
-                        if (let some(libObjects) = loadArchive(runtimeLib)) {
-                            var objects = newObjs()
-                            objects.push(program.obj)
-                            var objIndex = 0
-                            while (objIndex < len(libObjects)) {
-                                objects.push(libObjects[objIndex])
-                                objIndex = objIndex + 1
-                            }
-                            let exePath = outDir + "/" + baseName(target) + "_harness.exe"
-                            if (let some(errorText) = linkExe(objects, exePath, program.overrides)) {
-                                println("TEST LINK FAIL: " + errorText)
-                                printDiags(diags)
-                                return 1
-                            }
-                            var childArgv = createStrs()
-                            childArgv.push(exePath)
-                            let outcome = run_cmd(childArgv, none, none, none, none, none, none, true)
-                            if (let some(o) = outcome) {
-                                match (o) {
-                                    case (code, out, err, timed) -> {
-                                        if (let some(c) = code) {
-                                            return c
-                                        }
-                                    }
-                                    case _ -> {}
-                                }
-                            }
+                        var objects = newObjs()
+                        objects.push(program.obj)
+                        let exePath = outDir + "/" + baseName(target) + "_harness.exe"
+                        if (let some(errorText) = linkExe(objects, exePath, program.overrides)) {
+                            println("TEST LINK FAIL: " + errorText)
+                            printDiags(diags)
                             return 1
                         }
-                        println("TEST FAIL: cannot read runtime lib " + runtimeLib)
-                        printDiags(diags)
+                        var childArgv = createStrs()
+                        childArgv.push(exePath)
+                        let outcome = run_cmd(childArgv, none, none, none, none, none, none, true)
+                        if (let some(o) = outcome) {
+                            match (o) {
+                                case (code, out, err, timed) -> {
+                                    if (let some(c) = code) {
+                                        return c
+                                    }
+                                }
+                                case _ -> {}
+                            }
+                        }
                         return 1
                     }
                     println("TEST FAIL: harness did not lower to COFF")
