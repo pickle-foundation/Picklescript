@@ -80,6 +80,84 @@ fn tyBytes(t: IrTy) -> int {
     tyWidth(t) / 8
 }
 
+/// Where each argument goes under the selected ABI.
+///
+/// `reg[i]` is the register index within the argument's class - the integer
+/// register sequence for ints, the XMM sequence for floats - or -1 when the
+/// argument is passed on the stack. `stack[i]` is the 0-based stack slot in
+/// that case, or -1 for a register argument.
+///
+/// Win64 assigns both classes by argument position (arg i -> rcx/rdx/r8/r9 or
+/// xmm0..xmm3). SysV assigns each class independently and spills a class to
+/// the stack once its own register file is full, so the two counters move
+/// separately.
+class ArgLocs {
+    var reg: List<int>
+    var stack: List<int>
+
+    constructor(reg: List<int>, stack: List<int>) {
+        this.reg = reg
+        this.stack = stack
+    }
+}
+
+fn abiArgLocs(ptys: List<IrTy>, sysv: bool) -> ArgLocs {
+    var regs: List<int> = []
+    var stacks: List<int> = []
+    if (sysv) {
+        var ni = 0
+        var nf = 0
+        var ns = 0
+        for (t in ptys) {
+            if (isFloatTy(t)) {
+                if (nf < 8) {
+                    regs.push(nf)
+                    stacks.push(0 - 1)
+                    nf = nf + 1
+                } else {
+                    regs.push(0 - 1)
+                    stacks.push(ns)
+                    ns = ns + 1
+                }
+            } else {
+                if (ni < 6) {
+                    regs.push(ni)
+                    stacks.push(0 - 1)
+                    ni = ni + 1
+                } else {
+                    regs.push(0 - 1)
+                    stacks.push(ns)
+                    ns = ns + 1
+                }
+            }
+        }
+    } else {
+        var i = 0
+        while (i < len(ptys)) {
+            if (i < 4) {
+                regs.push(i)
+                stacks.push(0 - 1)
+            } else {
+                regs.push(0 - 1)
+                stacks.push(i - 4)
+            }
+            i = i + 1
+        }
+    }
+    ArgLocs(regs, stacks)
+}
+
+/// First stack argument's displacement above `rbp` in the callee. Win64 puts
+/// the caller's 32-byte shadow area between the return address and the first
+/// stack argument; SysV starts the stack arguments immediately after it.
+fn stackParamBase(sysv: bool) -> int {
+    if (sysv) {
+        16
+    } else {
+        48
+    }
+}
+
 fn isCmp(op: IrBinOp) -> bool {
     match (op) {
         case IrBinOp.Eq -> true
@@ -399,13 +477,22 @@ class CB {
 
     fn ld(reg: int, w: int, k: int) {
         var ext = 0
+        var needRex = false
         if (w == 64) {
             ext = ext | 0x08
+            needRex = true
         }
         if (reg >= 8) {
             ext = ext | 0x04
+            needRex = true
         }
-        if (ext != 0) {
+        // An 8-bit access into r4..r7 needs a bare REX so the encoding picks
+        // SPL/BPL/SIL/DIL rather than AH/CH/DH/BH. Without it a SysV bool
+        // parameter in SIL reads DH.
+        if (w == 8 && (reg & 7) >= 4) {
+            needRex = true
+        }
+        if (needRex) {
             this.u8(0x40 | ext)
         }
         if (w == 8) {
@@ -420,13 +507,21 @@ class CB {
 
     fn st(reg: int, w: int, k: int) {
         var ext = 0
+        var needRex = false
         if (w == 64) {
             ext = ext | 0x08
+            needRex = true
         }
         if (reg >= 8) {
             ext = ext | 0x04
+            needRex = true
         }
-        if (ext != 0) {
+        // See `ld`: an 8-bit store from r4..r7 must name SIL/DIL/BPL/SPL,
+        // not the legacy high-byte registers.
+        if (w == 8 && (reg & 7) >= 4) {
+            needRex = true
+        }
+        if (needRex) {
             this.u8(0x40 | ext)
         }
         if (w == 8) {
@@ -583,16 +678,27 @@ class CB {
     /// of re-reading them from their stack home at every use.
     fn movRR(dst: int, src: int, w: int) {
         var ext = 0
+        var needRex = false
         if (w == 64) {
             ext = ext | 0x08
+            needRex = true
         }
         if (src >= 8) {
             ext = ext | 0x04
+            needRex = true
         }
         if (dst >= 8) {
             ext = ext | 0x01
+            needRex = true
         }
-        if (ext != 0) {
+        // An 8-bit move to or from r4..r7 needs a bare REX for SIL/DIL/BPL/SPL;
+        // without it the encoding names DH/BH/CH/AH. A SysV bool argument
+        // arrives in SIL, and copying it into a pinned slot without the prefix
+        // reads DH instead.
+        if (w == 8 && ((src & 7) >= 4 || (dst & 7) >= 4)) {
+            needRex = true
+        }
+        if (needRex) {
             this.u8(0x40 | ext)
         }
         this.u8(0x89)
@@ -636,15 +742,28 @@ class CB {
     }
 
     fn stRsp(reg: int, w: int, disp: int) {
+        var ext = 0
+        var needRex = false
         if (w == 64) {
-            this.u8(0x48)
+            ext = ext | 0x08
+            needRex = true
+        }
+        if (reg >= 8) {
+            ext = ext | 0x04
+            needRex = true
+        }
+        if (w == 8 && (reg & 7) >= 4) {
+            needRex = true
+        }
+        if (needRex) {
+            this.u8(0x40 | ext)
         }
         if (w == 8) {
             this.u8(0x88)
         } else {
             this.u8(0x89)
         }
-        this.u8(0x44 | (reg << 3))
+        this.u8(0x44 | ((reg & 7) << 3))
         this.u8(0x24)
         this.u8(disp)
     }
@@ -891,15 +1010,30 @@ fn floatPinRegAt(j: int) -> int {
 /// uses already break even, but three keeps short leaf helpers untouched.
 const PIN_MIN_USES: int = 3
 
-fn pinRegAt(j: int) -> int {
-    match (j) {
-        case 0 -> PIN_REG_0
-        case 1 -> PIN_REG_1
-        case 2 -> PIN_REG_2
-        case 3 -> PIN_REG_3
-        case 4 -> PIN_REG_4
-        case 5 -> PIN_REG_5
-        case _ -> 15
+fn pinRegAt(j: int, sysv: bool) -> int {
+    if (sysv) {
+        // RSI/RDI are caller-saved under SysV and double as argument
+        // registers, so they cannot hold a slot across a call. RBX and
+        // R12-R15 are the five nonvolatile registers the frame pointer
+        // leaves free.
+        match (j) {
+            case 0 -> 3
+            case 1 -> 12
+            case 2 -> 13
+            case 3 -> 14
+            case 4 -> 15
+            case _ -> 15
+        }
+    } else {
+        match (j) {
+            case 0 -> PIN_REG_0
+            case 1 -> PIN_REG_1
+            case 2 -> PIN_REG_2
+            case 3 -> PIN_REG_3
+            case 4 -> PIN_REG_4
+            case 5 -> PIN_REG_5
+            case _ -> 15
+        }
     }
 }
 
@@ -1077,6 +1211,17 @@ fn externMayCollect(sym: string) -> bool {
         || sym == "__imp_GetProcessHeap" || sym == "__imp_ExitProcess"
         || sym == "__imp_TlsAlloc" || sym == "__imp_TlsGetValue"
         || sym == "__imp_TlsSetValue"
+        // Freestanding Linux primitives. `pkl_syscall` is one `syscall`
+        // instruction, `pkl_cas` one `lock cmpxchg`, and `pkl_thread_spawn`
+        // returns in the parent after `clone`; none of them can run
+        // PickleScript code on the calling thread. Leaving `pkl_syscall` out
+        // marked the raw heap may-GC, which put a shadow frame on
+        // `sysHeapAlloc`; that prologue re-entered `tlsInit` through
+        // `sysTlsGet` while `tlsInit` already held its own lock, so the first
+        // TLS use deadlocked before `--version` printed anything. `pkl_cas`
+        // matters for the same reason: every futex lock is built on it.
+        || sym == "__imp_pkl_syscall" || sym == "__imp_pkl_cas"
+        || sym == "__imp_pkl_thread_spawn"
         // Console writes. `abi_panic`/`abi_expect`/the fatal channel write to
         // stderr through these, and any diagnostic built on them is a leaf: a
         // WriteFile cannot re-enter PickleScript code, so it cannot reach the
@@ -1582,7 +1727,7 @@ fn analyzeAppendOwned(m: IrModule, fun: IrFunc, types: Map<int, IrTy>, tempUses:
     AppendPlan(owned, fuse)
 }
 
-fn analyze(m: IrModule, fun: IrFunc, mayGC: Map<string, bool>) -> FnPlan {
+fn analyze(m: IrModule, fun: IrFunc, mayGC: Map<string, bool>, sysv: bool) -> FnPlan {
     var slotCell: List<int> = []
     var slotK: List<int> = []
     var i = 0
@@ -1808,7 +1953,8 @@ fn analyze(m: IrModule, fun: IrFunc, mayGC: Map<string, bool>) -> FnPlan {
         i = i + 1
     }
     var picking = true
-    while (picking && len(pinRegs) < MAX_PINS) {
+    let maxPins = if (sysv) { 5 } else { MAX_PINS }
+    while (picking && len(pinRegs) < maxPins) {
         var best = 0 - 1
         var bestUses = 0
         var j = 0
@@ -1826,7 +1972,7 @@ fn analyze(m: IrModule, fun: IrFunc, mayGC: Map<string, bool>) -> FnPlan {
             picking = false
         } else {
             pinSet[best] = true
-            let rg = pinRegAt(len(pinRegs))
+            let rg = pinRegAt(len(pinRegs), sysv)
             slotReg[cand[best]] = rg
             pinRegs.push(rg)
         }
@@ -2057,7 +2203,7 @@ class X64Emitter {
         this.diags = diags
         this.failed = false
         this.mayGC = mayGC
-        this.plan = analyze(m, fun, mayGC)
+        this.plan = analyze(m, fun, mayGC, sysv)
         let ap = analyzeAppendOwned(m, fun, this.plan.types, this.plan.tempUses)
         this.appendOwned = ap.owned
         this.appendFuse = ap.fuse
@@ -3100,7 +3246,7 @@ class X64Emitter {
         this.cb.u8(0x89)
         this.cb.u8(0xE5)
         var frameK = this.plan.totalK
-        if (this.makesCalls()) {
+        if (this.makesCalls() && !this.sysv) {
             // Win64 reserves 32 bytes below every call for the callee's spill
             // area. Calls with at most four arguments emit no per-call `sub
             // rsp`, so the frame itself has to provide that scratch space;
@@ -3173,6 +3319,30 @@ class X64Emitter {
         }
     }
 
+    /// Move up to three operands from the Win64 argument registers into the
+    /// SysV ones. The handwritten inline fast paths keep their operands in
+    /// rcx/rdx/r8 throughout, because under SysV those are ordinary scratch
+    /// registers; only a fallback call has to enter the callee through the
+    /// ABI's own argument registers. Call this at the slow label, after the
+    /// operands are final and before the call.
+    ///
+    /// The order matters: rsi is filled from rdx before rdx is overwritten
+    /// with r8, and rdi/rcx are not destinations of an earlier move.
+    fn sysvArgShuffle(n: int) {
+        if (!this.sysv) {
+            return
+        }
+        if (n >= 2) {
+            this.cb.movRR(6, 2, 64)
+        }
+        if (n >= 3) {
+            this.cb.movRR(2, 8, 64)
+        }
+        if (n >= 1) {
+            this.cb.movRR(7, 1, 64)
+        }
+    }
+
     /// Pushes the shadow frame. Must run AFTER `seedParams`: the frame pointer
     /// is built with `lea` into the ABI's first argument register, so building
     /// the frame before spilling the incoming args would clobber arg 0.
@@ -3223,49 +3393,53 @@ class X64Emitter {
     }
 
     fn seedParams() {
+        var ptys: List<IrTy> = []
+        for (p in this.fun.params) {
+            ptys.push(p.ty)
+        }
+        let locs = abiArgLocs(ptys, this.sysv)
+        let base = stackParamBase(this.sysv)
         var i = 0
         while (i < len(this.fun.params)) {
             let t = this.fun.params[i].ty
+            let r = locs.reg[i]
+            let s = locs.stack[i]
             if (isFloatTy(t)) {
                 if (this.plan.floatSlotReg.has(i)) {
                     // The parameter's home is an XMM register for the whole
                     // body; move the incoming argument straight into the pin.
                     let xr = this.plan.floatSlotReg[i]
-                    if (i < 4) {
-                        if (xr != i) {
-                            this.cb.movsdRR(xr, i)
+                    if (r >= 0) {
+                        if (xr != r) {
+                            this.cb.movsdRR(xr, r)
                         }
                     } else {
-                        let disp = 48 + 8 * (i - 4)
-                        this.cb.ld(11, 64, 0 - disp)
+                        this.cb.ld(11, 64, 0 - (base + 8 * s))
                         this.cb.movqXmmR11(xr)
                     }
                 } else {
                     let k = this.kOfSlot(i)
-                    if (i < 4) {
-                        this.cb.stsd(i, k)
+                    if (r >= 0) {
+                        this.cb.stsd(r, k)
                     } else {
-                        let disp = 48 + 8 * (i - 4)
-                        this.cb.ld(0, 64, 0 - disp)
+                        this.cb.ld(0, 64, 0 - (base + 8 * s))
                         this.cb.st(0, 64, k)
                     }
                 }
             } else if (this.plan.slotReg.has(i)) {
                 // The parameter's home is a pinned register for the whole body.
                 let rg = this.plan.slotReg[i]
-                if (i < 4) {
-                    this.cb.movRR(rg, this.argReg(i), tyWidth(t))
+                if (r >= 0) {
+                    this.cb.movRR(rg, this.argReg(r), tyWidth(t))
                 } else {
-                    let disp = 48 + 8 * (i - 4)
-                    this.cb.ld(rg, 64, 0 - disp)
+                    this.cb.ld(rg, 64, 0 - (base + 8 * s))
                 }
             } else {
                 let k = this.kOfSlot(i)
-                if (i < 4) {
-                    this.cb.st(this.argReg(i), tyWidth(t), k)
+                if (r >= 0) {
+                    this.cb.st(this.argReg(r), tyWidth(t), k)
                 } else {
-                    let disp = 48 + 8 * (i - 4)
-                    this.cb.ld(0, 64, 0 - disp)
+                    this.cb.ld(0, 64, 0 - (base + 8 * s))
                     this.cb.st(0, tyWidth(t), k)
                 }
             }
@@ -4041,8 +4215,9 @@ class X64Emitter {
     ///
     /// The fast path is the whole runtime body when `len < cap`: read the
     /// element span, store, bump `len`. A full list falls back to the real
-    /// entry point with both arguments still in rcx/rdx, so growth, the
-    /// capacity floor, and the raw-span allocation stay in one place.
+    /// entry point with both arguments still in rcx/rdx (shuffled into the
+    /// ABI's registers first on SysV), so growth, the capacity floor, and the
+    /// raw-span allocation stay in one place.
     ///
     /// No collection can run between the load of `len` and the store, so the
     /// list and the value are as rooted as they were at the call site, and the
@@ -4089,6 +4264,7 @@ class X64Emitter {
         this.cb.u8(24)
         this.emitJmp(done)
         this.starts[slow] = this.cb.size()
+        this.sysvArgShuffle(2)
         this.cb.movabsReloc(10, "pickle_list_push")
         this.cb.u8(0x41)
         this.cb.u8(0xFF)
@@ -4293,6 +4469,7 @@ class X64Emitter {
         this.starts[slow] = this.cb.size()
         this.cb.u8(0xBA)
         this.cb.u32le(count)
+        this.sysvArgShuffle(2)
         this.cb.movabsReloc(10, "pickle_enum_new")
         this.cb.u8(0x41)
         this.cb.u8(0xFF)
@@ -4448,7 +4625,8 @@ class X64Emitter {
     /// through the extern still costs a call and the shadow frame its
     /// allocating first-use path needs. Probe the matching singleton here and
     /// fall back to the real entry point when it is still zero. The argument
-    /// stays in rcx for the fallback.
+    /// stays in rcx for the fallback (moved to the ABI's first argument
+    /// register on SysV).
     fn emitInlineBoxBool(d: int, arg: int) {
         this.loadTmp(1, 8, arg)
         let slow = 0 - 1 - this.inlineLab
@@ -4478,6 +4656,7 @@ class X64Emitter {
         this.emitJcc(0x04, slow)
         this.emitJmp(done)
         this.starts[slow] = this.cb.size()
+        this.sysvArgShuffle(1)
         this.cb.movabsReloc(10, "pickle_box_bool")
         this.cb.u8(0x41)
         this.cb.u8(0xFF)
@@ -4579,6 +4758,7 @@ class X64Emitter {
         this.emitJmp(done)
         // Cold table: the runtime builds it, and its path owns the insert.
         this.starts[cold] = this.cb.size()
+        this.sysvArgShuffle(1)
         this.cb.movabsReloc(10, "pickle_box_i64")
         this.cb.u8(0x41)
         this.cb.u8(0xFF)
@@ -4624,7 +4804,8 @@ class X64Emitter {
     /// round up, and take the next slice of the current chunk. Anything that
     /// needs a fresh chunk, an oversized request that bypasses the arena, or a
     /// request whose rounded size does not fit falls back to the real entry
-    /// point with rcx still holding the original size. `abiManagedAlloc` is a
+    /// point with rcx still holding the original size (shuffled to the ABI's
+    /// first argument register on SysV). `abiManagedAlloc` is a
     /// leaf that never calls into Pickle code, so the inline adds no
     /// collection point the caller did not already have.
     ///
@@ -4719,6 +4900,7 @@ class X64Emitter {
         this.cb.u8(0xD8)
         this.emitJmp(done)
         this.starts[slow] = this.cb.size()
+        this.sysvArgShuffle(1)
         this.cb.movabsReloc(10, "pkl_abiManagedAlloc")
         this.cb.u8(0x41)
         this.cb.u8(0xFF)
@@ -4738,7 +4920,8 @@ class X64Emitter {
     /// final) and no automatic collection to be armed. A cold environment, a
     /// live auto-collector (which needs the pin and the trigger) and a
     /// geometric registry growth all fall back to the real entry point with
-    /// rcx still holding the object address. The size word is read directly
+    /// rcx still holding the object address (shuffled to the ABI's first
+    /// argument register on SysV). The size word is read directly
     /// (word 2, byte 16), exactly as `geRegObjSize` does.
     fn emitInlineEngineRegister(d: int?, objT: int) {
         this.loadTmp(1, 64, objT)
@@ -4820,6 +5003,7 @@ class X64Emitter {
         this.cb.u8(0x10)
         this.emitJmp(done)
         this.starts[slow] = this.cb.size()
+        this.sysvArgShuffle(1)
         this.cb.movabsReloc(10, "pkl_abiEngineRegister")
         this.cb.u8(0x41)
         this.cb.u8(0xFF)
@@ -4846,7 +5030,8 @@ class X64Emitter {
     /// builds digits. Those entries are `FLAG_SHARED` and never freed, so a hit
     /// is immutable and pointer-identical to the split text the map probe
     /// compares against. A cold table, an out-of-range value or an unfilled
-    /// slot falls back to the real entry point with rcx untouched.
+    /// slot falls back to the real entry point with the value still in rcx
+    /// (moved to the ABI's first argument register on SysV).
     fn emitInlineStrFromI64(d: int, arg: int) {
         this.loadTmp(1, 64, arg)
         let slow = 0 - 1 - this.inlineLab
@@ -4884,6 +5069,7 @@ class X64Emitter {
         this.emitJcc(0x04, slow)
         this.emitJmp(done)
         this.starts[slow] = this.cb.size()
+        this.sysvArgShuffle(1)
         this.cb.movabsReloc(11, "pickle_str_from_i64")
         this.cb.u8(0x41)
         this.cb.u8(0xFF)
@@ -5048,6 +5234,7 @@ class X64Emitter {
         this.cb.u8(0x49)
         this.cb.u8(0x8B)
         this.cb.u8(0xCB)
+        this.sysvArgShuffle(2)
         this.cb.movabsReloc(10, "pkl_shortInternWord")
         this.cb.u8(0x41)
         this.cb.u8(0xFF)
@@ -5484,6 +5671,7 @@ class X64Emitter {
         this.emitJmp(done)
         this.starts[slow] = this.cb.size()
         // Arguments are still in rcx/rdx/r8; only r9/r10/r11/rax were touched.
+        this.sysvArgShuffle(3)
         this.cb.movabsReloc(10, "pickle_str_append_two")
         this.cb.u8(0x41)
         this.cb.u8(0xFF)
@@ -5687,6 +5875,7 @@ class X64Emitter {
         this.cb.u8(0xC0)
         this.emitJmp(done)
         this.starts[slow] = this.cb.size()
+        this.sysvArgShuffle(2)
         this.cb.movabsReloc(10, "pickle_map_get")
         this.cb.u8(0x41)
         this.cb.u8(0xFF)
@@ -5928,35 +6117,46 @@ class X64Emitter {
             }
         }
         let n = len(args)
+        let locs = abiArgLocs(ptys, this.sysv)
         var i = 0
-        while (i < n && i < 4) {
-            let t = ptys[i]
-            if (isFloatTy(t)) {
-                this.loadTmpFloat(i, args[i])
-            } else {
-                this.loadTmp(this.argReg(i), tyWidth(t), args[i])
+        while (i < n) {
+            let r = locs.reg[i]
+            if (r >= 0) {
+                let t = ptys[i]
+                if (isFloatTy(t)) {
+                    this.loadTmpFloat(r, args[i])
+                } else {
+                    this.loadTmp(this.argReg(r), tyWidth(t), args[i])
+                }
             }
             i = i + 1
         }
-        var ns = n - 4
-        if (ns < 0) {
-            ns = 0
+        var ns = 0
+        i = 0
+        while (i < n) {
+            if (locs.stack[i] >= 0) {
+                ns = ns + 1
+            }
+            i = i + 1
         }
         var R = 0
         if (ns > 0) {
-            R = CALL_SHADOW_BYTES + 8 * ns + 8 * (ns % 2)
+            let shadow = if (this.sysv) { 0 } else { CALL_SHADOW_BYTES }
+            R = shadow + 8 * ns + 8 * (ns % 2)
             this.cb.subRsp(R)
-            i = 4
+            i = 0
             while (i < n) {
-                let j = i - 4
-                let t = ptys[i]
-                let disp = CALL_SHADOW_BYTES + 8 * j
-                if (isFloatTy(t)) {
-                    this.loadTmpFloat(4, args[i])
-                    this.cb.stsdRsp(4, disp)
-                } else {
-                    this.loadTmp(0, tyWidth(t), args[i])
-                    this.cb.stRsp(0, tyWidth(t), disp)
+                let s = locs.stack[i]
+                if (s >= 0) {
+                    let t = ptys[i]
+                    let disp = shadow + 8 * s
+                    if (isFloatTy(t)) {
+                        this.loadTmpFloat(4, args[i])
+                        this.cb.stsdRsp(4, disp)
+                    } else {
+                        this.loadTmp(0, tyWidth(t), args[i])
+                        this.cb.stRsp(0, tyWidth(t), disp)
+                    }
                 }
                 i = i + 1
             }
@@ -6158,35 +6358,46 @@ class X64Emitter {
                     return
                 }
                 let n = len(args)
+                let locs = abiArgLocs(ptys, this.sysv)
                 var i = 0
-                while (i < n && i < 4) {
-                    let t = ptys[i]
-                    if (isFloatTy(t)) {
-                        this.loadTmpFloat(i, args[i])
-                    } else {
-                        this.loadTmp(this.argReg(i), tyWidth(t), args[i])
+                while (i < n) {
+                    let r = locs.reg[i]
+                    if (r >= 0) {
+                        let t = ptys[i]
+                        if (isFloatTy(t)) {
+                            this.loadTmpFloat(r, args[i])
+                        } else {
+                            this.loadTmp(this.argReg(r), tyWidth(t), args[i])
+                        }
                     }
                     i = i + 1
                 }
-                var ns = n - 4
-                if (ns < 0) {
-                    ns = 0
+                var ns = 0
+                i = 0
+                while (i < n) {
+                    if (locs.stack[i] >= 0) {
+                        ns = ns + 1
+                    }
+                    i = i + 1
                 }
                 var R = 0
                 if (ns > 0) {
-                    R = CALL_SHADOW_BYTES + 8 * ns + 8 * (ns % 2)
+                    let shadow = if (this.sysv) { 0 } else { CALL_SHADOW_BYTES }
+                    R = shadow + 8 * ns + 8 * (ns % 2)
                     this.cb.subRsp(R)
-                    i = 4
+                    i = 0
                     while (i < n) {
-                        let j = i - 4
-                        let t = ptys[i]
-                        let disp = CALL_SHADOW_BYTES + 8 * j
-                        if (isFloatTy(t)) {
-                            this.loadTmpFloat(4, args[i])
-                            this.cb.stsdRsp(4, disp)
-                        } else {
-                            this.loadTmp(0, tyWidth(t), args[i])
-                            this.cb.stRsp(0, tyWidth(t), disp)
+                        let s = locs.stack[i]
+                        if (s >= 0) {
+                            let t = ptys[i]
+                            let disp = shadow + 8 * s
+                            if (isFloatTy(t)) {
+                                this.loadTmpFloat(4, args[i])
+                                this.cb.stsdRsp(4, disp)
+                            } else {
+                                this.loadTmp(0, tyWidth(t), args[i])
+                                this.cb.stRsp(0, tyWidth(t), disp)
+                            }
                         }
                         i = i + 1
                     }

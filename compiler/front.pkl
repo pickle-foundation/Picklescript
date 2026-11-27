@@ -214,6 +214,7 @@ class Loader {
             this.files.push(ModuleFile(fileName, modulePath, exports, false, List<PubNs>(), List<PubItem>(), pp.imports, pp, emptyFileImports()))
             this.loaded[fileName] = 0
             this.processImports(0)
+            this.loadRuntimePrelude(fileName)
 
             var itemCounts = Map<string, int>()
             for (f in this.files) {
@@ -245,6 +246,28 @@ class Loader {
             return LoadedModules(merged, collided)
         }
         none
+    }
+
+    /// Load the runtime modules whose `#[symbol]` bodies the compiler calls
+    /// without the program naming them: the shadow stack around every
+    /// function, console printing, exception/panic reporting, aggregate and
+    /// class helpers, and the startup/exit/time/thread primitives.
+    ///
+    /// WHY THE PROGRAM OWNS THE RUNTIME. The alternative is a per-target
+    /// runtime archive that must be rebuilt whenever any runtime file changes,
+    /// then selected over by the linker. Loading these modules into the
+    /// program's own import closure emits each body once, into the same object
+    /// as the program, so `pklc build` is one lower-and-link step on every
+    /// target. The list is deliberately limited to modules a compiled program
+    /// can reach through a builtin; networking, TLS and streams stay explicit
+    /// imports, so a target without those backends still builds.
+    fn loadRuntimePrelude(rootFile: string) {
+        let prelude = runtimePrelude()
+        var i = 0
+        while (i < len(prelude)) {
+            let _ = this.ensureModule(rootFile, prelude[i], Span(0, 0))
+            i = i + 1
+        }
     }
 
     fn processImports(idx: int) {
@@ -686,6 +709,38 @@ class Loader {
         }
         none
     }
+}
+
+/// The runtime modules every compiled program carries. See
+/// `Loader.loadRuntimePrelude` for why this replaced the runtime archive.
+fn runtimePrelude() -> List<List<string>> {
+    var out = [[""]]
+    out.pop()
+    out.push(["runtime", "abi_runtime"])
+    out.push(["runtime", "abi_shadow"])
+    out.push(["runtime", "abi_console"])
+    out.push(["runtime", "abi_exception"])
+    out.push(["runtime", "abi_panic"])
+    out.push(["runtime", "abi_os"])
+    out.push(["runtime", "abi_class"])
+    out.push(["runtime", "abi_class_extra"])
+    out.push(["runtime", "abi_string"])
+    out.push(["runtime", "abi_list"])
+    out.push(["runtime", "abi_map"])
+    out.push(["runtime", "abi_enum"])
+    out.push(["runtime", "abi_tuple"])
+    out.push(["runtime", "abi_box"])
+    out.push(["runtime", "abi_float"])
+    out.push(["runtime", "abi_statics"])
+    out.push(["runtime", "abi_raw"])
+    out.push(["runtime", "abi_gc"])
+    out.push(["runtime", "abi_fs"])
+    out.push(["runtime", "abi_process"])
+    out.push(["runtime", "abi_time"])
+    out.push(["runtime", "abi_once"])
+    out.push(["runtime", "abi_sync"])
+    out.push(["runtime", "abi_threads"])
+    return out
 }
 
 fn frontend(fileName: string, source: string, diags: DiagnosticSink) -> FrontOutput? {

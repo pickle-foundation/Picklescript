@@ -1,0 +1,703 @@
+module compiler.elflink
+
+import { SEC_TEXT, SEC_RELA_TEXT, SEC_RDATA, SEC_DATA, SEC_SYMTAB, SEC_STRTAB, SEC_COUNT, appendBytes, padTo, setU16, setU32, setU64 } from compiler.elf
+
+/// Link one `compiler.elf` relocatable object into a freestanding Linux
+/// executable.
+///
+/// THE CONTRACT. The object carries the whole program, including the runtime
+/// prelude. It has no archive members, no import table and no C startup file.
+/// This linker supplies the only machine code a freestanding image needs:
+///
+///   `_start`           the process entry point: align the stack, call
+///                      `pickle_runtime_init`, call `pickle_main`, call
+///                      `pickle_flush`, then `exit_group(0)`.
+///   `pkl_syscall`      the seven-argument syscall bridge. The Pickle runtime
+///                      calls `sys_syscall(nr, a1..a6)`; the compiler lowers
+///                      that to an extern call to this stub. It moves the SysV
+///                      argument registers into the kernel's order (RCX -> R10)
+///                      and executes `syscall`.
+///   `pkl_cas`          `lock cmpxchg`, the primitive every futex lock is
+///                      built from.
+///   `pkl_thread_spawn` map a stack, `clone` the thread, and run the Pickle
+///                      entry on the new stack. The stack switch is why this
+///                      one cannot be written in Pickle: after `clone` returns
+///                      in the child, the caller's frame pointer still points
+///                      at the parent's stack.
+///   `memcpy`/`memset`  the two CRT builtins the code generator emits for
+///                      aggregate copies and clears.
+///
+/// There is no PT_INTERP, no `.dynamic`, no PLT and no libc. Every symbol the
+/// object leaves undefined is an error, except the stubs above. That is
+/// deliberate: a typo in a syscall wrapper must fail the link, not silently
+/// resolve to a system function that would reintroduce the C dependency.
+///
+/// LAYOUT. A non-PIE `ET_EXEC` at 0x400000:
+///
+///   file 0x0000  ELF header + three program headers
+///   file 0x1000  `_start`, the stubs, then the object's `.text` (R|X)
+///   next page    `.rdata` (R)
+///   next page    `.data`  (RW)
+///
+/// The first PT_LOAD starts at file offset 0 and includes the headers, so the
+/// kernel maps the whole RX span in one segment. `.rdata` and `.data` are
+/// separate page-aligned segments; no page is writable and executable at the
+/// same time.
+
+const BASE: int = 0x400000
+const PAGE: int = 0x1000
+const EHDR_SIZE: int = 64
+const PHDR_SIZE: int = 56
+const PHDR_COUNT: int = 3
+const TEXT_FILE_OFF: int = 0x1000
+
+/// One parsed symbol. `addr` is the final virtual address; `defined` is false
+/// for a symbol the object leaves for the linker.
+class LinkSym {
+    var name: string
+    var addr: int
+    var defined: bool
+
+    constructor(n: string, a: int, d: bool) {
+        this.name = n
+        this.addr = a
+        this.defined = d
+    }
+}
+
+/// One linker-supplied stub: a name the object may reference and the bytes
+/// that answer it.
+class LinkStub {
+    var name: string
+    var bytes: List<int>
+
+    constructor(n: string, b: List<int>) {
+        this.name = n
+        this.bytes = b
+    }
+}
+
+/// The linker's answer. `error` is empty on success; `unresolved` is the
+/// de-duplicated undefined list, which is the runtime port's worklist.
+class LinkOut {
+    var bytes: List<int>
+    var error: string
+    var unresolved: List<string>
+
+    constructor(b: List<int>, e: string, u: List<string>) {
+        this.bytes = b
+        this.error = e
+        this.unresolved = u
+    }
+}
+
+fn rdU16(b: List<int>, o: int) -> int {
+    b[o] | (b[o + 1] << 8)
+}
+
+fn rdU32(b: List<int>, o: int) -> int {
+    b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24)
+}
+
+/// Read a little-endian 64-bit value. Every value this linker reads is below
+/// 2^63 (file offsets, section sizes, symbol values), so the signed shift is
+/// exact.
+fn rdU64(b: List<int>, o: int) -> int {
+    rdU32(b, o) + (rdU32(b, o + 4) << 32)
+}
+
+/// Read a signed 64-bit addend. The object writer emits small values (-4 for
+/// the PC32 call field), but sign-extending the high word keeps the formula
+/// correct for any future absolute relocation.
+fn rdI64(b: List<int>, o: int) -> int {
+    rdU32(b, o) + (rdU32(b, o + 4) << 32)
+}
+
+fn wrU64(b: List<int>, o: int, v: int) {
+    var i = 0
+    while (i < 8) {
+        b[o + i] = (v >> (8 * i)) & 0xFF
+        i = i + 1
+    }
+}
+
+fn wrU32(b: List<int>, o: int, v: int) {
+    var i = 0
+    while (i < 4) {
+        b[o + i] = (v >> (8 * i)) & 0xFF
+        i = i + 1
+    }
+}
+
+fn shOff(obj: List<int>, shoff: int, idx: int) -> int {
+    rdU64(obj, shoff + idx * 64 + 24)
+}
+
+fn shSize(obj: List<int>, shoff: int, idx: int) -> int {
+    rdU64(obj, shoff + idx * 64 + 32)
+}
+
+/// Read the NUL-terminated name at `base + off` in a string table.
+fn strAt(tab: List<int>, base: int, off: int) -> string {
+    var out = ""
+    var i = base + off
+    while (i < len(tab) && tab[i] != 0) {
+        out += "{tab[i] as char}"
+        i = i + 1
+    }
+    out
+}
+
+fn alignUp(v: int, a: int) -> int {
+    if ((v % a) == 0) {
+        return v
+    }
+    v + (a - (v % a))
+}
+
+/// True when `[off, off + n)` lies inside a buffer of `total` bytes.
+fn inRange(total: int, off: int, n: int) -> bool {
+    if (off < 0 || n < 0) {
+        return false
+    }
+    if (off > total) {
+        return false
+    }
+    n <= total - off
+}
+
+/// True when section `idx` has a header inside the table and, for a section
+/// with file backing, a payload inside the object. `SHT_NOBITS` (8) has no
+/// payload bytes, so only its header is checked.
+fn sectionOk(obj: List<int>, shoff: int, shnum: int, idx: int) -> bool {
+    if (idx >= shnum) {
+        return false
+    }
+    let ent = shoff + idx * 64
+    if (!inRange(len(obj), ent, 64)) {
+        return false
+    }
+    if (rdU32(obj, ent + 4) == 8) {
+        return true
+    }
+    let off = rdU64(obj, ent + 24)
+    let size = rdU64(obj, ent + 32)
+    if (size < 0) {
+        return false
+    }
+    if (size == 0) {
+        return true
+    }
+    inRange(len(obj), off, size)
+}
+
+fn hasUnresolved(u: List<string>, name: string) -> bool {
+    var i = 0
+    while (i < len(u)) {
+        if (u[i] == name) {
+            return true
+        }
+        i = i + 1
+    }
+    false
+}
+
+/// `_start`: align the stack, call the runtime init, call the user entry, call
+/// the flush hook, then `exit_group(0)`. The three `E8` displacement fields are
+/// patched after the symbol table is known; their offsets are 7, 12 and 17.
+fn startBytes() -> List<int> {
+    var b = List<int>()
+    b.push(0x31)
+    b.push(0xED)
+    b.push(0x48)
+    b.push(0x83)
+    b.push(0xE4)
+    b.push(0xF0)
+    b.push(0xE8)
+    b.push(0)
+    b.push(0)
+    b.push(0)
+    b.push(0)
+    b.push(0xE8)
+    b.push(0)
+    b.push(0)
+    b.push(0)
+    b.push(0)
+    b.push(0xE8)
+    b.push(0)
+    b.push(0)
+    b.push(0)
+    b.push(0)
+    b.push(0x31)
+    b.push(0xFF)
+    b.push(0xB8)
+    b.push(0xE7)
+    b.push(0x00)
+    b.push(0x00)
+    b.push(0x00)
+    b.push(0x0F)
+    b.push(0x05)
+    b.push(0xCC)
+    b
+}
+
+/// `pkl_syscall(nr, a1..a6)`:
+///
+///   mov rax, rdi      nr
+///   mov rdi, rsi      a1
+///   mov rsi, rdx      a2
+///   mov rdx, rcx      a3
+///   mov r10, r8       a4   (the kernel wants a4 in R10, not RCX)
+///   mov r8,  r9       a5
+///   mov r9,  [rsp+8]  a6   (the seventh SysV argument)
+///   syscall
+///   ret
+fn syscallStub() -> List<int> {
+    var b = List<int>()
+    b.push(0x48)
+    b.push(0x89)
+    b.push(0xF8)
+    b.push(0x48)
+    b.push(0x89)
+    b.push(0xF7)
+    b.push(0x48)
+    b.push(0x89)
+    b.push(0xD6)
+    b.push(0x48)
+    b.push(0x89)
+    b.push(0xCA)
+    b.push(0x4D)
+    b.push(0x89)
+    b.push(0xC2)
+    b.push(0x4D)
+    b.push(0x89)
+    b.push(0xC8)
+    b.push(0x4C)
+    b.push(0x8B)
+    b.push(0x4C)
+    b.push(0x24)
+    b.push(0x08)
+    b.push(0x0F)
+    b.push(0x05)
+    b.push(0xC3)
+    b
+}
+
+/// `pkl_cas(addr, expected, value)`:
+///
+///   mov rax, rsi
+///   lock cmpxchg [rdi], rdx
+///   ret
+///
+/// The answer is the word that was in `addr`; the caller compares it with
+/// `expected` to learn whether the swap happened.
+fn casStub() -> List<int> {
+    var b = List<int>()
+    b.push(0x48)
+    b.push(0x89)
+    b.push(0xF0)
+    b.push(0xF0)
+    b.push(0x48)
+    b.push(0x0F)
+    b.push(0xB1)
+    b.push(0x17)
+    b.push(0xC3)
+    b
+}
+
+/// `memcpy(dst, src, n)`:
+///
+///   mov rax, rdi
+///   mov rcx, rdx
+///   rep movsb
+///   ret
+fn memcpyStub() -> List<int> {
+    var b = List<int>()
+    b.push(0x48)
+    b.push(0x89)
+    b.push(0xF8)
+    b.push(0x48)
+    b.push(0x89)
+    b.push(0xD1)
+    b.push(0xF3)
+    b.push(0xA4)
+    b.push(0xC3)
+    b
+}
+
+/// `memset(dst, value, n)`:
+///
+///   mov r9, rdi
+///   mov rcx, rdx
+///   mov eax, esi
+///   rep stosb
+///   mov rax, r9
+///   ret
+///
+/// The destination is saved in R9 because `rep stosb` writes AL and the
+/// function returns the original destination.
+fn memsetStub() -> List<int> {
+    var b = List<int>()
+    b.push(0x49)
+    b.push(0x89)
+    b.push(0xF9)
+    b.push(0x48)
+    b.push(0x89)
+    b.push(0xD1)
+    b.push(0x89)
+    b.push(0xF0)
+    b.push(0xF3)
+    b.push(0xAA)
+    b.push(0x4C)
+    b.push(0x89)
+    b.push(0xC8)
+    b.push(0xC3)
+    b
+}
+
+/// `pkl_thread_spawn(code, env)`:
+///
+///   mmap(NULL, 8 MiB, RW, PRIVATE|ANON|STACK, -1, 0)
+///   put code/env below the new stack top
+///   clone(CLONE_VM|FS|FILES|SIGHAND|THREAD|SYSVSEM|PARENT_SETTID|
+///         CHILD_SETTID|CHILD_CLEARTID, stackTop, &handle[0], &handle[8], 0)
+///   parent: return the handle (or 0 on failure)
+///   child:  call code(env), then exit(0)
+///
+/// The handle is the mapping base:
+///
+///   [0] tid   [1] ctid (kernel-cleared on exit)   [2] base   [3] size
+///
+/// `sysThreadWait` parks on the ctid word; `sysThreadClose` unmaps the base.
+fn threadSpawnStub() -> List<int> {
+    var b = List<int>()
+    // push rbx; push r12; push r13
+    appendBytes(b, [0x53, 0x41, 0x54, 0x41, 0x55])
+    // mov r12, rdi; mov r13, rsi
+    appendBytes(b, [0x49, 0x89, 0xFC, 0x49, 0x89, 0xF5])
+    // mmap(NULL, 8 MiB, RW, PRIVATE|ANON|STACK, -1, 0)
+    appendBytes(b, [0x31, 0xFF])
+    appendBytes(b, [0xBE, 0x00, 0x00, 0x80, 0x00])
+    appendBytes(b, [0xBA, 0x03, 0x00, 0x00, 0x00])
+    appendBytes(b, [0x41, 0xBA, 0x22, 0x00, 0x02, 0x00])
+    appendBytes(b, [0x49, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF])
+    appendBytes(b, [0x45, 0x31, 0xC9])
+    appendBytes(b, [0xB8, 0x09, 0x00, 0x00, 0x00])
+    appendBytes(b, [0x0F, 0x05])
+    // if (rax >= -4096) goto fail_nomap
+    appendBytes(b, [0x48, 0xC7, 0xC1, 0x00, 0xF0, 0xFF, 0xFF])
+    appendBytes(b, [0x48, 0x39, 0xC8])
+    let jae = len(b) + 1
+    appendBytes(b, [0x73, 0x00])
+    // handle = rax; handle[2] = base; handle[3] = size
+    appendBytes(b, [0x48, 0x89, 0xC3])
+    appendBytes(b, [0x48, 0x89, 0x5B, 0x10])
+    appendBytes(b, [0x48, 0xC7, 0x43, 0x18, 0x00, 0x00, 0x80, 0x00])
+    // stackTop = (handle + 8 MiB) & -16
+    appendBytes(b, [0x48, 0x8D, 0xB0, 0x00, 0x00, 0x80, 0x00])
+    appendBytes(b, [0x48, 0x83, 0xE6, 0xF0])
+    // [stackTop-16] = code; [stackTop-8] = env
+    appendBytes(b, [0x4C, 0x89, 0x66, 0xF0])
+    appendBytes(b, [0x4C, 0x89, 0x6E, 0xF8])
+    // clone(0x1350F00, stackTop, &handle[0], &handle[8], 0)
+    appendBytes(b, [0xBF, 0x00, 0x0F, 0x35, 0x01])
+    appendBytes(b, [0x48, 0x89, 0xDA])
+    appendBytes(b, [0x4C, 0x8D, 0x53, 0x08])
+    appendBytes(b, [0x45, 0x31, 0xC0])
+    appendBytes(b, [0xB8, 0x38, 0x00, 0x00, 0x00])
+    appendBytes(b, [0x0F, 0x05])
+    // if (rax == 0) goto child; if (rax < 0) goto fail_unmap
+    appendBytes(b, [0x48, 0x85, 0xC0])
+    let jz = len(b) + 1
+    appendBytes(b, [0x74, 0x00])
+    let js = len(b) + 1
+    appendBytes(b, [0x78, 0x00])
+    // return handle
+    appendBytes(b, [0x48, 0x89, 0xD8])
+    appendBytes(b, [0x41, 0x5D, 0x41, 0x5C, 0x5B, 0xC3])
+    let failUnmap = len(b)
+    // munmap(handle, 8 MiB)
+    appendBytes(b, [0x48, 0x89, 0xDF])
+    appendBytes(b, [0xBE, 0x00, 0x00, 0x80, 0x00])
+    appendBytes(b, [0xB8, 0x0B, 0x00, 0x00, 0x00])
+    appendBytes(b, [0x0F, 0x05])
+    appendBytes(b, [0x31, 0xC0])
+    appendBytes(b, [0x41, 0x5D, 0x41, 0x5C, 0x5B, 0xC3])
+    let failNoMap = len(b)
+    appendBytes(b, [0x31, 0xC0])
+    appendBytes(b, [0x41, 0x5D, 0x41, 0x5C, 0x5B, 0xC3])
+    let child = len(b)
+    // mov rdi, [rsp-8]; call [rsp-16]
+    appendBytes(b, [0x48, 0x8B, 0x7C, 0x24, 0xF8])
+    appendBytes(b, [0xFF, 0x54, 0x24, 0xF0])
+    // exit(0)
+    appendBytes(b, [0x31, 0xFF])
+    appendBytes(b, [0xB8, 0x3C, 0x00, 0x00, 0x00])
+    appendBytes(b, [0x0F, 0x05, 0xF4])
+    b[jae] = (failNoMap - (jae + 1)) & 0xFF
+    b[jz] = (child - (jz + 1)) & 0xFF
+    b[js] = (failUnmap - (js + 1)) & 0xFF
+    b
+}
+
+/// Link `obj` into a freestanding executable. The caller writes `bytes` when
+/// `error` is empty; otherwise `unresolved` names every symbol the runtime
+/// still has to supply.
+fn linkElfExe(obj: List<int>) -> LinkOut {
+    if (len(obj) < 64 || obj[0] != 0x7F || obj[1] != 0x45 || obj[2] != 0x4C || obj[3] != 0x46) {
+        return LinkOut(List<int>(), "input is not an ELF object", List<string>())
+    }
+    let shoff = rdU64(obj, 40)
+    let shnum = rdU16(obj, 60)
+    if (shoff == 0 || shnum < SEC_COUNT) {
+        return LinkOut(List<int>(), "input is not the fixed-section object this linker expects", List<string>())
+    }
+    if (shnum > 4096) {
+        return LinkOut(List<int>(), "section count is implausible", List<string>())
+    }
+    if (!inRange(len(obj), shoff, shnum * 64)) {
+        return LinkOut(List<int>(), "section header table runs past the object", List<string>())
+    }
+    if (!sectionOk(obj, shoff, shnum, SEC_TEXT) || !sectionOk(obj, shoff, shnum, SEC_RDATA) || !sectionOk(obj, shoff, shnum, SEC_DATA)) {
+        return LinkOut(List<int>(), "a loadable section runs past the object", List<string>())
+    }
+
+    let textSize = shSize(obj, shoff, SEC_TEXT)
+    let rdataSize = shSize(obj, shoff, SEC_RDATA)
+    let dataSize = shSize(obj, shoff, SEC_DATA)
+
+    // The text prefix: entry point, then the stubs, then the object text.
+    let textVaddr = BASE + TEXT_FILE_OFF
+    let startAddr = textVaddr
+    var prefix = List<int>()
+    appendBytes(prefix, startBytes())
+    padTo(prefix, 16)
+
+    var stubs = List<LinkStub>()
+    stubs.push(LinkStub("pkl_syscall", syscallStub()))
+    stubs.push(LinkStub("pkl_cas", casStub()))
+    stubs.push(LinkStub("pkl_thread_spawn", threadSpawnStub()))
+    stubs.push(LinkStub("memcpy", memcpyStub()))
+    stubs.push(LinkStub("memset", memsetStub()))
+
+    var stubAddr = Map<string, int>()
+    var si = 0
+    while (si < len(stubs)) {
+        stubAddr[stubs[si].name] = textVaddr + len(prefix)
+        appendBytes(prefix, stubs[si].bytes)
+        padTo(prefix, 16)
+        si = si + 1
+    }
+    let objTextOff = len(prefix)
+    let objTextAddr = textVaddr + objTextOff
+    let textTotal = objTextOff + textSize
+    let textFileEnd = TEXT_FILE_OFF + textTotal
+
+    let rdataFileOff = alignUp(textFileEnd, PAGE)
+    let rdataVaddr = BASE + rdataFileOff
+    let dataFileOff = rdataFileOff + alignUp(maxInt(rdataSize, 1), PAGE)
+    let dataVaddr = BASE + dataFileOff
+
+    // Parse the symbol table. Section symbols and definitions are resolved
+    // now; undefined entries are filled from the linker stubs. Every table
+    // extent is checked before a single entry is read: a malformed object must
+    // fail the link, not fault the host compiler (the audit's C-07 class).
+    if (!sectionOk(obj, shoff, shnum, SEC_SYMTAB) || !sectionOk(obj, shoff, shnum, SEC_STRTAB) || !sectionOk(obj, shoff, shnum, SEC_RELA_TEXT)) {
+        return LinkOut(List<int>(), "a table section runs past the object", List<string>())
+    }
+    let symOff = shOff(obj, shoff, SEC_SYMTAB)
+    let symSize = shSize(obj, shoff, SEC_SYMTAB)
+    let strOff = shOff(obj, shoff, SEC_STRTAB)
+    let strSize = shSize(obj, shoff, SEC_STRTAB)
+    let relaOff = shOff(obj, shoff, SEC_RELA_TEXT)
+    let relaSize = shSize(obj, shoff, SEC_RELA_TEXT)
+    if ((symSize % 24) != 0 || (relaSize % 24) != 0) {
+        return LinkOut(List<int>(), "symbol or relocation table has a partial entry", List<string>())
+    }
+    var syms = List<LinkSym>()
+    var unresolved = List<string>()
+    var spi = 0
+    while (spi < symSize) {
+        let base = symOff + spi
+        let nameOff = rdU32(obj, base)
+        var name = ""
+        if (nameOff < strSize) {
+            name = strAt(obj, strOff, nameOff)
+        }
+        let shndx = rdU16(obj, base + 6)
+        let value = rdU64(obj, base + 8)
+        var addr = 0
+        var defined = false
+        if (shndx == SEC_TEXT) {
+            addr = objTextAddr + value
+            defined = true
+        } else if (shndx == SEC_RDATA) {
+            addr = rdataVaddr + value
+            defined = true
+        } else if (shndx == SEC_DATA) {
+            addr = dataVaddr + value
+            defined = true
+        } else if (shndx == 0 && stubAddr.has(name)) {
+            addr = stubAddr[name]
+            defined = true
+        }
+        if (!defined && shndx == 0 && name != "") {
+            if (!hasUnresolved(unresolved, name)) {
+                unresolved.push(name)
+            }
+        }
+        syms.push(LinkSym(name, addr, defined))
+        spi = spi + 24
+    }
+    if (len(unresolved) > 0) {
+        return LinkOut(List<int>(), "unresolved symbols: " + joinNames(unresolved), unresolved)
+    }
+
+    // Resolve the three `_start` calls now that the symbol table is complete.
+    let initAddr = symAddr(syms, "pickle_runtime_init")
+    let mainAddr = symAddr(syms, "pickle_main")
+    let flushAddr = symAddr(syms, "pickle_flush")
+    if (initAddr < 0 || mainAddr < 0 || flushAddr < 0) {
+        return LinkOut(List<int>(), "missing pickle_runtime_init, pickle_main or pickle_flush", List<string>())
+    }
+    wrU32(prefix, 7, initAddr - (startAddr + 11))
+    wrU32(prefix, 12, mainAddr - (startAddr + 16))
+    wrU32(prefix, 17, flushAddr - (startAddr + 21))
+
+    // Copy the object text after the stubs, then apply `.rela.text`.
+    var text = List<int>()
+    appendBytes(text, prefix)
+    var ti = 0
+    while (ti < textSize) {
+        text.push(obj[shOff(obj, shoff, SEC_TEXT) + ti])
+        ti = ti + 1
+    }
+    var ri = 0
+    while (ri < relaSize) {
+        let base = relaOff + ri
+        let off = rdU64(obj, base)
+        let info = rdU64(obj, base + 8)
+        let symIdx = info >> 32
+        let typ = info & 0xFFFFFFFF
+        let addend = rdI64(obj, base + 16)
+        if (symIdx >= len(syms)) {
+            return LinkOut(List<int>(), "relocation names symbol " + str(symIdx) + " outside the table", List<string>())
+        }
+        let s = syms[symIdx].addr
+        let field = objTextOff + off
+        let p = objTextAddr + off
+        if (typ == 1) {
+            if (!inRange(textSize, off, 8)) {
+                return LinkOut(List<int>(), "absolute relocation runs past .text", List<string>())
+            }
+            wrU64(text, field, s + addend)
+        } else if (typ == 2) {
+            if (!inRange(textSize, off, 4)) {
+                return LinkOut(List<int>(), "PC-relative relocation runs past .text", List<string>())
+            }
+            wrU32(text, field, s + addend - p)
+        } else {
+            return LinkOut(List<int>(), "unsupported relocation type " + str(typ), List<string>())
+        }
+        ri = ri + 24
+    }
+
+    // Assemble the file.
+    var blob = List<int>()
+    var h = 0
+    while (h < EHDR_SIZE + PHDR_SIZE * PHDR_COUNT) {
+        blob.push(0)
+        h = h + 1
+    }
+    padTo(blob, TEXT_FILE_OFF)
+    appendBytes(blob, text)
+    padTo(blob, PAGE)
+    let rdataStart = len(blob)
+    var rdi = 0
+    while (rdi < rdataSize) {
+        blob.push(obj[shOff(obj, shoff, SEC_RDATA) + rdi])
+        rdi = rdi + 1
+    }
+    // Reserve the whole `.rdata` page span, even when the section is empty, so
+    // the data segment's file offset matches the address the symbols were
+    // resolved against.
+    while (len(blob) < dataFileOff) {
+        blob.push(0)
+    }
+    let dataStart = len(blob)
+    var di = 0
+    while (di < dataSize) {
+        blob.push(obj[shOff(obj, shoff, SEC_DATA) + di])
+        di = di + 1
+    }
+
+    // ELF header.
+    blob[0] = 0x7F
+    blob[1] = 0x45
+    blob[2] = 0x4C
+    blob[3] = 0x46
+    blob[4] = 2
+    blob[5] = 1
+    blob[6] = 1
+    setU16(blob, 16, 2)
+    setU16(blob, 18, 62)
+    setU32(blob, 20, 1)
+    setU64(blob, 24, startAddr)
+    setU64(blob, 32, 64)
+    setU64(blob, 40, 0)
+    setU32(blob, 48, 0)
+    setU16(blob, 52, EHDR_SIZE)
+    setU16(blob, 54, PHDR_SIZE)
+    setU16(blob, 56, PHDR_COUNT)
+    setU16(blob, 58, 0)
+    setU16(blob, 60, 0)
+    setU16(blob, 62, 0)
+
+    writePhdr(blob, 64, 1, 5, 0, BASE, textFileEnd, textFileEnd)
+    writePhdr(blob, 64 + PHDR_SIZE, 1, 4, rdataStart, rdataVaddr, rdataSize, rdataSize)
+    writePhdr(blob, 64 + PHDR_SIZE * 2, 1, 6, dataStart, dataVaddr, dataSize, dataSize)
+
+    LinkOut(blob, "", List<string>())
+}
+
+fn maxInt(a: int, b: int) -> int {
+    if (a > b) {
+        return a
+    }
+    return b
+}
+
+fn writePhdr(b: List<int>, o: int, typ: int, flags: int, off: int, vaddr: int, filesz: int, memsz: int) {
+    setU32(b, o, typ)
+    setU32(b, o + 4, flags)
+    setU64(b, o + 8, off)
+    setU64(b, o + 16, vaddr)
+    setU64(b, o + 24, vaddr)
+    setU64(b, o + 32, filesz)
+    setU64(b, o + 40, memsz)
+    setU64(b, o + 48, PAGE)
+}
+
+fn symAddr(syms: List<LinkSym>, name: string) -> int {
+    var i = 0
+    while (i < len(syms)) {
+        if (syms[i].name == name && syms[i].defined) {
+            return syms[i].addr
+        }
+        i = i + 1
+    }
+    -1
+}
+
+fn joinNames(names: List<string>) -> string {
+    var out = ""
+    var i = 0
+    while (i < len(names)) {
+        if (i > 0) {
+            out += ", "
+        }
+        out += names[i]
+        i = i + 1
+    }
+    out
+}

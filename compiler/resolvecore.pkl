@@ -361,6 +361,70 @@ fn declareBuiltins(rs: Resolver) {
     bs.push(mkBuiltin(span, "win_get_process_heap", List<ParamInfo>(), Ty.Int))
     bs.push(mkBuiltin(span, "win_heap_alloc", [anyParam(span, "heap"), anyParam(span, "flags"), anyParam(span, "size")], Ty.Int))
     bs.push(mkBuiltin(span, "win_heap_free", [anyParam(span, "heap"), anyParam(span, "flags"), anyParam(span, "ptr")], Ty.Empty))
+    // --- POSIX raw syscall seam ---
+    //
+    // `sys_syscall(nr, a1..a6)` is the freestanding replacement for every
+    // libc name in the POSIX runtime. It lowers to one extern call to
+    // `pkl_syscall`, a stub the ELF linker emits: the stub moves the SysV
+    // arguments into the kernel's register order (RCX -> R10) and executes
+    // `syscall`. No libc, no target-side assembler, no C compiler.
+    bs.push(mkBuiltin(span, "sys_syscall", [anyParam(span, "nr"), anyParam(span, "a1"), anyParam(span, "a2"), anyParam(span, "a3"), anyParam(span, "a4"), anyParam(span, "a5"), anyParam(span, "a6")], Ty.Int))
+    // `sys_cas(addr, expected, value)` is the raw `lock cmpxchg` the futex
+    // backend builds every lock from. It answers the word that was there, so
+    // `sys_cas(cell, 0, 1) == 0` is "acquired". The linker emits the three
+    // instructions; nothing in the runtime hand-rolls an atomic.
+    bs.push(mkBuiltin(span, "sys_cas", [anyParam(span, "addr"), anyParam(span, "expected"), anyParam(span, "value")], Ty.Int))
+    // --- POSIX substrate (libc names answered by `#[symbol]` bodies) ---
+    //
+    // The mirror of the Win32 block above for `runtime/abi_sys_posix.pkl`.
+    // The source names are `posix_*`; the IR symbol keeps the same `__imp_`
+    // spelling as every other extern, and `compiler.elf` strips it at the
+    // object boundary, where the symbol table resolves the bare name to the
+    // `#[symbol]` body in the same object. None of these lower on a Windows
+    // target, so the PE path never sees them.
+    bs.push(mkBuiltin(span, "posix_getenv", [anyParam(span, "name")], Ty.Int))
+    // --- POSIX filesystem (kernel syscalls) ---
+    //
+    // The mirror of the Win32 filesystem block for `runtime/abi_fs_posix.pkl`.
+    // Paths are raw C-string pointers; every size and count is a machine word.
+    // The declarations keep libc's argument shapes because the `#[symbol]`
+    // bodies in `abi_sys_posix` translate them to `openat`/`read`/`write`.
+    bs.push(mkBuiltin(span, "posix_access", [anyParam(span, "path"), anyParam(span, "mode")], Ty.Int))
+    bs.push(mkBuiltin(span, "posix_unlink", [anyParam(span, "path")], Ty.Int))
+    bs.push(mkBuiltin(span, "posix_rmdir", [anyParam(span, "path")], Ty.Int))
+    bs.push(mkBuiltin(span, "posix_mkdir", [anyParam(span, "path"), anyParam(span, "mode")], Ty.Int))
+    bs.push(mkBuiltin(span, "posix_getcwd", [anyParam(span, "buf"), anyParam(span, "size")], Ty.Int))
+    bs.push(mkBuiltin(span, "posix_open", [anyParam(span, "path"), anyParam(span, "flags"), anyParam(span, "mode")], Ty.Int))
+    bs.push(mkBuiltin(span, "posix_read", [anyParam(span, "fd"), anyParam(span, "buf"), anyParam(span, "n")], Ty.Int))
+    bs.push(mkBuiltin(span, "posix_write", [anyParam(span, "fd"), anyParam(span, "buf"), anyParam(span, "n")], Ty.Int))
+    bs.push(mkBuiltin(span, "posix_close", [anyParam(span, "fd")], Ty.Int))
+    // `DIR*` is opaque; only `opendir`/`readdir`/`closedir` see it.
+    bs.push(mkBuiltin(span, "posix_opendir", [anyParam(span, "path")], Ty.Int))
+    bs.push(mkBuiltin(span, "posix_readdir", [anyParam(span, "dir")], Ty.Int))
+    bs.push(mkBuiltin(span, "posix_closedir", [anyParam(span, "dir")], Ty.Int))
+    // --- POSIX process control (`runtime/abi_process_posix.pkl`) ---
+    //
+    // `fork`/`execve` are the spawn pair; everything else is the small set a
+    // captured run needs. `_exit` is the async-signal-safe exit a forked child
+    // must use - `exit` would run atexit handlers and flush stdio in a process
+    // that may have inherited another thread's locks.
+    bs.push(mkBuiltin(span, "posix_fork", List<ParamInfo>(), Ty.Int))
+    bs.push(mkBuiltin(span, "posix_execve", [anyParam(span, "path"), anyParam(span, "argv"), anyParam(span, "envp")], Ty.Int))
+    bs.push(mkBuiltin(span, "posix__exit", [anyParam(span, "code")], Ty.Empty))
+    bs.push(mkBuiltin(span, "posix_pipe", [anyParam(span, "fds")], Ty.Int))
+    bs.push(mkBuiltin(span, "posix_dup2", [anyParam(span, "oldfd"), anyParam(span, "newfd")], Ty.Int))
+    bs.push(mkBuiltin(span, "posix_waitpid", [anyParam(span, "pid"), anyParam(span, "status"), anyParam(span, "options")], Ty.Int))
+    bs.push(mkBuiltin(span, "posix_kill", [anyParam(span, "pid"), anyParam(span, "sig")], Ty.Int))
+    bs.push(mkBuiltin(span, "posix_fcntl", [anyParam(span, "fd"), anyParam(span, "cmd"), anyParam(span, "arg")], Ty.Int))
+    bs.push(mkBuiltin(span, "posix_chdir", [anyParam(span, "path")], Ty.Int))
+    // Clock and environment helpers, answered by `#[symbol]` bodies in
+    // `runtime/abi_sys_posix.pkl`.
+    bs.push(mkBuiltin(span, "pkl_now_ms", List<ParamInfo>(), Ty.Int))
+    bs.push(mkBuiltin(span, "pkl_sleep_ms", [anyParam(span, "ms")], Ty.Empty))
+    bs.push(mkBuiltin(span, "pkl_environ", List<ParamInfo>(), Ty.Int))
+    // Only spawn needs linker-emitted machine code. Wait and close are pure
+    // Pickle in `abi_sys_posix`, over futex and `munmap`.
+    bs.push(mkBuiltin(span, "pkl_thread_spawn", [anyParam(span, "code"), anyParam(span, "env")], Ty.Int))
     // The filesystem entry points, so a `#[symbol]` body can own
     // the whole `fs.rs` surface. All twelve are KERNEL32, which is
     // the DLL `win_import_addr` and `pelink::isShellImp` already
