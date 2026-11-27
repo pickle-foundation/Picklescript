@@ -1,0 +1,78 @@
+module runtime.abi_cstr
+
+import { rawByteAt } from runtime.abi_string
+
+/// Raw byte and C-string helpers shared by the POSIX backends.
+///
+/// A Pickle `string` is not NUL-terminated, so every libc call that wants a
+/// path, a name or an argument needs a raw copy with a terminator. This module
+/// is the one place that copy is made: `abi_fs_posix` and `abi_process_posix`
+/// agree on the allocator (the process heap `abi_raw` owns) and on the
+/// lifetime (the caller frees the block immediately after the syscall).
+///
+/// NOTHING HERE RELEASES THE WORLD LOCK. A copy is made and freed around the
+/// blocking call by the caller, which is the only place that knows how long
+/// the lock may be gone and that no managed value is live in the window.
+///
+/// The functions are portable (they only use `alloc`/`free` and byte reads),
+/// so this module is safe to pack into any target's archive; only the POSIX
+/// backends import it today.
+
+/// Byte `i` of a raw buffer.
+fn putRawByte(base: *int, i: int, v: int) {
+    unsafe {
+        let sh = (i & 7) * 8
+        let mask = 255 << sh
+        base[i >> 3] = (base[i >> 3] & ((0 - 1) ^ mask)) | ((v & 255) << sh)
+    }
+}
+
+/// A NUL-terminated raw copy of `s`. The caller owns the block.
+///
+/// The size is `(n + 8) / 8` words: at least one whole word past the last
+/// payload byte, so the terminator always has a slot even when `n` is a
+/// multiple of eight.
+fn cstrOf(s: string) -> *int {
+    unsafe {
+        let n = len(s)
+        var buf = alloc(int, (n + 8) / 8)
+        var i = 0
+        while (i < n) {
+            putRawByte(buf, i, s[i] as int)
+            i = i + 1
+        }
+        putRawByte(buf, n, 0)
+        return buf
+    }
+}
+
+/// The C string at `p` as a managed `string`, not including the terminator.
+///
+/// The bytes are copied through `List<byte>` and `str(...)` rather than by
+/// reinterpreting the pointer: `abiStrFromBytes` is typed `*int` and the
+/// language does not implicitly convert a raw pointer to a managed `string`
+/// at a return site.
+fn cstrToStr(p: *int) -> string {
+    var out = bytes("")
+    var i = 0
+    while (rawByteAt(p, i) != 0) {
+        out.push(rawByteAt(p, i) as byte)
+        i = i + 1
+    }
+    return str(out)
+}
+
+/// The index of the first `c` in the C string at `p`, or -1.
+fn cstrIndexOf(p: *int, c: int) -> int {
+    var i = 0
+    while (true) {
+        let b = rawByteAt(p, i)
+        if (b == 0) {
+            return -1
+        }
+        if (b == c) {
+            return i
+        }
+        i = i + 1
+    }
+}

@@ -1,10 +1,8 @@
 module runtime.abi_shadow
 
 /// Port of the `runtime/src/shadow.rs` thread registry + frame lists, via the
-/// Win32 TLS builtins (`win_tls_alloc` / `win_tls_get` / `win_tls_set`) and the
-/// process-heap builtins (`win_get_process_heap` / `win_heap_alloc` /
-/// `win_heap_free`), the storage and allocator this language does not otherwise
-/// have. Slice S3 of the live-GC qualification (native parities:
+/// platform substrate `runtime/abi_sys` (thread-local slots and the process
+/// heap), the storage and allocator this language does not otherwise have. Slice S3 of the live-GC qualification (native parities:
 /// `register_thread`/`unregister_thread`/`insert_thread_locked`/
 /// `ensure_registered_locked`, `push_frame`/`pop_frame` under the registry
 /// lock, `pickle_gc_register_thread`/`pickle_gc_unregister_thread` ids from 1).
@@ -34,7 +32,7 @@ module runtime.abi_shadow
 ///
 /// The pop-time LIFO check cannot reach the panic channel from this leaf
 /// (`writeStderr` sits above the collector), so a pop out of order is a silent
-/// `win_exit(1)`, not native's panicked "shadow stack pop out of order"
+/// `sysExit(1)`, not native's panicked "shadow stack pop out of order"
 /// message. The emitter always pops exactly the frames it pushed, so the check
 /// is a debugger aid, not a runtime contract.
 ///
@@ -49,7 +47,7 @@ module runtime.abi_shadow
 /// And because each node carries the thread's LIVE frame list, unregistering
 /// a thread whose frames are still in use tears the whole chain away - the
 /// next pop trips the out-of-order check (native: panic; here: silent
-/// `win_exit(1)`). The seam is therefore for END-OF-LIFE threads: either a
+/// `sysExit(1)`). The seam is therefore for END-OF-LIFE threads: either a
 /// spawned worker finishing, or the process tail. No suite may unregister
 /// the running harness thread.
 ///
@@ -111,6 +109,7 @@ module runtime.abi_shadow
 // platform backend. The collector imports this layer directly because the
 // GC-aware `abi_world` depends on the collector.
 import { rawLockAcquire, rawLockRelease } from runtime.abi_lock
+import { sysTlsAlloc, sysTlsGet, sysTlsSet, sysHeapAlloc, sysExit } from runtime.abi_sys
 
 /// The Win32 TLS index holding this thread's `GcThread` node pointer, or
 /// `-1` (`TLS_OUT_OF_INDEXES`) before the first push/registration.
@@ -236,7 +235,7 @@ fn abiShadowSelfIfRegistered() -> int {
         if (shadowTlsSlot == -1) {
             return 0
         }
-        return win_tls_get(shadowTlsSlot)
+        return sysTlsGet(shadowTlsSlot)
     }
 }
 
@@ -369,7 +368,7 @@ fn shadowInitNode(node: int) -> int {
 
 /// Allocate and link a node, assuming `shadowLock` is held. Retired nodes are
 /// recycled through `shadowFreeHead`; only the peak concurrent thread count
-/// ever reaches `win_heap_alloc`. A recycled node keeps its per-thread cache
+/// ever reaches `sysHeapAlloc`. A recycled node keeps its per-thread cache
 /// tables: the five cache words are read before `shadowInitNode` zeroes the
 /// node and written back after. The tables hold immutable values (boxes,
 /// interned strings) and managed-arena blocks are never reused, so a new thread
@@ -392,8 +391,7 @@ fn shadowAllocNodeLocked() -> int {
             (fresh as *int)[SHADOW_W_INT_TAB] = intTab
             return fresh
         }
-        var heap = win_get_process_heap()
-        node = win_heap_alloc(heap, 0, SHADOW_NODE_BYTES)
+        node = sysHeapAlloc(SHADOW_NODE_BYTES)
         if (node == 0) {
             return 0
         }
@@ -405,23 +403,23 @@ fn shadowAllocNodeLocked() -> int {
 /// `ensure_registered_locked`): TLS -1 (unallocated) allocates the slot; TLS
 /// slot 0 (no node) creates the node on the raw heap, links it, remembers the
 /// TLS handle; an existing node is returned untouched. Every referenced node
-/// word is written explicitly - `win_heap_alloc` does NOT zero. A failed node
+/// word is written explicitly - `sysHeapAlloc` does NOT zero. A failed node
 /// allocation (null under commit pressure) releases the lock and exits, the
 /// same divergence `abiShadowPop` takes for native panics - writes through
 /// address 0 inside the lock would be the worst possible failure shape.
 fn shadowEnsureRegisteredLocked() -> int {
     unsafe {
         if (shadowTlsSlot == -1) {
-            shadowTlsSlot = win_tls_alloc()
+            shadowTlsSlot = sysTlsAlloc()
         }
-        var node = win_tls_get(shadowTlsSlot)
+        var node = sysTlsGet(shadowTlsSlot)
         if (node == 0) {
             node = shadowAllocNodeLocked()
             if (node == 0) {
                 shadowRegistryLockRelease()
-                win_exit(1)
+                sysExit(1)
             }
-            let _ = win_tls_set(shadowTlsSlot, node)
+            let _ = sysTlsSet(shadowTlsSlot, node)
         }
         return node
     }
@@ -441,7 +439,7 @@ fn shadowEnsureRegisteredLocked() -> int {
 fn abiShadowPush(frame: *int) {
     unsafe {
         if (shadowTlsSlot != -1) {
-            let fast = win_tls_get(shadowTlsSlot)
+            let fast = sysTlsGet(shadowTlsSlot)
             if (fast != 0) {
                 frame[0] = (fast as *int)[0]
                 (fast as *int)[0] = frame as int
@@ -451,16 +449,16 @@ fn abiShadowPush(frame: *int) {
         let lockAddr = (&shadowLock) as int
         rawLockAcquire(lockAddr)
         if (shadowTlsSlot == -1) {
-            shadowTlsSlot = win_tls_alloc()
+            shadowTlsSlot = sysTlsAlloc()
         }
-        var node = win_tls_get(shadowTlsSlot)
+        var node = sysTlsGet(shadowTlsSlot)
         if (node == 0) {
             node = shadowAllocNodeLocked()
             if (node == 0) {
                 rawLockRelease(lockAddr)
-                win_exit(1)
+                sysExit(1)
             }
-            let _ = win_tls_set(shadowTlsSlot, node)
+            let _ = sysTlsSet(shadowTlsSlot, node)
         }
         frame[0] = (node as *int)[0]
         (node as *int)[0] = frame as int
@@ -472,16 +470,16 @@ fn abiShadowPush(frame: *int) {
 /// thread's stack (native `pop_frame`, with the same LIFO check). The steady
 /// state is lock-free for the same reason as `abiShadowPush`; the lock remains
 /// only for the impossible node-missing path. Out-of-order pop takes the
-/// silent `win_exit(1)` divergence instead of native's panic message (the leaf
+/// silent `sysExit(1)` divergence instead of native's panic message (the leaf
 /// cannot reach `writeStderr`).
 #[symbol("pickle_shadow_pop")]
 fn abiShadowPop(frame: *int) {
     unsafe {
         if (shadowTlsSlot != -1) {
-            let fast = win_tls_get(shadowTlsSlot)
+            let fast = sysTlsGet(shadowTlsSlot)
             if (fast != 0) {
                 if ((fast as *int)[0] != (frame as int)) {
-                    win_exit(1)
+                    sysExit(1)
                 }
                 (fast as *int)[0] = frame[0]
                 frame[0] = 0
@@ -491,18 +489,18 @@ fn abiShadowPop(frame: *int) {
         if (shadowTlsSlot != -1) {
             let lockAddr = (&shadowLock) as int
             rawLockAcquire(lockAddr)
-            var node = win_tls_get(shadowTlsSlot)
+            var node = sysTlsGet(shadowTlsSlot)
             if (node == 0) {
                 node = shadowAllocNodeLocked()
                 if (node == 0) {
                     rawLockRelease(lockAddr)
-                    win_exit(1)
+                    sysExit(1)
                 }
-                let _ = win_tls_set(shadowTlsSlot, node)
+                let _ = sysTlsSet(shadowTlsSlot, node)
             }
             if ((node as *int)[0] != (frame as int)) {
                 rawLockRelease(lockAddr)
-                win_exit(1)
+                sysExit(1)
             }
             (node as *int)[0] = frame[0]
             frame[0] = 0
@@ -519,7 +517,7 @@ fn abiShadowHead() -> int {
         if (shadowTlsSlot == -1) {
             return 0
         }
-        var node = win_tls_get(shadowTlsSlot)
+        var node = sysTlsGet(shadowTlsSlot)
         if (node == 0) {
             return 0
         }
@@ -579,7 +577,7 @@ fn abiGcRegisterThread() -> int {
 /// The doubly linked list makes the unlink straight-line, so no
 /// safepoint-bearing loop ever runs under `shadowLock` (the deadlock this
 /// function exists to remove). Nodes are recycled rather than
-/// `win_heap_free`d: a lock-free diagnostic walk can still hold the pointer,
+/// `sysHeapFree`d: a lock-free diagnostic walk can still hold the pointer,
 /// and recycling keeps that read inside live process memory.
 fn abiShadowRetireNode(node: int) {
     if (node == 0) {
@@ -693,11 +691,11 @@ fn abiGcUnregisterThread() {
         if (shadowTlsSlot == -1) {
             return
         }
-        let node = win_tls_get(shadowTlsSlot)
+        let node = sysTlsGet(shadowTlsSlot)
         if (node == 0) {
             return
         }
-        let _ = win_tls_set(shadowTlsSlot, 0)
+        let _ = sysTlsSet(shadowTlsSlot, 0)
         abiShadowRetireNode(node)
     }
 }

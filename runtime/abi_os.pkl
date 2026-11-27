@@ -6,9 +6,9 @@ module runtime.abi_os
 /// contract (`exitCodeOf`, `snapshotStrings`): pure Pickle, unit-tested, and
 /// deliberately free of any `#[symbol]` slot so `os_test` keeps exercising the
 /// native bodies. This file owns the one slot that can be filled without the
-/// object model and without the collector - `ExitProcess` is an ordinary Win32
-/// import reached through `win_exit`, the same way `win_thread_id` reaches
-/// `GetCurrentThreadId`.
+/// object model and without the collector - process termination is an ordinary
+/// platform primitive reached through `runtime.abi_sys` (`ExitProcess` on
+/// Windows, `exit` on POSIX), the same way the thread id is.
 ///
 /// WHY IT IS NOT IN `abi_exception`. That module's own header records the
 /// measured rule: a `#[symbol]` fn is linked only when Pickle code actually
@@ -33,14 +33,15 @@ module runtime.abi_os
 /// unit-tested, so the body hands off to it rather than re-deriving the
 /// bounds.
 import { exitCodeOf } from runtime.os
+import { sysExit } from runtime.abi_sys
 
 /// ABI: terminate the process with `code`.
 ///
 /// Returns nothing rather than being typed `-> !`: the language has no never
 /// type, the single emitter call site (`emit.rs`, the `exit(code)` builtin) is
 /// an `extern_call_void` that discards the result, and the call is
-/// unreachable-after anyway because `ExitProcess` does not return.
+/// unreachable-after anyway because the process exit does not return.
 #[symbol("pickle_exit")]
 fn abiExit(code: int) {
-    win_exit(exitCodeOf(code))
+    sysExit(exitCodeOf(code))
 }

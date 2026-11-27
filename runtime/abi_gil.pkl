@@ -20,90 +20,27 @@ module runtime.abi_gil
 ///
 /// WHO READS THE ENVIRONMENT. `abiGilInit` does, exactly once, from
 /// `pickle_runtime_init` before any other Pickle code runs. It is deliberately
-/// NOT called from `abiGilMode`: the environment scan calls a Win32 entry point
-/// the emitter classifies as may-collect, which would put a shadow frame on
-/// every lock acquire in the runtime. `abiGilMode` is a leaf read of one word
-/// and nothing else.
+/// NOT called from `abiGilMode`: the environment read enters the platform
+/// backend, whose environment entry point the emitter classifies as may-collect,
+/// which would put a shadow frame on every lock acquire in the runtime.
+/// `abiGilMode` is a leaf read of one word and nothing else.
 ///
 /// WHY THE SCAN ALLOCATES NOTHING. It runs before the first managed allocation,
 /// and `bytes()` would box every character of the whole environment block on
-/// the first allocation. The matcher is the same hardcoded UTF-16 walk
-/// `abi_gcengine`'s env scan uses, over the one key this module reads.
+/// the first allocation. `runtime.abi_sys` reads the one key in place, in the
+/// platform backend, and hands back an integer - no managed string is made.
+
+import { sysEnvFlag } from runtime.abi_sys
 
 /// 0 = parallel (the default), 1 = the process-wide lock stays in force.
 var gilFlag: int = 0
-
-fn gilUnitAt(w: *int, i: int) -> int {
-    unsafe {
-        return (w[i >> 2] >> ((i & 3) * 16)) & 65535
-    }
-}
-
-/// ASCII lower-case of a code unit already known to be <= 0x7F.
-fn gilLower(c: int) -> int {
-    if (c >= 65 && c <= 90) {
-        return c + 32
-    }
-    return c
-}
-
-/// `pkl_gil=`, ASCII case-insensitively.
-fn gilEntryGil(w: *int, start: int) -> bool {
-    if (gilLower(gilUnitAt(w, start + 0)) != 112) { return false }
-    if (gilLower(gilUnitAt(w, start + 1)) != 107) { return false }
-    if (gilLower(gilUnitAt(w, start + 2)) != 108) { return false }
-    if (gilLower(gilUnitAt(w, start + 3)) != 95) { return false }
-    if (gilLower(gilUnitAt(w, start + 4)) != 103) { return false }
-    if (gilLower(gilUnitAt(w, start + 5)) != 105) { return false }
-    if (gilLower(gilUnitAt(w, start + 6)) != 108) { return false }
-    return gilUnitAt(w, start + 7) == 61
-}
-
-/// Whether the value run at `start` is exactly `0` (surrounded by optional
-/// whitespace). Used only for the explicit `PKL_GIL=0` opt-out.
-fn gilValueIsZero(w: *int, start: int) -> bool {
-    var i = start
-    while (true) {
-        let cu = gilUnitAt(w, i)
-        if (cu == 32 || cu == 9) {
-            i = i + 1
-        } else {
-            break
-        }
-    }
-    if (gilUnitAt(w, i) != 48) {
-        return false
-    }
-    let next = gilUnitAt(w, i + 1)
-    return next == 0 || next == 32 || next == 9
-}
 
 /// Read the switch once. Idempotent and single-caller (`pickle_runtime_init`);
 /// a second call just recomputes the same value from the same environment.
 fn abiGilInit() {
     var v = 0
-    let block = win_get_environment_strings_w()
-    if (block != 0) {
-        var start = 0
-        var guard = 0
-        while (guard < 1048576) {
-            var u = 0
-            while (gilUnitAt(block as *int, start + u) != 0) {
-                u = u + 1
-            }
-            if (u == 0) {
-                break
-            }
-            if (gilEntryGil(block as *int, start)) {
-                if (!gilValueIsZero(block as *int, start + 8)) {
-                    v = 1
-                }
-                break
-            }
-            start = start + u + 1
-            guard = guard + 1
-        }
-        let _ = win_free_environment_strings_w(block)
+    if (sysEnvFlag("PKL_GIL") > 0) {
+        v = 1
     }
     gilFlag = v
 }

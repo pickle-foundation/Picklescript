@@ -5,6 +5,7 @@ import { writeStderr } from runtime.abi_stdio
 import { STR_BYTES_OFF } from runtime.layout
 import { abiShadowSelf, abiShadowSelfIfRegistered, SHADOW_W_ARENA_BASE, SHADOW_W_ARENA_USED, SHADOW_W_ARENA_CAP, SHADOW_W_ARENA_CHUNK } from runtime.abi_shadow
 import { rawLockAcquire, rawLockRelease } from runtime.abi_lock
+import { sysHeapAlloc, sysHeapFree, sysExit } from runtime.abi_sys
 
 /// Port of `runtime/src/raw.rs`: the two-slot manual-allocation pair behind
 /// `alloc(int, n)` and `free(p)`.
@@ -90,8 +91,7 @@ fn abiRawAlloc(size: int) -> int {
     if (n < 1) {
         n = 1
     }
-    var heap = win_get_process_heap()
-    let addr = win_heap_alloc(heap, 0, n)
+    let addr = sysHeapAlloc(n)
     if (addr == 0) {
         // Distinguish OOM from a compile error. The old path exited silently
         // with code 1, which reads exactly like a lowering failure and cost an
@@ -102,7 +102,7 @@ fn abiRawAlloc(size: int) -> int {
             var p = &msg
             let _ = writeStderr((p as int) + STR_BYTES_OFF, len(msg))
         }
-        win_exit(1)
+        sysExit(1)
     }
     return addr
 }
@@ -111,8 +111,7 @@ fn abiRawAlloc(size: int) -> int {
 /// Mirrors `raw.rs::pickle_raw_free`, minus the `LIVE` registry above.
 #[symbol("pickle_raw_free")]
 fn abiRawFree(ptr: int) {
-    var heap = win_get_process_heap()
-    win_heap_free(heap, 0, ptr)
+    sysHeapFree(ptr)
 }
 
 // ------------------------------------------------------- managed bump arena

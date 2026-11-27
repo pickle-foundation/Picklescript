@@ -1,0 +1,66 @@
+module runtime.abi_stdio
+
+/// POSIX body of `runtime.abi_stdio` - the same four entry points as
+/// `abi_stdio_win.pkl`, over file descriptors 1 and 2.
+///
+/// A POSIX build has no standard handles: the descriptors are the numbers the
+/// kernel gives every process, so the constants disappear and each body takes
+/// its fixed descriptor. Everything above this module still passes a payload
+/// pointer and a byte count, which is already the shape `write(2)` wants.
+///
+/// PARTIAL WRITES ARE REAL. `write(2)` may accept fewer bytes than asked (a
+/// full pipe, a signal), so each body loops until the count is satisfied or the
+/// call fails. The return value is still `0` on both outcomes: the portable
+/// contract is "attempted, nothing to report", exactly like the Win32 bodies
+/// that discard `WriteFile`'s answer.
+///
+/// `writeConsoleLine` has no console to detect: a POSIX program writes UTF-8
+/// bytes and every consumer (terminal, pipe, file) understands them, so the
+/// Windows "did the console take it" question does not arise. It always answers
+/// `true`.
+
+import { STR_BYTES_OFF } from runtime.layout
+
+/// `STDOUT_FILENO`.
+const STDOUT_FD: int = 1
+
+/// `STDERR_FILENO`.
+const STDERR_FD: int = 2
+
+/// Write every one of `n` bytes at `ptr` to `fd`, or stop at the first error.
+fn writeAll(fd: int, ptr: int, n: int) -> int {
+    unsafe {
+        var off = 0
+        while (off < n) {
+            let w = posix_write(fd, ptr + off, n - off)
+            if (w <= 0) {
+                return 0
+            }
+            off = off + w
+        }
+        return 0
+    }
+}
+
+/// Write `n` bytes starting at `ptr` to stdout.
+fn writeStdout(ptr: int, n: int) -> int {
+    return writeAll(STDOUT_FD, ptr, n)
+}
+
+/// Write `n` bytes starting at `ptr` to stderr.
+fn writeStderr(ptr: int, n: int) -> int {
+    return writeAll(STDERR_FD, ptr, n)
+}
+
+/// Write `s` and a newline to stdout as UTF-8. Always taken: there is no
+/// narrower console encoding to fall back from.
+fn writeConsoleLine(s: string) -> bool {
+    unsafe {
+        var line = s + "\n"
+        let n = len(line)
+        var p = &line
+        let src = (p as int) + STR_BYTES_OFF
+        let _ = writeAll(STDOUT_FD, src, n)
+        return true
+    }
+}

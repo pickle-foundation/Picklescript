@@ -1,0 +1,769 @@
+module runtime.abi_process
+
+import { rawByteAt } from runtime.abi_string
+import { cstrOf, cstrIndexOf, cstrToStr, putRawByte } from runtime.abi_cstr
+import { worldAcquire, worldRelease } from runtime.abi_world
+import { sysEnvPresent } from runtime.abi_sys
+
+/// POSIX body of `runtime.abi_process` - `pickle_args` and the captured
+/// `run_cmd` path over `fork`/`execve` and pipes.
+///
+/// THE CONTRACT IS THE WINDOWS ONE. `run_cmd` answers `none` when the program
+/// cannot start, otherwise `(code, stdout, stderr, timed_out)`; `code` is
+/// `none` for a signal death; `max_out` caps each captured stream while the
+/// pipe keeps draining; `timeout_ms` kills the child with `SIGKILL` and sets
+/// the timed-out flag; `inheritIo` leaves the child on the caller's
+/// descriptors and captures nothing. `args` excludes the program name.
+///
+/// ARGS COME FROM `/proc/self/cmdline`. Windows self-captures the command line
+/// because the freestanding entry point never sees `argc`/`argv`. Linux has
+/// the same problem - the ELF entry shim calls `pickle_main` with no
+/// arguments - and `/proc/self/cmdline` is the kernel's own copy of the argv
+/// block, so the runtime stays self-contained with no generated entry stub.
+/// A build without `/proc` answers an empty list; the compiler needs nothing
+/// else.
+///
+/// WHY THE PATH IS RESOLVED HERE. `execve` takes a path, and glibc's
+/// `execvpe` searches the *caller's* `PATH` rather than the child's, which is
+/// the wrong environment when `envs` overrides it. The search below is the
+/// `execvp` rule - a word containing `/` is used as written, otherwise each
+/// `PATH` component in turn - done before the fork so a missing program is a
+/// plain `none`.
+///
+/// THE ERROR PIPE. `chdir` and `execve` can only fail in the child, after the
+/// parent has already returned from `fork`. A close-on-exec pipe carries one
+/// byte back on either failure; the parent reads it and answers `none` for a
+/// spawn that never became the requested program. Without it a failed `exec`
+/// would look like a child that exited 127.
+///
+/// WHAT RUNS IN THE CHILD. After `fork` a multithreaded process may call only
+/// async-signal-safe functions - another thread can hold the allocator or a
+/// stdio lock at the instant of the fork. Every buffer (`argv`, `envp`, the
+/// cwd, `/dev/null`) is built before the fork; the child only calls `chdir`,
+/// `dup2`, `close`, `write`, `execve` and `_exit`, and never allocates.
+///
+/// THE WORLD LOCK. `fork`, the stdin write and the blocking `waitpid` after a
+/// timeout release it, because each can take long enough to starve a peer
+/// Pickle thread. The stdin payload is copied raw before the release, so no
+/// managed value is live in the window.
+///
+/// PORT STATUS. `run_spawn` and the `proc_*` handle family - the interactive
+/// stream API - are not ported yet. They answer "no handle" so the rest of the
+/// runtime links and `std.process.Result` works; `std.process.Proc.run_spawn`
+/// reports a spawn failure on this target until the second slice lands.
+
+/// The reference's capture ceiling, matching `abi_process_win`.
+const DEFAULT_MAX_OUT: int = 16777216
+
+/// One `read` per drain call.
+const DRAIN_BYTES: int = 8192
+const DRAIN_WORDS: int = 1024
+
+/// The proc stream kind, kept equal to `abi_stream`'s own constant.
+const STREAM_PROC: int = 4
+
+/// `access(2)` mode: executable.
+const X_OK: int = 1
+
+/// `fcntl` commands and the one flag bit used.
+const F_SETFD: int = 2
+const F_SETFL: int = 4
+const FD_CLOEXEC: int = 1
+const O_NONBLOCK: int = 2048
+
+/// `open(2)` read-only.
+const O_RDONLY: int = 0
+
+/// `waitpid` options and the kill signal.
+const WNOHANG: int = 1
+const SIGKILL: int = 9
+
+/// The `PATH` glibc's `execvp` uses when the variable is absent entirely.
+const DEFAULT_PATH: string = "/bin:/usr/bin"
+
+fn noArgs() -> List<string> {
+    var out = [""]
+    out.pop()
+    return out
+}
+
+/// Whether `s` contains a NUL, which no C string can carry.
+fn hasNul(s: string) -> bool {
+    var i = 0
+    while (i < len(s)) {
+        if ((s[i] as int) == 0) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+/// Whether `s` contains `/`, the "do not search PATH" rule.
+fn hasSlash(s: string) -> bool {
+    var i = 0
+    while (i < len(s)) {
+        if ((s[i] as int) == 47) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+/// A `string` from `n` raw bytes at `p`. The copy goes through a byte list
+/// because a raw `*int` does not implicitly become a managed `string`.
+fn strOfBytes(p: *int, n: int) -> string {
+    var out = bytes("")
+    var i = 0
+    while (i < n) {
+        out.push(rawByteAt(p, i) as byte)
+        i = i + 1
+    }
+    return str(out)
+}
+
+/// Milliseconds on the monotonic clock (the shim owns the struct layout).
+fn nowMs() -> int {
+    return pkl_now_ms()
+}
+
+/// Pace the poll loop without spinning a core.
+fn sleepMs(ms: int) {
+    pkl_sleep_ms(ms)
+}
+
+// ------------------------------------------------------------ environment
+
+/// The key part of a `K=V` environment entry.
+fn envEntryKey(p: *int) -> string {
+    let eq = cstrIndexOf(p, 61)
+    if (eq < 0) {
+        return cstrToStr(p)
+    }
+    return strOfBytes(p, eq)
+}
+
+fn envKeyRemoved(removes: List<string>?, key: string) -> bool {
+    if (let some(rs) = removes) {
+        for (r in rs) {
+            if (r == key) {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+fn envKeyOverridden(envs: Map<string, string>?, key: string) -> bool {
+    if (let some(em) = envs) {
+        if (let some(v) = em.get(key)) {
+            let _ = v
+            return true
+        }
+    }
+    return false
+}
+
+/// The parent environment entries this child keeps, as raw pointers.
+fn envPointers(envs: Map<string, string>?, removes: List<string>?) -> List<int> {
+    var kept = [0]
+    kept.pop()
+    unsafe {
+        let parent = pkl_environ() as *int
+        var i = 0
+        while (parent[i] != 0) {
+            let ent = parent[i] as *int
+            let key = envEntryKey(ent)
+            if (!envKeyRemoved(removes, key) && !envKeyOverridden(envs, key)) {
+                kept.push(parent[i])
+            }
+            i = i + 1
+        }
+    }
+    return kept
+}
+
+/// The NUL-terminated `char**` for `execve`, plus the blocks this process owns
+/// and must free after the fork. Parent entries are borrowed pointers, valid in
+/// the child's copy-on-write image and never freed here.
+fn buildEnvBlock(envs: Map<string, string>?, removes: List<string>?) -> (int, List<int>) {
+    unsafe {
+        let kept = envPointers(envs, removes)
+        var added = 0
+        if (let some(em) = envs) {
+            added = len(em.keys())
+        }
+        let total = len(kept) + added + 1
+        let block = alloc(int, total)
+        var i = 0
+        while (i < len(kept)) {
+            block[i] = kept[i]
+            i = i + 1
+        }
+        var owned = [0]
+        owned.pop()
+        if (let some(em) = envs) {
+            for (k in em.keys()) {
+                if (let some(v) = em.get(k)) {
+                    let c = cstrOf(k + "=" + v)
+                    owned.push(c as int)
+                    block[i] = c as int
+                    i = i + 1
+                }
+            }
+        }
+        block[i] = 0
+        return (block as int, owned)
+    }
+}
+
+/// The parent's value for `name`, or `""`.
+fn parentEnv(name: string) -> string {
+    unsafe {
+        let c = cstrOf(name)
+        let p = posix_getenv(c)
+        var out = ""
+        if (p != 0) {
+            out = cstrToStr(p as *int)
+        }
+        free(c)
+        return out
+    }
+}
+
+/// The effective `PATH` for the child: its own override, else the parent's,
+/// else the `execvp` default when the variable is absent.
+fn pathFor(envs: Map<string, string>?) -> string {
+    if (let some(em) = envs) {
+        if (let some(p) = em.get("PATH")) {
+            return p
+        }
+    }
+    if (sysEnvPresent("PATH")) {
+        return parentEnv("PATH")
+    }
+    return DEFAULT_PATH
+}
+
+/// `s` sliced on `:`; an empty component is the current directory.
+fn splitColon(s: string) -> List<string> {
+    let b = bytes(s)
+    var out = [""]
+    out.pop()
+    var start = 0
+    var i = 0
+    while (i < len(b)) {
+        if ((b[i] as int) == 58) {
+            out.push(sliceBytes(b, start, i))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    out.push(sliceBytes(b, start, len(b)))
+    return out
+}
+
+fn sliceBytes(b: List<byte>, start: int, end: int) -> string {
+    var acc = bytes("")
+    var i = start
+    while (i < end) {
+        acc.push(b[i])
+        i = i + 1
+    }
+    return str(acc)
+}
+
+/// The C-string path `execve` should receive, or 0 when a bare name is not on
+/// `PATH`. A name containing `/` is returned as written and left to `execve`.
+fn resolveProgram(prog: string, envs: Map<string, string>?) -> *int {
+    unsafe {
+        if (hasSlash(prog)) {
+            return cstrOf(prog)
+        }
+        let dirs = splitColon(pathFor(envs))
+        for (d in dirs) {
+            var cand = ""
+            if (d == "") {
+                cand = "./" + prog
+            } else {
+                cand = d + "/" + prog
+            }
+            let c = cstrOf(cand)
+            if (posix_access(c, X_OK) == 0) {
+                return c
+            }
+            free(c)
+        }
+        return 0 as *int
+    }
+}
+
+// ------------------------------------------------------------ run_cmd
+
+/// A `char**` of the arguments, NUL-terminated. Every string is a raw block
+/// the caller frees after the fork.
+fn argvBlock(argv: List<string>) -> *int {
+    unsafe {
+        let n = len(argv)
+        let block = alloc(int, n + 1)
+        var i = 0
+        while (i < n) {
+            block[i] = cstrOf(argv[i]) as int
+            i = i + 1
+        }
+        block[n] = 0
+        return block
+    }
+}
+
+/// A raw copy of `sb`, for the stdin write.
+fn stdinBlock(sb: List<byte>) -> *int {
+    unsafe {
+        let n = len(sb)
+        let buf = alloc(int, (n + 8) / 8)
+        var i = 0
+        while (i < n) {
+            putRawByte(buf, i, sb[i] as int)
+            i = i + 1
+        }
+        return buf
+    }
+}
+
+/// One byte on the error pipe, then `_exit`. Called only in the forked child,
+/// so it allocates nothing and touches only async-signal-safe calls.
+fn childFail(fd: int) {
+    unsafe {
+        var one = 1
+        let _ = posix_write(fd, &one, 1)
+        posix__exit(127)
+    }
+}
+
+/// Read whatever is available now, appending at most `cap` bytes to `sink`.
+/// A non-blocking descriptor answers -1 when the pipe is empty; that and EOF
+/// both end the call. Bytes past the cap are still read and dropped so the
+/// child never blocks on a full pipe.
+fn drainFd(fd: int, sink: List<byte>, chunk: *int, cap: int) {
+    while (true) {
+        let n = posix_read(fd, chunk, DRAIN_BYTES)
+        if (n <= 0) {
+            return
+        }
+        var i = 0
+        while (i < n) {
+            if (len(sink) < cap) {
+                sink.push(rawByteAt(chunk, i) as byte)
+            }
+            i = i + 1
+        }
+    }
+}
+
+/// `pickle_run_cmd`: run `argv` to completion, capturing its streams.
+#[symbol("pickle_run_cmd")]
+fn abiRunCmd(argv: List<string>, cwd: string?, envs: Map<string, string>?, envRemoves: List<string>?, stdinBytes: List<byte>?, maxOut: int?, timeoutMs: int?, inheritIo: bool) -> (int?, string, string, bool)? {
+    unsafe {
+        if (len(argv) == 0) {
+            return none
+        }
+        if (hasNul(argv[0])) {
+            return none
+        }
+        let progC = resolveProgram(argv[0], envs)
+        if (progC == 0 as *int) {
+            return none
+        }
+        let argc = len(argv)
+        let argvB = argvBlock(argv)
+        let (envp, ownedEnv) = buildEnvBlock(envs, envRemoves)
+        var cwdC: *int = 0 as *int
+        if (let some(d) = cwd) {
+            cwdC = cstrOf(d)
+        }
+
+        // Every descriptor block is allocated before the fork and holds -1
+        // until its pipe exists. Cleanup closes every slot unconditionally;
+        // the parent sets a slot to -1 as soon as it closes that end.
+        let outP = alloc(int, 2)
+        outP[0] = -1
+        outP[1] = -1
+        let errP = alloc(int, 2)
+        errP[0] = -1
+        errP[1] = -1
+        let inP = alloc(int, 2)
+        inP[0] = -1
+        inP[1] = -1
+        let epP = alloc(int, 2)
+        epP[0] = -1
+        epP[1] = -1
+        var devNull = -1
+
+        var ok = true
+        if (!inheritIo) {
+            if (posix_pipe(outP) != 0) {
+                ok = false
+            }
+            if (ok) {
+                if (posix_pipe(errP) != 0) {
+                    ok = false
+                }
+            }
+            if (ok) {
+                if (let some(sb) = stdinBytes) {
+                    if (posix_pipe(inP) != 0) {
+                        ok = false
+                    }
+                } else {
+                    let nulC = cstrOf("/dev/null")
+                    devNull = posix_open(nulC, O_RDONLY, 0)
+                    free(nulC)
+                    if (devNull < 0) {
+                        ok = false
+                    }
+                }
+            }
+        }
+        if (ok) {
+            if (posix_pipe(epP) != 0) {
+                ok = false
+            } else {
+                let _ = posix_fcntl(epP[1], F_SETFD, FD_CLOEXEC)
+            }
+        }
+
+        var pid = 0
+        if (ok) {
+            worldRelease()
+            pid = posix_fork()
+            worldAcquire()
+            if (pid < 0) {
+                ok = false
+            }
+        }
+
+        if (ok && pid == 0) {
+            // ---- child: no allocation, no locks, no managed values ----
+            if (!(cwdC == 0 as *int)) {
+                if (posix_chdir(cwdC) != 0) {
+                    childFail(epP[1])
+                }
+            }
+            if (!inheritIo) {
+                var inFd = devNull
+                if (inP[0] >= 0) {
+                    inFd = inP[0]
+                }
+                if (posix_dup2(inFd, 0) < 0) {
+                    childFail(epP[1])
+                }
+                if (posix_dup2(outP[1], 1) < 0) {
+                    childFail(epP[1])
+                }
+                if (posix_dup2(errP[1], 2) < 0) {
+                    childFail(epP[1])
+                }
+                let _ = posix_close(outP[0])
+                let _ = posix_close(outP[1])
+                let _ = posix_close(errP[0])
+                let _ = posix_close(errP[1])
+                if (inP[0] >= 0) {
+                    let _ = posix_close(inP[0])
+                }
+                if (inP[1] >= 0) {
+                    let _ = posix_close(inP[1])
+                }
+                if (devNull >= 0) {
+                    let _ = posix_close(devNull)
+                }
+            }
+            let _ = posix_execve(progC, argvB, envp as *int)
+            childFail(epP[1])
+        }
+
+        var spawnOk = ok
+        if (spawnOk) {
+            // ---- parent ----
+            if (!inheritIo) {
+                let _ = posix_close(outP[1])
+                outP[1] = -1
+                let _ = posix_close(errP[1])
+                errP[1] = -1
+                if (inP[0] >= 0) {
+                    let _ = posix_close(inP[0])
+                    inP[0] = -1
+                }
+                if (devNull >= 0) {
+                    let _ = posix_close(devNull)
+                    devNull = -1
+                }
+            }
+            let _ = posix_close(epP[1])
+            epP[1] = -1
+            // Blocks until `execve` succeeds (close-on-exec makes it EOF) or
+            // the child writes the failure byte and exits.
+            var errByte = 0
+            let failed = posix_read(epP[0], &errByte, 1) > 0
+            let _ = posix_close(epP[0])
+            epP[0] = -1
+            if (failed) {
+                spawnOk = false
+                let _ = posix_waitpid(pid, 0, 0)
+            }
+        }
+
+        var code: int? = none
+        var timed = false
+        var outS = ""
+        var errS = ""
+        if (spawnOk) {
+            if (!inheritIo) {
+                if (let some(sb) = stdinBytes) {
+                    let n = len(sb)
+                    if (n > 0) {
+                        let wb = stdinBlock(sb)
+                        worldRelease()
+                        var off = 0
+                        while (off < n) {
+                            let w = posix_write(inP[1], (wb as int) + off, n - off)
+                            if (w <= 0) {
+                                break
+                            }
+                            off = off + w
+                        }
+                        worldAcquire()
+                        free(wb)
+                    }
+                }
+                let _ = posix_close(inP[1])
+                inP[1] = -1
+                let _ = posix_fcntl(outP[0], F_SETFL, O_NONBLOCK)
+                let _ = posix_fcntl(errP[0], F_SETFL, O_NONBLOCK)
+            }
+
+            var cap = DEFAULT_MAX_OUT
+            if (let some(m) = maxOut) {
+                cap = m
+                if (cap < 0) {
+                    cap = 0
+                }
+            }
+            var outB = bytes("")
+            var errB = bytes("")
+            let chunk = alloc(int, DRAIN_WORDS)
+            let pStatus = alloc(int, 1)
+            pStatus[0] = 0
+            var deadline = -1
+            if (let some(t) = timeoutMs) {
+                var ms = t
+                if (ms < 0) {
+                    ms = 0
+                }
+                deadline = nowMs() + ms
+            }
+            var waitErr = false
+            var status = 0
+            var exited = false
+            while (!exited) {
+                if (!inheritIo) {
+                    drainFd(outP[0], outB, chunk, cap)
+                    drainFd(errP[0], errB, chunk, cap)
+                }
+                let r = posix_waitpid(pid, pStatus, WNOHANG)
+                if (r == pid) {
+                    exited = true
+                    status = pStatus[0]
+                } else {
+                    if (r < 0) {
+                        waitErr = true
+                        exited = true
+                    } else {
+                        if (deadline >= 0) {
+                            if (nowMs() >= deadline) {
+                                worldRelease()
+                                let _ = posix_kill(pid, SIGKILL)
+                                let _ = posix_waitpid(pid, pStatus, 0)
+                                worldAcquire()
+                                status = pStatus[0]
+                                timed = true
+                                exited = true
+                            }
+                        }
+                        if (!exited) {
+                            sleepMs(2)
+                        }
+                    }
+                }
+            }
+            if (!inheritIo) {
+                drainFd(outP[0], outB, chunk, cap)
+                drainFd(errP[0], errB, chunk, cap)
+            }
+            if (!waitErr) {
+                // WIFEXITED: the low seven bits are the signal number.
+                if ((status & 127) == 0) {
+                    code = (status >> 8) & 255
+                }
+            }
+            outS = str(outB)
+            errS = str(errB)
+            free(chunk)
+            free(pStatus)
+        }
+
+        // ---- cleanup: every slot is closed once, every block freed ----
+        let _ = posix_close(outP[0])
+        let _ = posix_close(outP[1])
+        let _ = posix_close(errP[0])
+        let _ = posix_close(errP[1])
+        let _ = posix_close(inP[0])
+        let _ = posix_close(inP[1])
+        let _ = posix_close(epP[0])
+        let _ = posix_close(epP[1])
+        if (devNull >= 0) {
+            let _ = posix_close(devNull)
+        }
+        free(outP)
+        free(errP)
+        free(inP)
+        free(epP)
+        var fi = 0
+        while (fi < argc) {
+            free(argvB[fi] as *int)
+            fi = fi + 1
+        }
+        free(argvB)
+        for (p in ownedEnv) {
+            free(p as *int)
+        }
+        free(envp as *int)
+        free(progC)
+        if (!(cwdC == 0 as *int)) {
+            free(cwdC)
+        }
+        if (!spawnOk) {
+            return none
+        }
+        return (code, outS, errS, timed)
+    }
+}
+
+// ------------------------------------------------------------ interactive spawn
+//
+// PORT STATUS: not ported. `run_spawn` opens a child with three live pipes and
+// the `proc_*` calls read, write, poll and kill it; that surface is the next
+// slice, and until it lands every entry point answers "no handle" so a caller
+// sees a spawn failure rather than a wrong process.
+
+#[symbol("pickle_run_spawn")]
+fn abiRunSpawn(argv: List<string>, cwd: string?, envs: Map<string, string>?, envRemoves: List<string>?, maxOut: int?) -> *int {
+    return 0 as *int
+}
+
+#[symbol("pickle_proc_wait")]
+fn abiProcWait(h: *int) -> bool {
+    return false
+}
+
+#[symbol("pickle_proc_running")]
+fn abiProcRunning(h: *int) -> bool {
+    return false
+}
+
+#[symbol("pickle_proc_code")]
+fn abiProcCode(h: *int) -> *int {
+    return 0 as *int
+}
+
+#[symbol("pickle_proc_kill")]
+fn abiProcKill(h: *int) -> bool {
+    return false
+}
+
+#[symbol("pickle_proc_out_read")]
+fn abiProcOutRead(h: *int, n: int) -> *int {
+    return 0 as *int
+}
+
+#[symbol("pickle_proc_err_read")]
+fn abiProcErrRead(h: *int, n: int) -> *int {
+    return 0 as *int
+}
+
+#[symbol("pickle_proc_in_write")]
+fn abiProcInWrite(h: *int, bytes: *int) -> int {
+    return 0
+}
+
+#[symbol("pickle_proc_in_close")]
+fn abiProcInClose(h: *int) -> bool {
+    return false
+}
+
+/// `abi_stream`'s close hook. A proc inner cannot exist while `run_spawn` has
+/// no POSIX body, so there is nothing to reap; the file-stream arms never call
+/// this.
+fn abiProcClose(inner: *int) -> bool {
+    return false
+}
+
+// ------------------------------------------------------------ args
+
+/// `pickle_args`: the process arguments, excluding the program name, read
+/// from the kernel's own argv block.
+#[symbol("pickle_args")]
+fn abiArgs() -> List<string> {
+    unsafe {
+        var out = noArgs()
+        let c = cstrOf("/proc/self/cmdline")
+        worldRelease()
+        let fd = posix_open(c, O_RDONLY, 0)
+        worldAcquire()
+        free(c)
+        if (fd < 0) {
+            return out
+        }
+        // `/proc` files report size 0, so the loop grows the buffer by one
+        // chunk at a time. A command line beyond 64 KiB is not a thing the
+        // compiler can be asked to build.
+        var cap = 65536
+        var buf = alloc(int, cap / 8)
+        var used = 0
+        let chunk = alloc(int, DRAIN_WORDS)
+        var done = false
+        while (!done) {
+            worldRelease()
+            let n = posix_read(fd, chunk, DRAIN_BYTES)
+            worldAcquire()
+            if (n <= 0) {
+                done = true
+            } else {
+                var b = 0
+                while (b < n && used < cap) {
+                    putRawByte(buf, used, rawByteAt(chunk, b))
+                    used = used + 1
+                    b = b + 1
+                }
+            }
+        }
+        free(chunk)
+        let _ = posix_close(fd)
+        // NUL-separated words; word 0 is the program name.
+        var start = 0
+        var i = 0
+        var index = 0
+        while (i < used) {
+            if (rawByteAt(buf, i) == 0) {
+                if (index > 0) {
+                    out.push(strOfBytes(((buf as int) + start) as *int, i - start))
+                }
+                index = index + 1
+                start = i + 1
+            }
+            i = i + 1
+        }
+        free(buf)
+        return out
+    }
+}

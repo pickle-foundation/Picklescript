@@ -1,0 +1,301 @@
+module runtime.abi_fs
+
+/// POSIX body of `runtime.abi_fs` - the same seven `#[symbol]` slots as
+/// `abi_fs_win.pkl`, over libc file descriptors and `DIR*`.
+///
+/// THE CONTRACT IS THE WINDOWS ONE. `read`/`list` answer `none` on failure,
+/// `write`/`remove`/`mkdir` answer `false`; `read_file` is `some("")` for an
+/// empty file and `none` only when the first open or read fails; `list_dir`
+/// returns full child paths and skips `.`/`..`. Callers (`runtime.fs`,
+/// `stdlib.fs`, the self-hosted CLI) import the module name, so none of them
+/// changes.
+///
+/// WHY THE PATHS ARE COPIED. A Pickle `string` is not NUL-terminated; libc
+/// wants a C string. `cstrOf` allocates one raw block per call and every
+/// syscall path frees it before returning. The block uses `alloc`/`free`, the
+/// same process-heap pair `abi_raw` owns, so there is one allocator in the
+/// process and a block never crosses allocators.
+///
+/// THE ONE ABI CONSTANT. `readdir` hands back a `struct dirent*` whose
+/// `d_name` field is at byte 19 on x86-64 glibc and musl alike
+/// (`d_ino: 8`, `d_off: 8`, `d_reclen: 2`, `d_type: 1`). This module never
+/// writes that struct, only reads the NUL-terminated name, and `DIR*` itself
+/// is opaque. Keeping the offset here - not in a shared header - means the
+/// rest of the runtime never sees a C layout.
+///
+/// THE WORLD LOCK. `open`, `read`, `write`, `opendir` and `readdir` can block
+/// (a pipe, a slow disk, a network mount), so each is wrapped in
+/// `worldRelease`/`worldAcquire` exactly as the Win32 bodies wrap
+/// `CreateFileW`/`ReadFile`/`WriteFile`. No managed value is live across the
+/// window: the read path accumulates into a raw block and the write path
+/// copies `text` first.
+
+import { rawByteAt } from runtime.abi_string
+import { cstrOf, cstrToStr, putRawByte } from runtime.abi_cstr
+import { abiRawAlloc } from runtime.abi_raw
+import { worldAcquire, worldRelease } from runtime.abi_world
+
+/// The read chunk `fs.rs::imp` uses: 16 KiB. The loop is driven by the answer
+/// each `read` gives, not by a size taken up front, so pipes work too.
+const READ_CHUNK_BYTES: int = 16384
+const READ_CHUNK_WORDS: int = 2048
+
+/// `open(2)` flags. `O_RDONLY` is 0 on Linux; the write set is
+/// `O_WRONLY|O_CREAT|O_TRUNC` and the mode is `0666` (the umask narrows it).
+const O_RDONLY: int = 0
+const O_WRONLY_CREAT_TRUNC: int = 577
+const CREATE_MODE: int = 438
+
+/// `access(2)` mode: existence only.
+const F_OK: int = 0
+
+/// `mkdir(2)` mode: `0777`, narrowed by the umask.
+const DIR_MODE: int = 511
+
+/// `d_name`'s byte offset in `struct dirent` on x86-64.
+const DIRENT_NAME_OFF: int = 19
+
+/// Whether `p` ends in `/`, the separator rule the Win32 body applies.
+fn endsWithSep(p: string) -> bool {
+    let n = len(p)
+    if (n == 0) {
+        return false
+    }
+    return (p[n - 1] as int) == 47
+}
+
+/// `pickle_file_exists`: whether anything lives at `path`.
+#[symbol("pickle_file_exists")]
+fn abiFileExists(path: string) -> bool {
+    unsafe {
+        let c = cstrOf(path)
+        let r = posix_access(c, F_OK)
+        free(c)
+        return r == 0
+    }
+}
+
+/// `pickle_delete`: remove a file, or an empty directory when it is one.
+/// `unlink` fails on a directory and `rmdir` fails on a file, so the pair is
+/// the same "try file, then directory" order the reference uses.
+#[symbol("pickle_delete")]
+fn abiDelete(path: string) -> bool {
+    unsafe {
+        let c = cstrOf(path)
+        if (posix_unlink(c) == 0) {
+            free(c)
+            return true
+        }
+        let r = posix_rmdir(c)
+        free(c)
+        return r == 0
+    }
+}
+
+/// `pickle_mkdir`: create one directory level, and fail if it exists.
+#[symbol("pickle_mkdir")]
+fn abiMkdir(path: string) -> bool {
+    unsafe {
+        let c = cstrOf(path)
+        let r = posix_mkdir(c, DIR_MODE)
+        free(c)
+        return r == 0
+    }
+}
+
+/// `pickle_current_dir`: the working directory, or `none`.
+///
+/// One `getcwd` into a `PATH_MAX` block. Linux rejects a longer answer with
+/// `ERANGE` rather than truncating, which is the "unset" answer the reference
+/// wants.
+#[symbol("pickle_current_dir")]
+fn abiCurrentDir() -> string? {
+    unsafe {
+        var buf = alloc(int, 512)
+        let r = posix_getcwd(buf, 4096)
+        if (r == 0) {
+            free(buf)
+            return none
+        }
+        let s = cstrToStr(buf)
+        free(buf)
+        return s
+    }
+}
+
+/// `pickle_read_file`: the bytes at `path`, or `none` when they could not be
+/// read at all.
+///
+/// `some("")` for a zero-length file, `none` only when the first `open` or
+/// `read` fails - the distinction the reference keeps. The buffer starts at
+/// one chunk and doubles; bytes accumulate raw, so nothing managed is live
+/// while the world lock is released.
+#[symbol("pickle_read_file")]
+fn abiReadFile(path: string) -> string? {
+    unsafe {
+        let c = cstrOf(path)
+        worldRelease()
+        let fd = posix_open(c, O_RDONLY, 0)
+        worldAcquire()
+        free(c)
+        if (fd < 0) {
+            return none
+        }
+        var cap = READ_CHUNK_BYTES
+        var buf = alloc(int, (cap + 7) / 8)
+        var used = 0
+        let chunk = alloc(int, READ_CHUNK_WORDS)
+        var anySuccess = false
+        var done = false
+        while (!done) {
+            worldRelease()
+            let n = posix_read(fd, chunk, READ_CHUNK_BYTES)
+            worldAcquire()
+            if (n < 0) {
+                done = true
+            } else if (n == 0) {
+                anySuccess = true
+                done = true
+            } else {
+                anySuccess = true
+                if (used + n > cap) {
+                    var ncap = cap
+                    while (ncap < used + n) {
+                        ncap = ncap * 2
+                    }
+                    let nbuf = alloc(int, (ncap + 7) / 8)
+                    var wi = 0
+                    while (wi < (used + 7) / 8) {
+                        nbuf[wi] = buf[wi]
+                        wi = wi + 1
+                    }
+                    free(buf)
+                    buf = nbuf
+                    cap = ncap
+                }
+                var b = 0
+                while (b < n) {
+                    putRawByte(buf, used + b, rawByteAt(chunk, b))
+                    b = b + 1
+                }
+                used = used + n
+            }
+        }
+        free(chunk)
+        posix_close(fd)
+        if (!anySuccess) {
+            free(buf)
+            return none
+        }
+        var out: List<byte> = bytes("")
+        var i = 0
+        while (i < used) {
+            out.push(rawByteAt(buf, i) as byte)
+            i = i + 1
+        }
+        free(buf)
+        return str(out)
+    }
+}
+
+/// `pickle_write_file`: overwrite `path` with `text`'s bytes.
+///
+/// `O_TRUNC` replaces what is there rather than appending, matching
+/// `std::fs::write`. An empty `text` still creates the file: the reference
+/// short-circuits the write but the open already happened.
+#[symbol("pickle_write_file")]
+fn abiWriteFile(path: string, text: string) -> bool {
+    unsafe {
+        let c = cstrOf(path)
+        worldRelease()
+        let fd = posix_open(c, O_WRONLY_CREAT_TRUNC, CREATE_MODE)
+        worldAcquire()
+        free(c)
+        if (fd < 0) {
+            return false
+        }
+        var ok = true
+        let n = len(text)
+        if (n != 0) {
+            var buf = alloc(int, (n + 7) / 8)
+            var b = 0
+            while (b < n) {
+                putRawByte(buf, b, text[b] as int)
+                b = b + 1
+            }
+            var off = 0
+            while (off < n) {
+                worldRelease()
+                let w = posix_write(fd, (buf as int) + off, n - off)
+                worldAcquire()
+                if (w <= 0) {
+                    ok = false
+                    break
+                }
+                off = off + w
+            }
+            free(buf)
+        }
+        posix_close(fd)
+        return ok
+    }
+}
+
+/// The NUL-terminated name in a `struct dirent`.
+fn direntName(ent: int) -> string {
+    var out = bytes("")
+    var i = 0
+    while (true) {
+        let b = rawByteAt(ent as *int, DIRENT_NAME_OFF + i)
+        if (b == 0) {
+            break
+        }
+        out.push(b as byte)
+        i = i + 1
+    }
+    return str(out)
+}
+
+/// `pickle_list_dir`: the full paths of everything in the directory, or `none`
+/// when it cannot be listed at all.
+///
+/// `opendir` is the "is this a directory" test: it fails for a regular file,
+/// while an empty directory succeeds and simply yields `.` and `..`, which are
+/// skipped. Child paths are `path + "/" + name` unless `path` already ends in
+/// a separator, matching the Win32 body.
+#[symbol("pickle_list_dir")]
+fn abiListDir(path: string) -> List<string>? {
+    unsafe {
+        let c = cstrOf(path)
+        worldRelease()
+        let dir = posix_opendir(c)
+        worldAcquire()
+        free(c)
+        if (dir == 0) {
+            return none
+        }
+        let sep = endsWithSep(path)
+        var out = [""]
+        out.pop()
+        while (true) {
+            worldRelease()
+            let ent = posix_readdir(dir)
+            worldAcquire()
+            if (ent == 0) {
+                break
+            }
+            let name = direntName(ent)
+            if (name != "." && name != "..") {
+                if (sep) {
+                    out.push(path + name)
+                } else {
+                    out.push(path + "/" + name)
+                }
+            }
+        }
+        worldRelease()
+        let _ = posix_closedir(dir)
+        worldAcquire()
+        return out
+    }
+}

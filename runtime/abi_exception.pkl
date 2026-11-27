@@ -86,6 +86,7 @@ import { byteAt } from runtime.abi_string
 import { writeStderr } from runtime.abi_stdio
 import { STR_BYTES_OFF } from runtime.layout
 import { rawLockAcquire, rawLockRelease } from runtime.abi_lock
+import { sysTlsAlloc, sysTlsGet, sysTlsSet } from runtime.abi_sys
 
 /// Word holding a string object's byte length. The header is
 /// [class_id, size, len, bytes...], so the length sits at word 3 and the
@@ -167,10 +168,10 @@ fn excEnsureSlots() {
     unsafe {
         rawLockAcquire((&excSlotLock) as int)
         if (excPendingSlot == -1) {
-            excPendingSlot = win_tls_alloc()
+            excPendingSlot = sysTlsAlloc()
         }
         if (excPayloadSlot == -1) {
-            excPayloadSlot = win_tls_alloc()
+            excPayloadSlot = sysTlsAlloc()
         }
         rawLockRelease((&excSlotLock) as int)
     }
@@ -188,8 +189,8 @@ fn excEnsureSlots() {
 fn abiExcThrow(payload: *int) {
     excEnsureSlots()
     unsafe {
-        let _ = win_tls_set(excPayloadSlot, payload as int)
-        let _ = win_tls_set(excPendingSlot, 1)
+        let _ = sysTlsSet(excPayloadSlot, payload as int)
+        let _ = sysTlsSet(excPendingSlot, 1)
     }
 }
 
@@ -200,7 +201,7 @@ fn abiExcPending() -> bool {
         return false
     }
     unsafe {
-        return win_tls_get(excPendingSlot) == 1
+        return sysTlsGet(excPendingSlot) == 1
     }
 }
 
@@ -223,8 +224,8 @@ fn abiExcTake() -> *int {
         return 0 as *int
     }
     unsafe {
-        let payload = win_tls_get(excPayloadSlot)
-        let _ = win_tls_set(excPendingSlot, 0)
+        let payload = sysTlsGet(excPayloadSlot)
+        let _ = sysTlsSet(excPendingSlot, 0)
         return payload as *int
     }
 }

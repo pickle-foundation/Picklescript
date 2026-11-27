@@ -1,0 +1,1149 @@
+module runtime.abi_sys
+
+/// The host this binary was built for. The CLI reads it to pick the default
+/// `build --target`; it is a compile-time fact, not a runtime switch.
+const SYS_PLATFORM: string = "posix"
+
+/// POSIX body of `runtime.abi_sys` - the same contract as `abi_sys_win.pkl`,
+/// over raw Linux syscalls.
+///
+/// NO LIBC. Every entry point below is either a `sys_syscall` wrapper or a
+/// Pickle routine over one. There is no `malloc`, no `getenv`, no `pthread_*`
+/// and no `exit`; the process heap is an mmap-backed size-class allocator, TLS
+/// is a tid-keyed table, and the clock/sleep/thread primitives are the kernel
+/// calls themselves. The only machine code this file relies on is the
+/// `pkl_syscall` stub `compiler.elflink` emits, plus `pkl_thread_spawn` for the
+/// one operation that must switch stacks inside the kernel.
+///
+/// WHY THE HEAP IS A SIZE-CLASS SLAB. `abi_raw` calls `sysHeapAlloc` for every
+/// raw block the containers need, so the pair is on a hot path. A header-only
+/// first-fit list would have to walk a chain per allocation; the class index in
+/// the sixteen-byte header makes a hit a single array load, and the classes are
+/// chosen so a compiler's small, repeated block sizes recycle exactly. Blocks
+/// larger than 64 KiB get their own mapping so a single huge read buffer cannot
+/// pin a chunk.
+///
+/// WHY TLS IS A TABLE AND NOT AN FS BASE. `sysTlsGet` runs on every managed
+/// call (the shadow stack head is a TLS word), so it must not take a lock or a
+/// syscall. The table is append-only: a thread writes its own tid and its own
+/// value words, and the count is published after them. A reader scans the live
+/// prefix - one comparison for the single-threaded compiler - and indexes a
+/// dense value block. No destructor runs on thread exit, which matches the
+/// contract (slots are process-lifetime ids, not OS keys).
+///
+/// WHY THE LOCK IS A FUTEX WORD. The portable lock cell is one zero-initialized
+/// machine word. The three-state futex mutex (0 free, 1 held, 2 held with
+/// waiters) is exactly that shape, and `sysLockWord`/`sysUnlockWord` are
+/// exported so `abi_world_impl_posix` can own the policy without a second
+/// hand-rolled lock. The fast path is one `lock cmpxchg`; the kernel is entered
+/// only when a waiter exists.
+///
+/// THE ENVIRONMENT IS READ ONCE. `/proc/self/environ` is the kernel's own copy
+/// of the initial environment block. `envLoad` parses it into a `char**` and
+/// every lookup is a scan of that block - no managed allocation, no `getenv`.
+/// The parse happens before the first managed allocation (the GIL switch is the
+/// first caller), so it cannot depend on the collector.
+
+// ---------------------------------------------------------------- syscalls
+/// x86-64 Linux syscall numbers. Only the calls this backend makes are named.
+const SYS_READ: int = 0
+const SYS_WRITE: int = 1
+const SYS_CLOSE: int = 3
+const SYS_MMAP: int = 9
+const SYS_MUNMAP: int = 11
+const SYS_ACCESS: int = 21
+const SYS_SCHED_YIELD: int = 24
+const SYS_DUP2: int = 33
+const SYS_NANOSLEEP: int = 35
+const SYS_CLONE: int = 56
+const SYS_FORK: int = 57
+const SYS_EXECVE: int = 59
+const SYS_EXIT: int = 60
+const SYS_WAIT4: int = 61
+const SYS_KILL: int = 62
+const SYS_FCNTL: int = 72
+const SYS_GETCWD: int = 79
+const SYS_CHDIR: int = 80
+const SYS_MKDIR: int = 83
+const SYS_RMDIR: int = 84
+const SYS_UNLINK: int = 87
+const SYS_GETTID: int = 186
+const SYS_FUTEX: int = 202
+const SYS_GETDENTS64: int = 217
+const SYS_CLOCK_GETTIME: int = 228
+const SYS_EXIT_GROUP: int = 231
+const SYS_OPENAT: int = 257
+const SYS_PIPE2: int = 293
+
+/// `AT_FDCWD`, the "resolve against the working directory" dirfd.
+const AT_FDCWD: int = -100
+
+/// `open(2)` bits used by the runtime and the `DIR` handle.
+const O_RDONLY: int = 0
+const O_DIRECTORY: int = 65536
+
+/// `mmap` protection and flags: private anonymous read/write pages.
+const PROT_READ_WRITE: int = 3
+const MAP_PRIVATE_ANON: int = 34
+
+/// `futex(2)` operations. The private flag says the word is process-private,
+/// which every lock cell in this runtime is.
+const FUTEX_WAIT: int = 0
+const FUTEX_WAKE: int = 1
+const FUTEX_PRIVATE: int = 128
+
+/// `clock_gettime` ids.
+const CLOCK_REALTIME: int = 0
+const CLOCK_MONOTONIC: int = 1
+
+/// `getdents64` buffer. One page holds a useful directory without making a
+/// small listing pay for a large one.
+const DIR_BUF_BYTES: int = 32768
+
+/// `struct dirent.d_reclen` and `d_name` offsets on x86-64.
+const DIRENT_RECLEN_OFF: int = 16
+const DIRENT_NAME_OFF: int = 19
+
+/// The environment block never grows past this; a command line that large is
+/// not something the compiler can be handed.
+const ENVIRON_MAX_BYTES: int = 65536
+
+/// TLS slots and the live-thread ceiling. The compiler spawns a handful; a
+/// program that exceeds the ceiling gets `-1` from `sysTlsAlloc`, which every
+/// caller already treats as "no slot".
+const TLS_SLOTS: int = 64
+const TLS_MAX_THREADS: int = 256
+
+fn sc0(nr: int) -> int {
+    return sys_syscall(nr, 0, 0, 0, 0, 0, 0)
+}
+
+fn sc1(nr: int, a: int) -> int {
+    return sys_syscall(nr, a, 0, 0, 0, 0, 0)
+}
+
+fn sc2(nr: int, a: int, b: int) -> int {
+    return sys_syscall(nr, a, b, 0, 0, 0, 0)
+}
+
+fn sc3(nr: int, a: int, b: int, c: int) -> int {
+    return sys_syscall(nr, a, b, c, 0, 0, 0)
+}
+
+fn sc4(nr: int, a: int, b: int, c: int, d: int) -> int {
+    return sys_syscall(nr, a, b, c, d, 0, 0)
+}
+
+fn alignUp(v: int, a: int) -> int {
+    if ((v % a) == 0) {
+        return v
+    }
+    return v + (a - (v % a))
+}
+
+// ------------------------------------------------------------ raw memory
+/// An anonymous private mapping, or 0 on failure. Linux reports a failed
+/// `mmap` as a small negative errno, never as a low address.
+fn sysMmap(len: int) -> int {
+    let r = sys_syscall(SYS_MMAP, 0, len, PROT_READ_WRITE, MAP_PRIVATE_ANON, -1, 0)
+    if (r < 0) {
+        return 0
+    }
+    return r
+}
+
+fn sysMunmap(addr: int, len: int) -> int {
+    return sc2(SYS_MUNMAP, addr, len)
+}
+
+/// Byte `i` of a raw buffer, little-endian.
+fn rawByteAt(base: int, i: int) -> int {
+    unsafe {
+        let w = base as *int
+        return (w[i >> 3] >> ((i & 7) * 8)) & 255
+    }
+}
+
+/// Write byte `i` of a raw buffer without disturbing its neighbours.
+fn putRawByte(base: int, i: int, v: int) {
+    unsafe {
+        let w = base as *int
+        let sh = (i & 7) * 8
+        let mask = 255 << sh
+        w[i >> 3] = (w[i >> 3] & ((0 - 1) ^ mask)) | ((v & 255) << sh)
+    }
+}
+
+// ------------------------------------------------------------ process heap
+/// Header bytes in front of every payload: the class index and one spare word
+/// (the mapping length for a large block).
+const HEAP_HDR: int = 16
+
+/// Smallest block: sixteen header bytes and sixteen payload bytes.
+const HEAP_MIN: int = 32
+
+/// Largest exact class. Above this the sizes grow by 1.5x.
+const HEAP_SMALL_MAX: int = 1040
+
+/// Number of exact 16-byte-step classes.
+const HEAP_SMALL_CLASSES: int = 64
+
+/// Enough classes for the geometric tail up to the 64 KiB cut-over.
+const HEAP_CLASSES: int = 80
+
+/// A request above this gets its own mapping.
+const HEAP_LARGE: int = 65536
+
+/// The chunk carved for small blocks.
+const HEAP_CHUNK: int = 1048576
+
+/// The free-list heads, one word per class. Allocated with `mmap` (not this
+/// allocator) on first use.
+var heapFree: int = 0
+var heapCur: int = 0
+var heapEnd: int = 0
+var heapLock: int = 0
+
+/// Address of `heapLock` for the futex helpers. `&` is only legal inside an
+/// `unsafe` block, and every caller wants nothing but the resulting integer.
+fn heapLockAddr() -> int {
+    var a = 0
+    unsafe {
+        a = (&heapLock) as int
+    }
+    a
+}
+
+/// The class that fits `need` total bytes (header included).
+fn heapClassFor(need: int) -> int {
+    if (need <= HEAP_MIN) {
+        return 0
+    }
+    if (need <= HEAP_SMALL_MAX) {
+        return (need - HEAP_MIN + 15) / 16
+    }
+    var size = HEAP_SMALL_MAX
+    var c = HEAP_SMALL_CLASSES - 1
+    while (size < need) {
+        size = alignUp(size + size / 2, 16)
+        c = c + 1
+    }
+    return c
+}
+
+/// The total block size of class `c`, recomputed from the same sequence the
+/// class search uses.
+fn heapClassSize(c: int) -> int {
+    if (c < HEAP_SMALL_CLASSES) {
+        return HEAP_MIN + 16 * c
+    }
+    var size = HEAP_SMALL_MAX
+    var i = HEAP_SMALL_CLASSES - 1
+    while (i < c) {
+        size = alignUp(size + size / 2, 16)
+        i = i + 1
+    }
+    return size
+}
+
+/// Install the free-list array. Called with `heapLock` held.
+fn heapInit() {
+    if (heapFree != 0) {
+        return
+    }
+    let p = sysMmap(4096)
+    if (p == 0) {
+        return
+    }
+    var i = 0
+    while (i < 512) {
+        unsafe {
+            (p as *int)[i] = 0
+        }
+        i = i + 1
+    }
+    heapFree = p
+}
+
+/// Carve `total` bytes from the bump chunk, mapping a fresh one when the
+/// current chunk is exhausted. Called with `heapLock` held.
+fn heapCarve(total: int) -> int {
+    if (heapCur == 0 || heapCur + total > heapEnd) {
+        var chunk = HEAP_CHUNK
+        if (total + 64 > chunk) {
+            chunk = alignUp(total + 64, 4096)
+        }
+        let p = sysMmap(chunk)
+        if (p == 0) {
+            return 0
+        }
+        heapCur = p
+        heapEnd = p + chunk
+    }
+    let block = heapCur
+    heapCur = block + total
+    return block
+}
+
+/// Process-heap allocation. `malloc(0)` is normalized to one byte, matching
+/// the Windows heap. The block is NOT zeroed.
+fn sysHeapAlloc(n: int) -> int {
+    var size = n
+    if (size < 1) {
+        size = 1
+    }
+    let need = alignUp(HEAP_HDR + size, 16)
+    if (need > HEAP_LARGE) {
+        let total = alignUp(need, 4096)
+        let block = sysMmap(total)
+        if (block == 0) {
+            return 0
+        }
+        unsafe {
+            let h = block as *int
+            h[0] = -1
+            h[1] = total
+        }
+        return block + HEAP_HDR
+    }
+    let c = heapClassFor(need)
+    sysLockWord(heapLockAddr())
+    heapInit()
+    var block = 0
+    if (heapFree != 0) {
+        unsafe {
+            let fl = heapFree as *int
+            block = fl[c]
+            if (block != 0) {
+                fl[c] = (block as *int)[0]
+            }
+        }
+    }
+    if (block == 0) {
+        block = heapCarve(heapClassSize(c))
+    }
+    sysUnlockWord(heapLockAddr())
+    if (block == 0) {
+        return 0
+    }
+    unsafe {
+        (block as *int)[0] = c
+    }
+    return block + HEAP_HDR
+}
+
+/// Return a block to its class list. Large blocks are unmapped.
+fn sysHeapFree(p: int) {
+    if (p == 0) {
+        return
+    }
+    let block = p - HEAP_HDR
+    var c = 0
+    unsafe {
+        c = (block as *int)[0]
+    }
+    if (c < 0) {
+        var total = 0
+        unsafe {
+            total = (block as *int)[1]
+        }
+        let _ = sysMunmap(block, total)
+        return
+    }
+    sysLockWord(heapLockAddr())
+    if (heapFree != 0) {
+        unsafe {
+            let fl = heapFree as *int
+            (block as *int)[0] = fl[c]
+            fl[c] = block
+        }
+    }
+    sysUnlockWord(heapLockAddr())
+}
+
+// ---------------------------------------------------------------- locks
+/// The one-word futex mutex. `sys_cas` is the linker-emitted `lock cmpxchg`
+/// stub; a zero return means the caller now owns the cell.
+fn sysLockWord(cell: int) {
+    var c = sys_cas(cell, 0, 1)
+    if (c == 0) {
+        return
+    }
+    while (true) {
+        if (c == 2 || sys_cas(cell, 1, 2) != 1) {
+            let _ = sys_syscall(SYS_FUTEX, cell, FUTEX_WAIT | FUTEX_PRIVATE, 2, 0, 0, 0)
+        }
+        c = sys_cas(cell, 0, 2)
+        if (c == 0) {
+            return
+        }
+    }
+}
+
+/// Non-blocking acquire: 1 when the cell was free, 0 otherwise.
+fn sysTryLockWord(cell: int) -> int {
+    if (sys_cas(cell, 0, 1) == 0) {
+        return 1
+    }
+    return 0
+}
+
+/// Release a cell taken by `sysLockWord`. A state of 2 means a waiter is
+/// parked, so the unlock hands it the wakeup.
+fn sysUnlockWord(cell: int) {
+    var old = 0
+    while (true) {
+        unsafe {
+            old = (cell as *int)[0]
+        }
+        if (sys_cas(cell, old, 0) == old) {
+            break
+        }
+    }
+    if (old == 2) {
+        let _ = sys_syscall(SYS_FUTEX, cell, FUTEX_WAKE | FUTEX_PRIVATE, 1, 0, 0, 0)
+    }
+}
+
+fn sysAtomicLoad(addr: int) -> int {
+    unsafe {
+        return (addr as *int)[0]
+    }
+}
+
+fn sysAtomicStore(addr: int, v: int) {
+    unsafe {
+        (addr as *int)[0] = v
+    }
+}
+
+/// Sleep until the word at `addr` is no longer `val` or a waker arrives. The
+/// kernel answers immediately when the word has already changed, which closes
+/// the lost-wakeup window around a release.
+fn sysFutexWait(addr: int, val: int) {
+    let _ = sys_syscall(SYS_FUTEX, addr, FUTEX_WAIT | FUTEX_PRIVATE, val, 0, 0, 0)
+}
+
+/// Wake up to `n` waiters parked on `addr`; `n = 0x7FFFFFFF` wakes all.
+fn sysFutexWake(addr: int, n: int) {
+    let _ = sys_syscall(SYS_FUTEX, addr, FUTEX_WAKE | FUTEX_PRIVATE, n, 0, 0, 0)
+}
+
+// ------------------------------------------------------------------- TLS
+/// Live thread ids, dense from index 0.
+var tlsTids: int = 0
+
+/// `TLS_MAX_THREADS * TLS_SLOTS` value words, dense by thread index.
+var tlsValues: int = 0
+var tlsCount: int = 0
+var tlsNextSlot: int = 0
+var tlsLock: int = 0
+var tlsInitLock: int = 0
+
+/// Address of `tlsLock`; see `heapLockAddr`.
+fn tlsLockAddr() -> int {
+    var a = 0
+    unsafe {
+        a = (&tlsLock) as int
+    }
+    a
+}
+
+/// Address of `tlsInitLock`; see `heapLockAddr`.
+fn tlsInitLockAddr() -> int {
+    var a = 0
+    unsafe {
+        a = (&tlsInitLock) as int
+    }
+    a
+}
+
+/// Install both tables. Called before `tlsLock` is taken, so a failed
+/// allocation leaves the module in the "no TLS" state rather than half-built.
+fn tlsInit() {
+    if (tlsTids != 0) {
+        return
+    }
+    sysLockWord(tlsInitLockAddr())
+    if (tlsTids == 0) {
+        let t = sysHeapAlloc(TLS_MAX_THREADS * 8)
+        let v = sysHeapAlloc(TLS_MAX_THREADS * TLS_SLOTS * 8)
+        if (t != 0 && v != 0) {
+            var i = 0
+            while (i < TLS_MAX_THREADS) {
+                unsafe {
+                    (t as *int)[i] = 0
+                }
+                i = i + 1
+            }
+            i = 0
+            while (i < TLS_MAX_THREADS * TLS_SLOTS) {
+                unsafe {
+                    (v as *int)[i] = 0
+                }
+                i = i + 1
+            }
+            tlsTids = t
+            tlsValues = v
+        }
+    }
+    sysUnlockWord(tlsInitLockAddr())
+}
+
+/// This thread's dense index, or -1 when it has never stored a value.
+fn tlsIndex(tid: int) -> int {
+    var i = 0
+    let n = tlsCount
+    while (i < n) {
+        unsafe {
+            if ((tlsTids as *int)[i] == tid) {
+                return i
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+/// Allocate a slot id. Slots are process-lifetime ids; the ceiling answer is
+/// -1, which every caller already treats as "no slot".
+fn sysTlsAlloc() -> int {
+    sysLockWord(tlsLockAddr())
+    var s = tlsNextSlot
+    if (s >= TLS_SLOTS) {
+        s = -1
+    } else {
+        tlsNextSlot = s + 1
+    }
+    sysUnlockWord(tlsLockAddr())
+    return s
+}
+
+/// Read this thread's word from `slot`. An unset slot is zero, which is what
+/// every caller treats as "no node yet".
+fn sysTlsGet(slot: int) -> int {
+    if (slot < 0 || slot >= TLS_SLOTS) {
+        return 0
+    }
+    tlsInit()
+    if (tlsTids == 0) {
+        return 0
+    }
+    let idx = tlsIndex(sysThreadId())
+    if (idx < 0) {
+        return 0
+    }
+    unsafe {
+        return (tlsValues as *int)[idx * TLS_SLOTS + slot]
+    }
+}
+
+/// Store this thread's word in `slot`. Registers the thread on first use.
+fn sysTlsSet(slot: int, v: int) -> int {
+    if (slot < 0 || slot >= TLS_SLOTS) {
+        return 0
+    }
+    tlsInit()
+    if (tlsTids == 0) {
+        return 0
+    }
+    let tid = sysThreadId()
+    sysLockWord(tlsLockAddr())
+    var idx = tlsIndex(tid)
+    if (idx < 0) {
+        idx = tlsCount
+        if (idx >= TLS_MAX_THREADS) {
+            sysUnlockWord(tlsLockAddr())
+            return 0
+        }
+        unsafe {
+            (tlsTids as *int)[idx] = tid
+        }
+        tlsCount = idx + 1
+    }
+    unsafe {
+        (tlsValues as *int)[idx * TLS_SLOTS + slot] = v
+    }
+    sysUnlockWord(tlsLockAddr())
+    return 1
+}
+
+// ------------------------------------------------------------- process
+/// Terminate the process with `code`. `exit_group` ends every thread, which is
+/// the contract `sysExit` has always had.
+fn sysExit(code: int) {
+    let _ = sys_syscall(SYS_EXIT_GROUP, code, 0, 0, 0, 0, 0)
+}
+
+/// A stable identity for the running thread. `gettid` is unique among live
+/// threads, which is all the registry uses it for.
+fn sysThreadId() -> int {
+    return sc0(SYS_GETTID)
+}
+
+// ---------------------------------------------------------------- clocks
+/// Nanoseconds from `clk`. The timespec lives in a raw block so no managed
+/// object is live across the call.
+fn clockNs(clk: int) -> int {
+    let ts = sysHeapAlloc(16)
+    if (ts == 0) {
+        return 0
+    }
+    let r = sc2(SYS_CLOCK_GETTIME, clk, ts)
+    var ns = 0
+    if (r == 0) {
+        unsafe {
+            let p = ts as *int
+            ns = p[0] * 1000000000 + p[1]
+        }
+    }
+    sysHeapFree(ts)
+    return ns
+}
+
+/// Wall-clock milliseconds since the Unix epoch.
+fn sysUnixMs() -> int {
+    return clockNs(CLOCK_REALTIME) / 1000000
+}
+
+/// Monotonic nanoseconds from an unspecified origin.
+fn sysMonotonicNs() -> int {
+    return clockNs(CLOCK_MONOTONIC)
+}
+
+/// Sleep this thread for `ms` milliseconds.
+fn sysThreadSleep(ms: int) {
+    if (ms <= 0) {
+        return
+    }
+    let ts = sysHeapAlloc(16)
+    if (ts == 0) {
+        return
+    }
+    unsafe {
+        let p = ts as *int
+        p[0] = ms / 1000
+        p[1] = (ms % 1000) * 1000000
+    }
+    let _ = sc2(SYS_NANOSLEEP, ts, 0)
+    sysHeapFree(ts)
+}
+
+/// Hand the CPU to a runnable peer.
+fn sysThreadYield() {
+    let _ = sc0(SYS_SCHED_YIELD)
+}
+
+// ------------------------------------------------------------- environment
+/// The parsed `char**` environment block, or 0 when `/proc` is unavailable.
+var envpBlock: int = 0
+var envpReady: int = 0
+var envpLock: int = 0
+
+/// Address of `envpLock`; see `heapLockAddr`.
+fn envpLockAddr() -> int {
+    var a = 0
+    unsafe {
+        a = (&envpLock) as int
+    }
+    a
+}
+
+/// Parse `/proc/self/environ` into a NUL-terminated pointer array. The buffer
+/// and the array are process-lifetime allocations and are never freed: they
+/// are the environment, and every caller borrows from them.
+fn envLoad() {
+    if (envpReady != 0) {
+        return
+    }
+    sysLockWord(envpLockAddr())
+    if (envpReady != 0) {
+        sysUnlockWord(envpLockAddr())
+        return
+    }
+    let path = "/proc/self/environ"
+    let c = cstrOf(path)
+    var fd = -1
+    if (c != 0) {
+        fd = sysOpen(c, O_RDONLY, 0)
+        sysHeapFree(c)
+    }
+    if (fd < 0) {
+        envpReady = 1
+        sysUnlockWord(envpLockAddr())
+        return
+    }
+    let buf = sysHeapAlloc(ENVIRON_MAX_BYTES)
+    if (buf == 0) {
+        let _ = sc1(SYS_CLOSE, fd)
+        envpReady = 1
+        sysUnlockWord(envpLockAddr())
+        return
+    }
+    var used = 0
+    while (used < ENVIRON_MAX_BYTES) {
+        let n = sc3(SYS_READ, fd, buf + used, ENVIRON_MAX_BYTES - used)
+        if (n <= 0) {
+            break
+        }
+        used = used + n
+    }
+    let _ = sc1(SYS_CLOSE, fd)
+    var count = 0
+    var i = 0
+    while (i < used) {
+        if (rawByteAt(buf, i) == 0) {
+            count = count + 1
+        }
+        i = i + 1
+    }
+    let arr = sysHeapAlloc((count + 1) * 8)
+    if (arr != 0) {
+        var idx = 0
+        var start = 0
+        i = 0
+        while (i < used) {
+            if (rawByteAt(buf, i) == 0) {
+                if (i > start) {
+                    unsafe {
+                        (arr as *int)[idx] = buf + start
+                    }
+                    idx = idx + 1
+                }
+                start = i + 1
+            }
+            i = i + 1
+        }
+        unsafe {
+            (arr as *int)[idx] = 0
+        }
+        envpBlock = arr
+    }
+    envpReady = 1
+    sysUnlockWord(envpLockAddr())
+}
+
+/// A NUL-terminated raw copy of `s`, or 0 when the heap cannot answer.
+fn cstrOf(s: string) -> int {
+    let n = len(s)
+    let buf = sysHeapAlloc(n + 1)
+    if (buf == 0) {
+        return 0
+    }
+    var i = 0
+    while (i < n) {
+        putRawByte(buf, i, s[i] as int)
+        i = i + 1
+    }
+    putRawByte(buf, n, 0)
+    return buf
+}
+
+/// `getenv(3)`: the value of `name` in the parsed block, or 0. The answer is a
+/// borrowed pointer into the environment buffer, exactly like libc's.
+#[symbol("getenv")]
+fn sysGetenv(name: int) -> int {
+    if (name == 0) {
+        return 0
+    }
+    envLoad()
+    if (envpBlock == 0) {
+        return 0
+    }
+    var n = 0
+    while (rawByteAt(name, n) != 0) {
+        n = n + 1
+    }
+    var i = 0
+    while (true) {
+        var ent = 0
+        unsafe {
+            ent = (envpBlock as *int)[i]
+        }
+        if (ent == 0) {
+            return 0
+        }
+        var k = 0
+        var same = true
+        while (k < n) {
+            if (rawByteAt(ent, k) != rawByteAt(name, k)) {
+                same = false
+                break
+            }
+            k = k + 1
+        }
+        if (same && rawByteAt(ent, n) == 61) {
+            return ent + n + 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+/// The C string `key` names, or 0 when it is absent. The caller owns the
+/// returned name buffer; the value itself is borrowed.
+fn envLookup(key: string) -> int {
+    let name = cstrOf(key)
+    if (name == 0) {
+        return 0
+    }
+    let value = sysGetenv(name)
+    sysHeapFree(name)
+    return value
+}
+
+/// Whether `key` is present at all, whatever its value.
+fn sysEnvPresent(key: string) -> bool {
+    return envLookup(key) != 0
+}
+
+/// Decimal value of `key`, or 0 when it is absent or holds no digits. Leading
+/// whitespace is skipped, a digit run is parsed, and anything after it is
+/// ignored - the reference `.trim()`s before parsing. Values saturate so a
+/// runaway run cannot overflow.
+fn sysEnvInt(key: string) -> int {
+    let p = envLookup(key)
+    if (p == 0) {
+        return 0
+    }
+    unsafe {
+        var i = 0
+        while (true) {
+            let c = rawByteAt(p, i)
+            if (c == 32 || c == 9) {
+                i = i + 1
+            } else {
+                break
+            }
+        }
+        var v = 0
+        while (true) {
+            let c = rawByteAt(p, i)
+            if (c < 48 || c > 57) {
+                break
+            }
+            if (v < 1000000000) {
+                v = v * 10 + (c - 48)
+            }
+            i = i + 1
+        }
+        return v
+    }
+}
+
+/// Three-state switch: -1 absent, 0 explicitly `0`, 1 any other value
+/// (including empty). Mirrors the Windows backend exactly.
+fn sysEnvFlag(key: string) -> int {
+    let p = envLookup(key)
+    if (p == 0) {
+        return -1
+    }
+    unsafe {
+        var i = 0
+        while (true) {
+            let c = rawByteAt(p, i)
+            if (c == 32 || c == 9) {
+                i = i + 1
+            } else {
+                break
+            }
+        }
+        if (rawByteAt(p, i) != 48) {
+            return 1
+        }
+        let next = rawByteAt(p, i + 1)
+        if (next == 0 || next == 32 || next == 9) {
+            return 0
+        }
+        return 1
+    }
+}
+
+// ------------------------------------------------------- libc surface
+// Every name below is a `#[symbol]` body, so the IR keeps its uniform
+// `__imp_name` extern spelling and `compiler.elf` strips the prefix at the
+// object boundary. The linker resolves the call to the body in this same
+// object; no system library is consulted.
+
+#[symbol("open")]
+fn sysOpen(path: int, flags: int, mode: int) -> int {
+    return sc4(SYS_OPENAT, AT_FDCWD, path, flags, mode)
+}
+
+#[symbol("read")]
+fn sysRead(fd: int, buf: int, n: int) -> int {
+    return sc3(SYS_READ, fd, buf, n)
+}
+
+#[symbol("write")]
+fn sysWrite(fd: int, buf: int, n: int) -> int {
+    return sc3(SYS_WRITE, fd, buf, n)
+}
+
+#[symbol("close")]
+fn sysClose(fd: int) -> int {
+    return sc1(SYS_CLOSE, fd)
+}
+
+#[symbol("access")]
+fn sysAccess(path: int, mode: int) -> int {
+    return sc2(SYS_ACCESS, path, mode)
+}
+
+#[symbol("unlink")]
+fn sysUnlink(path: int) -> int {
+    return sc1(SYS_UNLINK, path)
+}
+
+#[symbol("rmdir")]
+fn sysRmdir(path: int) -> int {
+    return sc1(SYS_RMDIR, path)
+}
+
+#[symbol("mkdir")]
+fn sysMkdir(path: int, mode: int) -> int {
+    return sc2(SYS_MKDIR, path, mode)
+}
+
+#[symbol("getcwd")]
+fn sysGetcwd(buf: int, size: int) -> int {
+    return sc2(SYS_GETCWD, buf, size)
+}
+
+#[symbol("chdir")]
+fn sysChdir(path: int) -> int {
+    return sc1(SYS_CHDIR, path)
+}
+
+/// `pipe(2)` writes two 32-bit descriptors. The runtime stores them in two
+/// 64-bit words, so the packed pair is unpacked after the call.
+#[symbol("pipe")]
+fn sysPipe(fds: int) -> int {
+    let r = sc2(SYS_PIPE2, fds, 0)
+    if (r != 0) {
+        return r
+    }
+    unsafe {
+        let p = fds as *int
+        let lo = p[0] & 0xFFFFFFFF
+        let hi = (p[0] >> 32) & 0xFFFFFFFF
+        p[0] = lo
+        p[1] = hi
+    }
+    return 0
+}
+
+#[symbol("fork")]
+fn sysFork() -> int {
+    return sc0(SYS_FORK)
+}
+
+#[symbol("execve")]
+fn sysExecve(path: int, argv: int, envp: int) -> int {
+    return sc3(SYS_EXECVE, path, argv, envp)
+}
+
+/// `_exit` ends this thread only. A forked child has exactly one thread, so
+/// the two meanings coincide there.
+#[symbol("_exit")]
+fn sysExitThread(code: int) {
+    let _ = sc1(SYS_EXIT, code)
+}
+
+#[symbol("dup2")]
+fn sysDup2(oldfd: int, newfd: int) -> int {
+    return sc2(SYS_DUP2, oldfd, newfd)
+}
+
+#[symbol("waitpid")]
+fn sysWaitpid(pid: int, status: int, options: int) -> int {
+    return sc4(SYS_WAIT4, pid, status, options, 0)
+}
+
+#[symbol("kill")]
+fn sysKill(pid: int, sig: int) -> int {
+    return sc2(SYS_KILL, pid, sig)
+}
+
+#[symbol("fcntl")]
+fn sysFcntl(fd: int, cmd: int, arg: int) -> int {
+    return sc3(SYS_FCNTL, fd, cmd, arg)
+}
+
+// ---------------------------------------------------------------- DIR
+/// A `DIR*` is a four-word record plus a `getdents64` buffer:
+///
+///   [0] fd   [1] buffer address   [2] bytes in buffer   [3] next offset
+///
+/// `readdir` hands back a pointer into that buffer, so the answer is valid
+/// until the next call - the same lifetime glibc gives.
+#[symbol("opendir")]
+fn sysOpendir(path: int) -> int {
+    let fd = sc4(SYS_OPENAT, AT_FDCWD, path, O_RDONLY | O_DIRECTORY, 0)
+    if (fd < 0) {
+        return 0
+    }
+    let d = sysHeapAlloc(32)
+    let buf = sysHeapAlloc(DIR_BUF_BYTES)
+    if (d == 0 || buf == 0) {
+        if (d != 0) {
+            sysHeapFree(d)
+        }
+        if (buf != 0) {
+            sysHeapFree(buf)
+        }
+        let _ = sc1(SYS_CLOSE, fd)
+        return 0
+    }
+    unsafe {
+        let p = d as *int
+        p[0] = fd
+        p[1] = buf
+        p[2] = 0
+        p[3] = 0
+    }
+    return d
+}
+
+#[symbol("readdir")]
+fn sysReaddir(dir: int) -> int {
+    if (dir == 0) {
+        return 0
+    }
+    unsafe {
+        let d = dir as *int
+        while (true) {
+            if (d[3] < d[2]) {
+                let ent = d[1] + d[3]
+                let reclen = rawByteAt(ent, DIRENT_RECLEN_OFF) | (rawByteAt(ent, DIRENT_RECLEN_OFF + 1) << 8)
+                if (reclen == 0) {
+                    return 0
+                }
+                d[3] = d[3] + reclen
+                return ent
+            }
+            let n = sc3(SYS_GETDENTS64, d[0], d[1], DIR_BUF_BYTES)
+            if (n <= 0) {
+                return 0
+            }
+            d[2] = n
+            d[3] = 0
+        }
+    }
+}
+
+#[symbol("closedir")]
+fn sysClosedir(dir: int) -> int {
+    if (dir == 0) {
+        return -1
+    }
+    var fd = 0
+    var buf = 0
+    unsafe {
+        let p = dir as *int
+        fd = p[0]
+        buf = p[1]
+    }
+    sysHeapFree(buf)
+    sysHeapFree(dir)
+    return sc1(SYS_CLOSE, fd)
+}
+
+// ------------------------------------------------------- clock/thread symbols
+/// Milliseconds on the monotonic clock, for `abi_process`'s poll loop.
+#[symbol("pkl_now_ms")]
+fn sysNowMs() -> int {
+    return sysMonotonicNs() / 1000000
+}
+
+/// Sleep the calling thread. Named `pkl_sleep_ms` for `abi_process`.
+#[symbol("pkl_sleep_ms")]
+fn sysSleepMs(ms: int) {
+    sysThreadSleep(ms)
+}
+
+/// The environment block as a `char**` for `execve`. The array is
+/// process-lifetime, so the caller must not free it.
+#[symbol("pkl_environ")]
+fn sysEnviron() -> int {
+    envLoad()
+    return envpBlock
+}
+
+// ---------------------------------------------------------------- threads
+/// Start `code` on a new OS thread with the closure object `env` in the first
+/// argument register. `pkl_thread_spawn` is the linker stub: it maps the stack,
+/// clones, and runs the child on that stack. Returns the handle, or 0.
+fn sysThreadSpawn(code: int, env: int) -> int {
+    return pkl_thread_spawn(code, env)
+}
+
+/// Wait for `handle`. A negative timeout means infinite. Returns 0 when the
+/// thread has exited, nonzero on timeout. The kernel clears the `ctid` word on
+/// exit and wakes futex waiters, so the wait is a plain futex loop.
+fn sysThreadWait(handle: int, timeoutMs: int) -> int {
+    if (handle == 0) {
+        return 0
+    }
+    let ctid = handle + 8
+    var ts = 0
+    if (timeoutMs >= 0) {
+        ts = sysHeapAlloc(16)
+        if (ts != 0) {
+            unsafe {
+                let p = ts as *int
+                p[0] = timeoutMs / 1000
+                p[1] = (timeoutMs % 1000) * 1000000
+            }
+        }
+    }
+    while (true) {
+        var v = 0
+        unsafe {
+            v = (ctid as *int)[0]
+        }
+        if (v == 0) {
+            if (ts != 0) {
+                sysHeapFree(ts)
+            }
+            return 0
+        }
+        let r = sys_syscall(SYS_FUTEX, ctid, FUTEX_WAIT | FUTEX_PRIVATE, v, ts, 0, 0)
+        if (r == -110) {
+            // ETIMEDOUT: the thread may have exited just as the wait expired.
+            unsafe {
+                v = (ctid as *int)[0]
+            }
+            if (ts != 0) {
+                sysHeapFree(ts)
+            }
+            if (v == 0) {
+                return 0
+            }
+            return 1
+        }
+        if (r < 0 && r != -4) {
+            // EINTR is a retry; anything else is a wait failure.
+            if (ts != 0) {
+                sysHeapFree(ts)
+            }
+            return 1
+        }
+    }
+}
+
+/// Release the handle. The mapping holds both the record and the stack, so one
+/// unmap retires the whole thing.
+fn sysThreadClose(handle: int) {
+    if (handle == 0) {
+        return
+    }
+    var base = 0
+    var size = 0
+    unsafe {
+        let p = handle as *int
+        base = p[2]
+        size = p[3]
+    }
+    let _ = sysMunmap(base, size)
+}
