@@ -1,0 +1,1273 @@
+module compiler.arm64
+
+import { Diagnostic, DiagnosticSink, Span } from compiler.diag
+import { Callee, IrFunc, IrModule, IrTy, IrConst, IrUnOp, IrBinOp, IrInstr, IrTerm, irTyStr } from compiler.ir
+import { optimizeModule } from compiler.irop
+import { Reloc, X64Func, X64Out, isManaged, tyWidth, isFloatTy, isCmp, funcSymbolOf, computeMayGC, constTy, callRet, defTy, isShadowApiFn, SHADOW_HEADER_BYTES, CELL_BYTES, SHADOW_FRAME_TAG, SHADOW_TAG_SHIFT, f64ToBits, alignK } from compiler.x64
+import { A64Buf, COND_EQ, COND_NE, COND_MI, COND_LS, COND_GT, COND_GE } from compiler.a64
+
+/// The ARM64 backend.
+///
+/// STRATEGY: CORRECT FIRST, FAST LATER. Unlike `compiler.x64`, this emitter has
+/// no register allocator, no value forwarding and no inlined runtime helpers.
+/// Every IR value - slot and temp alike - has a home in the frame, and every
+/// instruction loads its operands, computes in x0/x1 (or d0/d1), and stores the
+/// result. That is one memory round trip per value, which is slow but makes the
+/// shadow-frame contract trivial to satisfy: at every call boundary every live
+/// managed value is already in its cell, so the collector sees it without any
+/// spill logic. The x64 backend's optimisations can be ported one at a time
+/// once the ARM64 image compiles the whole runtime and self-hosts.
+///
+/// ABI. AAPCS64: the first eight integer arguments in x0..x7, the first eight
+/// float arguments in d0..d7, the rest on the stack in argument order. The
+/// frame keeps x29 as the frame pointer, so stack arguments are at x29+16 and
+/// every local home is `[x29 - k]`. x16/x17 are scratch: they are the
+/// intra-procedure-call registers, never argument registers and never
+/// callee-saved, so the emitter can use them without saving them.
+///
+/// SHADOW FRAMES. The layout is the one `runtime/abi_shadow.pkl` reads: word 0
+/// is the previous-frame link written by `pickle_shadow_push`, word 1 is
+/// `(TAG << 56) | (totalK << 32) | ncells`, and the cells follow. The frame
+/// base is `x29 - shadowBytes`. All managed slots and temps get a cell; every
+/// other home sits below the frame so the collector's conservative scan of
+/// `totalK` cannot mistake a raw word for a cell header.
+
+/// Round `k` up to a multiple of `a` (both positive).
+fn a64AlignUp(k: int, a: int) -> int {
+    alignK(k, a)
+}
+
+/// Where each argument goes. `reg[i]` is the register index within the
+/// argument's class - the integer sequence x0..x7 or the float sequence
+/// d0..d7 - or -1 when the argument is passed on the stack. `stack[i]` is the
+/// 0-based stack slot in that case, or -1.
+class A64Locs {
+    var reg: List<int>
+    var stack: List<int>
+
+    constructor(reg: List<int>, stack: List<int>) {
+        this.reg = reg
+        this.stack = stack
+    }
+}
+
+fn a64ArgLocs(ptys: List<IrTy>) -> A64Locs {
+    var regs: List<int> = []
+    var stacks: List<int> = []
+    var ni = 0
+    var nf = 0
+    var ns = 0
+    for (t in ptys) {
+        if (isFloatTy(t)) {
+            if (nf < 8) {
+                regs.push(nf)
+                stacks.push(0 - 1)
+                nf = nf + 1
+            } else {
+                regs.push(0 - 1)
+                stacks.push(ns)
+                ns = ns + 1
+            }
+        } else {
+            if (ni < 8) {
+                regs.push(ni)
+                stacks.push(0 - 1)
+                ni = ni + 1
+            } else {
+                regs.push(0 - 1)
+                stacks.push(ns)
+                ns = ns + 1
+            }
+        }
+    }
+    A64Locs(regs, stacks)
+}
+
+/// The frame plan for one function. Unlike `x64.FnPlan` this has no pinned
+/// registers: every value has exactly one home, so `slotHome`/`tempHome` never
+/// have to consult a register map.
+class A64Plan {
+    var ncells: int
+    var shadowBytes: int
+    var totalK: int
+    var shadowed: bool
+    var slotCell: List<int>
+    var slotK: List<int>
+    var tempCell: Map<int, int>
+    var tempK: Map<int, int>
+    var types: Map<int, IrTy>
+
+    constructor(
+        ncells: int,
+        shadowBytes: int,
+        totalK: int,
+        shadowed: bool,
+        slotCell: List<int>,
+        slotK: List<int>,
+        tempCell: Map<int, int>,
+        tempK: Map<int, int>,
+        types: Map<int, IrTy>
+    ) {
+        this.ncells = ncells
+        this.shadowBytes = shadowBytes
+        this.totalK = totalK
+        this.shadowed = shadowed
+        this.slotCell = slotCell
+        this.slotK = slotK
+        this.tempCell = tempCell
+        this.tempK = tempK
+        this.types = types
+    }
+
+    fn slotHome(s: int) -> int? {
+        if (s < len(this.slotCell) && this.slotCell[s] >= 0) {
+            return this.shadowBytes - SHADOW_HEADER_BYTES - CELL_BYTES * this.slotCell[s]
+        }
+        if (s < len(this.slotK) && this.slotK[s] >= 1) {
+            return this.slotK[s]
+        }
+        none
+    }
+
+    fn tempHome(t: int) -> int? {
+        if (this.tempCell.has(t)) {
+            return this.shadowBytes - SHADOW_HEADER_BYTES - CELL_BYTES * this.tempCell[t]
+        }
+        if (this.tempK.has(t)) {
+            return this.tempK[t]
+        }
+        none
+    }
+}
+
+/// Assign every slot and temp a home. Managed values go into shadow cells;
+/// everything else gets an eight-byte frame slot below the shadow frame. The
+/// type walk is the same one `x64.analyze` does; only the pinning and constant
+/// rematerialisation are omitted.
+fn a64Analyze(m: IrModule, fun: IrFunc, mayGC: Map<string, bool>) -> A64Plan {
+    var types: Map<int, IrTy> = {0: IrTy.Unit}
+    types.remove(0)
+    var allTemps: List<int> = []
+    for (blk in fun.blocks) {
+        for (ins in blk.instrs) {
+            match (ins) {
+                case IrInstr.Const(d, cst) -> {
+                    types[d] = constTy(cst)
+                    allTemps.push(d)
+                }
+                case IrInstr.UnOp(d, op, v) -> {
+                    if (op == IrUnOp.Not) {
+                        types[d] = IrTy.Bool
+                    } else {
+                        types[d] = defTy(types, v)
+                    }
+                    allTemps.push(d)
+                }
+                case IrInstr.BinOp(d, op, a, b) -> {
+                    if (isCmp(op)) {
+                        types[d] = IrTy.Bool
+                    } else {
+                        types[d] = defTy(types, a)
+                    }
+                    allTemps.push(d)
+                }
+                case IrInstr.Copy(d, v) -> {
+                    types[d] = defTy(types, v)
+                    allTemps.push(d)
+                }
+                case IrInstr.Itof(d, v) -> {
+                    types[d] = IrTy.Float
+                    allTemps.push(d)
+                }
+                case IrInstr.Ftoi(d, v) -> {
+                    types[d] = IrTy.Int
+                    allTemps.push(d)
+                }
+                case IrInstr.Chartoi(d, v) -> {
+                    types[d] = IrTy.Int
+                    allTemps.push(d)
+                }
+                case IrInstr.Itochar(d, v) -> {
+                    types[d] = IrTy.Char
+                    allTemps.push(d)
+                }
+                case IrInstr.LoadSlot(d, s) -> {
+                    types[d] = fun.slots[s]
+                    allTemps.push(d)
+                }
+                case IrInstr.StoreSlot(s, v) -> {}
+                case IrInstr.LocalAddr(d, s) -> {
+                    types[d] = IrTy.Int
+                    allTemps.push(d)
+                }
+                case IrInstr.LoadRaw(d, addr, ty) -> {
+                    types[d] = ty
+                    allTemps.push(d)
+                }
+                case IrInstr.StoreRaw(addr, v, ty) -> {}
+                case IrInstr.GlobalAddr(d, id) -> {
+                    types[d] = IrTy.Int
+                    allTemps.push(d)
+                }
+                case IrInstr.LoadGlobal(d, id, ty) -> {
+                    types[d] = ty
+                    allTemps.push(d)
+                }
+                case IrInstr.StoreGlobal(id, v, ty) -> {}
+                case IrInstr.Call(d, callee, args) -> {
+                    match (d) {
+                        case some(dd) -> {
+                            types[dd] = callRet(m, callee)
+                            allTemps.push(dd)
+                        }
+                        case none -> {}
+                    }
+                }
+                case IrInstr.CallInd(d, fnAddr, params, ret, args) -> {
+                    match (d) {
+                        case some(dd) -> {
+                            types[dd] = ret
+                            allTemps.push(dd)
+                        }
+                        case none -> {}
+                    }
+                }
+            }
+        }
+    }
+
+    var ncells = 0
+    var slotCell: List<int> = []
+    var slotK: List<int> = []
+    var i = 0
+    while (i < len(fun.slots)) {
+        slotCell.push(0 - 1)
+        slotK.push(0)
+        i = i + 1
+    }
+    i = 0
+    while (i < len(fun.slots)) {
+        if (isManaged(fun.slots[i])) {
+            slotCell[i] = ncells
+            ncells = ncells + 1
+        }
+        i = i + 1
+    }
+    var tempCell = {0: 0}
+    tempCell.remove(0)
+    for (t in allTemps) {
+        if (!tempCell.has(t) && isManaged(types[t])) {
+            tempCell[t] = ncells
+            ncells = ncells + 1
+        }
+    }
+    let shadowBytes = SHADOW_HEADER_BYTES + CELL_BYTES * ncells
+    // The first home has to clear the shadow frame's last byte, and starting
+    // one cell deeper leaves the same eight-byte guard x64 uses. `used` is the
+    // deepest K allocated so far; each new home is eight bytes below it.
+    var used = shadowBytes + CELL_BYTES
+    i = 0
+    while (i < len(fun.slots)) {
+        if (!isManaged(fun.slots[i])) {
+            used = used + CELL_BYTES
+            slotK[i] = used
+        }
+        i = i + 1
+    }
+    var tempK = {0: 0}
+    tempK.remove(0)
+    for (t in allTemps) {
+        if (!isManaged(types[t]) && !tempK.has(t)) {
+            used = used + CELL_BYTES
+            tempK[t] = used
+        }
+    }
+    let totalK = a64AlignUp(used, 16)
+    let shadowed = ncells > 0 && mayGC.has(fun.name) && !isShadowApiFn(fun.name, fun.symbol)
+    A64Plan(ncells, shadowBytes, totalK, shadowed, slotCell, slotK, tempCell, tempK, types)
+}
+
+/// One local branch placeholder: the instruction offset and the block id it
+/// has to reach.
+class A64Fix {
+    var off: int
+    var target: int
+
+    constructor(off: int, target: int) {
+        this.off = off
+        this.target = target
+    }
+}
+
+class A64Emitter {
+    var m: IrModule
+    var fun: IrFunc
+    var diags: DiagnosticSink
+    var mayGC: Map<string, bool>
+    var plan: A64Plan
+    var failed: bool
+    var b: A64Buf
+    var fixes: List<A64Fix>
+    var starts: Map<int, int>
+    /// Each `ldr Xt, label` instruction waiting for its literal-pool entry.
+    var litFixups: List<int>
+    var litSyms: List<string>
+    var spawnCapable: int
+    var loopHeads: Map<int, bool>
+    var loopHeadsComputed: bool
+
+    constructor(m: IrModule, fun: IrFunc, diags: DiagnosticSink, mayGC: Map<string, bool>) {
+        this.m = m
+        this.fun = fun
+        this.diags = diags
+        this.mayGC = mayGC
+        this.plan = a64Analyze(m, fun, mayGC)
+        this.failed = false
+        this.b = A64Buf()
+        this.fixes = List<A64Fix>()
+        this.starts = {0: 0}
+        this.starts.remove(0)
+        this.litFixups = List<int>()
+        this.litSyms = List<string>()
+        this.spawnCapable = 0 - 1
+        this.loopHeads = {0: false}
+        this.loopHeads.remove(0)
+        this.loopHeadsComputed = false
+    }
+
+    fn fail(msg: string) {
+        this.failed = true
+        this.diags.emit(Diagnostic.errorAt(Span(0, 0), "arm64: " + msg))
+    }
+
+    fn typeOfT(t: int) -> IrTy {
+        this.plan.types[t]
+    }
+
+    fn globalSym(id: int) -> string {
+        this.m.globals[id].symbol
+    }
+
+    fn globalTyOk(ty: IrTy) -> bool {
+        ty == IrTy.Int || ty == IrTy.Bool || ty == IrTy.Char || ty == IrTy.Float
+            || ty == IrTy.Str || ty == IrTy.Ptr
+    }
+
+    fn kOfSlot(s: int) -> int {
+        match (this.plan.slotHome(s)) {
+            case some(k) -> k
+            case none -> {
+                this.fail("unplanned slot " + str(s))
+                0
+            }
+        }
+    }
+
+    fn kOfTemp(t: int) -> int {
+        match (this.plan.tempHome(t)) {
+            case some(k) -> k
+            case none -> {
+                this.fail("unplanned temp " + str(t))
+                0
+            }
+        }
+    }
+
+    /// x16 = x29 - k. A frame larger than the 12-bit immediate can address is
+    /// materialised in x16 first; `subReg` is fine here because both operands
+    /// are ordinary registers, never SP.
+    fn frameAddr(reg: int, k: int) {
+        if (k <= 4095) {
+            this.b.subImm(reg, 29, k)
+        } else {
+            this.b.movImm(reg, k)
+            this.b.subReg(reg, 29, reg)
+        }
+    }
+
+    /// reg = x29 + off, for incoming stack arguments.
+    fn paramAddr(reg: int, off: int) {
+        if (off <= 4095) {
+            this.b.addImm(reg, 29, off)
+        } else {
+            this.b.movImm(reg, off)
+            this.b.addReg(reg, 29, reg)
+        }
+    }
+
+    fn loadTmp(reg: int, w: int, t: int) {
+        let k = this.kOfTemp(t)
+        this.frameAddr(16, k)
+        if (w == 8) {
+            this.b.ldrb(reg, 16, 0)
+        } else if (w == 32) {
+            this.b.ldrW(reg, 16, 0)
+        } else {
+            this.b.ldrX(reg, 16, 0)
+        }
+    }
+
+    fn storeTmp(t: int, reg: int, w: int) {
+        let k = this.kOfTemp(t)
+        this.frameAddr(16, k)
+        if (w == 8) {
+            this.b.strb(reg, 16, 0)
+        } else if (w == 32) {
+            this.b.strW(reg, 16, 0)
+        } else {
+            this.b.strX(reg, 16, 0)
+        }
+    }
+
+    fn loadTmpFloat(dreg: int, t: int) {
+        let k = this.kOfTemp(t)
+        this.frameAddr(16, k)
+        this.b.ldrD(dreg, 16, 0)
+    }
+
+    fn storeTmpFloat(t: int, dreg: int) {
+        let k = this.kOfTemp(t)
+        this.frameAddr(16, k)
+        this.b.strD(dreg, 16, 0)
+    }
+
+    /// Emit `ldr reg, <pool entry for sym>` and remember the patch site. The
+    /// pool itself is appended after the last block, where control cannot
+    /// reach, so the data never executes.
+    fn lit(reg: int, sym: string) {
+        let at = this.b.ldrLiteral(reg)
+        this.litFixups.push(at)
+        this.litSyms.push(sym)
+    }
+
+    fn flushLits() {
+        while ((this.b.size() % 8) != 0) {
+            this.b.u8(0)
+        }
+        var i = 0
+        while (i < len(this.litFixups)) {
+            let target = this.b.size()
+            this.b.abs64(this.litSyms[i])
+            this.b.patchLdrLit(this.litFixups[i], target)
+            i = i + 1
+        }
+    }
+
+    fn subSp(k: int) {
+        var left = k
+        while (left > 0) {
+            let chunk = if (left > 4095) { 4095 } else { left }
+            this.b.subImm(31, 31, chunk)
+            left = left - chunk
+        }
+    }
+
+    fn addSp(k: int) {
+        var left = k
+        while (left > 0) {
+            let chunk = if (left > 4095) { 4095 } else { left }
+            this.b.addImm(31, 31, chunk)
+            left = left - chunk
+        }
+    }
+
+    fn emitB(target: int) {
+        let off = this.b.b()
+        this.fixes.push(A64Fix(off, target))
+    }
+
+    fn emitCbnz(reg: int, target: int) {
+        let off = this.b.cbnz(reg)
+        this.fixes.push(A64Fix(off, target))
+    }
+
+    fn patchFixes() {
+        for (fx in this.fixes) {
+            match (this.starts.get(fx.target)) {
+                case some(at) -> {
+                    let w = this.b.wordAt(fx.off)
+                    if ((w & 0x7C000000) == 0x14000000) {
+                        this.b.patchB(fx.off, at)
+                    } else {
+                        this.b.patchCbz(fx.off, at)
+                    }
+                }
+                case none -> this.fail("unknown branch target " + str(fx.target))
+            }
+        }
+    }
+
+    /// Is the whole module spawn-capable? The loop safepoint is only needed
+    /// when another thread can collect while this one runs; a single-threaded
+    /// program never polls.
+    fn moduleMaySpawn() -> bool {
+        if (this.spawnCapable >= 0) {
+            return this.spawnCapable != 0
+        }
+        var found = false
+        for (e in this.m.externs) {
+            if (e.symbol == "pickle_thread_spawn") {
+                found = true
+            }
+        }
+        for (f in this.m.funcs) {
+            if (f.symbol == "pickle_thread_spawn") {
+                found = true
+            }
+        }
+        if (found) {
+            this.spawnCapable = 1
+        } else {
+            this.spawnCapable = 0
+        }
+        found
+    }
+
+    fn closesCycle(src: int, dst: int, pos: Map<int, int>) -> bool {
+        var seen = {0: false}
+        seen.remove(0)
+        var work: List<int> = [dst]
+        while (len(work) > 0) {
+            let cur = work.pop()
+            if (cur == src) {
+                return true
+            }
+            if (!seen.has(cur) && pos.has(cur)) {
+                seen[cur] = true
+                match (this.fun.blocks[pos[cur]].term) {
+                    case IrTerm.Branch(target) -> work.push(target)
+                    case IrTerm.BranchIf(_, tn, el) -> {
+                        work.push(tn)
+                        work.push(el)
+                    }
+                    case _ -> {}
+                }
+            }
+        }
+        false
+    }
+
+    fn isLoopHeader(id: int) -> bool {
+        if (!this.moduleMaySpawn()) {
+            return false
+        }
+        if (this.fun.symbol == "pickle_gc_poll") {
+            return false
+        }
+        if (!this.loopHeadsComputed) {
+            var pos = {0: 0}
+            pos.remove(0)
+            var i = 0
+            for (b in this.fun.blocks) {
+                pos[b.id] = i
+                i = i + 1
+            }
+            var reach = {0: false}
+            reach.remove(0)
+            reach[0] = true
+            var work: List<int> = [0]
+            while (len(work) > 0) {
+                let cur = work.pop()
+                if (pos.has(cur)) {
+                    match (this.fun.blocks[pos[cur]].term) {
+                        case IrTerm.Branch(target) -> {
+                            if (!reach.has(target)) {
+                                reach[target] = true
+                                work.push(target)
+                            }
+                        }
+                        case IrTerm.BranchIf(_, tn, el) -> {
+                            if (!reach.has(tn)) {
+                                reach[tn] = true
+                                work.push(tn)
+                            }
+                            if (!reach.has(el)) {
+                                reach[el] = true
+                                work.push(el)
+                            }
+                        }
+                        case _ -> {}
+                    }
+                }
+            }
+            i = 0
+            for (b in this.fun.blocks) {
+                if (reach.has(b.id)) {
+                    match (b.term) {
+                        case IrTerm.Branch(target) -> {
+                            if (pos.has(target) && pos[target] <= i && this.closesCycle(b.id, target, pos)) {
+                                this.loopHeads[target] = true
+                            }
+                        }
+                        case IrTerm.BranchIf(_, tn, el) -> {
+                            if (pos.has(tn) && pos[tn] <= i && this.closesCycle(b.id, tn, pos)) {
+                                this.loopHeads[tn] = true
+                            }
+                            if (pos.has(el) && pos[el] <= i && this.closesCycle(b.id, el, pos)) {
+                                this.loopHeads[el] = true
+                            }
+                        }
+                        case _ -> {}
+                    }
+                }
+                i = i + 1
+            }
+            this.loopHeadsComputed = true
+        }
+        this.loopHeads.has(id)
+    }
+
+    /// `if (pkl_global_gcRequested != 0) pickle_gc_poll()`.
+    fn emitGcPoll() {
+        this.lit(16, "pkl_global_gcRequested")
+        this.b.ldrW(17, 16, 0)
+        let skip = this.b.cbz(17)
+        this.b.callSym("pickle_gc_poll")
+        let after = this.b.size()
+        this.b.patchCbz(skip, after)
+    }
+
+    fn prologue() {
+        this.b.stpPre(29, 30, 31, 0 - 16)
+        this.b.addImm(29, 31, 0)
+        this.subSp(this.plan.totalK)
+        if (this.plan.shadowed) {
+            this.frameAddr(16, this.plan.shadowBytes)
+            let packed = (SHADOW_FRAME_TAG << SHADOW_TAG_SHIFT) | (this.plan.totalK << 32) | this.plan.ncells
+            this.b.movImm(17, packed)
+            this.b.strX(17, 16, 8)
+            this.b.addImm(16, 16, 16)
+            this.b.movz(17, 0, 0)
+            this.b.movImm(18, this.plan.ncells)
+            let loop = this.b.size()
+            let done = this.b.cbz(18)
+            this.b.strX(17, 16, 0)
+            this.b.addImm(16, 16, 8)
+            this.b.subImm(18, 18, 1)
+            let back = this.b.b()
+            let after = this.b.size()
+            this.b.patchCbz(done, after)
+            this.b.patchB(back, loop)
+        }
+    }
+
+    fn seedParams() {
+        var ptys: List<IrTy> = []
+        for (p in this.fun.params) {
+            ptys.push(p.ty)
+        }
+        let locs = a64ArgLocs(ptys)
+        // Parameters are slots, not temps: the body reads them with
+        // `LoadSlot(_, i)`, and `a64Analyze` gave slot i its home.
+        // Stack parameters are loaded first: a stack float would otherwise
+        // overwrite d0 while it still holds register argument 0.
+        var i = 0
+        while (i < len(ptys)) {
+            let s = locs.stack[i]
+            if (s >= 0) {
+                let off = 16 + 8 * s
+                let k = this.kOfSlot(i)
+                if (isFloatTy(ptys[i])) {
+                    this.paramAddr(16, off)
+                    this.b.ldrD(0, 16, 0)
+                    this.frameAddr(16, k)
+                    this.b.strD(0, 16, 0)
+                } else {
+                    this.paramAddr(16, off)
+                    this.b.ldrX(17, 16, 0)
+                    this.frameAddr(16, k)
+                    let w = tyWidth(ptys[i])
+                    if (w == 8) {
+                        this.b.strb(17, 16, 0)
+                    } else if (w == 32) {
+                        this.b.strW(17, 16, 0)
+                    } else {
+                        this.b.strX(17, 16, 0)
+                    }
+                }
+            }
+            i = i + 1
+        }
+        i = 0
+        while (i < len(ptys)) {
+            let r = locs.reg[i]
+            if (r >= 0) {
+                let k = this.kOfSlot(i)
+                let w = tyWidth(ptys[i])
+                this.frameAddr(16, k)
+                if (isFloatTy(ptys[i])) {
+                    this.b.strD(r, 16, 0)
+                } else if (w == 8) {
+                    this.b.strb(r, 16, 0)
+                } else if (w == 32) {
+                    this.b.strW(r, 16, 0)
+                } else {
+                    this.b.strX(r, 16, 0)
+                }
+            }
+            i = i + 1
+        }
+    }
+
+    fn pushShadow() {
+        if (this.plan.shadowed) {
+            this.frameAddr(0, this.plan.shadowBytes)
+            this.b.callSym("pickle_shadow_push")
+        }
+    }
+
+    fn popShadow() {
+        if (this.plan.shadowed) {
+            this.frameAddr(0, this.plan.shadowBytes)
+            this.b.callSym("pickle_shadow_pop")
+        }
+    }
+
+    fn emitConst(d: int, c: IrConst) {
+        match (c) {
+            case IrConst.Int(v) -> {
+                this.b.movImm(17, v)
+                this.storeTmp(d, 17, 64)
+            }
+            case IrConst.Float(v) -> {
+                this.b.movImm(17, f64ToBits(v))
+                this.b.fmovDX(0, 17)
+                this.storeTmpFloat(d, 0)
+            }
+            case IrConst.Bool(bv) -> {
+                let v = if (bv) { 1 } else { 0 }
+                this.b.movz(17, v, 0)
+                this.storeTmp(d, 17, 8)
+            }
+            case IrConst.Char(cv) -> {
+                this.b.movImm(17, cv as int)
+                this.storeTmp(d, 17, 32)
+            }
+            case IrConst.Null -> {
+                this.b.movz(17, 0, 0)
+                this.storeTmp(d, 17, 64)
+            }
+            case IrConst.Str(id) -> {
+                this.lit(17, "pkl_strdesc_" + str(id))
+                this.storeTmp(d, 17, 64)
+            }
+            case IrConst.StrAddr(id) -> {
+                this.lit(17, "pkl_strdata_" + str(id))
+                this.storeTmp(d, 17, 64)
+            }
+            case IrConst.FuncAddr(id) -> {
+                this.lit(17, funcSymbolOf(this.m, id))
+                this.storeTmp(d, 17, 64)
+            }
+        }
+    }
+
+    fn emitUnOp(d: int, op: IrUnOp, v: int) {
+        match (op) {
+            case IrUnOp.Neg -> {
+                let w = tyWidth(this.typeOfT(v))
+                this.loadTmp(0, w, v)
+                this.b.subReg(0, 31, 0)
+                this.storeTmp(d, 0, w)
+            }
+            case IrUnOp.Not -> {
+                this.loadTmp(0, 8, v)
+                this.b.cmpImm(0, 0)
+                this.b.cset(0, COND_EQ)
+                this.storeTmp(d, 0, 8)
+            }
+            case IrUnOp.BitNot -> {
+                let w = tyWidth(this.typeOfT(v))
+                this.loadTmp(0, w, v)
+                this.b.mvn(0, 0)
+                this.storeTmp(d, 0, w)
+            }
+        }
+    }
+
+    fn floatCond(op: IrBinOp) -> int {
+        match (op) {
+            case IrBinOp.Eq -> COND_EQ
+            case IrBinOp.Ne -> COND_NE
+            case IrBinOp.Lt -> COND_MI
+            case IrBinOp.Le -> COND_LS
+            case IrBinOp.Gt -> COND_GT
+            case _ -> COND_GE
+        }
+    }
+
+    fn intCond(op: IrBinOp) -> int {
+        match (op) {
+            case IrBinOp.Eq -> COND_EQ
+            case IrBinOp.Ne -> COND_NE
+            case IrBinOp.Lt -> COND_MI
+            case IrBinOp.Le -> COND_LS
+            case IrBinOp.Gt -> COND_GT
+            case _ -> COND_GE
+        }
+    }
+
+    fn emitBinOp(d: int, op: IrBinOp, a: int, b: int) {
+        let ta = this.typeOfT(a)
+        if (isFloatTy(ta)) {
+            if (op == IrBinOp.Mod) {
+                // a - trunc(a / b) * b. `fcvtzs` is not needed: `frintz` is
+                // the truncating rounding step, and `fmsub` keeps the fused
+                // multiply-subtract exact enough for the remainder.
+                this.loadTmpFloat(0, a)
+                this.loadTmpFloat(1, b)
+                this.b.fdiv(2, 0, 1)
+                this.b.frintz(2, 2)
+                this.b.fmsub(0, 2, 1, 0)
+                this.storeTmpFloat(d, 0)
+            } else if (isCmp(op)) {
+                this.loadTmpFloat(0, a)
+                this.loadTmpFloat(1, b)
+                this.b.fcmpReg(0, 1)
+                this.b.cset(0, this.floatCond(op))
+                this.storeTmp(d, 0, 8)
+            } else {
+                this.loadTmpFloat(0, a)
+                this.loadTmpFloat(1, b)
+                match (op) {
+                    case IrBinOp.Add -> this.b.fadd(0, 0, 1)
+                    case IrBinOp.Sub -> this.b.fsub(0, 0, 1)
+                    case IrBinOp.Mul -> this.b.fmul(0, 0, 1)
+                    case IrBinOp.Div -> this.b.fdiv(0, 0, 1)
+                    case _ -> this.fail("bad float binop")
+                }
+                this.storeTmpFloat(d, 0)
+            }
+        } else {
+            let w = tyWidth(ta)
+            this.loadTmp(0, w, a)
+            this.loadTmp(1, w, b)
+            if (isCmp(op)) {
+                this.b.cmpReg(0, 1)
+                this.b.cset(0, this.intCond(op))
+                this.storeTmp(d, 0, 8)
+            } else if (op == IrBinOp.Div) {
+                this.b.sdiv(0, 0, 1)
+                this.storeTmp(d, 0, 64)
+            } else if (op == IrBinOp.Mod) {
+                this.b.sdiv(2, 0, 1)
+                this.b.msub(0, 2, 1, 0)
+                this.storeTmp(d, 0, 64)
+            } else if (op == IrBinOp.Shl) {
+                this.b.lslv(0, 0, 1)
+                this.storeTmp(d, 0, 64)
+            } else if (op == IrBinOp.Shr) {
+                this.b.asrv(0, 0, 1)
+                this.storeTmp(d, 0, 64)
+            } else {
+                match (op) {
+                    case IrBinOp.Add -> this.b.addReg(0, 0, 1)
+                    case IrBinOp.Sub -> this.b.subReg(0, 0, 1)
+                    case IrBinOp.Mul -> this.b.madd(0, 0, 1, 31)
+                    case IrBinOp.BitAnd -> this.b.andReg(0, 0, 1)
+                    case IrBinOp.BitOr -> this.b.orrReg(0, 0, 1)
+                    case IrBinOp.BitXor -> this.b.eorReg(0, 0, 1)
+                    case _ -> this.fail("bad int binop")
+                }
+                this.storeTmp(d, 0, w)
+            }
+        }
+    }
+
+    fn emitMem(ins: IrInstr) {
+        match (ins) {
+            case IrInstr.LoadSlot(d, s) -> {
+                let ty = this.fun.slots[s]
+                let k = this.kOfSlot(s)
+                if (isFloatTy(ty)) {
+                    this.frameAddr(16, k)
+                    this.b.ldrD(0, 16, 0)
+                    this.storeTmpFloat(d, 0)
+                } else {
+                    let w = tyWidth(ty)
+                    this.frameAddr(16, k)
+                    if (w == 8) {
+                        this.b.ldrb(0, 16, 0)
+                    } else if (w == 32) {
+                        this.b.ldrW(0, 16, 0)
+                    } else {
+                        this.b.ldrX(0, 16, 0)
+                    }
+                    this.storeTmp(d, 0, w)
+                }
+            }
+            case IrInstr.StoreSlot(s, v) -> {
+                let ty = this.fun.slots[s]
+                let k = this.kOfSlot(s)
+                if (isFloatTy(ty)) {
+                    this.loadTmpFloat(0, v)
+                    this.frameAddr(16, k)
+                    this.b.strD(0, 16, 0)
+                } else {
+                    let w = tyWidth(ty)
+                    this.loadTmp(0, w, v)
+                    this.frameAddr(16, k)
+                    if (w == 8) {
+                        this.b.strb(0, 16, 0)
+                    } else if (w == 32) {
+                        this.b.strW(0, 16, 0)
+                    } else {
+                        this.b.strX(0, 16, 0)
+                    }
+                }
+            }
+            case IrInstr.LocalAddr(d, s) -> {
+                let k = this.kOfSlot(s)
+                this.frameAddr(0, k)
+                this.storeTmp(d, 0, 64)
+            }
+            case IrInstr.LoadRaw(d, addr, ty) -> {
+                this.loadTmp(1, 64, addr)
+                if (isFloatTy(ty)) {
+                    this.b.ldrD(0, 1, 0)
+                    this.storeTmpFloat(d, 0)
+                } else {
+                    let w = tyWidth(ty)
+                    if (w == 8) {
+                        this.b.ldrb(0, 1, 0)
+                    } else if (w == 32) {
+                        this.b.ldrW(0, 1, 0)
+                    } else {
+                        this.b.ldrX(0, 1, 0)
+                    }
+                    this.storeTmp(d, 0, w)
+                }
+            }
+            case IrInstr.StoreRaw(addr, v, ty) -> {
+                this.loadTmp(1, 64, addr)
+                if (isFloatTy(ty)) {
+                    this.loadTmpFloat(0, v)
+                    this.b.strD(0, 1, 0)
+                } else {
+                    let w = tyWidth(ty)
+                    this.loadTmp(0, w, v)
+                    if (w == 8) {
+                        this.b.strb(0, 1, 0)
+                    } else if (w == 32) {
+                        this.b.strW(0, 1, 0)
+                    } else {
+                        this.b.strX(0, 1, 0)
+                    }
+                }
+            }
+            case _ -> {}
+        }
+    }
+
+    fn emitCall(sum: string, ptys: List<IrTy>, ret: IrTy, d: int?, args: List<int>, direct: bool) {
+        if (len(args) > len(ptys)) {
+            this.fail("call to `" + sum + "` has " + str(len(args)) + " argument(s), but the callee takes " + str(len(ptys)))
+            return
+        }
+        let n = len(args)
+        let locs = a64ArgLocs(ptys)
+        var ns = 0
+        var i = 0
+        while (i < n) {
+            if (locs.stack[i] >= 0) {
+                ns = ns + 1
+            }
+            i = i + 1
+        }
+        var R = 0
+        if (ns > 0) {
+            R = a64AlignUp(8 * ns, 16)
+            this.subSp(R)
+            i = 0
+            while (i < n) {
+                let s = locs.stack[i]
+                if (s >= 0) {
+                    let t = ptys[i]
+                    let disp = 8 * s
+                    if (disp > 32760) {
+                        this.fail("too many stack arguments")
+                    }
+                    if (isFloatTy(t)) {
+                        this.loadTmpFloat(0, args[i])
+                        this.b.strD(0, 31, disp)
+                    } else {
+                        this.loadTmp(17, tyWidth(t), args[i])
+                        this.b.strX(17, 31, disp)
+                    }
+                }
+                i = i + 1
+            }
+        }
+        i = 0
+        while (i < n) {
+            let r = locs.reg[i]
+            if (r >= 0) {
+                if (isFloatTy(ptys[i])) {
+                    this.loadTmpFloat(r, args[i])
+                } else {
+                    this.loadTmp(r, tyWidth(ptys[i]), args[i])
+                }
+            }
+            i = i + 1
+        }
+        if (direct) {
+            this.b.callSym(sum)
+        } else {
+            this.lit(16, sum)
+            this.b.blr(16)
+        }
+        if (ns > 0) {
+            this.addSp(R)
+        }
+        match (d) {
+            case some(dd) -> {
+                if (isFloatTy(ret)) {
+                    this.storeTmpFloat(dd, 0)
+                } else {
+                    this.storeTmp(dd, 0, tyWidth(ret))
+                }
+            }
+            case none -> {}
+        }
+    }
+
+    fn emitCallInd(d: int?, fnAddr: int, params: List<IrTy>, ret: IrTy, args: List<int>) {
+        if (len(args) > len(params)) {
+            this.fail("indirect call has " + str(len(args)) + " argument(s), but the signature takes " + str(len(params)))
+            return
+        }
+        let n = len(args)
+        let locs = a64ArgLocs(params)
+        var ns = 0
+        var i = 0
+        while (i < n) {
+            if (locs.stack[i] >= 0) {
+                ns = ns + 1
+            }
+            i = i + 1
+        }
+        var R = 0
+        if (ns > 0) {
+            R = a64AlignUp(8 * ns, 16)
+            this.subSp(R)
+            i = 0
+            while (i < n) {
+                let s = locs.stack[i]
+                if (s >= 0) {
+                    let t = params[i]
+                    let disp = 8 * s
+                    if (disp > 32760) {
+                        this.fail("too many stack arguments")
+                    }
+                    if (isFloatTy(t)) {
+                        this.loadTmpFloat(0, args[i])
+                        this.b.strD(0, 31, disp)
+                    } else {
+                        this.loadTmp(17, tyWidth(t), args[i])
+                        this.b.strX(17, 31, disp)
+                    }
+                }
+                i = i + 1
+            }
+        }
+        i = 0
+        while (i < n) {
+            let r = locs.reg[i]
+            if (r >= 0) {
+                if (isFloatTy(params[i])) {
+                    this.loadTmpFloat(r, args[i])
+                } else {
+                    this.loadTmp(r, tyWidth(params[i]), args[i])
+                }
+            }
+            i = i + 1
+        }
+        this.loadTmp(16, 64, fnAddr)
+        this.b.blr(16)
+        if (ns > 0) {
+            this.addSp(R)
+        }
+        match (d) {
+            case some(dd) -> {
+                if (isFloatTy(ret)) {
+                    this.storeTmpFloat(dd, 0)
+                } else {
+                    this.storeTmp(dd, 0, tyWidth(ret))
+                }
+            }
+            case none -> {}
+        }
+    }
+
+    fn lowerInstr(ins: IrInstr) {
+        if (this.failed) {
+            return
+        }
+        match (ins) {
+            case IrInstr.Const(d, cst) -> this.emitConst(d, cst)
+            case IrInstr.UnOp(d, op, v) -> this.emitUnOp(d, op, v)
+            case IrInstr.BinOp(d, op, a, b) -> this.emitBinOp(d, op, a, b)
+            case IrInstr.Copy(d, v) -> {
+                let w = tyWidth(this.typeOfT(v))
+                this.loadTmp(0, w, v)
+                this.storeTmp(d, 0, w)
+            }
+            case IrInstr.Itof(d, v) -> {
+                this.loadTmp(0, 64, v)
+                this.b.scvtf(0, 0)
+                this.storeTmpFloat(d, 0)
+            }
+            case IrInstr.Ftoi(d, v) -> {
+                this.loadTmpFloat(0, v)
+                this.b.fcvtzs(0, 0)
+                this.storeTmp(d, 0, 64)
+            }
+            case IrInstr.Chartoi(d, v) -> {
+                this.loadTmp(0, 32, v)
+                this.storeTmp(d, 0, 64)
+            }
+            case IrInstr.Itochar(d, v) -> {
+                this.loadTmp(0, 64, v)
+                this.b.movReg32(0, 0)
+                this.storeTmp(d, 0, 32)
+            }
+            case IrInstr.LoadSlot(d, s) -> this.emitMem(IrInstr.LoadSlot(d, s))
+            case IrInstr.StoreSlot(s, v) -> this.emitMem(IrInstr.StoreSlot(s, v))
+            case IrInstr.LocalAddr(d, s) -> this.emitMem(IrInstr.LocalAddr(d, s))
+            case IrInstr.LoadRaw(d, addr, ty) -> this.emitMem(IrInstr.LoadRaw(d, addr, ty))
+            case IrInstr.StoreRaw(addr, v, ty) -> this.emitMem(IrInstr.StoreRaw(addr, v, ty))
+            case IrInstr.GlobalAddr(d, id) -> {
+                this.lit(17, this.globalSym(id))
+                this.storeTmp(d, 17, 64)
+            }
+            case IrInstr.LoadGlobal(d, id, ty) -> {
+                if (!this.globalTyOk(ty)) {
+                    this.fail("loadglobal of `" + irTyStr(ty) + "` is not lowered yet")
+                    return
+                }
+                let w = tyWidth(ty)
+                this.lit(17, this.globalSym(id))
+                if (w == 8) {
+                    this.b.ldrb(0, 17, 0)
+                } else if (w == 32) {
+                    this.b.ldrW(0, 17, 0)
+                } else {
+                    this.b.ldrX(0, 17, 0)
+                }
+                this.storeTmp(d, 0, w)
+            }
+            case IrInstr.StoreGlobal(id, v, ty) -> {
+                if (!this.globalTyOk(ty)) {
+                    this.fail("storeglobal of `" + irTyStr(ty) + "` is not lowered yet")
+                    return
+                }
+                let w = tyWidth(ty)
+                this.loadTmp(0, w, v)
+                this.lit(17, this.globalSym(id))
+                if (w == 8) {
+                    this.b.strb(0, 17, 0)
+                } else if (w == 32) {
+                    this.b.strW(0, 17, 0)
+                } else {
+                    this.b.strX(0, 17, 0)
+                }
+            }
+            case IrInstr.Call(d, callee, args) -> {
+                match (callee) {
+                    case Callee.Func(id) -> {
+                        let f = this.m.funcs[id]
+                        var ptys: List<IrTy> = []
+                        for (p in f.params) {
+                            ptys.push(p.ty)
+                        }
+                        this.emitCall(funcSymbolOf(this.m, id), ptys, f.ret, d, args, true)
+                    }
+                    case Callee.Extern(id) -> {
+                        let e = this.m.externs[id]
+                        this.emitCall(e.symbol, e.params, e.ret, d, args, true)
+                    }
+                }
+            }
+            case IrInstr.CallInd(d, fnAddr, params, ret, args) -> this.emitCallInd(d, fnAddr, params, ret, args)
+        }
+    }
+
+    fn lowerTerm(t: IrTerm) {
+        match (t) {
+            case IrTerm.Branch(target) -> this.emitB(target)
+            case IrTerm.BranchIf(c, tn, el) -> {
+                this.loadTmp(0, 8, c)
+                this.emitCbnz(0, tn)
+                this.emitB(el)
+            }
+            case IrTerm.Return(v) -> {
+                if (this.fun.symbol == "pickle_main") {
+                    this.b.callSym("pickle_exc_uncaught")
+                }
+                this.popShadow()
+                match (v) {
+                    case some(ti) -> {
+                        if (!(this.fun.ret == IrTy.Unit)) {
+                            if (isFloatTy(this.fun.ret)) {
+                                this.loadTmpFloat(0, ti)
+                            } else {
+                                this.loadTmp(0, tyWidth(this.fun.ret), ti)
+                            }
+                        }
+                    }
+                    case none -> {}
+                }
+                this.b.addImm(31, 29, 0)
+                this.b.ldpPost(29, 30, 31, 16)
+                this.b.ret()
+            }
+            case IrTerm.Unreachable -> this.b.brk(0)
+        }
+    }
+
+    fn emitFunc() -> X64Func? {
+        this.prologue()
+        this.seedParams()
+        this.pushShadow()
+        for (blk in this.fun.blocks) {
+            this.starts[blk.id] = this.b.size()
+            if (this.isLoopHeader(blk.id)) {
+                this.emitGcPoll()
+            }
+            for (ins in blk.instrs) {
+                this.lowerInstr(ins)
+            }
+            this.lowerTerm(blk.term)
+        }
+        if (this.failed) {
+            return none
+        }
+        this.patchFixes()
+        if (this.failed) {
+            return none
+        }
+        this.flushLits()
+        X64Func(this.fun.symbol, this.b.bytes, this.b.relocs, this.plan.ncells, this.plan.totalK)
+    }
+}
+
+/// Lower a module for ARM64 Linux. The result uses the shared `X64Out` shape,
+/// so `compiler.elf.elfObjForArm64` can write the object without knowing the
+/// instruction set.
+fn arm64LowerModule(m: IrModule, diags: DiagnosticSink) -> X64Out? {
+    let om = optimizeModule(m)
+    let mayGC = computeMayGC(om)
+    var funcs = List<X64Func>()
+    var i = 0
+    while (i < len(om.funcs)) {
+        let e = A64Emitter(om, om.funcs[i], diags, mayGC)
+        match (e.emitFunc()) {
+            case some(xf) -> funcs.push(xf)
+            case none -> {
+                return none
+            }
+        }
+        i = i + 1
+    }
+    X64Out(funcs)
+}
