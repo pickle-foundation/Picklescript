@@ -106,11 +106,11 @@ module runtime.abi_shadow
 /// mechanical correctness at small volumes but must not be pushed past the GC
 /// threshold. Byte-parity probes therefore run against the selflink.
 
-// Lock cells are taken through the platform lock backend rather than naming a
-// Win32 primitive here: `abi_world` is the portable contract, `abi_world_win`
-// the Win32 implementation. A POSIX shadow backend swaps this import for the
-// POSIX backend and keeps the same call sites.
-import { winLockAcquire, winLockRelease } from runtime.abi_world_win
+// Lock cells are taken through the raw lock seam rather than naming an OS
+// primitive here: `abi_lock` is the portable contract, `abi_world_impl` the
+// platform backend. The collector imports this layer directly because the
+// GC-aware `abi_world` depends on the collector.
+import { rawLockAcquire, rawLockRelease } from runtime.abi_lock
 
 /// The Win32 TLS index holding this thread's `GcThread` node pointer, or
 /// `-1` (`TLS_OUT_OF_INDEXES`) before the first push/registration.
@@ -154,10 +154,9 @@ var shadowTlsSlot: int = -1
 /// is a raw-heap block (`alloc`), never a managed object.
 ///
 /// `parkCv`/`parkLock` are a condition variable and the lock cell paired with
-/// it for this thread's safepoint. Both are zero-initialized words, which is
-/// the valid Win32 unlocked state for an `SRWLOCK` and a `CONDITION_VARIABLE`;
-/// their encoding is a backend detail, and the safepoint code only ever passes
-/// their addresses to the `abi_world_win` seam.
+/// it for this thread's safepoint. Both are zero-initialized words whose
+/// encoding is a backend detail; the safepoint code only ever passes their
+/// addresses to the `abi_lock` seam.
 const SHADOW_W_FRAMES: int = 0
 const SHADOW_W_ID: int = 1
 const SHADOW_W_NEXT: int = 2
@@ -302,14 +301,14 @@ var shadowLock: int = 0
 /// allocation exits without leaving the lock held.
 fn shadowRegistryLockAcquire() {
     unsafe {
-        winLockAcquire((&shadowLock) as int)
+        rawLockAcquire((&shadowLock) as int)
     }
 }
 
 /// Release the registry lock.
 fn shadowRegistryLockRelease() {
     unsafe {
-        winLockRelease((&shadowLock) as int)
+        rawLockRelease((&shadowLock) as int)
     }
 }
 
@@ -450,7 +449,7 @@ fn abiShadowPush(frame: *int) {
             }
         }
         let lockAddr = (&shadowLock) as int
-        winLockAcquire(lockAddr)
+        rawLockAcquire(lockAddr)
         if (shadowTlsSlot == -1) {
             shadowTlsSlot = win_tls_alloc()
         }
@@ -458,14 +457,14 @@ fn abiShadowPush(frame: *int) {
         if (node == 0) {
             node = shadowAllocNodeLocked()
             if (node == 0) {
-                winLockRelease(lockAddr)
+                rawLockRelease(lockAddr)
                 win_exit(1)
             }
             let _ = win_tls_set(shadowTlsSlot, node)
         }
         frame[0] = (node as *int)[0]
         (node as *int)[0] = frame as int
-        winLockRelease(lockAddr)
+        rawLockRelease(lockAddr)
     }
 }
 
@@ -491,23 +490,23 @@ fn abiShadowPop(frame: *int) {
         }
         if (shadowTlsSlot != -1) {
             let lockAddr = (&shadowLock) as int
-            winLockAcquire(lockAddr)
+            rawLockAcquire(lockAddr)
             var node = win_tls_get(shadowTlsSlot)
             if (node == 0) {
                 node = shadowAllocNodeLocked()
                 if (node == 0) {
-                    winLockRelease(lockAddr)
+                    rawLockRelease(lockAddr)
                     win_exit(1)
                 }
                 let _ = win_tls_set(shadowTlsSlot, node)
             }
             if ((node as *int)[0] != (frame as int)) {
-                winLockRelease(lockAddr)
+                rawLockRelease(lockAddr)
                 win_exit(1)
             }
             (node as *int)[0] = frame[0]
             frame[0] = 0
-            winLockRelease(lockAddr)
+            rawLockRelease(lockAddr)
         }
     }
 }

@@ -1,0 +1,77 @@
+module runtime.abi_lock
+
+/// Portable raw lock primitives: the only place a runtime module names a
+/// backend lock entry point.
+///
+/// WHY THIS IS SEPARATE FROM `abi_world`. `abi_world` is the *policy* layer: it
+/// knows about `PKL_GIL`, native sections and the collector's safepoint
+/// contract, so it imports `abi_gcengine`. The collector itself needs a lock,
+/// and it cannot import a module that imports the collector. This leaf module
+/// breaks that cycle: it wraps the platform backend with neutral names and
+/// depends on nothing else. The layering is:
+///
+///     abi_world_impl_win / abi_world_impl_posix   OS calls
+///                 ^
+///              abi_lock                         raw primitives (this file)
+///                 ^
+///              abi_world                        GC/GIL policy
+///
+/// The collector, the raw allocator, the shadow registry and the exception slot
+/// are the substrate the policy layer is built on, so they import `abi_lock`
+/// directly. Everything above them imports `abi_world` and gets the GC-aware
+/// wrappers. No module outside a backend file may name `pthread_*`, an
+/// `SRWLOCK`, or a futex.
+///
+/// The `raw*` prefix is deliberate: a call site says which layer it is using.
+
+import { implWorldAcquire, implWorldRelease, implWorldHeld, implWorldPark, implLockAcquire, implLockRelease, implLockTry, implParkOn, implWakeOn, implWakeAllOn } from runtime.abi_world_impl
+
+/// Take the process world lock, blocking until it is free.
+fn rawWorldAcquire() {
+    implWorldAcquire()
+}
+
+/// Release the process world lock. The caller must own it.
+fn rawWorldRelease() {
+    implWorldRelease()
+}
+
+/// Snapshot probe for the world lock. Startup-only; not an ownership test.
+fn rawWorldHeld() -> bool {
+    return implWorldHeld()
+}
+
+/// Park on `cv` while owning the world lock.
+fn rawWorldPark(cv: int) {
+    implWorldPark(cv)
+}
+
+/// Take a one-word lock cell, blocking until it is free.
+fn rawLockAcquire(cell: int) {
+    implLockAcquire(cell)
+}
+
+/// Release a one-word lock cell. The caller must own it.
+fn rawLockRelease(cell: int) {
+    implLockRelease(cell)
+}
+
+/// Non-blocking acquire of a one-word lock cell: 1 on success, 0 when owned.
+fn rawLockTry(cell: int) -> int {
+    return implLockTry(cell)
+}
+
+/// Atomically release `lockCell`, sleep on `cv`, reacquire `lockCell`.
+fn rawParkOn(lockCell: int, cv: int) {
+    implParkOn(lockCell, cv)
+}
+
+/// Wake one thread parked on `cv`. The caller must hold the paired lock cell.
+fn rawWakeOn(cv: int) {
+    implWakeOn(cv)
+}
+
+/// Wake every thread parked on `cv`. The caller must hold the paired lock cell.
+fn rawWakeAllOn(cv: int) {
+    implWakeAllOn(cv)
+}

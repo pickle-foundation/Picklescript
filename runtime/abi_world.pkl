@@ -39,22 +39,20 @@ module runtime.abi_world
 ///   - a thread blocked on a lock or a condition cell is in a native section,
 ///     so the collector never waits for it
 ///
-/// THIS MODULE IS THE SEAM. Every portable runtime module imports these
-/// functions and never names an OS lock. The Win32 implementation lives in
-/// `runtime/abi_world_win.pkl` (SRWLOCK + CONDITION_VARIABLE, both
-/// zero-initialized image data); a POSIX build supplies
-/// `runtime/abi_world_posix.pkl` with the same `winWorld*`/`winLock*` entry
-/// points backed by `pthread_mutex_t`/futex and a different word layout. The
-/// build's platform filter selects exactly one backend file, so the portable
-/// modules are unchanged. The same rule applies to every future parking
-/// primitive: the OS call belongs in a `_win`/`_posix` module, the
-/// wait/notify contract belongs here or in the module that owns the object.
+/// THIS MODULE IS THE POLICY SEAM. Every portable runtime module above the
+/// collector imports these functions and never names an OS lock. The raw
+/// primitives live in `runtime/abi_lock.pkl`, which wraps the platform backend
+/// (`abi_world_impl_win.pkl` / `abi_world_impl_posix.pkl`: SRWLOCK +
+/// CONDITION_VARIABLE on Win32, pthread objects behind one-word cells on POSIX).
+/// This module adds the GIL branch and the collector's native-section
+/// accounting; the collector and the other substrate modules import `abi_lock`
+/// directly so the dependency graph stays acyclic.
 ///
 /// WHAT MUST NOT HAPPEN. No `win_acquire_srw_exclusive`, `CRITICAL_SECTION`,
 /// `pthread_mutex_*`, or futex call may appear outside a backend module. A
 /// second hand-rolled spinlock is also forbidden.
 
-import { winWorldAcquire, winWorldRelease, winWorldHeld, winWorldPark, winLockAcquire, winLockRelease, winTryLockAcquire, winParkOn, winWakeOn, winWakeAllOn } from runtime.abi_world_win
+import { rawWorldAcquire, rawWorldRelease, rawWorldHeld, rawWorldPark, rawLockAcquire, rawLockRelease, rawLockTry, rawParkOn, rawWakeOn, rawWakeAllOn } from runtime.abi_lock
 import { abiGilMode } from runtime.abi_gil
 import { abiGcEnterNative, abiGcLeaveNative } from runtime.abi_gcengine
 
@@ -67,7 +65,7 @@ import { abiGcEnterNative, abiGcLeaveNative } from runtime.abi_gcengine
 fn worldAcquire() {
     abiGcEnterNative()
     if (abiGilMode() != 0) {
-        winWorldAcquire()
+        rawWorldAcquire()
     }
     abiGcLeaveNative()
 }
@@ -78,7 +76,7 @@ fn worldAcquire() {
 fn worldRelease() {
     abiGcEnterNative()
     if (abiGilMode() != 0) {
-        winWorldRelease()
+        rawWorldRelease()
     }
 }
 
@@ -89,7 +87,7 @@ fn worldRelease() {
 /// entry trampoline did not run `pickle_runtime_init` (the JIT lane). It is
 /// only consulted in serialized mode.
 fn worldHeld() -> bool {
-    return winWorldHeld()
+    return rawWorldHeld()
 }
 
 /// Take the one-word lock at `cell`, blocking until it is free.
@@ -102,11 +100,11 @@ fn lockAcquire(cell: int) {
     if (abiGilMode() != 0) {
         return
     }
-    if (winTryLockAcquire(cell) != 0) {
+    if (rawLockTry(cell) != 0) {
         return
     }
     abiGcEnterNative()
-    winLockAcquire(cell)
+    rawLockAcquire(cell)
     abiGcLeaveNative()
 }
 
@@ -115,7 +113,7 @@ fn lockRelease(cell: int) {
     if (abiGilMode() != 0) {
         return
     }
-    winLockRelease(cell)
+    rawLockRelease(cell)
 }
 
 /// Atomically release `lockCell`, sleep on `cv`, reacquire `lockCell`.
@@ -139,9 +137,9 @@ fn lockRelease(cell: int) {
 fn parkOn(lockCell: int, cv: int) {
     abiGcEnterNative()
     if (abiGilMode() != 0) {
-        winWorldPark(cv)
+        rawWorldPark(cv)
     } else {
-        winParkOn(lockCell, cv)
+        rawParkOn(lockCell, cv)
     }
     abiGcLeaveNative()
 }
@@ -149,10 +147,10 @@ fn parkOn(lockCell: int, cv: int) {
 /// Wake one thread parked on `cv`; a no-op when nobody is waiting. The caller
 /// must hold the lock cell paired with the condition cell.
 fn wakeOn(cv: int) {
-    winWakeOn(cv)
+    rawWakeOn(cv)
 }
 
 /// Wake every thread parked on `cv`. The caller must hold the paired lock cell.
 fn wakeAllOn(cv: int) {
-    winWakeAllOn(cv)
+    rawWakeAllOn(cv)
 }

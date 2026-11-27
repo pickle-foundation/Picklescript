@@ -9,6 +9,33 @@ import { ResolvedProgram, Resolver } from compiler.resolvebag
 import { checkProgram } from compiler.checkcore
 import { resolve } from compiler.resolvecore
 
+/// The backend variant this build resolves platform modules for.
+///
+/// A module may ship as `<name>_win.pkl` and `<name>_posix.pkl`, both declaring
+/// the plain module name `<name>`. The loader tries the suffix for the current
+/// platform before the unsuffixed file, so portable callers import `<name>` and
+/// never name an OS. `cli.rtlib` applies the same rule when it packs the
+/// runtime archive, so the source tree and the archive agree on which file is
+/// the backend.
+var buildPlatform: string = "win"
+
+fn setBuildPlatform(p: string) {
+    buildPlatform = p
+}
+
+/// The file a module resolves to under the current platform, or none.
+fn platformModuleFile(base: string, rel: string) -> string? {
+    let f = pathJoin(base, rel + "_" + buildPlatform + ".pkl")
+    if (isFileP(f)) {
+        return f
+    }
+    let plain = pathJoin(base, rel + ".pkl")
+    if (isFileP(plain)) {
+        return plain
+    }
+    none
+}
+
 class FrontOutput {
     var program: Program
     var resolved: ResolvedProgram
@@ -613,7 +640,6 @@ class Loader {
             return none
         }
         let rel = joinPathParts(segments)
-        let relFile = rel + ".pkl"
         if (let some(crateDir) = this.workspace.crates.get(segments[0])) {
             if (len(segments) == 1) {
                 var stems = ["lib", "main", segments[0]]
@@ -626,8 +652,7 @@ class Loader {
                 return none
             }
             let sub = joinPathParts(subListStr(segments, 1, len(segments) - 1))
-            let f = pathJoin(crateDir, sub + ".pkl")
-            if (isFileP(f)) {
+            if (let some(f) = platformModuleFile(crateDir, sub)) {
                 return ModuleLoc.File(f)
             }
             let p = pathJoin(crateDir, sub)
@@ -651,8 +676,7 @@ class Loader {
         }
         bases.push("src")
         for (base in bases) {
-            let f = pathJoin(base, relFile)
-            if (isFileP(f)) {
+            if (let some(f) = platformModuleFile(base, rel)) {
                 return ModuleLoc.File(f)
             }
             let pt = pathJoin(base, rel)

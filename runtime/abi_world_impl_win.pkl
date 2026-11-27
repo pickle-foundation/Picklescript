@@ -1,11 +1,11 @@
-module runtime.abi_world_win
+module runtime.abi_world_impl
 
-/// Win32 backend for the world lock: `runtime.abi_world` owns the portable
+/// Win32 backend for the world lock: `runtime.abi_lock` owns the portable raw
 /// contract, this file owns the only place a Win32 lock primitive is named.
 ///
 /// WHY THIS SPLIT MATTERS. A synchronization primitive is the easiest kind of
 /// code to let leak into every caller, and then the whole runtime is pinned to
-/// one OS. The contract in `abi_world` is deliberately platform-neutral:
+/// one OS. The contract in `abi_lock` is deliberately platform-neutral:
 ///
 ///   - one process-wide mutual exclusion lock
 ///   - blocking acquire, flat ownership (never taken twice by one thread)
@@ -14,13 +14,12 @@ module runtime.abi_world_win
 ///   - a word-sized condition cell: park on it while holding the world lock,
 ///     and wake one/all from the same lock
 ///
-/// A POSIX build provides `runtime/abi_world_posix.pkl` with the same
-/// `winWorld*`/`winLock*` entry points backed by `pthread_mutex_t` (or a
-/// futex/semaphore pair) and its own `alloc`-ed, initialized lock object. The
-/// condition cell can become a futex word or a pointer to a backend-owned
-/// object; the portable side only ever passes its address. The portable
-/// modules import `runtime.abi_world` and never see the difference;
-/// the archive's platform filter picks exactly one backend file.
+/// A POSIX build provides `runtime/abi_world_impl_posix.pkl` with the same
+/// `implWorld*`/`implLock*` entry points backed by `pthread_mutex_t` and
+/// `pthread_cond_t` objects reached through one-word cells. `abi_lock` imports
+/// `runtime.abi_world_impl` and never sees the difference; `abi_world` adds the
+/// GIL/native-section policy on top. The loader's platform suffix picks exactly
+/// one backend file.
 ///
 /// WHY SRWLOCKS HERE. `InterlockedCompareExchange64` - the obvious spinlock
 /// primitive - is a compiler intrinsic, not a KERNEL32 export, so a runtime
@@ -36,27 +35,27 @@ module runtime.abi_world_win
 
 /// A zero-initialized `SRWLOCK`: the Win32 unlocked state is all-zeroes, so
 /// image data is a valid lock with no initializer.
-var winWorldLock: int = 0
+var implWorldLock: int = 0
 
 /// Take the world lock, blocking until it is free.
-fn winWorldAcquire() {
+fn implWorldAcquire() {
     unsafe {
-        win_acquire_srw_exclusive((&winWorldLock) as int)
+        win_acquire_srw_exclusive((&implWorldLock) as int)
     }
 }
 
 /// Release the world lock. The caller must own it.
-fn winWorldRelease() {
+fn implWorldRelease() {
     unsafe {
-        win_release_srw_exclusive((&winWorldLock) as int)
+        win_release_srw_exclusive((&implWorldLock) as int)
     }
 }
 
 /// Non-blocking probe. The low bits of an `SRWLOCK` carry contention flags, so
 /// this is only meaningful when nothing else is running - the lazy-acquire net
 /// on the JIT entry path. Never use it as an ownership test in a live runtime.
-fn winWorldHeld() -> bool {
-    return winWorldLock != 0
+fn implWorldHeld() -> bool {
+    return implWorldLock != 0
 }
 
 /// Acquire a Win32-owned one-word lock cell (an `SRWLOCK` in image data).
@@ -65,12 +64,12 @@ fn winWorldHeld() -> bool {
 /// shadow registry - so there is exactly one lock implementation per platform
 /// instead of a second hand-rolled spin. A POSIX shadow backend will use its
 /// own object through the same seam.
-fn winLockAcquire(cell: int) {
+fn implLockAcquire(cell: int) {
     win_acquire_srw_exclusive(cell)
 }
 
-/// Release a lock cell previously taken by `winLockAcquire`.
-fn winLockRelease(cell: int) {
+/// Release a lock cell previously taken by `implLockAcquire`.
+fn implLockRelease(cell: int) {
     win_release_srw_exclusive(cell)
 }
 
@@ -80,7 +79,7 @@ fn winLockRelease(cell: int) {
 /// `win_try_acquire_srw_exclusive` returns a Win32 `BOOLEAN` in AL, and the
 /// call lowering hands back the full RAX, so the high bits are garbage. Masking
 /// to the low byte is mandatory, not defensive.
-fn winTryLockAcquire(cell: int) -> int {
+fn implLockTry(cell: int) -> int {
     unsafe {
         return win_try_acquire_srw_exclusive(cell) & 255
     }
@@ -98,42 +97,32 @@ const WIN_INFINITE: int = 4294967295
 /// predicate between the caller's check and the park, because the waker would
 /// have to take the same world lock. Spurious wakeups are possible; every
 /// caller re-tests its predicate in a loop.
-fn winWorldPark(cv: int) {
+fn implWorldPark(cv: int) {
     unsafe {
-        let _ = win_sleep_condition_variable_srw(cv, (&winWorldLock) as int, WIN_INFINITE, 0)
+        let _ = win_sleep_condition_variable_srw(cv, (&implWorldLock) as int, WIN_INFINITE, 0)
     }
-}
-
-/// Wake one thread parked on `cv`. No waiter is not an error.
-fn winWorldWake(cv: int) {
-    win_wake_condition_variable(cv)
-}
-
-/// Wake every thread parked on `cv`.
-fn winWorldWakeAll(cv: int) {
-    win_wake_all_condition_variable(cv)
 }
 
 /// Park on `cv` while owning the arbitrary lock cell `lockCell`.
 ///
-/// This is the world-lock-free sibling of `winWorldPark`: the caller owns a
+/// This is the world-lock-free sibling of `implWorldPark`: the caller owns a
 /// per-object lock (a safepoint's own park lock today, a sync primitive's lock
 /// in Phase 4), not the process world lock. `SleepConditionVariableSRW`
 /// releases `lockCell` and reacquires it atomically around the wait, so the
 /// same lost-wakeup argument applies: a waker must take `lockCell` before it
 /// changes the predicate or wakes the cell.
-fn winParkOn(lockCell: int, cv: int) {
+fn implParkOn(lockCell: int, cv: int) {
     unsafe {
         let _ = win_sleep_condition_variable_srw(cv, lockCell, WIN_INFINITE, 0)
     }
 }
 
 /// Wake one thread parked on `cv` (the caller owns the paired lock cell).
-fn winWakeOn(cv: int) {
+fn implWakeOn(cv: int) {
     win_wake_condition_variable(cv)
 }
 
 /// Wake every thread parked on `cv` (the caller owns the paired lock cell).
-fn winWakeAllOn(cv: int) {
+fn implWakeAllOn(cv: int) {
     win_wake_all_condition_variable(cv)
 }
