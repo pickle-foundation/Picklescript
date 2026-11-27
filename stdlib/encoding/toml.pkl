@@ -2,12 +2,13 @@ module std.encoding.toml
 
 // A dependency-free TOML subset parser.
 //
-// Supported: comments, bare/dotted keys, `[table]` headers, basic strings
-// (`"..."` with `\n`, `\t`, `\r`, `\"`, `\\`), literal strings (`'...'`),
-// integers with an optional sign, booleans, and arrays (including nested and
-// multi-line arrays). Not supported: floats, dates/times, multi-line strings,
-// `[[array-of-tables]]`, inline tables, and quoted keys - a document using them
-// parses as `none` instead of being silently misread.
+// Supported: comments, bare/dotted/quoted keys, `[table]` headers, basic
+// strings (`"..."` with `\n`, `\t`, `\r`, `\"`, `\\`), literal strings
+// (`'...'`), integers with an optional sign, booleans, and arrays (including
+// nested and multi-line arrays). Quoted keys make `[dependencies]` entries such
+// as `"vendor/package" = "1.0.0"` readable. Not supported: floats,
+// dates/times, multi-line strings, `[[array-of-tables]]`, and inline tables -
+// a document using them parses as `none` instead of being silently misread.
 //
 // `parse(text)` returns the root table value or `none` on any syntax error.
 // The accessor helpers mirror `std.json` (`typeOf`, `asStr`, `asInt`, `asBool`,
@@ -141,27 +142,46 @@ class Parser {
         this.fail = true
     }
 
-    /// A dotted key path; an empty list after `fail` is set on error.
+    /// A dotted key path; an empty list after `fail` is set on error. Segments
+    /// may be bare or quoted (`"vendor/package"`), as TOML allows.
     fn parseKeyPath() -> List<string> {
         var out: List<string> = [""]
         out.remove(0)
         this.skipInline()
         while (!this.fail) {
-            var seg = bytes("")
-            while (true) {
-                let c = this.peek()
-                if (isKeyByte(c)) {
-                    seg.push(c as byte)
-                    this.i = this.i + 1
-                } else {
-                    break
+            var segText = ""
+            let quote = this.peek()
+            if (quote == 0x22) {
+                match (this.parseBasicString()) {
+                    case Toml.TStr(s) -> segText = s
+                    case _ -> this.fail = true
                 }
+            } else if (quote == 0x27) {
+                match (this.parseLiteralString()) {
+                    case Toml.TStr(s) -> segText = s
+                    case _ -> this.fail = true
+                }
+            } else {
+                var seg = bytes("")
+                while (true) {
+                    let c = this.peek()
+                    if (isKeyByte(c)) {
+                        seg.push(c as byte)
+                        this.i = this.i + 1
+                    } else {
+                        break
+                    }
+                }
+                if (len(seg) == 0) {
+                    this.fail = true
+                    return out
+                }
+                segText = str(seg)
             }
-            if (len(seg) == 0) {
-                this.fail = true
+            if (this.fail) {
                 return out
             }
-            out.push(str(seg))
+            out.push(segText)
             this.skipInline()
             if (this.peek() == 0x2E) {
                 this.i = this.i + 1
