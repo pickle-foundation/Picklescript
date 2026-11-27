@@ -1964,6 +1964,10 @@ fn analyze(m: IrModule, fun: IrFunc, mayGC: Map<string, bool>) -> FnPlan {
 
 class X64Emitter {
     var m: IrModule
+    /// True when the module is lowered for the SysV x86-64 ABI (ELF) rather
+    /// than Win64 (PE/COFF). Only the argument registers and the shadow-frame
+    /// pointer differ; the instruction selection and frame layout are shared.
+    var sysv: bool
     var diags: DiagnosticSink
     var fun: IrFunc
     var mayGC: Map<string, bool>
@@ -2046,8 +2050,9 @@ class X64Emitter {
     /// `pickle_str_append_two` call with both pieces.
     var appendFuse: Map<int, List<int>>
 
-    constructor(m: IrModule, fun: IrFunc, diags: DiagnosticSink, mayGC: Map<string, bool>) {
+    constructor(m: IrModule, fun: IrFunc, diags: DiagnosticSink, mayGC: Map<string, bool>, sysv: bool) {
         this.m = m
+        this.sysv = sysv
         this.fun = fun
         this.diags = diags
         this.failed = false
@@ -3148,12 +3153,32 @@ class X64Emitter {
         }
     }
 
+    /// The register that carries integer argument `i` under the selected ABI.
+    /// Win64 uses rcx/rdx/r8/r9; SysV uses rdi/rsi/rdx/rcx/r8/r9. The emitter
+    /// only seeds the first four in registers today, so both mappings agree on
+    /// the stack layout for anything beyond that.
+    fn argReg(i: int) -> int {
+        if (this.sysv) {
+            match (i) {
+                case 0 -> 7
+                case 1 -> 6
+                case 2 -> 2
+                case 3 -> 1
+                case 4 -> 8
+                case 5 -> 9
+                case _ -> 0
+            }
+        } else {
+            intArgReg(i)
+        }
+    }
+
     /// Pushes the shadow frame. Must run AFTER `seedParams`: the frame pointer
-    /// is built with `lea rcx` and `rcx` is also `intArgReg(0)`, so building the
-    /// frame before spilling the incoming args would clobber arg 0.
+    /// is built with `lea` into the ABI's first argument register, so building
+    /// the frame before spilling the incoming args would clobber arg 0.
     fn pushShadow() {
         if (this.plan.shadowed) {
-            this.cb.leaRbp(1, this.plan.shadowBytes)
+            this.cb.leaRbp(this.argReg(0), this.plan.shadowBytes)
             this.cb.movabsReloc(10, "pickle_shadow_push")
             this.cb.u8(0x41)
             this.cb.u8(0xFF)
@@ -3163,7 +3188,7 @@ class X64Emitter {
 
     fn popShadow() {
         if (this.plan.shadowed) {
-            this.cb.leaRbp(1, this.plan.shadowBytes)
+            this.cb.leaRbp(this.argReg(0), this.plan.shadowBytes)
             this.cb.movabsReloc(10, "pickle_shadow_pop")
             this.cb.u8(0x41)
             this.cb.u8(0xFF)
@@ -3229,7 +3254,7 @@ class X64Emitter {
                 // The parameter's home is a pinned register for the whole body.
                 let rg = this.plan.slotReg[i]
                 if (i < 4) {
-                    this.cb.movRR(rg, intArgReg(i), tyWidth(t))
+                    this.cb.movRR(rg, this.argReg(i), tyWidth(t))
                 } else {
                     let disp = 48 + 8 * (i - 4)
                     this.cb.ld(rg, 64, 0 - disp)
@@ -3237,7 +3262,7 @@ class X64Emitter {
             } else {
                 let k = this.kOfSlot(i)
                 if (i < 4) {
-                    this.cb.st(intArgReg(i), tyWidth(t), k)
+                    this.cb.st(this.argReg(i), tyWidth(t), k)
                 } else {
                     let disp = 48 + 8 * (i - 4)
                     this.cb.ld(0, 64, 0 - disp)
@@ -5909,7 +5934,7 @@ class X64Emitter {
             if (isFloatTy(t)) {
                 this.loadTmpFloat(i, args[i])
             } else {
-                this.loadTmp(intArgReg(i), tyWidth(t), args[i])
+                this.loadTmp(this.argReg(i), tyWidth(t), args[i])
             }
             i = i + 1
         }
@@ -6135,7 +6160,7 @@ class X64Emitter {
                     if (isFloatTy(t)) {
                         this.loadTmpFloat(i, args[i])
                     } else {
-                        this.loadTmp(intArgReg(i), tyWidth(t), args[i])
+                        this.loadTmp(this.argReg(i), tyWidth(t), args[i])
                     }
                     i = i + 1
                 }
@@ -6393,7 +6418,7 @@ class X64Emitter {
     }
 }
 
-fn x64LowerModule(m: IrModule, diags: DiagnosticSink) -> X64Out? {
+fn x64LowerModule(m: IrModule, diags: DiagnosticSink, sysv: bool) -> X64Out? {
     // Constant folding, load CSE, copy propagation and DCE first: the emitter
     // lowers every instruction literally, so removing the redundant ones here
     // is what keeps the generated code compact.
@@ -6402,7 +6427,7 @@ fn x64LowerModule(m: IrModule, diags: DiagnosticSink) -> X64Out? {
     let mayGC = computeMayGC(om)
     var i = 0
     while (i < len(om.funcs)) {
-        let e = X64Emitter(om, om.funcs[i], diags, mayGC)
+        let e = X64Emitter(om, om.funcs[i], diags, mayGC, sysv)
         let f = e.emitFunc()
         var failed = false
         match (f) {
