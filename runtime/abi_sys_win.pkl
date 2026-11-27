@@ -1,0 +1,326 @@
+module runtime.abi_sys
+
+import { STR_BYTES_OFF } from runtime.layout
+
+/// The host this binary was built for. The CLI reads it to pick the default
+/// `build --target`; it is a compile-time fact, not a runtime switch.
+const SYS_PLATFORM: string = "win"
+
+/// The operating-system substrate: heap, thread-local storage, process exit,
+/// thread identity and the environment.
+///
+/// WHY THIS MODULE EXISTS. `abi_raw` (allocator), `abi_shadow` (thread
+/// registry), `abi_map` (per-thread scratch), `abi_exception` (pending-throw
+/// slots), `abi_os`/`abi_panic` (exit) and the GC's environment scan all need
+/// the same handful of OS services. Before this module each one named a
+/// `win_*` builtin directly, so a second target had to edit eight portable
+/// files. Now they import `runtime.abi_sys` and only the two backend files
+/// below know which OS is underneath.
+///
+/// WHY IT IMPORTS ALMOST NOTHING. `abi_raw` and `abi_shadow` sit under the
+/// collector; this module must not pull a dependency back into them. The only
+/// import is `runtime.layout`, which is constants, so the graph stays acyclic.
+///
+/// THE CONTRACT IS DELIBERATELY SMALL. Every function is a leaf over one OS
+/// primitive. `sysHeapAlloc` is the process heap, not the managed arena - the
+/// collector's own bookkeeping must not re-enter the collector. `sysTls*` is
+/// one opaque word per thread; the POSIX backend builds it from
+/// `pthread_key_create` + `pthread_getspecific`. `sysEnvPresent`/`sysEnvInt`/
+/// `sysEnvFlag` read one named variable without allocating a managed string,
+/// because `abi_gcengine` calls them before the first managed allocation.
+
+/// Process-heap allocation. The Windows heap is already zero-filled? No:
+/// `HeapAlloc(..., 0, n)` returns uninitialized memory, exactly like
+/// `malloc`, and every caller here writes what it reads.
+fn sysHeapAlloc(n: int) -> int {
+    if (n < 1) {
+        n = 1
+    }
+    return win_heap_alloc(win_get_process_heap(), 0, n)
+}
+
+/// Return a process-heap block. A null pointer is a no-op so a caller may
+/// free a partially initialized node without a branch of its own.
+fn sysHeapFree(p: int) {
+    if (p != 0) {
+        win_heap_free(win_get_process_heap(), 0, p)
+    }
+}
+
+/// Allocate a per-thread slot. Returns -1 when the OS refuses.
+fn sysTlsAlloc() -> int {
+    return win_tls_alloc()
+}
+
+/// Read this thread's word from `slot`. A missing slot or an unset word is 0.
+fn sysTlsGet(slot: int) -> int {
+    if (slot == -1) {
+        return 0
+    }
+    return win_tls_get(slot)
+}
+
+/// Store this thread's word in `slot`. Returns nonzero on success, matching
+/// `TlsSetValue`; callers that do not care discard it.
+fn sysTlsSet(slot: int, v: int) -> int {
+    if (slot == -1) {
+        return 0
+    }
+    return win_tls_set(slot, v)
+}
+
+/// Terminate the process with `code`.
+fn sysExit(code: int) {
+    win_exit(code)
+}
+
+/// A stable identity for the running thread. Only equality and hashing use
+/// it; the numeric range is not part of the contract.
+fn sysThreadId() -> int {
+    return win_thread_id()
+}
+
+// ---------------------------------------------------------------- clocks
+/// 100-ns ticks between the FILETIME epoch (1601-01-01 UTC) and the Unix epoch
+/// (1970-01-01 UTC): 11 644 473 600 seconds.
+const FILETIME_UNIX_DELTA_100NS: int = 116444736000000000
+
+/// QPC ticks per second, queried once and cached. 0 means "not queried yet".
+var qpcFreq: int = 0
+
+/// Wall-clock milliseconds since the Unix epoch, from
+/// `GetSystemTimeAsFileTime`. The call writes a 64-bit FILETIME (100-ns ticks
+/// since 1601) into the buffer; subtracting the epoch delta and dividing by
+/// 10 000 gives milliseconds.
+fn sysUnixMs() -> int {
+    unsafe {
+        let p = alloc(int, 1)
+        p[0] = 0
+        win_get_system_time_as_file_time(p)
+        let ft = p[0]
+        free(p)
+        return (ft - FILETIME_UNIX_DELTA_100NS) / 10000
+    }
+}
+
+/// Monotonic nanoseconds from `QueryPerformanceCounter`. Falls back to the
+/// 64-bit millisecond tick counter when the frequency query fails, which is a
+/// coarse but still monotonic answer.
+fn sysMonotonicNs() -> int {
+    if (qpcFreq == 0) {
+        unsafe {
+            let p = alloc(int, 1)
+            p[0] = 0
+            win_query_performance_frequency(p)
+            let f = p[0]
+            free(p)
+            if (f > 0) {
+                qpcFreq = f
+            }
+        }
+    }
+    let f = qpcFreq
+    if (f <= 0) {
+        return win_tick_ms64() * 1000000
+    }
+    unsafe {
+        let p = alloc(int, 1)
+        p[0] = 0
+        win_query_performance_counter(p)
+        let c = p[0]
+        free(p)
+        let whole = c / f
+        let rem = c - whole * f
+        return whole * 1000000000 + (rem * 1000000000) / f
+    }
+}
+
+// ---------------------------------------------------------------- threads
+/// Start `code` on a new OS thread with the closure object `env` in the first
+/// argument register. Returns the OS handle, or 0 when the create fails.
+fn sysThreadSpawn(code: int, env: int) -> int {
+    return win_create_thread(0, 0, code, env, 0, 0)
+}
+
+/// Wait for `handle`. A negative timeout means infinite. Returns 0 when the
+/// thread has exited, nonzero on timeout - the `WaitForSingleObject` contract.
+fn sysThreadWait(handle: int, timeoutMs: int) -> int {
+    var t = timeoutMs
+    if (t < 0) {
+        t = 4294967295
+    }
+    return win_wait_single(handle, t)
+}
+
+/// Release the OS handle. The caller must have observed the thread exit.
+fn sysThreadClose(handle: int) {
+    let _ = win_close_handle(handle)
+}
+
+/// Sleep this thread for `ms` milliseconds.
+fn sysThreadSleep(ms: int) {
+    win_sleep(ms)
+}
+
+/// Hand the CPU to a runnable peer.
+fn sysThreadYield() {
+    let _ = win_switch_to_thread()
+}
+
+// ------------------------------------------------------------ environment
+/// One UTF-16 code unit of the packed environment block. `GetEnvironmentStringsW`
+/// returns a `WCHAR*`, four units to a 64-bit word on this target.
+fn envUnitAt(w: *int, i: int) -> int {
+    unsafe {
+        return (w[i >> 2] >> ((i & 3) * 16)) & 65535
+    }
+}
+
+/// Byte `i` of a raw buffer, little-endian.
+fn envRawByte(base: int, i: int) -> int {
+    unsafe {
+        let w = base as *int
+        return (w[i >> 3] >> ((i & 7) * 8)) & 255
+    }
+}
+
+/// ASCII lower-case of a code unit already known to be <= 0x7F.
+fn envLower(c: int) -> int {
+    if (c >= 65 && c <= 90) {
+        return c + 32
+    }
+    return c
+}
+
+/// Whether the entry at unit `start` is `key` followed by `=`.
+///
+/// The key arrives as a UTF-8 `string`; the block is UTF-16. Both sides are
+/// ASCII here (every key this runtime reads is), so one byte per unit is the
+/// whole comparison. Comparing in place keeps the scan allocation-free, which
+/// is a hard requirement: this runs before the first managed allocation.
+fn envEntry(w: *int, start: int, kbase: int, klen: int) -> bool {
+    var i = 0
+    while (i < klen) {
+        if (envLower(envUnitAt(w, start + i)) != envRawByte(kbase, i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return envUnitAt(w, start + klen) == 61
+}
+
+/// Unit index of `key`'s value in `block`, or -1 when absent. Walks
+/// NUL-terminated entries until the empty terminating entry.
+fn envFind(block: int, key: string) -> int {
+    unsafe {
+        let w = block as *int
+        var p = &key
+        let kbase = (p as int) + STR_BYTES_OFF
+        let klen = len(key)
+        var start = 0
+        var guard = 0
+        while (guard < 1048576) {
+            var u = 0
+            while (envUnitAt(w, start + u) != 0) {
+                u = u + 1
+            }
+            if (u == 0) {
+                return -1
+            }
+            if (envEntry(w, start, kbase, klen)) {
+                return start + klen + 1
+            }
+            start = start + u + 1
+            guard = guard + 1
+        }
+        return -1
+    }
+}
+
+/// Whether `key` is present at all, whatever its value.
+fn sysEnvPresent(key: string) -> bool {
+    let block = win_get_environment_strings_w()
+    if (block == 0) {
+        return false
+    }
+    let at = envFind(block, key)
+    let _ = win_free_environment_strings_w(block)
+    return at >= 0
+}
+
+/// Decimal value of `key`, or 0 when it is absent or holds no digits. Leading
+/// whitespace is skipped, a digit run is parsed, and anything after it is
+/// ignored - the reference `.trim()`s before parsing. Values saturate so a
+/// runaway run cannot overflow.
+fn sysEnvInt(key: string) -> int {
+    let block = win_get_environment_strings_w()
+    if (block == 0) {
+        return 0
+    }
+    let at = envFind(block, key)
+    var v = 0
+    if (at >= 0) {
+        unsafe {
+            let w = block as *int
+            var i = at
+            while (true) {
+                let cu = envUnitAt(w, i)
+                if (cu == 32 || cu == 9) {
+                    i = i + 1
+                } else {
+                    break
+                }
+            }
+            while (true) {
+                let cu = envUnitAt(w, i)
+                if (cu < 48 || cu > 57) {
+                    break
+                }
+                if (v < 1000000000) {
+                    v = v * 10 + (cu - 48)
+                }
+                i = i + 1
+            }
+        }
+    }
+    let _ = win_free_environment_strings_w(block)
+    return v
+}
+
+/// Three-state switch: -1 absent, 0 explicitly `0`, 1 any other value
+/// (including empty). `PKL_GIL` uses this so `PKL_GIL=0` is the documented
+/// opt-out while a typo cannot silently disable serialization.
+fn sysEnvFlag(key: string) -> int {
+    let block = win_get_environment_strings_w()
+    if (block == 0) {
+        return -1
+    }
+    let at = envFind(block, key)
+    var flag = -1
+    if (at >= 0) {
+        unsafe {
+            let w = block as *int
+            var i = at
+            while (true) {
+                let cu = envUnitAt(w, i)
+                if (cu == 32 || cu == 9) {
+                    i = i + 1
+                } else {
+                    break
+                }
+            }
+            if (envUnitAt(w, i) == 48) {
+                let next = envUnitAt(w, i + 1)
+                if (next == 0 || next == 32 || next == 9) {
+                    flag = 0
+                } else {
+                    flag = 1
+                }
+            } else {
+                flag = 1
+            }
+        }
+    }
+    let _ = win_free_environment_strings_w(block)
+    return flag
+}

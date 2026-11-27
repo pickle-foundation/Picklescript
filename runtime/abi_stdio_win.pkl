@@ -1,7 +1,7 @@
 module runtime.abi_stdio
 
 /// THE ARCHITECTURE SEAM: every write of a standard stream in the ported
-/// runtime goes through these two functions. Nothing else in `pickle/` may call
+/// runtime goes through these functions. Nothing else in `pickle/` may call
 /// `win_get_std_handle` or `win_write_file` on a standard handle.
 ///
 /// WHY IT IS ITS OWN MODULE. This file is the only place where "which OS am I
@@ -21,18 +21,19 @@ module runtime.abi_stdio
 /// makes it safe for `cli/main` to import - the self-host gap is measured in
 /// whole symbols and this module adds none.
 ///
-/// WHAT A LINUX PORT CHANGES. Only the two bodies below, to `write(1, ...)` and
-/// `write(2, ...)`, plus the handle constants (a POSIX build has no handle at
-/// all, so the constants go unused and the bodies take a fixed fd). The callers
-/// keep passing a payload pointer and a byte count, which is already the shape
-/// every libc and Win32 write wants. Nothing above this module knows that
-/// `GetStdHandle` exists.
-///
 /// WHY THE POINTER IS A RAW `int` AND NOT A `*int`. The callers compute the
 /// payload address with `+ STR_BYTES_OFF` themselves, because the string layout
 /// is a *layout* question (`runtime.layout`), not an OS question. Keeping the
 /// offset arithmetic outside means a change to string headers moves only the
 /// layout-dependent lines and leaves this file's contract untouched.
+///
+/// `writeConsoleLine` IS THE ONE EXCEPTION, and it lives here rather than in
+/// `cli/main` for the same reason: `WriteConsoleW` is the only console path
+/// that keeps a non-BMP code point intact on Windows, and a POSIX build simply
+/// writes the UTF-8 bytes. The CLI asks for "a line on the console" and this
+/// module owns what that means on the target.
+
+import { STR_BYTES_OFF } from runtime.layout
 
 /// `STD_OUTPUT_HANDLE`, spelled the way the SDK does: `(DWORD)-11`.
 const STD_OUTPUT_HANDLE: int = -11
@@ -65,5 +66,40 @@ fn writeStderr(ptr: int, n: int) -> int {
         var h = win_get_std_handle(STD_ERROR_HANDLE)
         let _ = win_write_file(h, ptr, n, 0, 0)
         return 0
+    }
+}
+
+/// Write `s` and a newline to the console, answering whether the console path
+/// took it.
+///
+/// `WriteConsoleW` is the only console path that keeps a non-BMP code point
+/// intact; when stdout is a pipe or a file it fails, and the caller falls back
+/// to the ordinary UTF-8 route (`println`). That fallback is why this answers
+/// `bool` instead of writing unconditionally.
+fn writeConsoleLine(s: string) -> bool {
+    unsafe {
+        var line = s + "\n"
+        let n = len(line)
+        var p = &line
+        let src = (p as int) + STR_BYTES_OFF
+        let need = win_multi_byte_to_wide_char(65001, 0, src, n, 0, 0)
+        if (need <= 0) {
+            return false
+        }
+        let wide = alloc(int, need + 1)
+        if ((wide as int) == 0) {
+            return false
+        }
+        let got = win_multi_byte_to_wide_char(65001, 0, src, n, wide, need)
+        var ok = false
+        if (got == need) {
+            let h = win_get_std_handle(STD_OUTPUT_HANDLE)
+            let pW = alloc(int, 1)
+            pW[0] = 0
+            ok = (win_write_console_w(h, wide, need, pW, 0) & 4294967295) != 0
+            free(pW)
+        }
+        free(wide)
+        return ok
     }
 }

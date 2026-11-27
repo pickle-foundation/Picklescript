@@ -54,8 +54,9 @@ module runtime.abi_gcengine
 import { shadowRegistryLockAcquire, shadowRegistryLockRelease, abiShadowRegistryHead, abiShadowSelf, abiShadowSelfIfRegistered, abiShadowReapDeadLocked, shadowCriticalEnter, shadowCriticalExit, SHADOW_W_NEXT, SHADOW_W_REG_BASE, SHADOW_W_REG_COUNT, SHADOW_W_REG_CAP, SHADOW_W_ALLOC_BYTES, SHADOW_W_ALLOC_COUNT, SHADOW_W_REG_BYTES, SHADOW_W_STATE, SHADOW_W_PARK, SHADOW_W_PARK_LOCK, SHADOW_W_CRITICAL, SHADOW_W_TEMP_BASE, SHADOW_W_TEMP_COUNT, SHADOW_W_TEMP_CAP, SHADOW_STATE_RUNNING, SHADOW_STATE_PARKED, SHADOW_STATE_NATIVE, SHADOW_STATE_COLLECTING } from runtime.abi_shadow
 import { abiClassOwnedMaskOf, abiClassFinalizerOf } from runtime.abi_classwords
 import { abiManagedRelease, abiRawParallelMode } from runtime.abi_raw
-import { winLockAcquire, winLockRelease, winParkOn, winWakeOn, winWakeAllOn } from runtime.abi_world_win
+import { rawLockAcquire, rawLockRelease, rawParkOn, rawWakeOn, rawWakeAllOn } from runtime.abi_lock
 import { MAP_BLOOM_OFF } from runtime.layout
+import { sysEnvPresent, sysEnvInt } from runtime.abi_sys
 
 /// Managed class ids on object words (mirror of `runtime/object` labels).
 /// Word 1 carries the id; string's id is 0 (see `abi_raw`'s note on word 0's
@@ -461,156 +462,6 @@ fn abiEngineUnregister(obj: *int) {
     regBytes = regBytes - size
 }
 
-// --------------------------------------------------------------- env read
-/// Mask for one UTF-16 code unit packed four-to-a-64-bit-word.
-const GE_WCHAR_MASK: int = 65535
-
-/// Read unit `i` of a packed UTF-16 buffer: four units share a 64-bit word.
-/// (The `abi_fs` helper of the same shape lives there and cannot be imported -
-/// `abi_fs` imports `abi_raw`, which imports this leaf: a cycle.)
-fn geUnitAt(w: *int, i: int) -> int {
-    unsafe {
-        return (w[i >> 2] >> ((i & 3) * 16)) & GE_WCHAR_MASK
-    }
-}
-
-/// ASCII lower-case of a code unit already known to be <= 0x7F.
-fn geLowerAscii(c: int) -> int {
-    if (c >= 65 && c <= 90) {
-        return c + 32
-    }
-    return c
-}
-
-/// Whether the NUL-terminated entry starting at unit `start` is `pkl_no_auto_gc=`
-/// or `pkl_gc_threshold=`, ASCII case-insensitively: the unit at each offset is
-/// lowered and compared against the key byte spelled out as a constant. These
-/// are the only two keys the engine reads, so the byte values are hardcoded -
-/// a `bytes()` scan would box every char of every entry into managed boxes,
-/// inflating the allocation count seen by the first collection (native's
-/// `gc.rs::env_init` allocates nothing, so our env-init must not either).
-fn geEntryNoAutoGc(w: *int, start: int) -> bool {
-    if (geLowerAscii(geUnitAt(w, start + 0)) != 112) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 1)) != 107) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 2)) != 108) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 3)) != 95) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 4)) != 110) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 5)) != 111) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 6)) != 95) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 7)) != 97) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 8)) != 117) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 9)) != 116) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 10)) != 111) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 11)) != 95) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 12)) != 103) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 13)) != 99) { return false }
-    return geUnitAt(w, start + 14) == 61
-}
-
-/// `PKL_STRESS_GC`: force a collection at every trigger.
-fn geEntryStressGc(w: *int, start: int) -> bool {
-    if (geLowerAscii(geUnitAt(w, start + 0)) != 112) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 1)) != 107) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 2)) != 108) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 3)) != 95) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 4)) != 115) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 5)) != 116) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 6)) != 114) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 7)) != 101) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 8)) != 115) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 9)) != 115) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 10)) != 95) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 11)) != 103) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 12)) != 99) { return false }
-    return geUnitAt(w, start + 13) == 61
-}
-
-fn geEntryThreshold(w: *int, start: int) -> bool {
-    if (geLowerAscii(geUnitAt(w, start + 0)) != 112) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 1)) != 107) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 2)) != 108) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 3)) != 95) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 4)) != 103) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 5)) != 99) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 6)) != 95) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 7)) != 116) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 8)) != 104) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 9)) != 114) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 10)) != 101) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 11)) != 115) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 12)) != 104) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 13)) != 111) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 14)) != 108) { return false }
-    if (geLowerAscii(geUnitAt(w, start + 15)) != 100) { return false }
-    return geUnitAt(w, start + 16) == 61
-}
-
-/// Unit index of `keySel`'s value in the environment block, or -1 when the key
-/// is absent. Walks NUL-terminated entries until the empty terminating entry.
-/// `keySel` selects the hardcoded matcher (0 = no-auto-gc, 1 = threshold).
-fn geEnvFind(w: *int, keySel: int) -> int {
-    var start = 0
-    var guard = 0
-    while (guard < 1048576) {
-        var u = 0
-        while (geUnitAt(w, start + u) != 0) {
-            u = u + 1
-        }
-        if (u == 0) {
-            return -1
-        }
-        if (keySel == 0) {
-            if (geEntryNoAutoGc(w, start)) {
-                return start + 14 + 1
-            }
-        } else if (keySel == 1) {
-            if (geEntryThreshold(w, start)) {
-                return start + 16 + 1
-            }
-        } else if (keySel == 2) {
-            if (geEntryStressGc(w, start)) {
-                return start + 13 + 1
-            }
-        }
-        start = start + u + 1
-        guard = guard + 1
-    }
-    return -1
-}
-
-/// Decimal value of the NUL-terminated run at unit `start`, or -1 when it holds
-/// no digits. Leading and trailing non-digits are ignored (native `.trim()`s
-/// before parsing); the value saturates so a runaway run cannot spin.
-fn geEnvIntAt(w: *int, start: int) -> int {
-    var i = start
-    // Skip leading whitespace.
-    while (true) {
-        var cu = geUnitAt(w, i)
-        if (cu == 32 || cu == 9) {
-            i = i + 1
-        } else {
-            break
-        }
-    }
-    var v = 0
-    var any = false
-    while (true) {
-        var c = geUnitAt(w, i)
-        if (c < 48 || c > 57) {
-            break
-        }
-        if (v < 1000000000) {
-            v = v * 10 + (c - 48)
-        }
-        any = true
-        i = i + 1
-    }
-    if (!any) {
-        return -1
-    }
-    return v
-}
-
 /// One-time read of `PKL_NO_AUTO_GC` (presence suppresses auto-collection),
 /// `PKL_GC_THRESHOLD` (a positive value pins the threshold and disables
 /// adaptation) and `PKL_STRESS_GC` - the port's `gc.rs::env_init`. Also called
@@ -629,58 +480,51 @@ fn abiEngineInitFromEnv() {
         return
     }
     unsafe {
-        winLockAcquire((&envLock) as int)
+        rawLockAcquire((&envLock) as int)
     }
     if (envInited == 2) {
         unsafe {
-            winLockRelease((&envLock) as int)
+            rawLockRelease((&envLock) as int)
         }
         return
     }
     if (envInited == 1) {
         unsafe {
-            winLockRelease((&envLock) as int)
+            rawLockRelease((&envLock) as int)
         }
         while (envInited != 2) {
             unsafe {
-                winLockAcquire((&envLock) as int)
+                rawLockAcquire((&envLock) as int)
                 if (envInited != 2) {
-                    winParkOn((&envLock) as int, (&envCv) as int)
+                    rawParkOn((&envLock) as int, (&envCv) as int)
                 }
-                winLockRelease((&envLock) as int)
+                rawLockRelease((&envLock) as int)
             }
         }
         return
     }
     envInited = 1
     unsafe {
-        winLockRelease((&envLock) as int)
+        rawLockRelease((&envLock) as int)
     }
-    var block = win_get_environment_strings_w()
-    if (block != 0) {
-        if (geEnvFind(block as *int, 0) >= 0) {
-            noAutoGc = 1
-        }
-        var tstart = geEnvFind(block as *int, 1)
-        if (tstart >= 0) {
-            var n = geEnvIntAt(block as *int, tstart)
-            if (n > 0) {
-                overrideThreshold = n
-                thresholdManual = 1
-            }
-        }
-        if (geEnvFind(block as *int, 2) >= 0) {
-            stressGc = 1
-        }
-        let _ = win_free_environment_strings_w(block)
+    if (sysEnvPresent("PKL_NO_AUTO_GC")) {
+        noAutoGc = 1
+    }
+    var n = sysEnvInt("PKL_GC_THRESHOLD")
+    if (n > 0) {
+        overrideThreshold = n
+        thresholdManual = 1
+    }
+    if (sysEnvPresent("PKL_STRESS_GC")) {
+        stressGc = 1
     }
     unsafe {
-        winLockAcquire((&envLock) as int)
+        rawLockAcquire((&envLock) as int)
     }
     envInited = 2
     unsafe {
-        winWakeAllOn((&envCv) as int)
-        winLockRelease((&envLock) as int)
+        rawWakeAllOn((&envCv) as int)
+        rawLockRelease((&envLock) as int)
     }
 }
 
@@ -1394,9 +1238,9 @@ fn geNodeWord(base: int, word: int) -> int {
     return base + GE_WORD_BYTES * word
 }
 
-/// Addresses of the safepoint's own synchronization words, for the
-/// `abi_world_win` seam. A zero-initialized `SRWLOCK`/`CONDITION_VARIABLE` is
-/// the Win32 unlocked/empty state, so no explicit initialisation is needed.
+/// Addresses of the safepoint's own synchronization words, for the `abi_lock`
+/// seam. A zero-initialized lock or condition cell is the backend's
+/// unlocked/empty state, so no explicit initialisation is needed.
 fn geCountLockAddr() -> int {
     var p = 0
     unsafe {
@@ -1428,7 +1272,7 @@ fn geCollectorCvAddr() -> int {
 ///
 /// The park protocol is the classic condition-variable one: the thread owns its
 /// `parkLock` across the predicate check and the atomic release inside
-/// `winParkOn`, so the collector cannot clear `gcRequested` between the check
+/// `rawParkOn`, so the collector cannot clear `gcRequested` between the check
 /// and the sleep without first taking `parkLock` - which it can only do after
 /// the sleeper has released it.
 #[symbol("pickle_gc_poll")]
@@ -1456,28 +1300,28 @@ fn abiGcPoll() {
             return
         }
         // Runtime-internal critical section: a peer may be blocked on the
-        // lock this thread holds (with `winLockAcquire`, so it is counted and
+        // lock this thread holds (with `rawLockAcquire`, so it is counted and
         // cannot park). Parking here would stall the collector's barrier
         // forever. The thread parks at its next poll outside the section.
         if (node[SHADOW_W_CRITICAL] != 0) {
             return
         }
-        winLockAcquire(lockAddr)
+        rawLockAcquire(lockAddr)
         if (gcRequested != 0) {
             node[SHADOW_W_STATE] = SHADOW_STATE_PARKED
-            winLockAcquire(geCountLockAddr())
+            rawLockAcquire(geCountLockAddr())
             gcRunningCount = gcRunningCount - 1
-            winWakeOn(geCollectorCvAddr())
-            winLockRelease(geCountLockAddr())
+            rawWakeOn(geCollectorCvAddr())
+            rawLockRelease(geCountLockAddr())
             while (gcRequested != 0) {
-                winParkOn(lockAddr, cvAddr)
+                rawParkOn(lockAddr, cvAddr)
             }
             node[SHADOW_W_STATE] = SHADOW_STATE_RUNNING
-            winLockAcquire(geCountLockAddr())
+            rawLockAcquire(geCountLockAddr())
             gcRunningCount = gcRunningCount + 1
-            winLockRelease(geCountLockAddr())
+            rawLockRelease(geCountLockAddr())
         }
-        winLockRelease(lockAddr)
+        rawLockRelease(lockAddr)
     }
 }
 
@@ -1500,13 +1344,13 @@ fn abiGcEnterNative() {
         }
         node[SHADOW_W_STATE] = SHADOW_STATE_NATIVE
     }
-    winLockAcquire(geCountLockAddr())
+    rawLockAcquire(geCountLockAddr())
     gcRunningCount = gcRunningCount - 1
     // Wake the collector while the count lock is still held: a collector that
     // has already decided to wait must not miss this decrement. A wake after
     // the release can arrive between the predicate check and the sleep.
-    winWakeOn(geCollectorCvAddr())
-    winLockRelease(geCountLockAddr())
+    rawWakeOn(geCollectorCvAddr())
+    rawLockRelease(geCountLockAddr())
 }
 
 /// Return from a native section: count the thread again, then run a safepoint
@@ -1527,9 +1371,9 @@ fn abiGcLeaveNative() {
         }
         node[SHADOW_W_STATE] = SHADOW_STATE_RUNNING
     }
-    winLockAcquire(geCountLockAddr())
+    rawLockAcquire(geCountLockAddr())
     gcRunningCount = gcRunningCount + 1
-    winLockRelease(geCountLockAddr())
+    rawLockRelease(geCountLockAddr())
     abiGcPoll()
 }
 
@@ -1540,9 +1384,9 @@ fn abiGcThreadStarting() {
     if (gcParallel == 0) {
         return
     }
-    winLockAcquire(geCountLockAddr())
+    rawLockAcquire(geCountLockAddr())
     gcRunningCount = gcRunningCount + 1
-    winLockRelease(geCountLockAddr())
+    rawLockRelease(geCountLockAddr())
 }
 
 /// Uncount a thread that has left Pickle code. Called after the last heap
@@ -1566,10 +1410,10 @@ fn abiGcThreadExited() {
             }
         }
     }
-    winLockAcquire(geCountLockAddr())
+    rawLockAcquire(geCountLockAddr())
     gcRunningCount = gcRunningCount - 1
-    winWakeOn(geCollectorCvAddr())
-    winLockRelease(geCountLockAddr())
+    rawWakeOn(geCollectorCvAddr())
+    rawLockRelease(geCountLockAddr())
 }
 
 /// One collection cycle: mark from the port's roots, sweep the unmarked
@@ -1607,9 +1451,9 @@ fn abiEngineCollect(force: bool) {
         // collection with this one still excluded (count 0), drive the count
         // negative, and sleep forever on the collector CV because the restore
         // no longer matched its decrement.
-        winLockAcquire(geStartLockAddr())
+        rawLockAcquire(geStartLockAddr())
         if (gcRequested != 0) {
-            winLockRelease(geStartLockAddr())
+            rawLockRelease(geStartLockAddr())
             abiGcPoll()
             return
         }
@@ -1617,12 +1461,12 @@ fn abiEngineCollect(force: bool) {
             // Epilogue window: the collection is over, only the bookkeeping
             // is left. Return without collecting; the caller's next allocation
             // polls normally.
-            winLockRelease(geStartLockAddr())
+            rawLockRelease(geStartLockAddr())
             return
         }
         collecting = 1
         gcRequested = 1
-        winLockRelease(geStartLockAddr())
+        rawLockRelease(geStartLockAddr())
         collectorNode = abiShadowSelfIfRegistered()
         if (collectorNode != 0) {
             unsafe {
@@ -1631,12 +1475,12 @@ fn abiEngineCollect(force: bool) {
         }
         // Exclude the collector from the barrier, then wait for every other
         // RUNNING thread to park. A thread that is NATIVE is not counted.
-        winLockAcquire(geCountLockAddr())
+        rawLockAcquire(geCountLockAddr())
         gcRunningCount = gcRunningCount - 1
         while (gcRunningCount != 0) {
-            winParkOn(geCountLockAddr(), geCollectorCvAddr())
+            rawParkOn(geCountLockAddr(), geCollectorCvAddr())
         }
-        winLockRelease(geCountLockAddr())
+        rawLockRelease(geCountLockAddr())
     } else {
         collecting = 1
     }
@@ -1769,17 +1613,17 @@ fn abiEngineCollect(force: bool) {
         while (wakeNode != 0) {
             let lockAddr = geNodeWord(wakeNode, SHADOW_W_PARK_LOCK)
             let cvAddr = geNodeWord(wakeNode, SHADOW_W_PARK)
-            winLockAcquire(lockAddr)
-            winWakeAllOn(cvAddr)
-            winLockRelease(lockAddr)
+            rawLockAcquire(lockAddr)
+            rawWakeAllOn(cvAddr)
+            rawLockRelease(lockAddr)
             unsafe {
                 wakeNode = (wakeNode as *int)[SHADOW_W_NEXT]
             }
         }
         shadowRegistryLockRelease()
-        winLockAcquire(geCountLockAddr())
+        rawLockAcquire(geCountLockAddr())
         gcRunningCount = gcRunningCount + 1
-        winLockRelease(geCountLockAddr())
+        rawLockRelease(geCountLockAddr())
         if (collectorNode != 0) {
             unsafe {
                 (collectorNode as *int)[SHADOW_W_STATE] = SHADOW_STATE_RUNNING
@@ -1789,9 +1633,9 @@ fn abiEngineCollect(force: bool) {
         // the token free: a new collector that claims it will observe a
         // consistent count and cannot wait for a barrier this collection has
         // already satisfied.
-        winLockAcquire(geStartLockAddr())
+        rawLockAcquire(geStartLockAddr())
         collecting = 0
-        winLockRelease(geStartLockAddr())
+        rawLockRelease(geStartLockAddr())
     } else {
         collecting = 0
     }
@@ -1847,13 +1691,13 @@ fn abiEngineManualCount() -> int {
 /// collector's barrier. `abiGcPoll` returns early while the depth is non-zero.
 fn geLock(cell: int) {
     shadowCriticalEnter()
-    winLockAcquire(cell)
+    rawLockAcquire(cell)
 }
 
 /// Release a lock taken by `geLock`, leaving the critical section only after
 /// the lock is free.
 fn geUnlock(cell: int) {
-    winLockRelease(cell)
+    rawLockRelease(cell)
     shadowCriticalExit()
 }
 

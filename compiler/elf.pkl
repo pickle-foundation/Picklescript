@@ -1,0 +1,434 @@
+module compiler.elf
+
+import { IrModule } from compiler.ir
+import { X64Out, Reloc, X64Func } from compiler.x64
+import { pad16, pushStrDesc, zeroGlobalBytes, fmodBytes } from compiler.coff
+
+/// One entry in the ELF `.symtab`.
+class ElfSym {
+    var name: string
+    /// ELF binding: 0 local, 1 global.
+    var bind: int
+    /// ELF type: 0 notype, 1 object, 2 function, 3 section.
+    var typ: int
+    var shndx: int
+    var value: int
+    var size: int
+
+    constructor(n: string, b: int, t: int, sh: int, v: int, sz: int) {
+        this.name = n
+        this.bind = b
+        this.typ = t
+        this.shndx = sh
+        this.value = v
+        this.size = sz
+    }
+}
+
+/// One `.rela.text` entry. `typ` is the COFF-style kind from `x64.Reloc`:
+/// 1 = absolute 64-bit, 4 = PC-relative 32-bit.
+class ElfRel {
+    var off: int
+    var sym: string
+    var typ: int
+    var addend: int
+
+    constructor(o: int, s: string, t: int, a: int) {
+        this.off = o
+        this.sym = s
+        this.typ = t
+        this.addend = a
+    }
+}
+
+/// ELF has no import-address-table prefix. Win64 lowers a CRT import to
+/// `__imp_Name`; the SysV call is direct (see `x64.emitCall`) and the object
+/// names the same external `Name`, so no IAT slot is emitted or referenced.
+/// Keeping the strip here, at the target boundary, leaves the IR target-neutral.
+fn elfSymName(name: string) -> string {
+    if (len(name) >= 6 && sliceRange(name, 0, 6) == "__imp_") {
+        return sliceRange(name, 6, len(name))
+    }
+    return name
+}
+
+/// Fixed section indices for the object this writer emits. Keeping them fixed
+/// makes the symbol and relocation tables independent of whether a section is
+/// empty; empty `.rdata`/`.data` sections are legal.
+const SEC_NULL: int = 0
+const SEC_TEXT: int = 1
+const SEC_RELA_TEXT: int = 2
+const SEC_RDATA: int = 3
+const SEC_DATA: int = 4
+const SEC_SYMTAB: int = 5
+const SEC_STRTAB: int = 6
+const SEC_SHSTRTAB: int = 7
+const SEC_NOTE: int = 8
+const SEC_COUNT: int = 9
+
+fn pushU8(bs: List<int>, v: int) {
+    bs.push(v & 0xFF)
+}
+
+fn pushU16(bs: List<int>, v: int) {
+    bs.push(v & 0xFF)
+    bs.push((v >> 8) & 0xFF)
+}
+
+fn pushU32(bs: List<int>, v: int) {
+    var i = 0
+    while (i < 4) {
+        bs.push((v >> (8 * i)) & 0xFF)
+        i = i + 1
+    }
+}
+
+fn pushU64(bs: List<int>, v: int) {
+    var i = 0
+    while (i < 8) {
+        bs.push((v >> (8 * i)) & 0xFF)
+        i = i + 1
+    }
+}
+
+fn setU16(bs: List<int>, off: int, v: int) {
+    bs[off] = v & 0xFF
+    bs[off + 1] = (v >> 8) & 0xFF
+}
+
+fn setU32(bs: List<int>, off: int, v: int) {
+    var i = 0
+    while (i < 4) {
+        bs[off + i] = (v >> (8 * i)) & 0xFF
+        i = i + 1
+    }
+}
+
+fn setU64(bs: List<int>, off: int, v: int) {
+    var i = 0
+    while (i < 8) {
+        bs[off + i] = (v >> (8 * i)) & 0xFF
+        i = i + 1
+    }
+}
+
+fn padTo(bs: List<int>, a: int) {
+    while ((len(bs) % a) != 0) {
+        bs.push(0)
+    }
+}
+
+fn appendBytes(dst: List<int>, src: List<int>) {
+    var i = 0
+    while (i < len(src)) {
+        dst.push(src[i])
+        i = i + 1
+    }
+}
+
+fn zeroAt(bs: List<int>, off: int, n: int) {
+    var i = 0
+    while (i < n) {
+        bs[off + i] = 0
+        i = i + 1
+    }
+}
+
+/// Read a signed 32-bit little-endian field. The only non-zero ELF addends the
+/// emitter produces are the small negatives written by `rel32Data` (`-1` for
+/// the GC poll), so a 32-bit read is enough.
+fn readI32(bs: List<int>, off: int) -> int {
+    let v = bs[off] | (bs[off + 1] << 8) | (bs[off + 2] << 16) | (bs[off + 3] << 24)
+    if (v >= 0x80000000) {
+        v - 0x100000000
+    } else {
+        v
+    }
+}
+
+/// Offset of `name` in a string table, adding it (with a trailing NUL) when it
+/// is not present yet. The table always starts with a NUL byte at offset 0.
+fn strOff(tab: List<int>, seen: Map<string, int>, name: string) -> int {
+    if (seen.has(name)) {
+        return seen[name]
+    }
+    let off = len(tab)
+    seen[name] = off
+    let bs = bytes(name)
+    var i = 0
+    while (i < len(bs)) {
+        tab.push(bs[i] as int)
+        i = i + 1
+    }
+    tab.push(0)
+    off
+}
+
+fn addSym(syms: List<ElfSym>, indexes: Map<string, int>, s: ElfSym) {
+    if (indexes.has(s.name)) {
+        return
+    }
+    indexes[s.name] = len(syms)
+    syms.push(s)
+}
+
+fn writeShdr(blob: List<int>, base: int, nameOff: int, typ: int, flags: int, off: int, size: int, link: int, info: int, align: int, entsize: int) {
+    setU32(blob, base, nameOff)
+    setU32(blob, base + 4, typ)
+    setU64(blob, base + 8, flags)
+    setU64(blob, base + 16, 0)
+    setU64(blob, base + 24, off)
+    setU64(blob, base + 32, size)
+    setU32(blob, base + 40, link)
+    setU32(blob, base + 44, info)
+    setU64(blob, base + 48, align)
+    setU64(blob, base + 56, entsize)
+}
+
+/// Emit an ELF64 relocatable object for an already-lowered module.
+///
+/// This mirrors `compiler.coff::coffObjFor`: the same `.text`/`.rdata`/`.data`
+/// payloads and the same symbol names, but in the ELF64 container with
+/// `R_X86_64_64` and `R_X86_64_PC32` relocations. The caller must have lowered
+/// with the SysV ABI (`x64LowerModule(..., true)`); the object writer itself
+/// only sees the instruction bytes.
+fn elfObjFor(m: IrModule, out: X64Out) -> List<int> {
+    var text = [0]
+    text.pop()
+    var rdata = [0]
+    rdata.pop()
+    var data = [0]
+    data.pop()
+
+    var funcStart = [0]
+    funcStart.pop()
+    var rels = [ElfRel(0, "x", 1, 0)]
+    rels.pop()
+
+    var i = 0
+    while (i < len(out.funcs)) {
+        let f = out.funcs[i]
+        funcStart.push(len(text))
+        appendBytes(text, f.bytes)
+        pad16(text)
+        var r = 0
+        while (r < len(f.relocs)) {
+            let rel = f.relocs[r]
+            let off = funcStart[len(funcStart) - 1] + rel.off
+            var addend = 0
+            if (rel.type == 4) {
+                // COFF REL32 is measured from the end of the four-byte field;
+                // ELF PC32 is measured from its start. The emitter stores any
+                // extra displacement in the field, so shift both by four.
+                addend = readI32(f.bytes, rel.off) - 4
+                zeroAt(text, off, 4)
+            } else {
+                zeroAt(text, off, 8)
+            }
+            rels.push(ElfRel(off, elfSymName(rel.sym), rel.type, addend))
+            r = r + 1
+        }
+        i = i + 1
+    }
+    funcStart.push(len(text))
+    appendBytes(text, fmodBytes())
+    pad16(text)
+
+    var strStart = [0]
+    strStart.pop()
+    var s = 0
+    while (s < len(m.strings)) {
+        strStart.push(len(rdata))
+        pushStrDesc(rdata, m.strings[s])
+        pad16(rdata)
+        s = s + 1
+    }
+
+    var globStart = [0]
+    globStart.pop()
+    var g = 0
+    while (g < len(m.globals)) {
+        let glob = m.globals[g]
+        globStart.push(len(data))
+        var gb = zeroGlobalBytes()
+        if (let some(bs) = glob.init) {
+            gb = bs
+        }
+        appendBytes(data, gb)
+        g = g + 1
+    }
+
+    // Symbol table: null, the three section symbols (all local), then every
+    // definition, then the undefined symbols referenced by relocations.
+    var syms = [ElfSym("", 0, 0, 0, 0, 0)]
+    syms.pop()
+    syms.push(ElfSym("", 0, 0, 0, 0, 0))
+    syms.push(ElfSym(".text", 0, 3, SEC_TEXT, 0, 0))
+    syms.push(ElfSym(".rdata", 0, 3, SEC_RDATA, 0, 0))
+    syms.push(ElfSym(".data", 0, 3, SEC_DATA, 0, 0))
+    var indexes = Map<string, int>()
+    indexes[".text"] = 1
+    indexes[".rdata"] = 2
+    indexes[".data"] = 3
+
+    var fi = 0
+    while (fi < len(out.funcs)) {
+        let f = out.funcs[fi]
+        addSym(syms, indexes, ElfSym(f.symbol, 1, 2, SEC_TEXT, funcStart[fi], len(f.bytes)))
+        fi = fi + 1
+    }
+    let fmod = fmodBytes()
+    addSym(syms, indexes, ElfSym("pickle_fmod", 1, 2, SEC_TEXT, funcStart[len(out.funcs)], len(fmod)))
+
+    var gi = 0
+    while (gi < len(m.globals)) {
+        let glob = m.globals[gi]
+        var sz = 8
+        if (let some(bs) = glob.init) {
+            sz = len(bs)
+        }
+        addSym(syms, indexes, ElfSym(glob.symbol, 1, 1, SEC_DATA, globStart[gi], sz))
+        gi = gi + 1
+    }
+
+    var si = 0
+    while (si < len(m.strings)) {
+        let n = len(m.strings[si])
+        addSym(syms, indexes, ElfSym("pkl_strdesc_" + str(si), 1, 1, SEC_RDATA, strStart[si], 32 + ((n + 7) / 8) * 8))
+        addSym(syms, indexes, ElfSym("pkl_strdata_" + str(si), 1, 1, SEC_RDATA, strStart[si] + 32, n))
+        si = si + 1
+    }
+
+    var ri = 0
+    while (ri < len(rels)) {
+        if (!indexes.has(rels[ri].sym)) {
+            addSym(syms, indexes, ElfSym(rels[ri].sym, 1, 0, 0, 0, 0))
+        }
+        ri = ri + 1
+    }
+
+    // String table for symbols.
+    var strtab = [0]
+    strtab.pop()
+    strtab.push(0)
+    var strSeen = Map<string, int>()
+    var symtab = [0]
+    symtab.pop()
+    // Null symbol.
+    pushU32(symtab, 0)
+    pushU8(symtab, 0)
+    pushU8(symtab, 0)
+    pushU16(symtab, 0)
+    pushU64(symtab, 0)
+    pushU64(symtab, 0)
+    var sy = 1
+    while (sy < len(syms)) {
+        let e = syms[sy]
+        pushU32(symtab, strOff(strtab, strSeen, e.name))
+        pushU8(symtab, (e.bind << 4) | e.typ)
+        pushU8(symtab, 0)
+        pushU16(symtab, e.shndx)
+        pushU64(symtab, e.value)
+        pushU64(symtab, e.size)
+        sy = sy + 1
+    }
+
+    // Relocation section: R_X86_64_64 for absolute fields and
+    // R_X86_64_PC32 (addend -4) for the E8 call displacement.
+    var rela = [0]
+    rela.pop()
+    var rr = 0
+    while (rr < len(rels)) {
+        let r = rels[rr]
+        pushU64(rela, r.off)
+        var et = 1
+        if (r.typ == 4) {
+            et = 2
+        }
+        pushU64(rela, (indexes[r.sym] << 32) | et)
+        pushU64(rela, r.addend)
+        rr = rr + 1
+    }
+
+    // Section-name table.
+    var shstr = [0]
+    shstr.pop()
+    shstr.push(0)
+    var shSeen = Map<string, int>()
+    let textName = strOff(shstr, shSeen, ".text")
+    let relaName = strOff(shstr, shSeen, ".rela.text")
+    let rdataName = strOff(shstr, shSeen, ".rdata")
+    let dataName = strOff(shstr, shSeen, ".data")
+    let symtabName = strOff(shstr, shSeen, ".symtab")
+    let strtabName = strOff(shstr, shSeen, ".strtab")
+    let shstrtabName = strOff(shstr, shSeen, ".shstrtab")
+    let noteName = strOff(shstr, shSeen, ".note.GNU-stack")
+
+    // Layout: ELF header, then the section payloads in index order.
+    var blob = [0]
+    blob.pop()
+    var h = 0
+    while (h < 64) {
+        blob.push(0)
+        h = h + 1
+    }
+    let textOff = len(blob)
+    appendBytes(blob, text)
+    padTo(blob, 8)
+    let relaOff = len(blob)
+    appendBytes(blob, rela)
+    padTo(blob, 16)
+    let rdataOff = len(blob)
+    appendBytes(blob, rdata)
+    padTo(blob, 16)
+    let dataOff = len(blob)
+    appendBytes(blob, data)
+    padTo(blob, 8)
+    let symtabOff = len(blob)
+    appendBytes(blob, symtab)
+    let strtabOff = len(blob)
+    appendBytes(blob, strtab)
+    let shstrOff = len(blob)
+    appendBytes(blob, shstr)
+    let noteOff = len(blob)
+    padTo(blob, 8)
+    let shoff = len(blob)
+
+    var sh = 0
+    while (sh < SEC_COUNT * 64) {
+        blob.push(0)
+        sh = sh + 1
+    }
+    writeShdr(blob, shoff + 0 * 64, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    writeShdr(blob, shoff + SEC_TEXT * 64, textName, 1, 6, textOff, len(text), 0, 0, 16, 0)
+    writeShdr(blob, shoff + SEC_RELA_TEXT * 64, relaName, 4, 0, relaOff, len(rela), SEC_SYMTAB, SEC_TEXT, 8, 24)
+    writeShdr(blob, shoff + SEC_RDATA * 64, rdataName, 1, 2, rdataOff, len(rdata), 0, 0, 16, 0)
+    writeShdr(blob, shoff + SEC_DATA * 64, dataName, 1, 3, dataOff, len(data), 0, 0, 16, 0)
+    writeShdr(blob, shoff + SEC_SYMTAB * 64, symtabName, 2, 0, symtabOff, len(symtab), SEC_STRTAB, 4, 8, 24)
+    writeShdr(blob, shoff + SEC_STRTAB * 64, strtabName, 3, 0, strtabOff, len(strtab), 0, 0, 1, 0)
+    writeShdr(blob, shoff + SEC_SHSTRTAB * 64, shstrtabName, 3, 0, shstrOff, len(shstr), 0, 0, 1, 0)
+    writeShdr(blob, shoff + SEC_NOTE * 64, noteName, 1, 0, noteOff, 0, 0, 0, 1, 0)
+
+    // ELF header.
+    blob[0] = 0x7F
+    blob[1] = 0x45
+    blob[2] = 0x4C
+    blob[3] = 0x46
+    blob[4] = 2
+    blob[5] = 1
+    blob[6] = 1
+    setU16(blob, 16, 1)
+    setU16(blob, 18, 62)
+    setU32(blob, 20, 1)
+    setU64(blob, 24, 0)
+    setU64(blob, 32, 0)
+    setU64(blob, 40, shoff)
+    setU32(blob, 48, 0)
+    setU16(blob, 52, 64)
+    setU16(blob, 54, 0)
+    setU16(blob, 56, 0)
+    setU16(blob, 58, 64)
+    setU16(blob, 60, SEC_COUNT)
+    setU16(blob, 62, SEC_SHSTRTAB)
+    blob
+}

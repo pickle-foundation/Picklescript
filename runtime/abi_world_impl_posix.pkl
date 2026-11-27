@@ -1,0 +1,115 @@
+module runtime.abi_world_impl
+
+import { sysLockWord, sysUnlockWord, sysTryLockWord, sysFutexWait, sysFutexWake, sysAtomicLoad, sysAtomicStore } from runtime.abi_sys
+
+/// POSIX backend for the world lock: `runtime.abi_lock` owns the portable raw
+/// contract, this file owns the only place a futex is named.
+///
+/// THE ONE-WORD CELL IS THE LOCK. The portable contract says a lock cell and a
+/// condition cell are each one zero-initialized machine word. Win32's
+/// `SRWLOCK`/`CONDITION_VARIABLE` fit that shape; `pthread_mutex_t` does not,
+/// which is why the earlier port heap-allocated a pthread object and hid the
+/// pointer in the cell. The futex encoding removes the indirection: the cell
+/// itself is the three-state mutex (0 free, 1 held, 2 held with waiters), and
+/// `runtime/abi_sys` owns the `lock cmpxchg`/`futex` pair.
+///
+/// THE CONDITION WORD IS A SEQUENCE COUNTER. `pthread_cond_wait` atomically
+/// releases the paired mutex and parks; a raw futex has no such combined
+/// operation, so the waiter reads the sequence *while still holding the lock*,
+/// releases, and only then enters `FUTEX_WAIT` with that value. A waker that
+/// holds the same lock increments the sequence before waking, so a signal that
+/// lands in the release/wait window changes the word and the wait returns
+/// `EAGAIN` instead of sleeping through it. Spurious wakes are possible, which
+/// the portable contract already requires every caller to tolerate.
+///
+/// THE OWNER WORD. `implWorldHeld` is a startup-only snapshot, and a raw futex
+/// word has no owner field. The backend records the acquiring thread's id
+/// instead; nonzero means some thread holds the lock, which is all the
+/// lazy-acquire net in `abiThreadSpawn` asks.
+///
+/// NO C SHIM. The previous `pkl_posix_mutex`/`pkl_posix_cond` pair existed to
+/// build a `pthread_mutex_t` under a static initializer. A futex word needs no
+/// initializer: zero is free.
+
+/// The world lock's cell.
+var implWorldLock: int = 0
+
+/// Nonzero while some thread holds the world lock. The probe never asks
+/// *which* thread, so a marker is enough and the acquire path avoids a
+/// `gettid` syscall.
+var implWorldOwner: int = 0
+
+/// Address of `implWorldLock` for the futex helpers; `&` is only legal inside
+/// an `unsafe` block.
+fn implWorldLockAddr() -> int {
+    var a = 0
+    unsafe {
+        a = (&implWorldLock) as int
+    }
+    a
+}
+
+/// Take the world lock, blocking until it is free.
+fn implWorldAcquire() {
+    sysLockWord(implWorldLockAddr())
+    implWorldOwner = 1
+}
+
+/// Release the world lock. The caller must own it.
+fn implWorldRelease() {
+    implWorldOwner = 0
+    sysUnlockWord(implWorldLockAddr())
+}
+
+/// Snapshot probe: does some thread hold the world lock right now? Startup
+/// only; not an ownership test.
+fn implWorldHeld() -> bool {
+    return implWorldOwner != 0
+}
+
+/// Acquire a one-word lock cell owned by a runtime state block.
+fn implLockAcquire(cell: int) {
+    sysLockWord(cell)
+}
+
+/// Release a lock cell previously taken by `implLockAcquire`.
+fn implLockRelease(cell: int) {
+    sysUnlockWord(cell)
+}
+
+/// Non-blocking acquire of a lock cell: 1 on success, 0 when another thread
+/// owns it.
+fn implLockTry(cell: int) -> int {
+    return sysTryLockWord(cell)
+}
+
+/// Park the calling thread on the condition cell `cv`, which must be owned by
+/// the caller's primitive. The caller owns the world lock; the release/wait
+/// pair is made atomic against the waker by the sequence word.
+fn implWorldPark(cv: int) {
+    let seq = sysAtomicLoad(cv)
+    implWorldRelease()
+    sysFutexWait(cv, seq)
+    implWorldAcquire()
+}
+
+/// Park on `cv` while owning the arbitrary lock cell `lockCell`. Same atomic
+/// release/reacquire as `implWorldPark`, over the caller's own mutex.
+fn implParkOn(lockCell: int, cv: int) {
+    let seq = sysAtomicLoad(cv)
+    sysUnlockWord(lockCell)
+    sysFutexWait(cv, seq)
+    sysLockWord(lockCell)
+}
+
+/// Wake one thread parked on `cv` (the caller owns the paired lock cell).
+fn implWakeOn(cv: int) {
+    sysAtomicStore(cv, sysAtomicLoad(cv) + 1)
+    sysFutexWake(cv, 1)
+}
+
+/// Wake every thread parked on `cv` (the caller owns the paired lock cell).
+fn implWakeAllOn(cv: int) {
+    sysAtomicStore(cv, sysAtomicLoad(cv) + 1)
+    sysFutexWake(cv, 2147483647)
+}

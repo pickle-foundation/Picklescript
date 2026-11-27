@@ -1707,6 +1707,54 @@ fn flatBuiltin(name: string) -> (string, List<IrTy>, bool, IrTy, List<string>)? 
         // the answer, and reading a 32-bit `BOOL` back as a 64-bit `Int`
         // would depend on the upper half happening to be zero.
         case "win_heap_free" -> ("__imp_HeapFree", [IrTy.Int, IrTy.Int, IrTy.Int], false, IrTy.Int, ["heap", "flags", "ptr"])
+        // The freestanding syscall seam. `pkl_syscall` is emitted by
+        // `compiler.elflink`, not resolved from a system library: it moves the
+        // six SysV argument registers into the kernel's order and executes
+        // `syscall`. The `__imp_` spelling keeps the IR uniform with every
+        // other extern; the ELF boundary strips it.
+        case "sys_syscall" -> ("__imp_pkl_syscall", [IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["nr", "a1", "a2", "a3", "a4", "a5", "a6"])
+        // `pkl_cas` is the linker's `lock cmpxchg` stub. It returns the word
+        // that was in `addr` before the attempt, so the caller compares it with
+        // `expected` to learn whether the swap happened.
+        case "sys_cas" -> ("__imp_pkl_cas", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["addr", "expected", "value"])
+        // POSIX substrate: the same `__imp_` spelling, stripped to the bare
+        // name by `compiler.elf`. Every name here is answered by a
+        // `#[symbol]` body in `runtime/abi_sys_posix.pkl`; the ELF writer's
+        // symbol table resolves the extern to that definition.
+        case "posix_getenv" -> ("__imp_getenv", [IrTy.Int], true, IrTy.Int, ["name"])
+        // POSIX filesystem. Every pointer, size and count is one machine word;
+        // the ELF writer strips the prefix and the link editor resolves the
+        // bare libc name.
+        case "posix_access" -> ("__imp_access", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["path", "mode"])
+        case "posix_unlink" -> ("__imp_unlink", [IrTy.Int], true, IrTy.Int, ["path"])
+        case "posix_rmdir" -> ("__imp_rmdir", [IrTy.Int], true, IrTy.Int, ["path"])
+        case "posix_mkdir" -> ("__imp_mkdir", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["path", "mode"])
+        case "posix_getcwd" -> ("__imp_getcwd", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["buf", "size"])
+        case "posix_open" -> ("__imp_open", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["path", "flags", "mode"])
+        case "posix_read" -> ("__imp_read", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["fd", "buf", "n"])
+        case "posix_write" -> ("__imp_write", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["fd", "buf", "n"])
+        case "posix_close" -> ("__imp_close", [IrTy.Int], true, IrTy.Int, ["fd"])
+        case "posix_opendir" -> ("__imp_opendir", [IrTy.Int], true, IrTy.Int, ["path"])
+        case "posix_readdir" -> ("__imp_readdir", [IrTy.Int], true, IrTy.Int, ["dir"])
+        case "posix_closedir" -> ("__imp_closedir", [IrTy.Int], true, IrTy.Int, ["dir"])
+        // POSIX process control.
+        case "posix_fork" -> ("__imp_fork", List<IrTy>(), true, IrTy.Int, List<string>())
+        case "posix_execve" -> ("__imp_execve", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["path", "argv", "envp"])
+        case "posix__exit" -> ("__imp__exit", [IrTy.Int], false, IrTy.Int, ["code"])
+        case "posix_pipe" -> ("__imp_pipe", [IrTy.Int], true, IrTy.Int, ["fds"])
+        case "posix_dup2" -> ("__imp_dup2", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["oldfd", "newfd"])
+        case "posix_waitpid" -> ("__imp_waitpid", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["pid", "status", "options"])
+        case "posix_kill" -> ("__imp_kill", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["pid", "sig"])
+        case "posix_fcntl" -> ("__imp_fcntl", [IrTy.Int, IrTy.Int, IrTy.Int], true, IrTy.Int, ["fd", "cmd", "arg"])
+        case "posix_chdir" -> ("__imp_chdir", [IrTy.Int], true, IrTy.Int, ["path"])
+        // Clock/environment helpers. `pkl_thread_spawn` is the one thread
+        // primitive the linker has to emit machine code for: it maps the
+        // stack and calls `clone`. Wait and close are pure Pickle in
+        // `abi_sys_posix`, over futex and `munmap`.
+        case "pkl_now_ms" -> ("__imp_pkl_now_ms", List<IrTy>(), true, IrTy.Int, List<string>())
+        case "pkl_sleep_ms" -> ("__imp_pkl_sleep_ms", [IrTy.Int], false, IrTy.Int, ["ms"])
+        case "pkl_environ" -> ("__imp_pkl_environ", List<IrTy>(), true, IrTy.Int, List<string>())
+        case "pkl_thread_spawn" -> ("__imp_pkl_thread_spawn", [IrTy.Int, IrTy.Int], true, IrTy.Int, ["code", "env"])
         // The filesystem entry points, so a `#[symbol]` body can own
         // the whole `fs.rs` surface. All are KERNEL32, which is what
         // `win_import_addr` and `pelink::isShellImp` already assume for

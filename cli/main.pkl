@@ -1,5 +1,6 @@
 module cli.main
 
+import { VERSION } from compiler.version
 import { Lexer } from compiler.lexer
 import { LexedToken, canonTok } from compiler.token
 import { DiagnosticSink } from compiler.diag
@@ -14,7 +15,7 @@ import { catalogue, explainById, normalizeId } from compiler.error
 import { splitLines, subStr } from compiler.front
 import { renderHistory, renderBuilds, renderExplainHistory, gitRoot, historyFor } from cli.history
 import { currentDir } from std.process
-import { writeStderr } from runtime.abi_stdio
+import { writeStderr, writeConsoleLine } from runtime.abi_stdio
 import { STR_BYTES_OFF } from runtime.layout
 import { abiStrFromF64 } from runtime.abi_float
 import { abiShadowPush, abiShadowPop } from runtime.abi_shadow
@@ -32,6 +33,8 @@ import { abiEnumNew, abiEnumTag, abiEnumField, abiEnumSetField, abiEnumEq } from
 import { abiMapNew, abiMapSet, abiMapGetBoxed, abiMapGet, abiMapHas, abiMapRemove, abiMapLen, abiMapKeys, abiMapValues } from runtime.abi_map
 import { abiTupleNew, abiTupleLen, abiTupleSetField, abiTupleField } from runtime.abi_tuple
 import { resolve } from compiler.resolvecore
+import { parseBuildOptions } from cli.buildcmd
+import { buildLinux } from cli.linuxbuild
 
 fn lex(src: string) -> List<LexedToken> {
     let lx = Lexer(bytes(src), 0, 0, none, range(0), 0)
@@ -531,52 +534,40 @@ fn runCheckCmd(argv: List<string>) {
     }
 }
 
-fn pklcDword(v: int) -> int {
-    v & 4294967295
-}
-
-/// See `cli/pklc.pkl`: `WriteConsoleW` is the only console path that keeps a
-/// non-BMP code point intact, and the fallback keeps pipes and files UTF-8.
-fn pklcSayWideLine(s: string) -> bool {
-    unsafe {
-        var line = s + "\n"
-        let n = len(line)
-        var p = &line
-        let src = (p as int) + STR_BYTES_OFF
-        let need = win_multi_byte_to_wide_char(65001, 0, src, n, 0, 0)
-        if (need <= 0) {
-            return false
-        }
-        let wide = alloc(int, need + 1)
-        if ((wide as int) == 0) {
-            return false
-        }
-        let got = win_multi_byte_to_wide_char(65001, 0, src, n, wide, need)
-        var ok = false
-        if (got == need) {
-            let h = win_get_std_handle(-11)
-            let pW = alloc(int, 1)
-            pW[0] = 0
-            ok = pklcDword(win_write_console_w(h, wide, need, pW, 0)) != 0
-            free(pW)
-        }
-        free(wide)
-        return ok
-    }
-}
-
+/// A line on the console. `runtime.abi_stdio` owns whether that is
+/// `WriteConsoleW` (Windows) or a UTF-8 write to fd 1 (POSIX). On Windows the
+/// console path refuses when stdout is a pipe or a file, and the `println`
+/// fallback keeps those UTF-8.
 fn pklcSayLine(s: string) {
-    if (pklcSayWideLine(s)) {
+    if (writeConsoleLine(s)) {
         return
     }
     println(s)
+}
+
+/// `build [--target linux] [-o <path>] [--runtime <dir>] <file.pkl>`.
+/// The POSIX front end builds ELF only; the Windows front end owns the PE
+/// path. Both parse the same flags through `cli.buildcmd`.
+fn runBuildCmd(argv: List<string>) {
+    if (let some(opts) = parseBuildOptions(argv)) {
+        if (opts.target != "linux") {
+            println("pklc: this binary builds linux targets; use the windows pklc for " + opts.target)
+            exit(1)
+        }
+        if (!buildLinux(opts.source, opts.output, opts.rtDir, opts.link, opts.keepObject)) {
+            exit(1)
+        }
+        println("built " + opts.output)
+        return
+    }
+    exit(1)
 }
 
 fn main() {
     let argv = args()
     if (len(argv) >= 1) {
         if (argv[0] == "--version" || argv[0] == "-V") {
-            println("pickle 0.1.0")
+            println("pickle " + VERSION)
             return
         }
         if (argv[0] == "jar") {
@@ -605,6 +596,10 @@ fn main() {
         }
         if (argv[0] == "irx") {
             runIrx(argv)
+            return
+        }
+        if (argv[0] == "build") {
+            runBuildCmd(argv)
             return
         }
         if (argv[0] == "lex") {

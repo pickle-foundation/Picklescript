@@ -4,7 +4,8 @@ import { abiEngineAllocCount, abiEngineAllocBytes, abiEngineResetCounters, abiEn
 import { writeStderr } from runtime.abi_stdio
 import { STR_BYTES_OFF } from runtime.layout
 import { abiShadowSelf, abiShadowSelfIfRegistered, SHADOW_W_ARENA_BASE, SHADOW_W_ARENA_USED, SHADOW_W_ARENA_CAP, SHADOW_W_ARENA_CHUNK } from runtime.abi_shadow
-import { winLockAcquire, winLockRelease } from runtime.abi_world_win
+import { rawLockAcquire, rawLockRelease } from runtime.abi_lock
+import { sysHeapAlloc, sysHeapFree, sysExit } from runtime.abi_sys
 
 /// Port of `runtime/src/raw.rs`: the two-slot manual-allocation pair behind
 /// `alloc(int, n)` and `free(p)`.
@@ -90,8 +91,7 @@ fn abiRawAlloc(size: int) -> int {
     if (n < 1) {
         n = 1
     }
-    var heap = win_get_process_heap()
-    let addr = win_heap_alloc(heap, 0, n)
+    let addr = sysHeapAlloc(n)
     if (addr == 0) {
         // Distinguish OOM from a compile error. The old path exited silently
         // with code 1, which reads exactly like a lowering failure and cost an
@@ -102,7 +102,7 @@ fn abiRawAlloc(size: int) -> int {
             var p = &msg
             let _ = writeStderr((p as int) + STR_BYTES_OFF, len(msg))
         }
-        win_exit(1)
+        sysExit(1)
     }
     return addr
 }
@@ -111,8 +111,7 @@ fn abiRawAlloc(size: int) -> int {
 /// Mirrors `raw.rs::pickle_raw_free`, minus the `LIVE` registry above.
 #[symbol("pickle_raw_free")]
 fn abiRawFree(ptr: int) {
-    var heap = win_get_process_heap()
-    win_heap_free(heap, 0, ptr)
+    sysHeapFree(ptr)
 }
 
 // ------------------------------------------------------- managed bump arena
@@ -211,9 +210,9 @@ fn abiManagedAllocParallel(n: int) -> int {
     let rec = self as *int
     unsafe {
         if (rec[SHADOW_W_ARENA_BASE] == 0 || rec[SHADOW_W_ARENA_USED] + n > rec[SHADOW_W_ARENA_CAP]) {
-            winLockAcquire((&managedChunkLock) as int)
+            rawLockAcquire((&managedChunkLock) as int)
             let base = managedChunkNew()
-            winLockRelease((&managedChunkLock) as int)
+            rawLockRelease((&managedChunkLock) as int)
             rec[SHADOW_W_ARENA_CHUNK] = base - MANAGED_CHUNK_HEADER
             rec[SHADOW_W_ARENA_BASE] = base
             rec[SHADOW_W_ARENA_USED] = 0
@@ -281,7 +280,7 @@ fn abiManagedRelease(addr: int) {
     unsafe {
         lockAddr = (&managedChunkLock) as int
     }
-    winLockAcquire(lockAddr)
+    rawLockAcquire(lockAddr)
     var chunk = managedArenaChunk
     while (chunk != 0) {
         var next = 0
@@ -292,12 +291,12 @@ fn abiManagedRelease(addr: int) {
         }
         if (addr >= chunk && addr < chunk + size) {
             managedLastChunk = chunk
-            winLockRelease(lockAddr)
+            rawLockRelease(lockAddr)
             return
         }
         chunk = next
     }
-    winLockRelease(lockAddr)
+    rawLockRelease(lockAddr)
     abiRawFree(addr)
 }
 

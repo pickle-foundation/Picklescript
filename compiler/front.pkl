@@ -9,6 +9,33 @@ import { ResolvedProgram, Resolver } from compiler.resolvebag
 import { checkProgram } from compiler.checkcore
 import { resolve } from compiler.resolvecore
 
+/// The backend variant this build resolves platform modules for.
+///
+/// A module may ship as `<name>_win.pkl` and `<name>_posix.pkl`, both declaring
+/// the plain module name `<name>`. The loader tries the suffix for the current
+/// platform before the unsuffixed file, so portable callers import `<name>` and
+/// never name an OS. `cli.rtlib` applies the same rule when it packs the
+/// runtime archive, so the source tree and the archive agree on which file is
+/// the backend.
+var buildPlatform: string = "win"
+
+fn setBuildPlatform(p: string) {
+    buildPlatform = p
+}
+
+/// The file a module resolves to under the current platform, or none.
+fn platformModuleFile(base: string, rel: string) -> string? {
+    let f = pathJoin(base, rel + "_" + buildPlatform + ".pkl")
+    if (isFileP(f)) {
+        return f
+    }
+    let plain = pathJoin(base, rel + ".pkl")
+    if (isFileP(plain)) {
+        return plain
+    }
+    none
+}
+
 class FrontOutput {
     var program: Program
     var resolved: ResolvedProgram
@@ -187,6 +214,7 @@ class Loader {
             this.files.push(ModuleFile(fileName, modulePath, exports, false, List<PubNs>(), List<PubItem>(), pp.imports, pp, emptyFileImports()))
             this.loaded[fileName] = 0
             this.processImports(0)
+            this.loadRuntimePrelude(fileName)
 
             var itemCounts = Map<string, int>()
             for (f in this.files) {
@@ -218,6 +246,28 @@ class Loader {
             return LoadedModules(merged, collided)
         }
         none
+    }
+
+    /// Load the runtime modules whose `#[symbol]` bodies the compiler calls
+    /// without the program naming them: the shadow stack around every
+    /// function, console printing, exception/panic reporting, aggregate and
+    /// class helpers, and the startup/exit/time/thread primitives.
+    ///
+    /// WHY THE PROGRAM OWNS THE RUNTIME. The alternative is a per-target
+    /// runtime archive that must be rebuilt whenever any runtime file changes,
+    /// then selected over by the linker. Loading these modules into the
+    /// program's own import closure emits each body once, into the same object
+    /// as the program, so `pklc build` is one lower-and-link step on every
+    /// target. The list is deliberately limited to modules a compiled program
+    /// can reach through a builtin; networking, TLS and streams stay explicit
+    /// imports, so a target without those backends still builds.
+    fn loadRuntimePrelude(rootFile: string) {
+        let prelude = runtimePrelude()
+        var i = 0
+        while (i < len(prelude)) {
+            let _ = this.ensureModule(rootFile, prelude[i], Span(0, 0))
+            i = i + 1
+        }
     }
 
     fn processImports(idx: int) {
@@ -613,7 +663,6 @@ class Loader {
             return none
         }
         let rel = joinPathParts(segments)
-        let relFile = rel + ".pkl"
         if (let some(crateDir) = this.workspace.crates.get(segments[0])) {
             if (len(segments) == 1) {
                 var stems = ["lib", "main", segments[0]]
@@ -626,8 +675,7 @@ class Loader {
                 return none
             }
             let sub = joinPathParts(subListStr(segments, 1, len(segments) - 1))
-            let f = pathJoin(crateDir, sub + ".pkl")
-            if (isFileP(f)) {
+            if (let some(f) = platformModuleFile(crateDir, sub)) {
                 return ModuleLoc.File(f)
             }
             let p = pathJoin(crateDir, sub)
@@ -651,8 +699,7 @@ class Loader {
         }
         bases.push("src")
         for (base in bases) {
-            let f = pathJoin(base, relFile)
-            if (isFileP(f)) {
+            if (let some(f) = platformModuleFile(base, rel)) {
                 return ModuleLoc.File(f)
             }
             let pt = pathJoin(base, rel)
@@ -662,6 +709,42 @@ class Loader {
         }
         none
     }
+}
+
+/// The runtime modules every compiled program carries. See
+/// `Loader.loadRuntimePrelude` for why this replaced the runtime archive.
+fn runtimePrelude() -> List<List<string>> {
+    var out = [[""]]
+    out.pop()
+    out.push(["runtime", "abi_runtime"])
+    out.push(["runtime", "abi_shadow"])
+    out.push(["runtime", "abi_console"])
+    out.push(["runtime", "abi_exception"])
+    out.push(["runtime", "abi_panic"])
+    out.push(["runtime", "abi_os"])
+    out.push(["runtime", "abi_class"])
+    out.push(["runtime", "abi_class_extra"])
+    out.push(["runtime", "abi_classpred"])
+    out.push(["runtime", "abi_string"])
+    out.push(["runtime", "abi_list"])
+    out.push(["runtime", "abi_map"])
+    out.push(["runtime", "abi_enum"])
+    out.push(["runtime", "abi_union"])
+    out.push(["runtime", "abi_tuple"])
+    out.push(["runtime", "abi_box"])
+    out.push(["runtime", "abi_float"])
+    out.push(["runtime", "abi_math"])
+    out.push(["runtime", "abi_statics"])
+    out.push(["runtime", "abi_raw"])
+    out.push(["runtime", "abi_gc"])
+    out.push(["runtime", "abi_fs"])
+    out.push(["runtime", "abi_process"])
+    out.push(["runtime", "abi_stream"])
+    out.push(["runtime", "abi_time"])
+    out.push(["runtime", "abi_once"])
+    out.push(["runtime", "abi_sync"])
+    out.push(["runtime", "abi_threads"])
+    return out
 }
 
 fn frontend(fileName: string, source: string, diags: DiagnosticSink) -> FrontOutput? {
@@ -1362,8 +1445,9 @@ fn aliasSuffix(i: int) -> string {
 
 /// Workspace crates bundled next to the compiler binary. The release compiler
 /// points this at its own directory so `std.*` and the runtime sources resolve
-/// from any working directory. Crates found by the normal walk win; the
-/// bundled set only fills names the source tree does not provide.
+/// from any working directory. Bundled crates win over anything a project
+/// discovers: a generated or hand-edited workspace map must not be able to
+/// shadow the compiler's own `std`, `compiler`, `cli`, or `runtime` sources.
 var workspaceRoot: string = ""
 
 fn setWorkspaceRoot(root: string) {
@@ -1386,14 +1470,14 @@ fn discoverWorkspace(fileName: string) -> Workspace {
         let manifest = pathJoin(workspaceRoot, "picklescript.toml")
         if (let some(bundled) = readWorkspaceMembers(manifest)) {
             var merged = Map<string, string>()
-            for (k in found.crates.keys()) {
-                if (let some(v) = found.crates.get(k)) {
+            for (k in bundled.keys()) {
+                if (let some(v) = bundled.get(k)) {
                     merged[k] = v
                 }
             }
-            for (k in bundled.keys()) {
+            for (k in found.crates.keys()) {
                 if (!merged.has(k)) {
-                    if (let some(v) = bundled.get(k)) {
+                    if (let some(v) = found.crates.get(k)) {
                         merged[k] = v
                     }
                 }

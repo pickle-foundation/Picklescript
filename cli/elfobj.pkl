@@ -1,0 +1,63 @@
+module cli.elfobj
+
+import { DiagnosticSink } from compiler.diag
+import { frontend, setBuildPlatform } from compiler.front
+import { emitIrEx } from compiler.emit
+import { x64LowerModule } from compiler.x64
+import { elfObjFor } from compiler.elf
+import { strFrom } from compiler.linklib
+
+/// Diagnostic driver: lower one module to an ELF64 relocatable object using
+/// the SysV ABI. This is the cross-build seam for the Linux port; it does not
+/// link or run anything, so it can be exercised on Windows.
+fn main() {
+    let argv = args()
+    if (len(argv) < 2) {
+        println("usage: elfobj <src.pkl> <out.o>")
+        exit(1)
+    }
+    let target = argv[0]
+    let out = argv[1]
+    setBuildPlatform("posix")
+    if (let some(src) = read_file(target)) {
+        let sinks = DiagnosticSink()
+        if (let some(loaded) = frontend(target, src, sinks)) {
+            if (let some(emitted) = emitIrEx(loaded.program, loaded.resolved, sinks, 0, "", List<string>())) {
+                if (let some(xout) = x64LowerModule(emitted.ir, sinks, true)) {
+                    let obj = elfObjFor(emitted.ir, xout)
+                    if (write_file(out, strFrom(obj))) {
+                        println("ELFOK bytes=" + str(len(obj)))
+                        return
+                    }
+                    println("ELF FAIL: write")
+                } else {
+                    printDiags(sinks)
+                    println("ELF FAIL: x64")
+                }
+            } else {
+                printDiags(sinks)
+                println("ELF FAIL: emit")
+            }
+        } else {
+            printDiags(sinks)
+            println("ELF FAIL: frontend")
+        }
+    } else {
+        println("ELF FAIL: read")
+    }
+    exit(1)
+}
+
+fn printDiags(diags: DiagnosticSink) {
+    let ds = diags.diagnostics
+    var i = 0
+    while (i < len(ds)) {
+        let d = ds[i]
+        var sp = "none"
+        if (let some(s0) = d.span) {
+            sp = "(" + str(s0.start) + "," + str(s0.end) + ")"
+        }
+        println("DIAG " + d.message + " span=" + sp)
+        i = i + 1
+    }
+}

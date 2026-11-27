@@ -1,5 +1,7 @@
 module runtime.abi_time
 
+import { sysUnixMs, sysMonotonicNs } from runtime.abi_sys
+
 /// THE CLOCK SEAM: the two clock reads the STD is built on.
 ///
 /// `std.time` is written entirely above this module. It asks for
@@ -19,113 +21,30 @@ module runtime.abi_time
 /// would make `Instant.elapsed()` report negative spans on a clock step, which
 /// is exactly the bug a monotonic source exists to prevent.
 ///
+/// THE PLATFORM BODIES live in `runtime.abi_sys_win.pkl` (FILETIME plus
+/// `QueryPerformanceCounter`) and `runtime.abi_sys_posix.pkl`
+/// (`clock_gettime(CLOCK_REALTIME)` and `CLOCK_MONOTONIC)`), behind the same
+/// `sysUnixMs`/`sysMonotonicNs` contract. This module therefore stays free of
+/// OS names and is identical on every target.
+///
 /// CONTRACTS.
 ///
 ///   unix_ms         milliseconds since the Unix epoch, UTC, truncated toward
 ///                   the epoch at sub-millisecond precision. Not monotonic.
 ///   monotonic_ns    never decreases for the life of the process. The origin is
-///                   unspecified (it is the performance counter, which starts
-///                   near boot), so only differences are meaningful, and they
+///                   unspecified, so only differences are meaningful, and they
 ///                   are not comparable across processes.
-///
-/// PRECISION. `GetSystemTimeAsFileTime` is a 100-ns counter but the system
-/// timer only advances it at the timer tick, so `unix_ms` is honest to about a
-/// millisecond. The performance counter is the high-resolution source; on
-/// current Windows it runs at 10 MHz, so `monotonic_ns` resolves to 100 ns.
-///
-/// NO OVERFLOW IN THE NS MATH. The counter is converted as
-/// `(c / f) * 1e9 + ((c % f) * 1e9) / f`: the second term is below `1e9 * f`
-/// (10^16 for a 10 MHz counter), which fits the 64-bit `int`, and the first
-/// term is whole seconds. Forming `c * 1e9` first would overflow after a few
-/// minutes of uptime.
-///
-/// WHAT A LINUX PORT CHANGES. Only the two `plat*` bodies below, to
-/// `clock_gettime(CLOCK_REALTIME)` and `clock_gettime(CLOCK_MONOTONIC)` (both
-/// `struct timespec` reads, seconds + nanoseconds); macOS has the same two
-/// calls. Nothing above this module knows that `GetSystemTimeAsFileTime` or
-/// `QueryPerformanceCounter` exist. ARM changes no signature: the ABI is
-/// integer-only and Pickle's `int` is 64-bit on every target, so a 32-bit
-/// ABI would return the same value in a register pair rather than a new type.
-
-/// 100-ns ticks between the FILETIME epoch (1601-01-01 UTC) and the Unix epoch
-/// (1970-01-01 UTC): 11 644 473 600 seconds.
-const FILETIME_UNIX_DELTA_100NS: int = 116444736000000000
-
-/// QPC ticks per second, queried once and cached. 0 means "not queried yet".
-/// The frequency is constant for the life of the process, so one read is
-/// enough; keeping it here also keeps the two `Instant.now()` calls a caller
-/// makes per measurement down to one counter read.
-var qpcFreq: int = 0
-
-/// QPC ticks per second, or 0 when the query fails. The Windows bodies fall
-/// back to the millisecond tick counter rather than inventing a frequency.
-fn platFrequency() -> int {
-    if (qpcFreq > 0) {
-        return qpcFreq
-    }
-    unsafe {
-        let p = alloc(int, 1)
-        p[0] = 0
-        win_query_performance_frequency(p)
-        let f = p[0]
-        free(p)
-        if (f > 0) {
-            qpcFreq = f
-        }
-        return f
-    }
-}
-
-// ------------------------------------------------------------------ Windows
-
-/// Wall-clock milliseconds since the Unix epoch, from
-/// `GetSystemTimeAsFileTime`. The call writes a 64-bit FILETIME (100-ns ticks
-/// since 1601) into the buffer; subtracting the epoch delta and dividing by
-/// 10 000 gives milliseconds. The counter is always past 1970 on a live
-/// system, so the division never sees a negative dividend.
-fn platUnixMs() -> int {
-    unsafe {
-        let p = alloc(int, 1)
-        p[0] = 0
-        win_get_system_time_as_file_time(p)
-        let ft = p[0]
-        free(p)
-        return (ft - FILETIME_UNIX_DELTA_100NS) / 10000
-    }
-}
-
-/// Monotonic nanoseconds from `QueryPerformanceCounter`. Falls back to the
-/// 64-bit millisecond tick counter when the frequency query fails, which is a
-/// coarse but still monotonic answer.
-fn platMonotonicNs() -> int {
-    let f = platFrequency()
-    if (f <= 0) {
-        return win_tick_ms64() * 1000000
-    }
-    unsafe {
-        let p = alloc(int, 1)
-        p[0] = 0
-        win_query_performance_counter(p)
-        let c = p[0]
-        free(p)
-        let whole = c / f
-        let rem = c - whole * f
-        return whole * 1000000000 + (rem * 1000000000) / f
-    }
-}
-
-// ------------------------------------------------------------- ABI surface
 
 /// Wall-clock milliseconds since the Unix epoch, UTC.
 /// Mirrors `std.time.unixMillis()`.
 #[symbol("pickle_time_unix_ms")]
 fn abiTimeUnixMs() -> int {
-    return platUnixMs()
+    return sysUnixMs()
 }
 
 /// Monotonic nanoseconds from an unspecified origin.
 /// Mirrors `std.time.monotonicNanos()`.
 #[symbol("pickle_time_monotonic_ns")]
 fn abiTimeMonotonicNs() -> int {
-    return platMonotonicNs()
+    return sysMonotonicNs()
 }

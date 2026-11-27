@@ -75,6 +75,7 @@ import { abiGcRegisterThread, abiShadowRetireNode, abiShadowSelfIfRegistered } f
 import { abiRawSetParallel } from runtime.abi_raw
 import { worldAcquire, worldRelease, worldHeld, lockAcquire, lockRelease } from runtime.abi_world
 import { abiGilMode } from runtime.abi_gil
+import { sysThreadSpawn, sysThreadWait, sysThreadClose, sysThreadSleep, sysThreadYield } from runtime.abi_sys
 
 /// Task-record word indexes. See the header layout table.
 const TASK_HANDLE: int = 0
@@ -92,9 +93,6 @@ const TASK_WORDS: int = 10
 const TASK_RUNNING: int = 0
 const TASK_DONE: int = 1
 const TASK_FAILED: int = 2
-
-/// `INFINITE` for `WaitForSingleObject`: a DWORD all-ones, passed as a word.
-const THR_INFINITE: int = 4294967295
 
 /// How many tasks have been spawned. Handles are the pre-increment counter
 /// value (0-based, like `threads.rs:134`).
@@ -262,7 +260,7 @@ fn abiThreadSpawn(body: fn () -> void) -> int {
         // observe a live thread it does not know about. A failed create
         // uncounts it again.
         abiGcThreadStarting()
-        let h = win_create_thread(0, 0, code, entryAddr, 0, 0)
+        let h = sysThreadSpawn(code, entryAddr)
         if (h == 0) {
             abiGcThreadExited()
             abiEngineTempUnrootShared(entryObj)
@@ -308,7 +306,7 @@ fn abiThreadJoin(handle: int) -> bool {
         lockRelease(taskWord(rec, TASK_LOCK))
         if (mine) {
             worldRelease()
-            let _ = win_wait_single(h, THR_INFINITE)
+            let _ = sysThreadWait(h, -1)
             worldAcquire()
             lockAcquire(taskWord(rec, TASK_LOCK))
             rec[TASK_HANDLE] = 0
@@ -318,7 +316,7 @@ fn abiThreadJoin(handle: int) -> bool {
             if (node != 0) {
                 abiShadowRetireNode(node)
             }
-            let _ = win_close_handle(h)
+            sysThreadClose(h)
         }
         if (rec[TASK_STATE] == TASK_FAILED) {
             return false
@@ -347,7 +345,7 @@ fn abiThreadFinished(handle: int) -> bool {
             // is gone. The handle stays open for `join` to close.
             var node = 0
             let h = rec[TASK_HANDLE]
-            if (h != 0 && win_wait_single(h, 0) == 0) {
+            if (h != 0 && sysThreadWait(h, 0) == 0) {
                 node = rec[TASK_NODE]
                 rec[TASK_NODE] = 0
             }
@@ -362,7 +360,7 @@ fn abiThreadFinished(handle: int) -> bool {
             lockRelease(taskWord(rec, TASK_LOCK))
             return true
         }
-        let rc = win_wait_single(h, 0)
+        let rc = sysThreadWait(h, 0)
         if (rc == 0) {
             // The OS thread has exited, so its node can be unlinked. Keep a
             // failed body's state: only a still-RUNNING task becomes DONE.
@@ -420,7 +418,7 @@ fn abiThreadSleepMs(ms: int) -> int {
         m = 60000
     }
     worldRelease()
-    win_sleep(m)
+    sysThreadSleep(m)
     worldAcquire()
     return 0
 }
@@ -429,7 +427,7 @@ fn abiThreadSleepMs(ms: int) -> int {
 #[symbol("pickle_thread_yield")]
 fn abiThreadYield() -> int {
     worldRelease()
-    let _ = win_switch_to_thread()
+    sysThreadYield()
     worldAcquire()
     return 0
 }
