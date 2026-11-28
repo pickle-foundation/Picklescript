@@ -563,6 +563,87 @@ fn memsetStubArm64() -> List<int> {
     b.bytes
 }
 
+/// ARM64 `pkl_thread_spawn(code, env)`: map an 8 MiB stack, stash the entry
+/// pair at its top, and `clone` a thread that shares the address space.
+///
+/// Handle layout matches the x86-64 stub so the Pickle runtime above it is
+/// architecture-neutral:
+///
+///   [0] tid   [1] ctid (kernel-cleared on exit)   [2] base   [3] size
+///
+/// `sysThreadWait` parks on the ctid word; `sysThreadClose` unmaps the base.
+fn threadSpawnStubArm64() -> List<int> {
+    let b = A64Buf()
+    // Frame: save the three callee-saved registers this stub uses.
+    b.stpPre(19, 20, 31, -32)
+    b.strX(21, 31, 16)
+    b.movReg(19, 0)
+    b.movReg(20, 1)
+    // mmap(NULL, 8 MiB, RW, PRIVATE|ANON|STACK, -1, 0)
+    b.movImm(0, 0)
+    b.movImm(1, 0x800000)
+    b.movImm(2, 3)
+    b.movImm(3, 0x20022)
+    b.movImm(4, -1)
+    b.movImm(5, 0)
+    b.movImm(8, 222)
+    b.svc(0)
+    // Linux reports a failed mmap as -4095..-1.
+    b.movImm(9, -4096)
+    b.cmpReg(0, 9)
+    let nomap = b.bCond(COND_CS)
+    b.movReg(21, 0)
+    b.strX(21, 21, 16)
+    b.movImm(9, 0x800000)
+    b.strX(9, 21, 24)
+    // stackTop is page-aligned because mmap is; the entry pair sits just below.
+    b.movImm(9, 0x800000)
+    b.addReg(9, 21, 9)
+    b.subImm(9, 9, 16)
+    b.stpPre(19, 20, 9, 0)
+    b.addImm(10, 9, 16)
+    // clone(0x1350F00, stackTop, &handle[0], &handle[8], 0)
+    b.movImm(0, 0x1350F00)
+    b.movReg(1, 10)
+    b.movReg(2, 21)
+    b.addImm(3, 21, 8)
+    b.movImm(4, 0)
+    b.movImm(8, 220)
+    b.svc(0)
+    let child = b.cbz(0)
+    let unmapped = b.bCond(COND_MI)
+    b.movReg(0, 21)
+    b.ldrX(21, 31, 16)
+    b.ldpPost(19, 20, 31, 32)
+    b.ret()
+    let failUnmap = b.size()
+    b.movReg(0, 21)
+    b.movImm(1, 0x800000)
+    b.movImm(8, 215)
+    b.svc(0)
+    b.movImm(0, 0)
+    b.ldrX(21, 31, 16)
+    b.ldpPost(19, 20, 31, 32)
+    b.ret()
+    let failNoMap = b.size()
+    b.movImm(0, 0)
+    b.ldrX(21, 31, 16)
+    b.ldpPost(19, 20, 31, 32)
+    b.ret()
+    let childAt = b.size()
+    // The child inherits x9 = stackTop-16; the entry pair is right there.
+    b.ldpPost(0, 1, 9, 0)
+    b.blr(0)
+    b.movImm(0, 0)
+    b.movImm(8, 93)
+    b.svc(0)
+    b.brk(0)
+    b.patchBCond(nomap, failNoMap)
+    b.patchCbz(child, childAt)
+    b.patchBCond(unmapped, failUnmap)
+    b.bytes
+}
+
 fn x64Arch() -> LinkArch {
     var stubs = List<LinkStub>()
     stubs.push(LinkStub("pkl_syscall", syscallStub()))
@@ -573,14 +654,13 @@ fn x64Arch() -> LinkArch {
     LinkArch(62, false, startBytes(), [7, 12, 17], stubs)
 }
 
-/// The ARM64 stub set. `pkl_thread_spawn` is not here yet: it is the one
-/// routine that needs a real stack switch and a clone sequence, and the
-/// compiler build will add it with the thread backend. Until then an object
-/// that references it fails the link rather than resolving to x86-64 bytes.
+/// The ARM64 stub set. Every stub is native AArch64; none of the x86-64
+/// machine code is reused.
 fn arm64Arch() -> LinkArch {
     var stubs = List<LinkStub>()
     stubs.push(LinkStub("pkl_syscall", syscallStubArm64()))
     stubs.push(LinkStub("pkl_cas", casStubArm64()))
+    stubs.push(LinkStub("pkl_thread_spawn", threadSpawnStubArm64()))
     stubs.push(LinkStub("memcpy", memcpyStubArm64()))
     stubs.push(LinkStub("memset", memsetStubArm64()))
     LinkArch(183, true, startBytesArm64(), [8, 12, 16], stubs)
