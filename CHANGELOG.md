@@ -17,6 +17,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A POSIX stream backend (`abi_stream_posix`) mirroring the Windows stream
   symbols, so `std.fs` append/read works on Linux.
 
+- Linux AArch64 (ARM64) self-hosted toolchain: an AArch64 backend over the
+  same IR, an AArch64 ELF writer and linker with native stubs, and
+  `build --target linux-arm64` in both drivers. The cross-built compiler and
+  the compiler it builds from its own source are byte-identical (6,013,840
+  bytes, SHA-256
+  `8BBA394C801395298E0B08B3C314ECF7DC8DB2280D69282092FDD59274FCA927`),
+  so ARM64 reaches its own fixed point. Verified under `qemu-aarch64` only.
+
+- `runtime.abi_sysno` now owns every Linux syscall number, argument shape and
+  arch-specific open flag, with separate x86-64 and AArch64 bodies. A module
+  may also ship as `<name>_<platform>_<arch>.pkl`, and `runtime.abi_sys`
+  exports `SYS_ARCH` so the CLI can default to the host's instruction set.
+
 ### Changed
 
 - The toolchain version now has a single source of truth in
@@ -25,6 +38,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The runtime archive is being retired. Programs are lowered with their import
   closure into one object, so `pklc build` links a program itself.
+
+### Fixed
+
+- AArch64 integer comparisons used the float condition codes, so `<` and `<=`
+  against a negative value behaved like an unsigned compare and loops such as
+  `while (i < 0)` never ran. Float compares keep the `MI`/`LS` tests that
+  `fcmp` needs.
+
+- `list_dir` on AArch64 opened directories with the x86-64 `O_DIRECTORY`
+  value (`0x10000`), which is `O_DIRECT` on that architecture; every listing
+  failed with `EINVAL`. The flag now comes from the per-arch syscall seam.
 
 ### Security
 
