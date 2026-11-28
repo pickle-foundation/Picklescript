@@ -1038,13 +1038,18 @@ fn sysThreadSpawn(code: int, env: int) -> int {
 }
 
 /// Wait for `handle`. A negative timeout means infinite. Returns 0 when the
-/// thread has exited, nonzero on timeout. The kernel clears the `ctid` word on
-/// exit and wakes futex waiters, so the wait is a plain futex loop.
+/// thread has exited, nonzero on timeout. Word 0 is both `parent_tid` and
+/// `child_tid`: the kernel stores the TID there before `clone` returns, so a
+/// live thread is never seen as zero, and clears it on exit. The exit wake is
+/// a *shared* futex (`mm_release` calls `do_futex(..., FUTEX_WAKE, ...)`
+/// without `FUTEX_PRIVATE`), so the wait must be shared too; a private wait
+/// sleeps forever even after the word reaches zero (glibc's `pthread_join`
+/// uses `FUTEX_WAIT_BITSET` without `FUTEX_PRIVATE` for the same reason).
 fn sysThreadWait(handle: int, timeoutMs: int) -> int {
     if (handle == 0) {
         return 0
     }
-    let ctid = handle + 8
+    let ctid = handle
     var ts = 0
     if (timeoutMs >= 0) {
         ts = sysHeapAlloc(16)
@@ -1067,7 +1072,7 @@ fn sysThreadWait(handle: int, timeoutMs: int) -> int {
             }
             return 0
         }
-        let r = sysnoFutex(ctid, FUTEX_WAIT | FUTEX_PRIVATE, v, ts)
+        let r = sysnoFutex(ctid, FUTEX_WAIT, v, ts)
         if (r == -110) {
             // ETIMEDOUT: the thread may have exited just as the wait expired.
             unsafe {

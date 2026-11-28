@@ -382,15 +382,15 @@ fn memsetStub() -> List<int> {
 ///   mmap(NULL, 8 MiB, RW, PRIVATE|ANON|STACK, -1, 0)
 ///   put code/env below the new stack top
 ///   clone(CLONE_VM|FS|FILES|SIGHAND|THREAD|SYSVSEM|PARENT_SETTID|
-///         CHILD_SETTID|CHILD_CLEARTID, stackTop, &handle[0], &handle[8], 0)
+///         CHILD_SETTID|CHILD_CLEARTID, stackTop, &handle[0], &handle[0], 0)
 ///   parent: return the handle (or 0 on failure)
 ///   child:  call code(env), then exit(0)
 ///
 /// The handle is the mapping base:
 ///
-///   [0] tid   [1] ctid (kernel-cleared on exit)   [2] base   [3] size
+///   [0] tid (also ctid; kernel-cleared on exit)   [2] base   [3] size
 ///
-/// `sysThreadWait` parks on the ctid word; `sysThreadClose` unmaps the base.
+/// `sysThreadWait` parks on word 0; `sysThreadClose` unmaps the base.
 fn threadSpawnStub() -> List<int> {
     var b = List<int>()
     // push rbx; push r12; push r13
@@ -421,10 +421,16 @@ fn threadSpawnStub() -> List<int> {
     // [stackTop-16] = code; [stackTop-8] = env
     appendBytes(b, [0x4C, 0x89, 0x66, 0xF0])
     appendBytes(b, [0x4C, 0x89, 0x6E, 0xF8])
-    // clone(0x1350F00, stackTop, &handle[0], &handle[8], 0)
+    // clone(0x1350F00, stackTop, &handle[0], &handle[0], 0)
+    //
+    // `parent_tid` and `child_tid` are the same word. The kernel writes the
+    // TID there with CLONE_PARENT_SETTID before clone returns, so the parent
+    // can never observe zero for a live thread, and CLONE_CHILD_CLEARTID
+    // clears it on exit. Giving the child a different word would let the
+    // parent read it before the child is scheduled.
     appendBytes(b, [0xBF, 0x00, 0x0F, 0x35, 0x01])
     appendBytes(b, [0x48, 0x89, 0xDA])
-    appendBytes(b, [0x4C, 0x8D, 0x53, 0x08])
+    appendBytes(b, [0x4C, 0x8D, 0x53, 0x00])
     appendBytes(b, [0x45, 0x31, 0xC0])
     appendBytes(b, [0xB8, 0x38, 0x00, 0x00, 0x00])
     appendBytes(b, [0x0F, 0x05])
@@ -569,9 +575,9 @@ fn memsetStubArm64() -> List<int> {
 /// Handle layout matches the x86-64 stub so the Pickle runtime above it is
 /// architecture-neutral:
 ///
-///   [0] tid   [1] ctid (kernel-cleared on exit)   [2] base   [3] size
+///   [0] tid (also ctid; kernel-cleared on exit)   [2] base   [3] size
 ///
-/// `sysThreadWait` parks on the ctid word; `sysThreadClose` unmaps the base.
+/// `sysThreadWait` parks on word 0; `sysThreadClose` unmaps the base.
 fn threadSpawnStubArm64() -> List<int> {
     let b = A64Buf()
     // Frame: save the three callee-saved registers this stub uses.
@@ -602,15 +608,24 @@ fn threadSpawnStubArm64() -> List<int> {
     b.subImm(9, 9, 16)
     b.stpPre(19, 20, 9, 0)
     b.addImm(10, 9, 16)
-    // clone(0x1350F00, stackTop, &handle[0], &handle[8], 0)
+    // clone(0x1350F00, stackTop, &handle[0], tls=0, &handle[0])
+    //
+    // AArch64 is CONFIG_CLONE_BACKWARDS: the fourth argument is `tls` and the
+    // fifth is `child_tid`, the reverse of x86-64. Both TID pointers name the
+    // same word so CLONE_PARENT_SETTID stores the TID before clone returns and
+    // CLONE_CHILD_CLEARTID clears it on exit; otherwise the parent can read
+    // zero before the child has run and unmap a live stack.
     b.movImm(0, 0x1350F00)
     b.movReg(1, 10)
     b.movReg(2, 21)
-    b.addImm(3, 21, 8)
-    b.movImm(4, 0)
+    b.movImm(3, 0)
+    b.movReg(4, 21)
     b.movImm(8, 220)
     b.svc(0)
     let child = b.cbz(0)
+    // `svc` leaves NZCV alone, so compare the result before branching on its
+    // sign; the flags still describe the mmap check above otherwise.
+    b.cmpImm(0, 0)
     let unmapped = b.bCond(COND_MI)
     b.movReg(0, 21)
     b.ldrX(21, 31, 16)

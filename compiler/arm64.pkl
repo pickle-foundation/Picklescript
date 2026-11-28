@@ -659,9 +659,30 @@ class A64Emitter {
         let locs = a64ArgLocs(ptys)
         // Parameters are slots, not temps: the body reads them with
         // `LoadSlot(_, i)`, and `a64Analyze` gave slot i its home.
-        // Stack parameters are loaded first: a stack float would otherwise
-        // overwrite d0 while it still holds register argument 0.
+        // Register arguments are saved first. A stack float is loaded through
+        // d0, so doing the stack pass first would clobber incoming d0 before
+        // it reached its home; saving the registers first makes that load
+        // harmless.
         var i = 0
+        while (i < len(ptys)) {
+            let r = locs.reg[i]
+            if (r >= 0) {
+                let k = this.kOfSlot(i)
+                let w = tyWidth(ptys[i])
+                this.frameAddr(16, k)
+                if (isFloatTy(ptys[i])) {
+                    this.b.strD(r, 16, 0)
+                } else if (w == 8) {
+                    this.b.strb(r, 16, 0)
+                } else if (w == 32) {
+                    this.b.strW(r, 16, 0)
+                } else {
+                    this.b.strX(r, 16, 0)
+                }
+            }
+            i = i + 1
+        }
+        i = 0
         while (i < len(ptys)) {
             let s = locs.stack[i]
             if (s >= 0) {
@@ -684,25 +705,6 @@ class A64Emitter {
                     } else {
                         this.b.strX(17, 16, 0)
                     }
-                }
-            }
-            i = i + 1
-        }
-        i = 0
-        while (i < len(ptys)) {
-            let r = locs.reg[i]
-            if (r >= 0) {
-                let k = this.kOfSlot(i)
-                let w = tyWidth(ptys[i])
-                this.frameAddr(16, k)
-                if (isFloatTy(ptys[i])) {
-                    this.b.strD(r, 16, 0)
-                } else if (w == 8) {
-                    this.b.strb(r, 16, 0)
-                } else if (w == 32) {
-                    this.b.strW(r, 16, 0)
-                } else {
-                    this.b.strX(r, 16, 0)
                 }
             }
             i = i + 1
@@ -766,9 +768,15 @@ class A64Emitter {
         match (op) {
             case IrUnOp.Neg -> {
                 let w = tyWidth(this.typeOfT(v))
-                this.loadTmp(0, w, v)
-                this.b.subReg(0, 31, 0)
-                this.storeTmp(d, 0, w)
+                if (isFloatTy(this.typeOfT(v))) {
+                    this.loadTmpFloat(0, v)
+                    this.b.fneg(0, 0)
+                    this.storeTmpFloat(d, 0)
+                } else {
+                    this.loadTmp(0, w, v)
+                    this.b.subReg(0, 31, 0)
+                    this.storeTmp(d, 0, w)
+                }
             }
             case IrUnOp.Not -> {
                 this.loadTmp(0, 8, v)
@@ -805,6 +813,28 @@ class A64Emitter {
             case IrBinOp.Gt -> COND_GT
             case _ -> COND_GE
         }
+    }
+
+    /// AArch64 `sdiv` returns zero for a zero divisor and INT64_MIN for
+    /// INT64_MIN / -1, while x86-64 `idiv` raises SIGFPE for both. The IR
+    /// optimizer leaves those cases unfurled because it expects the trap, so
+    /// trap here too rather than silently returning a value.
+    fn emitDivGuard() {
+        let ok = this.b.cbnz(1)
+        this.b.brk(1)
+        let after = this.b.size()
+        this.b.patchCbz(ok, after)
+        // INT64_MIN is `movz x2, #0x8000, lsl #48`; -1 is `mvn x2, xzr`.
+        this.b.movz(2, 0x8000, 48)
+        this.b.cmpReg(0, 2)
+        let notMin = this.b.bCond(COND_NE)
+        this.b.mvn(2, 31)
+        this.b.cmpReg(1, 2)
+        let notNeg1 = this.b.bCond(COND_NE)
+        this.b.brk(1)
+        let done = this.b.size()
+        this.b.patchBCond(notMin, done)
+        this.b.patchBCond(notNeg1, done)
     }
 
     fn emitBinOp(d: int, op: IrBinOp, a: int, b: int) {
@@ -847,9 +877,11 @@ class A64Emitter {
                 this.b.cset(0, this.intCond(op))
                 this.storeTmp(d, 0, 8)
             } else if (op == IrBinOp.Div) {
+                this.emitDivGuard()
                 this.b.sdiv(0, 0, 1)
                 this.storeTmp(d, 0, 64)
             } else if (op == IrBinOp.Mod) {
+                this.emitDivGuard()
                 this.b.sdiv(2, 0, 1)
                 this.b.msub(0, 2, 1, 0)
                 this.storeTmp(d, 0, 64)
