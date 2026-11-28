@@ -1,0 +1,530 @@
+module compiler.a64
+
+import { Reloc } from compiler.x64
+
+/// The AArch64 instruction encoder.
+///
+/// This is the ARM64 counterpart of `compiler.x64.CB`: a byte buffer that
+/// writes little-endian 32-bit instructions and records the two relocation
+/// shapes the freestanding image needs.
+///
+/// WHY A HAND-WRITTEN ENCODER. The deliverable has no assembler and no C
+/// toolchain, on the host or the target. Every instruction in the ARM64
+/// compiler, the runtime stubs and the linker's `_start` is emitted by this
+/// module, exactly as `CB` emits x86-64. Keeping the encoders in one place
+/// means an encoding bug is a unit test, not a SIGILL three layers away.
+///
+/// TWO RELOCATIONS. `abs64` names an eight-byte field the linker fills with
+/// `symbol + addend`; it is how a 64-bit address reaches a literal pool.
+/// `call26` names a `bl` whose 26-bit immediate the linker patches with
+/// `(symbol - P) >> 2`. ARM64 cannot materialise an arbitrary 64-bit address
+/// in one instruction, so callers load addresses from a literal pool rather
+/// than using an `adrp`/`add` pair. A pool entry per distinct symbol is a few
+/// bytes and removes the page-relative relocation pair entirely.
+///
+/// PATCHING. Branches and literal loads are emitted with a zero displacement
+/// and patched once the target offset is known. `patchB`, `patchBCond`,
+/// `patchCbz` and `patchLdrLit` recompute only the immediate field, leaving
+/// the opcode and registers untouched.
+
+/// Condition codes. Only the ones the backend and stubs use are named; the
+/// full set is the four-bit field in `b.cond`.
+const COND_EQ: int = 0
+const COND_NE: int = 1
+const COND_CS: int = 2
+const COND_CC: int = 3
+const COND_MI: int = 4
+const COND_PL: int = 5
+const COND_VS: int = 6
+const COND_VC: int = 7
+const COND_HI: int = 8
+const COND_LS: int = 9
+const COND_GE: int = 10
+const COND_LT: int = 11
+const COND_GT: int = 12
+const COND_LE: int = 13
+
+/// Register aliases. XZR and SP both encode as 31; the instruction decides
+/// which one 31 means, so the names exist for readability only.
+const XZR: int = 31
+const SP: int = 31
+const LR: int = 30
+const FP: int = 29
+
+/// Relocation kinds in an `X64Out`. Kind 1 is the existing absolute-64 field
+/// shared with x86-64; kind 6 is the ARM64 `bl` immediate. `compiler.elf`
+/// maps them to ELF relocation types at the object boundary.
+const REL_ABS64: int = 1
+const REL_CALL26: int = 6
+
+class A64Buf {
+    var bytes: List<int>
+    var relocs: List<Reloc>
+
+    constructor() {
+        this.bytes = [0]
+        this.bytes.pop()
+        this.relocs = List<Reloc>()
+    }
+
+    fn size() -> int {
+        len(this.bytes)
+    }
+
+    fn u8(b: int) {
+        this.bytes.push(b & 0xFF)
+    }
+
+    /// Append one instruction word.
+    fn word(w: int) {
+        this.u8(w)
+        this.u8(w >> 8)
+        this.u8(w >> 16)
+        this.u8(w >> 24)
+    }
+
+    /// Read the word at byte offset `off`.
+    fn wordAt(off: int) -> int {
+        this.bytes[off] | (this.bytes[off + 1] << 8) | (this.bytes[off + 2] << 16) | (this.bytes[off + 3] << 24)
+    }
+
+    /// Replace the word at byte offset `off`.
+    fn setWord(off: int, w: int) {
+        this.bytes[off] = w & 0xFF
+        this.bytes[off + 1] = (w >> 8) & 0xFF
+        this.bytes[off + 2] = (w >> 16) & 0xFF
+        this.bytes[off + 3] = (w >> 24) & 0xFF
+    }
+
+    /// An eight-byte absolute address, filled by the linker.
+    fn abs64(sym: string) {
+        let off = this.size()
+        this.u8(0)
+        this.u8(0)
+        this.u8(0)
+        this.u8(0)
+        this.u8(0)
+        this.u8(0)
+        this.u8(0)
+        this.u8(0)
+        this.relocs.push(Reloc(off, sym, REL_ABS64))
+    }
+
+    /// A `bl` to `sym`, patched by the linker.
+    fn callSym(sym: string) {
+        let off = this.size()
+        this.word(0x94000000)
+        this.relocs.push(Reloc(off, sym, REL_CALL26))
+    }
+
+    // ---- moves and arithmetic ----
+
+    /// `movz Xd, #imm16, lsl #shift`; `shift` is 0, 16, 32 or 48.
+    fn movz(rd: int, imm: int, shift: int) {
+        this.word(0xD2800000 | ((shift / 16) << 21) | ((imm & 0xFFFF) << 5) | rd)
+    }
+
+    fn movz32(rd: int, imm: int, shift: int) {
+        this.word(0x52800000 | ((shift / 16) << 21) | ((imm & 0xFFFF) << 5) | rd)
+    }
+
+    /// `movk Xd, #imm16, lsl #shift`.
+    fn movk(rd: int, imm: int, shift: int) {
+        this.word(0xF2800000 | ((shift / 16) << 21) | ((imm & 0xFFFF) << 5) | rd)
+    }
+
+    fn movk32(rd: int, imm: int, shift: int) {
+        this.word(0x72800000 | ((shift / 16) << 21) | ((imm & 0xFFFF) << 5) | rd)
+    }
+
+    /// Materialise a 64-bit constant: `movz` for the low half, `movk` for every
+    /// non-zero half above it. Negative values keep their high halves, so the
+    /// result is the two's-complement bit pattern.
+    fn movImm(rd: int, v: int) {
+        this.movz(rd, v & 0xFFFF, 0)
+        if (((v >> 16) & 0xFFFF) != 0) {
+            this.movk(rd, (v >> 16) & 0xFFFF, 16)
+        }
+        if (((v >> 32) & 0xFFFF) != 0) {
+            this.movk(rd, (v >> 32) & 0xFFFF, 32)
+        }
+        if (((v >> 48) & 0xFFFF) != 0) {
+            this.movk(rd, (v >> 48) & 0xFFFF, 48)
+        }
+    }
+
+    /// `mov Xd, Xm` (an alias for `orr Xd, XZR, Xm`).
+    fn movReg(rd: int, rm: int) {
+        this.word(0xAA0003E0 | (rm << 16) | rd)
+    }
+
+    /// `mov Wd, Wm`.
+    fn movReg32(rd: int, rm: int) {
+        this.word(0x2A0003E0 | (rm << 16) | rd)
+    }
+
+    /// `add Xd, Xn, #imm12`.
+    fn addImm(rd: int, rn: int, imm: int) {
+        this.word(0x91000000 | ((imm & 0xFFF) << 10) | (rn << 5) | rd)
+    }
+
+    /// `add Xd, Xn, #imm12, lsl #12`.
+    fn addImm12(rd: int, rn: int, imm: int) {
+        this.word(0x91400000 | ((imm & 0xFFF) << 10) | (rn << 5) | rd)
+    }
+
+    /// `sub Xd, Xn, #imm12`.
+    fn subImm(rd: int, rn: int, imm: int) {
+        this.word(0xD1000000 | ((imm & 0xFFF) << 10) | (rn << 5) | rd)
+    }
+
+    fn subImm12(rd: int, rn: int, imm: int) {
+        this.word(0xD1400000 | ((imm & 0xFFF) << 10) | (rn << 5) | rd)
+    }
+
+    /// `add Xd, Xn, Xm`.
+    fn addReg(rd: int, rn: int, rm: int) {
+        this.word(0x8B000000 | (rm << 16) | (rn << 5) | rd)
+    }
+
+    /// `sub Xd, Xn, Xm`.
+    fn subReg(rd: int, rn: int, rm: int) {
+        this.word(0xCB000000 | (rm << 16) | (rn << 5) | rd)
+    }
+
+    /// `subs Xd, Xn, #imm12`.
+    fn subsImm(rd: int, rn: int, imm: int) {
+        this.word(0xF1000000 | ((imm & 0xFFF) << 10) | (rn << 5) | rd)
+    }
+
+    /// `subs Xd, Xn, Xm`.
+    fn subsReg(rd: int, rn: int, rm: int) {
+        this.word(0xEB000000 | (rm << 16) | (rn << 5) | rd)
+    }
+
+    /// `cmp Xn, Xm`.
+    fn cmpReg(rn: int, rm: int) {
+        this.subsReg(XZR, rn, rm)
+    }
+
+    /// `cmp Xn, #imm12`.
+    fn cmpImm(rn: int, imm: int) {
+        this.subsImm(XZR, rn, imm)
+    }
+
+    /// `and Xd, Xn, Xm`.
+    fn andReg(rd: int, rn: int, rm: int) {
+        this.word(0x8A000000 | (rm << 16) | (rn << 5) | rd)
+    }
+
+    /// `orr Xd, Xn, Xm`.
+    fn orrReg(rd: int, rn: int, rm: int) {
+        this.word(0xAA000000 | (rm << 16) | (rn << 5) | rd)
+    }
+
+    /// `eor Xd, Xn, Xm`.
+    fn eorReg(rd: int, rn: int, rm: int) {
+        this.word(0xCA000000 | (rm << 16) | (rn << 5) | rd)
+    }
+
+    /// `sdiv Xd, Xn, Xm`.
+    fn sdiv(rd: int, rn: int, rm: int) {
+        this.word(0x9AC00C00 | (rm << 16) | (rn << 5) | rd)
+    }
+
+    /// `udiv Xd, Xn, Xm`.
+    fn udiv(rd: int, rn: int, rm: int) {
+        this.word(0x9AC00800 | (rm << 16) | (rn << 5) | rd)
+    }
+
+    /// `madd Xd, Xn, Xm, Xa` = `Xa + Xn * Xm`.
+    fn madd(rd: int, rn: int, rm: int, ra: int) {
+        this.word(0x9B000000 | (rm << 16) | (ra << 10) | (rn << 5) | rd)
+    }
+
+    /// `msub Xd, Xn, Xm, Xa` = `Xa - Xn * Xm`.
+    fn msub(rd: int, rn: int, rm: int, ra: int) {
+        this.word(0x9B008000 | (rm << 16) | (ra << 10) | (rn << 5) | rd)
+    }
+
+    /// `lslv Xd, Xn, Xm`.
+    fn lslv(rd: int, rn: int, rm: int) {
+        this.word(0x9AC02000 | (rm << 16) | (rn << 5) | rd)
+    }
+
+    /// `lsrv Xd, Xn, Xm`.
+    fn lsrv(rd: int, rn: int, rm: int) {
+        this.word(0x9AC02400 | (rm << 16) | (rn << 5) | rd)
+    }
+
+    /// `asrv Xd, Xn, Xm`.
+    fn asrv(rd: int, rn: int, rm: int) {
+        this.word(0x9AC02800 | (rm << 16) | (rn << 5) | rd)
+    }
+
+    /// `csel Xd, Xn, Xm, cond`.
+    fn csel(rd: int, rn: int, rm: int, cond: int) {
+        this.word(0x9A800000 | (rm << 16) | ((cond & 15) << 12) | (rn << 5) | rd)
+    }
+
+    /// `mvn Xd, Xm` (an alias for `orn Xd, XZR, Xm`).
+    fn mvn(rd: int, rm: int) {
+        this.word(0xAA200000 | (rm << 16) | (XZR << 5) | rd)
+    }
+
+    /// `cset Xd, cond` (an alias for `csinc Xd, XZR, XZR, invert(cond)`).
+    fn cset(rd: int, cond: int) {
+        this.word(0x9A9F07E0 | (((cond ^ 1) & 15) << 12) | rd)
+    }
+
+    // ---- scalar floating point ----
+
+    /// `fmov Dd, Xn`: reinterpret the low 64 bits of a GPR as a double.
+    fn fmovDX(rd: int, rn: int) {
+        this.word(0x9E670000 | (rn << 5) | rd)
+    }
+
+    /// `fmov Xd, Dn`: reinterpret a double as its 64-bit pattern.
+    fn fmovXD(rd: int, rn: int) {
+        this.word(0x9E660000 | (rn << 5) | rd)
+    }
+
+    fn fadd(rd: int, rn: int, rm: int) {
+        this.word(0x1E602800 | (rm << 16) | (rn << 5) | rd)
+    }
+
+    fn fsub(rd: int, rn: int, rm: int) {
+        this.word(0x1E603800 | (rm << 16) | (rn << 5) | rd)
+    }
+
+    fn fmul(rd: int, rn: int, rm: int) {
+        this.word(0x1E600800 | (rm << 16) | (rn << 5) | rd)
+    }
+
+    fn fdiv(rd: int, rn: int, rm: int) {
+        this.word(0x1E601800 | (rm << 16) | (rn << 5) | rd)
+    }
+
+    /// `fneg Dd, Dn`: flip the sign bit with floating-point semantics.
+    fn fneg(rd: int, rn: int) {
+        this.word(0x1E614000 | (rn << 5) | rd)
+    }
+
+    /// `fcmp Dn, Dm`; sets NZCV with the unordered case in C/V.
+    fn fcmpReg(rn: int, rm: int) {
+        this.word(0x1E602000 | (rm << 16) | (rn << 5))
+    }
+
+    /// `fcvtzs Xd, Dn`: truncate toward zero, saturating; NaN becomes zero.
+    fn fcvtzs(rd: int, rn: int) {
+        this.word(0x9E780000 | (rn << 5) | rd)
+    }
+
+    /// `scvtf Dd, Xn`: signed integer to double.
+    fn scvtf(rd: int, rn: int) {
+        this.word(0x9E620000 | (rn << 5) | rd)
+    }
+
+    /// `frintz Dd, Dn`: round toward zero.
+    fn frintz(rd: int, rn: int) {
+        this.word(0x1E65C000 | (rn << 5) | rd)
+    }
+
+    /// `fmsub Dd, Dn, Dm, Da` = `Da - Dn * Dm`.
+    fn fmsub(rd: int, rn: int, rm: int, ra: int) {
+        this.word(0x1F408000 | (rm << 16) | (ra << 10) | (rn << 5) | rd)
+    }
+
+    // ---- loads and stores ----
+
+    /// `ldr Xt, [Xn, #imm]`; `imm` must be a non-negative multiple of 8.
+    fn ldrX(rt: int, rn: int, imm: int) {
+        this.word(0xF9400000 | (((imm / 8) & 0xFFF) << 10) | (rn << 5) | rt)
+    }
+
+    /// `str Xt, [Xn, #imm]`; `imm` must be a non-negative multiple of 8.
+    fn strX(rt: int, rn: int, imm: int) {
+        this.word(0xF9000000 | (((imm / 8) & 0xFFF) << 10) | (rn << 5) | rt)
+    }
+
+    /// `ldr Wt, [Xn, #imm]`; `imm` must be a non-negative multiple of 4.
+    fn ldrW(rt: int, rn: int, imm: int) {
+        this.word(0xB9400000 | (((imm / 4) & 0xFFF) << 10) | (rn << 5) | rt)
+    }
+
+    /// `str Wt, [Xn, #imm]`; `imm` must be a non-negative multiple of 4.
+    fn strW(rt: int, rn: int, imm: int) {
+        this.word(0xB9000000 | (((imm / 4) & 0xFFF) << 10) | (rn << 5) | rt)
+    }
+
+    /// `ldr Dt, [Xn, #imm]`; `imm` must be a non-negative multiple of 8.
+    fn ldrD(rt: int, rn: int, imm: int) {
+        this.word(0xFD400000 | (((imm / 8) & 0xFFF) << 10) | (rn << 5) | rt)
+    }
+
+    /// `str Dt, [Xn, #imm]`; `imm` must be a non-negative multiple of 8.
+    fn strD(rt: int, rn: int, imm: int) {
+        this.word(0xFD000000 | (((imm / 8) & 0xFFF) << 10) | (rn << 5) | rt)
+    }
+
+    /// `str Xt, [Xn], #imm`: post-indexed store.
+    fn strXPost(rt: int, rn: int, imm: int) {
+        this.word(0xF8000400 | ((imm & 0x1FF) << 12) | (rn << 5) | rt)
+    }
+
+    /// `ldr Xt, [Xn], #imm`: post-indexed load.
+    fn ldrXPost(rt: int, rn: int, imm: int) {
+        this.word(0xF8400400 | ((imm & 0x1FF) << 12) | (rn << 5) | rt)
+    }
+
+    /// `ldrb Wt, [Xn, #imm]`.
+    fn ldrb(rt: int, rn: int, imm: int) {
+        this.word(0x39400000 | ((imm & 0xFFF) << 10) | (rn << 5) | rt)
+    }
+
+    /// `strb Wt, [Xn, #imm]`.
+    fn strb(rt: int, rn: int, imm: int) {
+        this.word(0x39000000 | ((imm & 0xFFF) << 10) | (rn << 5) | rt)
+    }
+
+    /// `ldrb Wt, [Xn], #1`.
+    fn ldrbPost(rt: int, rn: int, imm: int) {
+        this.word(0x38400400 | ((imm & 0x1FF) << 12) | (rn << 5) | rt)
+    }
+
+    /// `strb Wt, [Xn], #1`.
+    fn strbPost(rt: int, rn: int, imm: int) {
+        this.word(0x38000400 | ((imm & 0x1FF) << 12) | (rn << 5) | rt)
+    }
+
+    /// `ldr Xt, label`: a PC-relative literal load with a placeholder
+    /// displacement. Returns the instruction's byte offset for `patchLdrLit`.
+    fn ldrLiteral(rt: int) -> int {
+        let off = this.size()
+        this.word(0x58000000 | rt)
+        off
+    }
+
+    /// Patch the literal displacement of the `ldr` at `at` to `target`.
+    fn patchLdrLit(at: int, target: int) {
+        let imm = (target - at) >> 2
+        this.setWord(at, (this.wordAt(at) & 0xFF00001F) | ((imm & 0x7FFFF) << 5))
+    }
+
+    /// `stp Xt, Xt2, [Xn, #imm]!`; `imm` is a signed multiple of 8.
+    fn stpPre(rt: int, rt2: int, rn: int, imm: int) {
+        this.word(0xA9800000 | (((imm / 8) & 0x7F) << 15) | (rt2 << 10) | (rn << 5) | rt)
+    }
+
+    /// `ldp Xt, Xt2, [Xn], #imm`; `imm` is a signed multiple of 8.
+    fn ldpPost(rt: int, rt2: int, rn: int, imm: int) {
+        this.word(0xA8C00000 | (((imm / 8) & 0x7F) << 15) | (rt2 << 10) | (rn << 5) | rt)
+    }
+
+    // ---- branches ----
+
+    /// `b label`: a placeholder for a local backward/forward branch.
+    fn b() -> int {
+        let off = this.size()
+        this.word(0x14000000)
+        off
+    }
+
+    /// `b.cond label`: a placeholder for a local conditional branch.
+    fn bCond(cond: int) -> int {
+        let off = this.size()
+        this.word(0x54000000 | (cond & 15))
+        off
+    }
+
+    /// `cbz Xt, label`.
+    fn cbz(rt: int) -> int {
+        let off = this.size()
+        this.word(0xB4000000 | rt)
+        off
+    }
+
+    /// `cbnz Xt, label`.
+    fn cbnz(rt: int) -> int {
+        let off = this.size()
+        this.word(0xB5000000 | rt)
+        off
+    }
+
+    /// Patch a `b`/`bl` placeholder at `at` to `target`.
+    fn patchB(at: int, target: int) {
+        let imm = (target - at) >> 2
+        this.setWord(at, (this.wordAt(at) & 0xFC000000) | (imm & 0x3FFFFFF))
+    }
+
+    /// Patch a `b.cond` placeholder at `at` to `target`.
+    fn patchBCond(at: int, target: int) {
+        let imm = (target - at) >> 2
+        this.setWord(at, (this.wordAt(at) & 0xFF00001F) | ((imm & 0x7FFFF) << 5))
+    }
+
+    /// Patch a `cbz`/`cbnz` placeholder at `at` to `target`.
+    fn patchCbz(at: int, target: int) {
+        let imm = (target - at) >> 2
+        this.setWord(at, (this.wordAt(at) & 0xFF00001F) | ((imm & 0x7FFFF) << 5))
+    }
+
+    /// `bl label` for a known local offset.
+    fn blLocal(off: int) {
+        this.word(0x94000000 | ((off >> 2) & 0x3FFFFFF))
+    }
+
+    /// `b label` for a known local offset.
+    fn bLocal(off: int) {
+        this.word(0x14000000 | ((off >> 2) & 0x3FFFFFF))
+    }
+
+    /// `ret`.
+    fn ret() {
+        this.word(0xD65F03C0)
+    }
+
+    /// `br Xn`.
+    fn br(rn: int) {
+        this.word(0xD61F0000 | (rn << 5))
+    }
+
+    /// `blr Xn`.
+    fn blr(rn: int) {
+        this.word(0xD63F0000 | (rn << 5))
+    }
+
+    /// `svc #imm16`.
+    fn svc(imm: int) {
+        this.word(0xD4000001 | ((imm & 0xFFFF) << 5))
+    }
+
+    /// `brk #imm16`.
+    fn brk(imm: int) {
+        this.word(0xD4200000 | ((imm & 0xFFFF) << 5))
+    }
+
+    // ---- atomics ----
+
+    /// `ldaxr Xt, [Xn]`.
+    fn ldaxr(rt: int, rn: int) {
+        this.word(0xC85FFC00 | (rn << 5) | rt)
+    }
+
+    /// `stlxr Ws, Xt, [Xn]`.
+    fn stlxr(rs: int, rt: int, rn: int) {
+        this.word(0xC800FC00 | (rs << 16) | (rn << 5) | rt)
+    }
+}
+
+/// The byte offset of `target` measured from the instruction at `at`, or a
+/// diagnostic when a 26-bit branch cannot reach. The backend checks this
+/// before patching so a too-large function fails the build instead of
+/// silently wrapping the immediate.
+fn branchInRange(at: int, target: int) -> bool {
+    let d = target - at
+    if (d < 0) {
+        return d >= (0 - 0x8000000)
+    }
+    d <= 0x7FFFFFC
+}

@@ -1,8 +1,15 @@
 module runtime.abi_sys
 
+import { sysnoRead, sysnoWrite, sysnoClose, sysnoMmap, sysnoMunmap, sysnoFutex, sysnoExitGroup, sysnoGettid, sysnoClockGettime, sysnoNanosleep, sysnoSchedYield, sysnoOpenat, sysnoAccess, sysnoUnlink, sysnoRmdir, sysnoMkdir, sysnoGetcwd, sysnoChdir, sysnoPipe2, sysnoFork, sysnoExecve, sysnoExit, sysnoDup2, sysnoWait4, sysnoKill, sysnoFcntl, sysnoGetdents64, O_DIRECTORY, SYS_ARCH as SYSNO_ARCH } from runtime.abi_sysno
+
 /// The host this binary was built for. The CLI reads it to pick the default
 /// `build --target`; it is a compile-time fact, not a runtime switch.
 const SYS_PLATFORM: string = "posix"
+
+/// The instruction set this binary was built for. `SYS_PLATFORM` says which
+/// operating system, this says which machine, and together they name the
+/// default target. The value comes from the arch seam so the two cannot drift.
+const SYS_ARCH: string = SYSNO_ARCH
 
 /// POSIX body of `runtime.abi_sys` - the same contract as `abi_sys_win.pkl`,
 /// over raw Linux syscalls.
@@ -45,42 +52,14 @@ const SYS_PLATFORM: string = "posix"
 /// first caller), so it cannot depend on the collector.
 
 // ---------------------------------------------------------------- syscalls
-/// x86-64 Linux syscall numbers. Only the calls this backend makes are named.
-const SYS_READ: int = 0
-const SYS_WRITE: int = 1
-const SYS_CLOSE: int = 3
-const SYS_MMAP: int = 9
-const SYS_MUNMAP: int = 11
-const SYS_ACCESS: int = 21
-const SYS_SCHED_YIELD: int = 24
-const SYS_DUP2: int = 33
-const SYS_NANOSLEEP: int = 35
-const SYS_CLONE: int = 56
-const SYS_FORK: int = 57
-const SYS_EXECVE: int = 59
-const SYS_EXIT: int = 60
-const SYS_WAIT4: int = 61
-const SYS_KILL: int = 62
-const SYS_FCNTL: int = 72
-const SYS_GETCWD: int = 79
-const SYS_CHDIR: int = 80
-const SYS_MKDIR: int = 83
-const SYS_RMDIR: int = 84
-const SYS_UNLINK: int = 87
-const SYS_GETTID: int = 186
-const SYS_FUTEX: int = 202
-const SYS_GETDENTS64: int = 217
-const SYS_CLOCK_GETTIME: int = 228
-const SYS_EXIT_GROUP: int = 231
-const SYS_OPENAT: int = 257
-const SYS_PIPE2: int = 293
+// Numbers and argument shapes live in `runtime.abi_sysno`, whose POSIX body
+// is selected per architecture (`abi_sysno_posix_arm64.pkl` for AArch64).
 
 /// `AT_FDCWD`, the "resolve against the working directory" dirfd.
 const AT_FDCWD: int = -100
 
 /// `open(2)` bits used by the runtime and the `DIR` handle.
 const O_RDONLY: int = 0
-const O_DIRECTORY: int = 65536
 
 /// `mmap` protection and flags: private anonymous read/write pages.
 const PROT_READ_WRITE: int = 3
@@ -114,26 +93,6 @@ const ENVIRON_MAX_BYTES: int = 65536
 const TLS_SLOTS: int = 64
 const TLS_MAX_THREADS: int = 256
 
-fn sc0(nr: int) -> int {
-    return sys_syscall(nr, 0, 0, 0, 0, 0, 0)
-}
-
-fn sc1(nr: int, a: int) -> int {
-    return sys_syscall(nr, a, 0, 0, 0, 0, 0)
-}
-
-fn sc2(nr: int, a: int, b: int) -> int {
-    return sys_syscall(nr, a, b, 0, 0, 0, 0)
-}
-
-fn sc3(nr: int, a: int, b: int, c: int) -> int {
-    return sys_syscall(nr, a, b, c, 0, 0, 0)
-}
-
-fn sc4(nr: int, a: int, b: int, c: int, d: int) -> int {
-    return sys_syscall(nr, a, b, c, d, 0, 0)
-}
-
 fn alignUp(v: int, a: int) -> int {
     if ((v % a) == 0) {
         return v
@@ -145,7 +104,7 @@ fn alignUp(v: int, a: int) -> int {
 /// An anonymous private mapping, or 0 on failure. Linux reports a failed
 /// `mmap` as a small negative errno, never as a low address.
 fn sysMmap(len: int) -> int {
-    let r = sys_syscall(SYS_MMAP, 0, len, PROT_READ_WRITE, MAP_PRIVATE_ANON, -1, 0)
+    let r = sysnoMmap(0, len, PROT_READ_WRITE, MAP_PRIVATE_ANON, -1, 0)
     if (r < 0) {
         return 0
     }
@@ -153,7 +112,7 @@ fn sysMmap(len: int) -> int {
 }
 
 fn sysMunmap(addr: int, len: int) -> int {
-    return sc2(SYS_MUNMAP, addr, len)
+    return sysnoMunmap(addr, len)
 }
 
 /// Byte `i` of a raw buffer, little-endian.
@@ -371,7 +330,7 @@ fn sysLockWord(cell: int) {
     }
     while (true) {
         if (c == 2 || sys_cas(cell, 1, 2) != 1) {
-            let _ = sys_syscall(SYS_FUTEX, cell, FUTEX_WAIT | FUTEX_PRIVATE, 2, 0, 0, 0)
+            let _ = sysnoFutex(cell, FUTEX_WAIT | FUTEX_PRIVATE, 2, 0)
         }
         c = sys_cas(cell, 0, 2)
         if (c == 0) {
@@ -401,7 +360,7 @@ fn sysUnlockWord(cell: int) {
         }
     }
     if (old == 2) {
-        let _ = sys_syscall(SYS_FUTEX, cell, FUTEX_WAKE | FUTEX_PRIVATE, 1, 0, 0, 0)
+        let _ = sysnoFutex(cell, FUTEX_WAKE | FUTEX_PRIVATE, 1, 0)
     }
 }
 
@@ -421,12 +380,12 @@ fn sysAtomicStore(addr: int, v: int) {
 /// kernel answers immediately when the word has already changed, which closes
 /// the lost-wakeup window around a release.
 fn sysFutexWait(addr: int, val: int) {
-    let _ = sys_syscall(SYS_FUTEX, addr, FUTEX_WAIT | FUTEX_PRIVATE, val, 0, 0, 0)
+    let _ = sysnoFutex(addr, FUTEX_WAIT | FUTEX_PRIVATE, val, 0)
 }
 
 /// Wake up to `n` waiters parked on `addr`; `n = 0x7FFFFFFF` wakes all.
 fn sysFutexWake(addr: int, n: int) {
-    let _ = sys_syscall(SYS_FUTEX, addr, FUTEX_WAKE | FUTEX_PRIVATE, n, 0, 0, 0)
+    let _ = sysnoFutex(addr, FUTEX_WAKE | FUTEX_PRIVATE, n, 0)
 }
 
 // ------------------------------------------------------------------- TLS
@@ -572,13 +531,13 @@ fn sysTlsSet(slot: int, v: int) -> int {
 /// Terminate the process with `code`. `exit_group` ends every thread, which is
 /// the contract `sysExit` has always had.
 fn sysExit(code: int) {
-    let _ = sys_syscall(SYS_EXIT_GROUP, code, 0, 0, 0, 0, 0)
+    sysnoExitGroup(code)
 }
 
 /// A stable identity for the running thread. `gettid` is unique among live
 /// threads, which is all the registry uses it for.
 fn sysThreadId() -> int {
-    return sc0(SYS_GETTID)
+    return sysnoGettid()
 }
 
 // ---------------------------------------------------------------- clocks
@@ -589,7 +548,7 @@ fn clockNs(clk: int) -> int {
     if (ts == 0) {
         return 0
     }
-    let r = sc2(SYS_CLOCK_GETTIME, clk, ts)
+    let r = sysnoClockGettime(clk, ts)
     var ns = 0
     if (r == 0) {
         unsafe {
@@ -625,13 +584,13 @@ fn sysThreadSleep(ms: int) {
         p[0] = ms / 1000
         p[1] = (ms % 1000) * 1000000
     }
-    let _ = sc2(SYS_NANOSLEEP, ts, 0)
+    let _ = sysnoNanosleep(ts, 0)
     sysHeapFree(ts)
 }
 
 /// Hand the CPU to a runnable peer.
 fn sysThreadYield() {
-    let _ = sc0(SYS_SCHED_YIELD)
+    let _ = sysnoSchedYield()
 }
 
 // ------------------------------------------------------------- environment
@@ -675,20 +634,20 @@ fn envLoad() {
     }
     let buf = sysHeapAlloc(ENVIRON_MAX_BYTES)
     if (buf == 0) {
-        let _ = sc1(SYS_CLOSE, fd)
+        let _ = sysnoClose(fd)
         envpReady = 1
         sysUnlockWord(envpLockAddr())
         return
     }
     var used = 0
     while (used < ENVIRON_MAX_BYTES) {
-        let n = sc3(SYS_READ, fd, buf + used, ENVIRON_MAX_BYTES - used)
+        let n = sysnoRead(fd, buf + used, ENVIRON_MAX_BYTES - used)
         if (n <= 0) {
             break
         }
         used = used + n
     }
-    let _ = sc1(SYS_CLOSE, fd)
+    let _ = sysnoClose(fd)
     var count = 0
     var i = 0
     while (i < used) {
@@ -867,59 +826,59 @@ fn sysEnvFlag(key: string) -> int {
 
 #[symbol("open")]
 fn sysOpen(path: int, flags: int, mode: int) -> int {
-    return sc4(SYS_OPENAT, AT_FDCWD, path, flags, mode)
+    return sysnoOpenat(AT_FDCWD, path, flags, mode)
 }
 
 #[symbol("read")]
 fn sysRead(fd: int, buf: int, n: int) -> int {
-    return sc3(SYS_READ, fd, buf, n)
+    return sysnoRead(fd, buf, n)
 }
 
 #[symbol("write")]
 fn sysWrite(fd: int, buf: int, n: int) -> int {
-    return sc3(SYS_WRITE, fd, buf, n)
+    return sysnoWrite(fd, buf, n)
 }
 
 #[symbol("close")]
 fn sysClose(fd: int) -> int {
-    return sc1(SYS_CLOSE, fd)
+    return sysnoClose(fd)
 }
 
 #[symbol("access")]
 fn sysAccess(path: int, mode: int) -> int {
-    return sc2(SYS_ACCESS, path, mode)
+    return sysnoAccess(path, mode)
 }
 
 #[symbol("unlink")]
 fn sysUnlink(path: int) -> int {
-    return sc1(SYS_UNLINK, path)
+    return sysnoUnlink(path)
 }
 
 #[symbol("rmdir")]
 fn sysRmdir(path: int) -> int {
-    return sc1(SYS_RMDIR, path)
+    return sysnoRmdir(path)
 }
 
 #[symbol("mkdir")]
 fn sysMkdir(path: int, mode: int) -> int {
-    return sc2(SYS_MKDIR, path, mode)
+    return sysnoMkdir(path, mode)
 }
 
 #[symbol("getcwd")]
 fn sysGetcwd(buf: int, size: int) -> int {
-    return sc2(SYS_GETCWD, buf, size)
+    return sysnoGetcwd(buf, size)
 }
 
 #[symbol("chdir")]
 fn sysChdir(path: int) -> int {
-    return sc1(SYS_CHDIR, path)
+    return sysnoChdir(path)
 }
 
 /// `pipe(2)` writes two 32-bit descriptors. The runtime stores them in two
 /// 64-bit words, so the packed pair is unpacked after the call.
 #[symbol("pipe")]
 fn sysPipe(fds: int) -> int {
-    let r = sc2(SYS_PIPE2, fds, 0)
+    let r = sysnoPipe2(fds, 0)
     if (r != 0) {
         return r
     }
@@ -935,39 +894,39 @@ fn sysPipe(fds: int) -> int {
 
 #[symbol("fork")]
 fn sysFork() -> int {
-    return sc0(SYS_FORK)
+    return sysnoFork()
 }
 
 #[symbol("execve")]
 fn sysExecve(path: int, argv: int, envp: int) -> int {
-    return sc3(SYS_EXECVE, path, argv, envp)
+    return sysnoExecve(path, argv, envp)
 }
 
 /// `_exit` ends this thread only. A forked child has exactly one thread, so
 /// the two meanings coincide there.
 #[symbol("_exit")]
 fn sysExitThread(code: int) {
-    let _ = sc1(SYS_EXIT, code)
+    sysnoExit(code)
 }
 
 #[symbol("dup2")]
 fn sysDup2(oldfd: int, newfd: int) -> int {
-    return sc2(SYS_DUP2, oldfd, newfd)
+    return sysnoDup2(oldfd, newfd)
 }
 
 #[symbol("waitpid")]
 fn sysWaitpid(pid: int, status: int, options: int) -> int {
-    return sc4(SYS_WAIT4, pid, status, options, 0)
+    return sysnoWait4(pid, status, options, 0)
 }
 
 #[symbol("kill")]
 fn sysKill(pid: int, sig: int) -> int {
-    return sc2(SYS_KILL, pid, sig)
+    return sysnoKill(pid, sig)
 }
 
 #[symbol("fcntl")]
 fn sysFcntl(fd: int, cmd: int, arg: int) -> int {
-    return sc3(SYS_FCNTL, fd, cmd, arg)
+    return sysnoFcntl(fd, cmd, arg)
 }
 
 // ---------------------------------------------------------------- DIR
@@ -979,7 +938,7 @@ fn sysFcntl(fd: int, cmd: int, arg: int) -> int {
 /// until the next call - the same lifetime glibc gives.
 #[symbol("opendir")]
 fn sysOpendir(path: int) -> int {
-    let fd = sc4(SYS_OPENAT, AT_FDCWD, path, O_RDONLY | O_DIRECTORY, 0)
+    let fd = sysnoOpenat(AT_FDCWD, path, O_RDONLY | O_DIRECTORY, 0)
     if (fd < 0) {
         return 0
     }
@@ -992,7 +951,7 @@ fn sysOpendir(path: int) -> int {
         if (buf != 0) {
             sysHeapFree(buf)
         }
-        let _ = sc1(SYS_CLOSE, fd)
+        let _ = sysnoClose(fd)
         return 0
     }
     unsafe {
@@ -1022,7 +981,7 @@ fn sysReaddir(dir: int) -> int {
                 d[3] = d[3] + reclen
                 return ent
             }
-            let n = sc3(SYS_GETDENTS64, d[0], d[1], DIR_BUF_BYTES)
+            let n = sysnoGetdents64(d[0], d[1], DIR_BUF_BYTES)
             if (n <= 0) {
                 return 0
             }
@@ -1046,7 +1005,7 @@ fn sysClosedir(dir: int) -> int {
     }
     sysHeapFree(buf)
     sysHeapFree(dir)
-    return sc1(SYS_CLOSE, fd)
+    return sysnoClose(fd)
 }
 
 // ------------------------------------------------------- clock/thread symbols
@@ -1079,13 +1038,18 @@ fn sysThreadSpawn(code: int, env: int) -> int {
 }
 
 /// Wait for `handle`. A negative timeout means infinite. Returns 0 when the
-/// thread has exited, nonzero on timeout. The kernel clears the `ctid` word on
-/// exit and wakes futex waiters, so the wait is a plain futex loop.
+/// thread has exited, nonzero on timeout. Word 0 is both `parent_tid` and
+/// `child_tid`: the kernel stores the TID there before `clone` returns, so a
+/// live thread is never seen as zero, and clears it on exit. The exit wake is
+/// a *shared* futex (`mm_release` calls `do_futex(..., FUTEX_WAKE, ...)`
+/// without `FUTEX_PRIVATE`), so the wait must be shared too; a private wait
+/// sleeps forever even after the word reaches zero (glibc's `pthread_join`
+/// uses `FUTEX_WAIT_BITSET` without `FUTEX_PRIVATE` for the same reason).
 fn sysThreadWait(handle: int, timeoutMs: int) -> int {
     if (handle == 0) {
         return 0
     }
-    let ctid = handle + 8
+    let ctid = handle
     var ts = 0
     if (timeoutMs >= 0) {
         ts = sysHeapAlloc(16)
@@ -1108,7 +1072,7 @@ fn sysThreadWait(handle: int, timeoutMs: int) -> int {
             }
             return 0
         }
-        let r = sys_syscall(SYS_FUTEX, ctid, FUTEX_WAIT | FUTEX_PRIVATE, v, ts, 0, 0)
+        let r = sysnoFutex(ctid, FUTEX_WAIT, v, ts)
         if (r == -110) {
             // ETIMEDOUT: the thread may have exited just as the wait expired.
             unsafe {

@@ -2,11 +2,12 @@ module cli.buildlib
 
 import { DiagnosticSink, Diagnostic } from compiler.diag
 import { IrModule } from compiler.ir
-import { frontend, setBuildPlatform } from compiler.front
+import { frontend, setBuildPlatform, setBuildArch } from compiler.front
 import { emitIrEx, EmitOut } from compiler.emit
 import { x64LowerModule } from compiler.x64
+import { arm64LowerModule } from compiler.arm64
 import { coffObjFor } from compiler.coff
-import { elfObjFor } from compiler.elf
+import { elfObjFor, elfObjForArm64 } from compiler.elf
 import { CoffObj } from compiler.objread
 import { scanDefs, select, mergeAll, strFrom } from compiler.linklib
 import { buildExe, FailBox } from compiler.pelink
@@ -128,6 +129,7 @@ fn lowerModuleObjBytesElf(target: string, src: string, sinks: DiagnosticSink) ->
 /// program headers. No C compiler, no system linker, no libc.
 fn lowerProgramElf(target: string, src: string, sinks: DiagnosticSink) -> LoweredBytes? {
     setBuildPlatform("posix")
+    setBuildArch("")
     if (let some(loaded) = frontend(target, src, sinks)) {
         if (let some(emitted) = emitIrEx(loaded.program, loaded.resolved, sinks, 0, "", List<string>())) {
             if (!hasMain(emitted.ir)) {
@@ -136,6 +138,27 @@ fn lowerProgramElf(target: string, src: string, sinks: DiagnosticSink) -> Lowere
             }
             if (let some(xout) = x64LowerModule(emitted.ir, sinks, true)) {
                 return LoweredBytes(elfObjFor(emitted.ir, xout), emitted.classCount)
+            }
+        }
+    }
+    none
+}
+
+/// The AArch64 form of `lowerProgramElf`. Same front end, same IR, same
+/// entry-point check; only the backend, the object writer and the module
+/// resolution suffix differ. The suffix is what makes the POSIX runtime pick
+/// `abi_sysno_posix_arm64.pkl` instead of the x86-64 syscall table.
+fn lowerProgramElfArm64(target: string, src: string, sinks: DiagnosticSink) -> LoweredBytes? {
+    setBuildPlatform("posix")
+    setBuildArch("arm64")
+    if (let some(loaded) = frontend(target, src, sinks)) {
+        if (let some(emitted) = emitIrEx(loaded.program, loaded.resolved, sinks, 0, "", List<string>())) {
+            if (!hasMain(emitted.ir)) {
+                sinks.emit(Diagnostic.error("no `main` in this module; nothing to build"))
+                return none
+            }
+            if (let some(xout) = arm64LowerModule(emitted.ir, sinks)) {
+                return LoweredBytes(elfObjForArm64(emitted.ir, xout), emitted.classCount)
             }
         }
     }

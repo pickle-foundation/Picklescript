@@ -2,6 +2,7 @@ module compiler.elf
 
 import { IrModule } from compiler.ir
 import { X64Out, Reloc, X64Func } from compiler.x64
+import { REL_CALL26 } from compiler.a64
 import { pad16, pushStrDesc, zeroGlobalBytes, fmodBytes } from compiler.coff
 
 /// One entry in the ELF `.symtab`.
@@ -25,8 +26,9 @@ class ElfSym {
     }
 }
 
-/// One `.rela.text` entry. `typ` is the COFF-style kind from `x64.Reloc`:
-/// 1 = absolute 64-bit, 4 = PC-relative 32-bit.
+/// One `.rela.text` entry. `typ` is the ELF relocation type the writer will
+/// place in `r_info`: 1 (`R_X86_64_64`) and 2 (`R_X86_64_PC32`) for x86-64,
+/// 257 (`R_AARCH64_ABS64`) and 283 (`R_AARCH64_CALL26`) for ARM64.
 class ElfRel {
     var off: int
     var sym: string
@@ -185,7 +187,7 @@ fn writeShdr(blob: List<int>, base: int, nameOff: int, typ: int, flags: int, off
     setU64(blob, base + 56, entsize)
 }
 
-/// Emit an ELF64 relocatable object for an already-lowered module.
+/// Emit an ELF64 relocatable object for an already-lowered x86-64 module.
 ///
 /// This mirrors `compiler.coff::coffObjFor`: the same `.text`/`.rdata`/`.data`
 /// payloads and the same symbol names, but in the ELF64 container with
@@ -193,6 +195,18 @@ fn writeShdr(blob: List<int>, base: int, nameOff: int, typ: int, flags: int, off
 /// with the SysV ABI (`x64LowerModule(..., true)`); the object writer itself
 /// only sees the instruction bytes.
 fn elfObjFor(m: IrModule, out: X64Out) -> List<int> {
+    return elfObjForEx(m, out, false)
+}
+
+/// Emit the same container for an ARM64 backend. `out` is the shared
+/// `X64Out` shape (functions of bytes and relocations); the writer only needs
+/// to know the machine field and the relocation vocabulary, so the ARM64
+/// backend does not need a second object format.
+fn elfObjForArm64(m: IrModule, out: X64Out) -> List<int> {
+    return elfObjForEx(m, out, true)
+}
+
+fn elfObjForEx(m: IrModule, out: X64Out, arm64: bool) -> List<int> {
     var text = [0]
     text.pop()
     var rdata = [0]
@@ -216,23 +230,41 @@ fn elfObjFor(m: IrModule, out: X64Out) -> List<int> {
             let rel = f.relocs[r]
             let off = funcStart[len(funcStart) - 1] + rel.off
             var addend = 0
-            if (rel.type == 4) {
+            var et = 1
+            if (arm64) {
+                if (rel.type == REL_CALL26) {
+                    // The linker patches the 26-bit `bl` immediate from the
+                    // instruction's own address. Keep the opcode word: unlike
+                    // x86-64's displacement field, the relocation covers the
+                    // whole instruction and zeroing it would destroy `bl`.
+                    et = 283
+                } else {
+                    zeroAt(text, off, 8)
+                    et = 257
+                }
+            } else if (rel.type == 4) {
                 // COFF REL32 is measured from the end of the four-byte field;
                 // ELF PC32 is measured from its start. The emitter stores any
                 // extra displacement in the field, so shift both by four.
                 addend = readI32(f.bytes, rel.off) - 4
                 zeroAt(text, off, 4)
+                et = 2
             } else {
                 zeroAt(text, off, 8)
             }
-            rels.push(ElfRel(off, elfSymName(rel.sym), rel.type, addend))
+            rels.push(ElfRel(off, elfSymName(rel.sym), et, addend))
             r = r + 1
         }
         i = i + 1
     }
-    funcStart.push(len(text))
-    appendBytes(text, fmodBytes())
-    pad16(text)
+    if (!arm64) {
+        // `pickle_fmod` is an x86-64 machine-code helper. ARM64 gets its own
+        // implementation with the backend; until then an object that calls it
+        // fails the link instead of resolving to the wrong instruction set.
+        funcStart.push(len(text))
+        appendBytes(text, fmodBytes())
+        pad16(text)
+    }
 
     var strStart = [0]
     strStart.pop()
@@ -277,8 +309,10 @@ fn elfObjFor(m: IrModule, out: X64Out) -> List<int> {
         addSym(syms, indexes, ElfSym(f.symbol, 1, 2, SEC_TEXT, funcStart[fi], len(f.bytes)))
         fi = fi + 1
     }
-    let fmod = fmodBytes()
-    addSym(syms, indexes, ElfSym("pickle_fmod", 1, 2, SEC_TEXT, funcStart[len(out.funcs)], len(fmod)))
+    if (!arm64) {
+        let fmod = fmodBytes()
+        addSym(syms, indexes, ElfSym("pickle_fmod", 1, 2, SEC_TEXT, funcStart[len(out.funcs)], len(fmod)))
+    }
 
     var gi = 0
     while (gi < len(m.globals)) {
@@ -341,11 +375,7 @@ fn elfObjFor(m: IrModule, out: X64Out) -> List<int> {
     while (rr < len(rels)) {
         let r = rels[rr]
         pushU64(rela, r.off)
-        var et = 1
-        if (r.typ == 4) {
-            et = 2
-        }
-        pushU64(rela, (indexes[r.sym] << 32) | et)
+        pushU64(rela, (indexes[r.sym] << 32) | r.typ)
         pushU64(rela, r.addend)
         rr = rr + 1
     }
@@ -418,7 +448,11 @@ fn elfObjFor(m: IrModule, out: X64Out) -> List<int> {
     blob[5] = 1
     blob[6] = 1
     setU16(blob, 16, 1)
-    setU16(blob, 18, 62)
+    if (arm64) {
+        setU16(blob, 18, 183)
+    } else {
+        setU16(blob, 18, 62)
+    }
     setU32(blob, 20, 1)
     setU64(blob, 24, 0)
     setU64(blob, 32, 0)

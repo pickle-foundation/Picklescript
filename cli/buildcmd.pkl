@@ -1,7 +1,7 @@
 module cli.buildcmd
 
 import { subStr } from compiler.front
-import { SYS_PLATFORM } from runtime.abi_sys
+import { SYS_PLATFORM, SYS_ARCH } from runtime.abi_sys
 
 /// Options for `pklc build`, shared by the POSIX and Windows front ends so the
 /// two commands accept the same flags and compute the same default output.
@@ -24,9 +24,13 @@ class BuildOptions {
 }
 
 /// The target this compiler was built for. A native Linux `pklc` defaults to
-/// `linux`; the Windows bootstrap defaults to `win`. `--target` overrides it.
+/// `linux` on x86-64 and `linux-arm64` on AArch64; the Windows bootstrap
+/// defaults to `win`. `--target` overrides it.
 fn defaultBuildTarget() -> string {
     if (SYS_PLATFORM == "posix") {
+        if (SYS_ARCH == "arm64") {
+            return "linux-arm64"
+        }
         return "linux"
     }
     "win"
@@ -44,7 +48,7 @@ fn parseBuildOptions(argv: List<string>) -> BuildOptions? {
         let a = argv[i]
         if (a == "--target") {
             if (i + 1 >= len(argv)) {
-                return buildUsage("--target needs win or linux")
+                return buildUsage("--target needs win, linux or linux-arm64")
             }
             target = normalizeTarget(argv[i + 1])
             if (target == "") {
@@ -92,7 +96,10 @@ fn normalizeTarget(t: string) -> string {
     if (t == "win" || t == "windows") {
         return "win"
     }
-    if (t == "linux" || t == "posix") {
+    if (t == "linux-arm64" || t == "linux-aarch64" || t == "arm64" || t == "aarch64") {
+        return "linux-arm64"
+    }
+    if (t == "linux" || t == "posix" || t == "linux-x64" || t == "linux-amd64") {
         return "linux"
     }
     ""
@@ -147,6 +154,6 @@ fn hasSuffix(s: string, suf: string) -> bool {
 
 fn buildUsage(msg: string) -> BuildOptions? {
     println("pklc: " + msg)
-    println("usage: pklc build [--target win|linux] [-o <path>] [--runtime <dir>] [--no-link] <file.pkl>")
+    println("usage: pklc build [--target win|linux|linux-arm64] [-o <path>] [--runtime <dir>] [--no-link] <file.pkl>")
     none
 }
