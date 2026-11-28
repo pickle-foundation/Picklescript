@@ -22,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `build --target linux-arm64` in both drivers. The cross-built compiler and
   the compiler it builds from its own source are byte-identical (6,013,840
   bytes, SHA-256
-  `8BBA394C801395298E0B08B3C314ECF7DC8DB2280D69282092FDD59274FCA927`),
+  `51F46D4D2E60D452E09908F4DEB425458997BDC5399F05DDFF007E52F0E4E531`),
   so ARM64 reaches its own fixed point. Verified under `qemu-aarch64` only.
 
 - `runtime.abi_sysno` now owns every Linux syscall number, argument shape and
